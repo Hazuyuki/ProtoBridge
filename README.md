@@ -26,13 +26,13 @@ reduce / reduce-scatter) against the fabric.
 
 ```
             ┌─────────────────────────────────────────────────────┐
-   App ───▶ │  C1: operation → packet                              │
+   App ───▶ │  OTP: operation → packet                             │
  (collective│   ProtocolModel (7 vendors) + ProtocolPayloadBuilder │
   injector) │   FabricHeader (type/seq/flow/VC)                    │
             └──────────────────────┬──────────────────────────────┘
                                    ▼
             ┌─────────────────────────────────────────────────────┐
-            │  C2: packet execution                                 │
+            │  PEX: packet execution                                │
             │   FecModel  CreditManager  LlrManager  LinkDegradation│
             │   NVSwitch: VOQ + crossbar arbiter + SHARP allreduce │
             │   ContentionModel (WFQ collective vs P2P)             │
@@ -41,12 +41,12 @@ reduce / reduce-scatter) against the fabric.
                           PointToPoint channel (BER + delay + bw)
 ```
 
-- **C1** turns a collective operation into a stream of fabric packets:
+- **OTP** turns a collective operation into a stream of fabric packets:
   `ProtocolModel` selects the vendor wire format / protocol (LL / LL128 /
   SIMPLE for NCCL; HCCS for Huawei; …), `ProtocolPayloadBuilder` packs the
   tensor chunks, and `FabricHeader` carries Packet Type (DATA/CREDIT),
   Sequence Number, Flow ID, and Virtual Channel ID.
-- **C2** executes those packets: `FecModel` (RS codes), `CreditManager`
+- **PEX** executes those packets: `FecModel` (RS codes), `CreditManager`
   (per-VC credit gating), `LlrManager` (go-back-N / SACK retransmission),
   `LinkDegradationModel` (per-link BER sampling), and the NVSwitch model
   (input VOQs, a crossbar arbiter resolving output-port contention, and
@@ -91,6 +91,24 @@ hypercube/torus/mesh/…), `--algorithm` (ring/tree/sharp/nvls/fullmesh/auto),
 
 Prints the resolved bundle: vendor, FEC (544/514/15), 4 VCs × 64 credits,
 credit flow control, LLR off.
+
+### Define a protocol in config
+
+A `.cfg` declares the two layers in one file — a `[stack]` PEX bundle (by
+reference to a profile) and an `[op]` OTP stencil of replicated transfers —
+which a compiler turns into a transaction graph run by the generic runner.
+This is the "define a protocol in tens of lines of config" seam; the
+validated PEX topology/BER/FEC wiring is reused unchanged.
+
+```bash
+./ns3 run "gpu-cluster-sim --protocolConfig=\
+configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
+```
+
+Two examples ship: `h200-ring-allreduce.cfg` (reproduces the hand-written
+ring) and `h200-request-response.cfg` (a two-leg ping-pong). See
+[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the `.cfg` schema and the
+OTP/PEX transaction-graph seam.
 
 ## Surrogate models
 
@@ -151,7 +169,7 @@ All calibration is H200 NVLink4 (no A800). Under `surrogate/calibration/`:
 ## Repository layout
 
 ```
-src/gpu-cluster/        C1 + C2 + NVSwitch + collective injectors + tests
+src/gpu-cluster/        OTP + PEX + NVSwitch + collective injectors + tests
 scratch/                gpu-cluster-sim.cc (simulator entry), protocol-profile-demo.cc
 configs/                protocol_profiles/ (h200-ll128.profile), dse/topo_specs.csv
 surrogate/              theory/  analytical/  topo/  calibration/  test/

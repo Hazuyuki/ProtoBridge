@@ -20,6 +20,8 @@ build_lib(
     model/protocol-model.cc
     model/protocol-payload-builder.cc
     model/protocol-profile.cc
+    model/protocol-config.cc
+    model/protocol-config-runner.cc
     model/fabric-switch.cc
     model/nccl-protocol-model.cc
     model/nccl-protocol-payload-builder.cc
@@ -74,6 +76,8 @@ build_lib(
     model/protocol-model.h
     model/protocol-payload-builder.h
     model/protocol-profile.h
+    model/protocol-config.h
+    model/protocol-config-runner.h
     model/flow-control-policy.h
     model/hybrid-routing-table.h
     model/gateway-endpoint.h

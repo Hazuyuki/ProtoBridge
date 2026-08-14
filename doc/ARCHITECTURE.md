@@ -5,9 +5,19 @@ This document describes the layering, the fabric header, the flow-control /
 spraying / reorder model, the NVSwitch datapath, the resilience tiers, and the
 topology grammar.
 
-## Layering: C1 (operation → packet) and C2 (packet execution)
+## Layering: OTP (operation → packet) and PEX (packet execution)
 
-**C1 — operation to packet.** A collective injector (ring-allreduce,
+The simulator is split into two abstraction layers, mirroring the paper's
+OTP/PEX model. **OTP — operation to packet** (a.k.a. C1) turns a tensor
+operation into a stream of fabric packets. **PEX — packet execution**
+(a.k.a. C2) drives those packets across the wire. The two layers are
+decoupled by a small transaction-graph seam (see below): OTP emits a graph of
+ACTION/delivery-WAIT nodes; PEX fires each ACTION as a wire send and feeds
+delivery events back. A collective can be expressed either by a hand-written
+injector (the validated path) or by a few lines of config compiled through
+that seam (the `--protocolConfig` path).
+
+**OTP — operation to packet.** A collective injector (ring-allreduce,
 tree-allreduce, nvls-allgather, sharp-allreduce, fullmesh, alltoall, …)
 decomposes a tensor operation into a stream of fabric packets. For each packet
 it asks:
@@ -20,7 +30,7 @@ it asks:
 - `FabricHeader` to stamp packet type, sequence number, flow ID, virtual
   channel, source/dest rank.
 
-**C2 — packet execution.** Each packet traverses:
+**PEX — packet execution.** Each packet traverses:
 
 - `CreditManager` — per-VC credit gating; a DATA packet consumes one credit on
   the matching VC and the receiver returns a CREDIT packet when the buffer
@@ -38,6 +48,103 @@ it asks:
   Head-of-Line contention on a per-cycle round-robin schedule, and SHARP
   in-network allreduce (buffers aligned packets, models a compute delay, then
   multicasts the result to all endpoints).
+
+## OTP/PEX boundary: the transaction-graph seam
+
+OTP and PEX never call each other directly. They meet at a small data
+structure, the `ProtocolTransactionGraph`, and a runner,
+`ProtocolTransactionExecutor`:
+
+```
+  OTP side                                  PEX side
+  ┌──────────────────────┐                  ┌──────────────────────┐
+  │ ProtocolTransaction- │  ACTION node     │  action callback     │
+  │ Graph                │ ───────────────▶ │  → SendBulkWire-     │
+  │  (ACTION / WAIT /   │                  │     TransferSize()   │
+  │   DELAY / COMPLETE)  │  PACKET_DELIVERED │                      │
+  │                      │ ◀─────────────── │  receive callback    │
+  │ Executor::NotifyEvent│   (event)        │  → NotifyEvent()     │
+  └──────────────────────┘                  └──────────────────────┘
+```
+
+- **OTP** builds the graph: `ProtocolModel::AddTransaction` expands one
+  logical transfer into an `ACTION` (the wire send) plus a delivery `WAIT`
+  (matched on packet type, source/dest rank, flow id, stage id, byte count).
+  `DELAY` nodes insert startup / inter-step software overhead;
+  `COMPLETE` is the terminal fan-in/fan-out node.
+- **The seam** is two callbacks: the executor's `ActionCallback`
+  (OTP → PEX: "fire this wire send") and `NotifyEvent` (PEX → OTP: "a
+  packet matching this WAIT arrived"). The runner derives `stageId =
+  flowId − baseFlowId` on the receive side so the delivery event routes to
+  the right WAIT — this is what lets a multi-step ring pipeline advance.
+- **PEX** owns the `FabricEndpoint` + `FecModel` + `CreditManager` +
+  `LlrManager` + `LinkDegradationModel` + `NVSwitch` models below.
+
+The hand-written injectors (e.g. `RingAllReduce`) build this graph in C++.
+The config path (next section) builds the same kind of graph from a `.cfg`,
+so a protocol is "defined in tens of lines of config" — the paper's OTP
+stencil — without touching the PEX models.
+
+## Config-driven protocol stack (`.cfg`)
+
+A `.cfg` declares the two layers in one file: a `[stack]` PEX bundle (by
+reference to a `ProtocolProfile`) and an `[op]` OTP stencil (a replicated
+set of logical transfers). A compiler (`ProtocolConfig::Compile`) expands
+the stencil through the vendor `ProtocolModel` — which emits the ACTION +
+delivery WAIT nodes — so the config declares *transfers*, never raw graph
+nodes.
+
+```
+[stack]
+# PEX bundle by reference: protocol/FEC/credits/BER/flow-control/LLR.
+profile = configs/protocol_profiles/h200-ll128.profile
+
+[op]
+# Symbolic params, evaluated in order; may reference numGpus, dataSize,
+# and earlier params. Integer arithmetic only (+ - * / mod, parentheses).
+param.N        = numGpus
+param.segment  = dataSize / N
+param.steps    = 2 * (N - 1)
+
+# Replication domain: one transfer instance per (gpu, step). The first
+# replicate var is the chain axis (each gpu's steps are chained in order).
+replicate.gpu  = 0 .. N-1
+replicate.step = 0 .. steps-1
+
+# Per-chain startup. "auto" = the protocol model's startup delay for the
+# total data size at N GPUs (matches the hand-written RingAllReduce).
+startup        = auto
+# Inter-step software overhead (ns) inserted between a gpu's steps.
+per_step_delay = 0
+
+# The transfer stencil, evaluated per instance with gpu/step/N/segment in
+# scope. flowId and stageId are assigned by the compiler (baseFlowId +
+# stage counter). kind ∈ DATA | P2P | MEMORY_READ | MEMORY_WRITE.
+transfer.0.kind  = DATA
+transfer.0.src   = gpu
+transfer.0.dst   = (gpu + 1) mod N
+transfer.0.bytes = segment
+transfer.0.vc    = 0
+
+# Completion: every gpu's final step must deliver (all | any).
+complete = all
+```
+
+Run it with the validated topology / BER / FEC wiring kept on the PEX side:
+
+```
+./ns3 run "gpu-cluster-sim --protocolConfig=\
+configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
+```
+
+Two example configs ship: `h200-ring-allreduce.cfg` (reproduces the
+hand-written ring) and `h200-request-response.cfg` (a two-leg ping-pong
+showing the stencil is not ring-specific). The config path uses the
+profile's PEX parameters (4 VCs × 64 credits, RS(544,514,15) FEC, 15 µs
+startup), so its latency is profile-canonical rather than bit-identical to
+the default-path injector (which uses the protocol model's 65 µs startup
+default). See [configs/protocol_configs/](../configs/protocol_configs) and
+[configs/protocol_profiles/](../configs/protocol_profiles).
 
 ## FabricHeader layout
 

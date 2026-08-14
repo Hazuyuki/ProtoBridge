@@ -30,6 +30,7 @@
 #include "ns3/application-container.h"
 #include "ns3/gpu-cluster-helper.h"
 #include "ns3/protocol-profile.h"
+#include "ns3/protocol-config.h"
 #include "ns3/flow-control-policy.h"
 
 #include <fstream>
@@ -3309,6 +3310,258 @@ class ProtocolProfileBundleTest : public TestCase
     }
 };
 
+/**
+ * @brief Guards the OTP compiler (F2): a `.cfg` ring stencil compiles into a
+ * ProtocolTransactionGraph with the vendor model's ACTION + delivery WAIT
+ * expansion. The full switched-topology run is exercised via `gpu-cluster-sim
+ * --protocolConfig`; this test pins the compile-time structure (node counts,
+ * per-transfer dst/bytes) so a compiler regression cannot silently shrink the
+ * graph.
+ */
+class ProtocolConfigCompileTest : public TestCase
+{
+  public:
+    ProtocolConfigCompileTest() : TestCase("ProtocolConfig compiles ring stencil") {}
+
+    // Resolve the H200 profile to an absolute path so the temp cfg is
+    // CWD-independent (the test-runner CWD varies by build config).
+    static std::string ResolveProfileAbsPath()
+    {
+        const char* candidates[] = {
+            "configs/protocol_profiles/h200-ll128.profile",
+            "../configs/protocol_profiles/h200-ll128.profile",
+            "../../configs/protocol_profiles/h200-ll128.profile",
+            nullptr};
+        for (int i = 0; candidates[i]; ++i)
+        {
+            std::ifstream f(candidates[i]);
+            if (f.good())
+            {
+                char* abs = realpath(candidates[i], nullptr);
+                if (abs)
+                {
+                    std::string s(abs);
+                    free(abs);
+                    return s;
+                }
+            }
+        }
+        return "";
+    }
+
+    void DoRun() override
+    {
+        const std::string profilePath = ResolveProfileAbsPath();
+        const std::string cfgPath = "/tmp/protobridge_cfgtest_ring.cfg";
+        std::ofstream cfg(cfgPath);
+        NS_TEST_ASSERT_MSG_EQ(cfg.good(), true, "temp ring cfg opens for write");
+        cfg << "[stack]\n";
+        if (!profilePath.empty())
+        {
+            cfg << "profile = " << profilePath << "\n";
+        }
+        cfg << "[op]\n"
+            << "param.N = numGpus\n"
+            << "param.segment = dataSize / N\n"
+            << "param.steps = 2 * (N - 1)\n"
+            << "replicate.gpu = 0 .. N-1\n"
+            << "replicate.step = 0 .. steps-1\n"
+            << "startup = auto\n"
+            << "per_step_delay = 0\n"
+            << "transfer.0.kind = DATA\n"
+            << "transfer.0.src = gpu\n"
+            << "transfer.0.dst = (gpu + 1) mod N\n"
+            << "transfer.0.bytes = segment\n"
+            << "transfer.0.vc = 0\n"
+            << "complete = all\n";
+        cfg.close();
+
+        ProtocolConfig pconfig;
+        std::string err;
+        NS_TEST_ASSERT_MSG_EQ(pconfig.Load(cfgPath, &err), true, "ring cfg loads: " << err);
+
+        // PEX protocol model from the profile when available; a default NCCL
+        // model is sufficient for compilation (only packetization is consulted).
+        Ptr<ProtocolModel> proto;
+        if (!profilePath.empty())
+        {
+            ProtocolProfile profile;
+            NS_TEST_ASSERT_MSG_EQ(profile.Load(profilePath), true, "profile loads");
+            ProtocolBundle b = profile.Build();
+            NS_TEST_ASSERT_MSG_NE(b.protocol, nullptr, "bundle has a protocol model");
+            proto = b.protocol;
+        }
+        else
+        {
+            proto = CreateObject<NcclProtocolModel>();
+        }
+        NS_TEST_ASSERT_MSG_NE(proto, nullptr, "protocol model present");
+
+        const uint16_t N = 4;
+        const uint64_t dataSize = 1024 * 1024; // 1 MiB
+        ProtocolTransactionGraph graph;
+        ProtocolTransactionNodeId term =
+            pconfig.Compile(graph, proto, N, dataSize, /*baseFlowId=*/1, &err);
+        NS_TEST_ASSERT_MSG_NE(term, PROTOCOL_TRANSACTION_INVALID_NODE,
+                              "ring stencil compiles: " << err);
+
+        // 4 GPUs x 2*(N-1)=6 steps = 24 transfers => 24 ACTION + 24 WAIT nodes.
+        uint32_t actions = 0;
+        uint32_t waits = 0;
+        for (const auto& node : graph.GetNodes())
+        {
+            if (node.type == ProtocolTransactionNodeType::ACTION)
+            {
+                ++actions;
+            }
+            else if (node.type == ProtocolTransactionNodeType::WAIT)
+            {
+                ++waits;
+            }
+        }
+        NS_TEST_ASSERT_MSG_EQ(actions, 24u, "ring emits 24 ACTION nodes (4 GPUs x 6 steps)");
+        NS_TEST_ASSERT_MSG_EQ(waits, 24u, "ring emits 24 delivery WAIT nodes");
+
+        // Structural check: every action is gpu -> (gpu+1)%N carrying dataSize/N.
+        for (const auto& node : graph.GetNodes())
+        {
+            if (node.type != ProtocolTransactionNodeType::ACTION)
+            {
+                continue;
+            }
+            const auto& a = node.action;
+            NS_TEST_ASSERT_MSG_EQ(a.destinationRank,
+                                  static_cast<uint16_t>((a.sourceRank + 1) % N),
+                                  "ring action dst = (src+1) mod N");
+            NS_TEST_ASSERT_MSG_EQ(a.effectiveBytes, dataSize / N,
+                                  "ring action carries one segment (dataSize/N)");
+        }
+    }
+};
+
+/**
+ * @brief Guards the config -> executor -> completion run path (F3/F5): a
+ * compiled request/response graph executes to completion when driven by
+ * delivery events shaped like the runner's OnPacketReceived output. The real
+ * switched-topology run is covered by `gpu-cluster-sim --protocolConfig`; this
+ * pins the execute seam so an OTP/PEX regression cannot leave the graph
+ * hanging.
+ */
+class ProtocolConfigRunTest : public TestCase
+{
+  public:
+    ProtocolConfigRunTest() : TestCase("ProtocolConfig runs to completion") {}
+
+    static std::string ResolveProfileAbsPath()
+    {
+        return ProtocolConfigCompileTest::ResolveProfileAbsPath();
+    }
+
+    void DoRun() override
+    {
+        const std::string profilePath = ResolveProfileAbsPath();
+        const std::string cfgPath = "/tmp/protobridge_cfgtest_rr.cfg";
+        std::ofstream cfg(cfgPath);
+        NS_TEST_ASSERT_MSG_EQ(cfg.good(), true, "temp rr cfg opens for write");
+        cfg << "[stack]\n";
+        if (!profilePath.empty())
+        {
+            cfg << "profile = " << profilePath << "\n";
+        }
+        cfg << "[op]\n"
+            << "param.N = numGpus\n"
+            << "replicate.gpu = 0 .. 0\n"
+            << "startup = auto\n"
+            << "per_step_delay = 0\n"
+            << "transfer.0.kind = DATA\n"
+            << "transfer.0.src = 0\n"
+            << "transfer.0.dst = 1 mod N\n"
+            << "transfer.0.bytes = 4096\n"
+            << "transfer.0.vc = 0\n"
+            << "transfer.1.kind = DATA\n"
+            << "transfer.1.src = 1 mod N\n"
+            << "transfer.1.dst = 0\n"
+            << "transfer.1.bytes = 65536\n"
+            << "transfer.1.vc = 0\n"
+            << "complete = all\n";
+        cfg.close();
+
+        ProtocolConfig pconfig;
+        std::string err;
+        NS_TEST_ASSERT_MSG_EQ(pconfig.Load(cfgPath, &err), true, "rr cfg loads: " << err);
+
+        Ptr<ProtocolModel> proto;
+        if (!profilePath.empty())
+        {
+            ProtocolProfile profile;
+            NS_TEST_ASSERT_MSG_EQ(profile.Load(profilePath), true, "profile loads");
+            proto = profile.Build().protocol;
+        }
+        else
+        {
+            proto = CreateObject<NcclProtocolModel>();
+        }
+        NS_TEST_ASSERT_MSG_NE(proto, nullptr, "protocol model present");
+
+        const uint16_t N = 2;
+        ProtocolTransactionGraph graph;
+        ProtocolTransactionNodeId term =
+            pconfig.Compile(graph, proto, N, /*dataSize=*/4096, /*baseFlowId=*/1, &err);
+        NS_TEST_ASSERT_MSG_NE(term, PROTOCOL_TRANSACTION_INVALID_NODE,
+                              "rr stencil compiles: " << err);
+
+        m_executor = CreateObject<ProtocolTransactionExecutor>();
+        m_executor->SetActionCallback(
+            [this](const ProtocolTransactionAction& a) { OnAction(a); });
+        m_executor->SetCompletionCallback([this]() {
+            m_completed = true;
+            m_durationNs = Simulator::Now().GetNanoSeconds();
+        });
+        NS_TEST_ASSERT_MSG_EQ(m_executor->SetGraph(graph, &err), true, "set graph: " << err);
+
+        // Bound the run so a regression cannot hang the suite.
+        Simulator::Stop(MicroSeconds(500));
+        m_executor->Start();
+        Simulator::Run();
+        Simulator::Destroy();
+
+        NS_TEST_ASSERT_MSG_EQ(m_actions.size(), 2u,
+                              "two transfers execute (request then response)");
+        NS_TEST_ASSERT_MSG_EQ(m_actions[0].sourceRank, 0u, "request leg src=0");
+        NS_TEST_ASSERT_MSG_EQ(m_actions[0].destinationRank, 1u, "request leg dst=1");
+        NS_TEST_ASSERT_MSG_EQ(m_actions[1].sourceRank, 1u, "response leg src=1");
+        NS_TEST_ASSERT_MSG_EQ(m_actions[1].destinationRank, 0u, "response leg dst=0");
+        NS_TEST_ASSERT_MSG_EQ(m_completed, true,
+                              "graph reaches completion within the time bound");
+        NS_TEST_ASSERT_MSG_GT(m_durationNs, 0, "completion stamps a positive time");
+    }
+
+  private:
+    // The action callback mirrors the runner's OTP->PEX handoff: the vendor
+    // ACTION fires a wire send. Here we simulate delivery by injecting a
+    // matching PACKET_DELIVERED event a short time later (the runner does this
+    // from its FabricEndpoint receive callback -> NotifyEvent).
+    void OnAction(const ProtocolTransactionAction& a)
+    {
+        m_actions.push_back(a);
+        ProtocolTransactionEvent ev;
+        ev.type = ProtocolTransactionEventType::PACKET_DELIVERED;
+        ev.packetType = a.packetType;
+        ev.sourceRank = a.sourceRank;
+        ev.destinationRank = a.destinationRank;
+        ev.flowId = a.flowId;
+        ev.stageId = a.stageId;
+        ev.bytes = a.effectiveBytes;
+        Simulator::Schedule(NanoSeconds(100),
+                           [this, ev]() { m_executor->NotifyEvent(ev); });
+    }
+
+    Ptr<ProtocolTransactionExecutor> m_executor;
+    std::vector<ProtocolTransactionAction> m_actions;
+    bool m_completed{false};
+    int64_t m_durationNs{0};
+};
+
 class GpuClusterTestSuite : public TestSuite
 {
   public:
@@ -3452,6 +3705,8 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new FlowControlGateTest, TestCase::Duration::QUICK);
     AddTestCase(new MemoryFallbackTest, TestCase::Duration::QUICK);
     AddTestCase(new ProtocolProfileBundleTest, TestCase::Duration::QUICK);
+    AddTestCase(new ProtocolConfigCompileTest, TestCase::Duration::QUICK);
+    AddTestCase(new ProtocolConfigRunTest, TestCase::Duration::QUICK);
 }
 
 static GpuClusterTestSuite g_gpuClusterTestSuite;

@@ -33,6 +33,9 @@
 #include "ns3/device-type.h"
 #include "ns3/fabric-type.h"
 #include "ns3/protocol-model.h"
+#include "ns3/protocol-profile.h"
+#include "ns3/protocol-config.h"
+#include "ns3/protocol-config-runner.h"
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/ici-protocol-model.h"
 #include "ns3/hccs-protocol-model.h"
@@ -438,7 +441,44 @@ main(int argc, char* argv[])
     cmd.AddValue("intraNodeAlgorithm", "Intra-node algorithm for hierarchical: ring/fullmesh", intraNodeAlgorithm);
     std::string stepTraceFile = "";
     cmd.AddValue("stepTraceFile", "Path to write per-step completion CSV (gpu,step,startNs,completeNs,delayNs)", stepTraceFile);
+    std::string protocolConfigPath = "";
+    cmd.AddValue("protocolConfig",
+                 "Path to a .cfg protocol config. When set, the [stack] profile drives the "
+                 "PEX bundle (protocol/FEC/credits/LLR) and the [op] stencil drives the OTP "
+                 "graph, replacing the hardcoded collective injector.",
+                 protocolConfigPath);
     cmd.Parse(argc, argv);
+
+    // Config-driven mode: load the .cfg + build the PEX bundle up front so the
+    // BER fallback, protocol/FEC/payloadBuilder reassignment, and per-endpoint
+    // credit/VC override below all see the profile's values. When the flag is
+    // absent the validated hardcoded path is untouched.
+    ProtocolConfig pconfig;
+    ProtocolBundle pbundle;
+    bool configMode = false;
+    if (!protocolConfigPath.empty())
+    {
+        std::string cfgErr;
+        if (!pconfig.Load(protocolConfigPath, &cfgErr))
+        {
+            NS_ABORT_MSG("could not load protocol config: " << cfgErr);
+        }
+        ProtocolProfile prof;
+        if (pconfig.GetProfilePath().empty())
+        {
+            NS_ABORT_MSG("protocol config has no [stack] profile");
+        }
+        if (!prof.Load(pconfig.GetProfilePath()))
+        {
+            NS_ABORT_MSG("could not load profile: " << pconfig.GetProfilePath());
+        }
+        for (const auto& kv : pconfig.GetStackValues())
+        {
+            prof.Set(kv.first, kv.second);
+        }
+        pbundle = prof.Build();
+        configMode = true;
+    }
 
     if (topology == "railfattree")
     {
@@ -605,6 +645,19 @@ main(int argc, char* argv[])
     // Link degradation model: created before topology build so helper can
     // propagate BER to switch ports. Applied to endpoints after build.
     // Triggered by global --ber, any per-tier BER flag, or packet loss rate.
+    // In config mode the profile is the source of truth for BER, so when no
+    // CLI tier BER was given, fall back to the bundle's per-tier BERs.
+    if (configMode
+        && berIntraNodeElectrical == 0.0 && berIntraRackElectrical == 0.0
+        && berInterRackElectrical == 0.0 && berInterRackOptical == 0.0)
+    {
+        // The profile exposes three BER tiers (intra-node electrical,
+        // intra-rack electrical, inter-rack optical). The CLI's fourth tier
+        // (inter-rack electrical) has no profile counterpart and stays 0.
+        berIntraNodeElectrical = pbundle.berIntraNodeElectrical;
+        berIntraRackElectrical = pbundle.berIntraRackElectrical;
+        berInterRackOptical = pbundle.berInterRackOptical;
+    }
     Ptr<LinkDegradationModel> degradation;
     if (ber > 0.0 || packetLossRate > 0.0
         || berIntraNodeElectrical > 0.0 || berIntraRackElectrical > 0.0
@@ -675,6 +728,22 @@ main(int argc, char* argv[])
 
     ObjectFactory payloadFactory(payloadBuilderType);
     Ptr<ProtocolPayloadBuilder> payloadBuilder = payloadFactory.Create<ProtocolPayloadBuilder>();
+
+    // Config mode: the [stack] profile is the source of truth for the PEX
+    // bundle. Reassign the protocol model, payload builder, FEC model, and
+    // LLR flag to the bundle's objects so all downstream wiring (the endpoint
+    // apply loops, NVSwitch FEC, and the FEC/LLR gate above) uses them.
+    if (configMode)
+    {
+        protoModel = pbundle.protocol;
+        payloadBuilder = pbundle.payloadBuilder;
+        if (pbundle.fec) { fecModel = pbundle.fec; }
+        llrEnabled = pbundle.llrEnabled;
+        if (forceProtocol != 0)
+        {
+            protoModel->SetForceProtocolId(static_cast<uint8_t>(forceProtocol));
+        }
+    }
 
     Ptr<ContentionModel> contentionModel;  // Created in single-node else block or later
 
@@ -1126,6 +1195,7 @@ main(int argc, char* argv[])
               << llrReloadLatencyNs << "ns" << std::endl;
 
     Ptr<CollectiveInjector> injector;
+    ProtocolConfigRunner configRunner;  // used only in config mode
     // Resolve "auto" for the single-shot path (trace path resolves per-phase
     // inside CreateTraceCollectiveInjector). hasNvls follows the same rule.
     bool hasNvls = (topology == "switched");
@@ -1138,7 +1208,24 @@ main(int argc, char* argv[])
                   << " N=" << numGpus << " topo=" << topology
                   << " -> " << algo << std::endl;
     }
-    if (collective == "allreduce")
+    if (configMode)
+    {
+        // Apply the profile's PEX bundle to the endpoints (overrides the inline
+        // 1-VC convenience credit setup with the profile's VC count + per-VC
+        // credits + flow-control policy), compile the [op] stencil into a
+        // transaction graph, and run it via the generic runner. The runner
+        // lives in main scope so it outlives Simulator::Run() below.
+        ProtocolConfigRunner::ApplyBundle(endpoints, pbundle, bulkChunkSize);
+        std::string cfgErr;
+        if (!configRunner.Initialize(endpoints, pbundle, pconfig, numGpus, dataSize, &cfgErr))
+        {
+            NS_ABORT_MSG("protocol config compile error: " << cfgErr);
+        }
+        configRunner.SetCompletionCallback(
+            [](uint64_t durationNs) { OnCollectiveComplete(durationNs); });
+        configRunner.Start();
+    }
+    else if (collective == "allreduce")
     {
         if (algo == "hierarchical")
         {
