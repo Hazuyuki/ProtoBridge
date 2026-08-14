@@ -1,0 +1,92 @@
+[
+  {
+    "dataSize": 65536,
+    "simTimeUs": 24.7,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  },
+  {
+    "dataSize": 262144,
+    "simTimeUs": 26.0,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  },
+  {
+    "dataSize": 1048576,
+    "simTimeUs": 31.3,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  },
+  {
+    "dataSize": 2097152,
+    "simTimeUs": 38.3,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  },
+  {
+    "dataSize": 4194304,
+    "simTimeUs": 52.3,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  },
+  {
+    "dataSize": 8388608,
+    "simTimeUs": 80.2,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  },
+  {
+    "dataSize": 16777216,
+    "simTimeUs": 136.2,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  },
+  {
+    "dataSize": 67108864,
+    "simTimeUs": 471.7,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  },
+  {
+    "dataSize": 268435456,
+    "simTimeUs": 1814.1,
+    "numGpus": 8,
+    "algorithm": "nvls",
+    "collective": "allreduce",
+    "config": "baseline",
+    "ber": 0,
+    "ll128_threshold": 2097152
+  }
+]

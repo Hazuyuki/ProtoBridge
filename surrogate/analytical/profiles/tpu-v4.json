@@ -1,0 +1,26 @@
+{
+  "name": "tpu-v4",
+  "vendor": "Google",
+  "gpuType": "TPU-v4",
+  "deviceType": "TPU",
+  "fabricType": "ICI",
+  "maxGpusPerNode": 4096,
+  "topology": "torus",
+  "torusDims": [16, 16, 16],
+  "ici": {
+    "perLinkEffectiveBandwidthGBps": 100,
+    "linksPerDim": 2,
+    "latencyNs": 100,
+    "bidirectional": true
+  },
+  "protocolModel": "ns3::IciProtocolModel",
+  "payloadBuilder": "ns3::IciPayloadBuilder",
+  "startupDelay": {
+    "simpleNs": 40000
+  },
+  "credits": {
+    "numVcs": 1,
+    "vcCreditsBytes": 104857600
+  },
+  "sprayChunkSize": 524288
+}

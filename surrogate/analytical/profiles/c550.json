@@ -1,0 +1,55 @@
+{
+  "name": "c550",
+  "vendor": "MetaX",
+  "gpuType": "C550",
+  "maxGpusPerNode": 8,
+  "numLanes": 1,
+  "metaxlink": {
+    "specBandwidthGBps": 448,
+    "specPerLinkBandwidthGBps": 64,
+    "perLinkBandwidthGBps": 64,
+    "perLinkEffectiveBandwidthGBps": 38,
+    "perLinkEffectiveBandwidthByGpuCount": {
+      "2": 87,
+      "4": 135,
+      "8": 265
+    },
+    "bwOverrideByCollective": {
+      "2-alltoall": 47,
+      "8-alltoall": 229
+    },
+    "latencyNs": 500,
+    "bidirectional": true,
+    "description": "MetaXLink P2P full mesh: N-1 links per GPU, peak 64 GB/s. Calibrated fullmesh algorithm: startup LL/LL128=5µs, SIMPLE=10µs (ramp×2 from boundary), + 750ns/GPU. Per-direction aggregate BW by GPU count: 2GPU=87, 4GPU=135, 8GPU=265 GB/s. 2GPU alltoall override: 47 GB/s."
+  },
+  "protocolModel": "ns3::NcclProtocolModel",
+  "startupDelay": {
+    "llNs": 5000,
+    "ll128Ns": 5000,
+    "simpleNs": 10000,
+    "simpleStartupRampFactor": 2,
+    "llThreshold": 8192,
+    "ll128Threshold": 131072,
+    "perGpuNs": 750
+  },
+  "credits": {
+    "numVcs": 1,
+    "vcCreditsBytes": 104857600
+  },
+  "memorySemantic": {
+    "syncMemLatencyNs": 200,
+    "asyncMemLatencyNs": 1000
+  },
+  "sprayChunkSize": 4096,
+  "topology": "fullmesh",
+  "algorithm": "fullmesh",
+  "fabricType": "NVLink",
+  "deviceType": "GPU",
+  "interNode": {
+    "fabricType": "RoCE",
+    "bandwidthGbps": 200,
+    "latencyNs": 20000,
+    "startupNs": 40000,
+    "topology": "fullmesh"
+  }
+}

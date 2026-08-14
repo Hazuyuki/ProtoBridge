@@ -1,0 +1,29 @@
+{
+  "name": "ascend-ub-superpod",
+  "vendor": "Huawei",
+  "gpuType": "Ascend-UB",
+  "deviceType": "UB_NPU",
+  "fabricType": "UB",
+  "maxGpusPerNode": 64,
+  "topology": "2dfullmesh",
+  "ub": {
+    "laneSpeedGbps": 118,
+    "numLanesPerPort": 8,
+    "perLinkEffectiveBandwidthGBps": 56,
+    "latencyNs": 100,
+    "syncMemLatencyNs": 200,
+    "asyncMemLatencyNs": 2000,
+    "bidirectional": true,
+    "llrEnabled": true
+  },
+  "protocolModel": "ns3::UbProtocolModel",
+  "payloadBuilder": "ns3::UbPayloadBuilder",
+  "startupDelay": { "simpleNs": 50000 },
+  "credits": { "numVcs": 1, "vcCreditsBytes": 104857600 },
+  "memorySemantic": {
+    "syncMemLatencyNs": 200,
+    "asyncMemLatencyNs": 2000
+  },
+  "topologyParams": { "rackRows": 8, "rackCols": 8, "numRacks": 1, "numSpineSwitches": 0 },
+  "sprayChunkSize": 524288
+}

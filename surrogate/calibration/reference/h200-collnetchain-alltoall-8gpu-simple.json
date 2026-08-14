@@ -1,0 +1,30 @@
+{
+  "hardware": "h200",
+  "gpuType": "H200-SXM5",
+  "collective": "alltoall",
+  "numGpus": 8,
+  "topology": "switched",
+  "algorithm": "collnetchain",
+  "protocol": "Simple",
+  "source": "nccl_scan: op-alltoall_algo-CollNetChain_proto-Simple",
+  "measurements": {
+    "1024": 9.11,
+    "2048": 9.32,
+    "4096": 15.65,
+    "8192": 9.33,
+    "16384": 8.89,
+    "32768": 8.86,
+    "65536": 8.84,
+    "131072": 20.43,
+    "262144": 12.01,
+    "524288": 14.06,
+    "1048576": 15.41,
+    "2097152": 17.9,
+    "4194304": 26.19,
+    "8388608": 48.69,
+    "16777216": 70.46,
+    "67108864": 216.75,
+    "268435456": 777.74
+  },
+  "ll128_threshold": 2097152
+}

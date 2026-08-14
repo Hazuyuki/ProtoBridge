@@ -1,0 +1,38 @@
+{
+  "name": "nvl72",
+  "vendor": "NVIDIA",
+  "gpuType": "B200-Blackwell",
+  "deviceType": "GPU",
+  "fabricType": "NVLink",
+  "maxGpusPerNode": 72,
+  "topology": "nvl72",
+  "nvlink": {
+    "aggregateBandwidthGBps": 900,
+    "perLinkEffectiveBandwidthGBps": 50,
+    "latencyNs": 100,
+    "linksPerGpu": 18,
+    "bidirectional": true
+  },
+  "nvswitch": {
+    "present": true,
+    "switchPlanes": 18,
+    "gpusPerGroup": 12,
+    "voqDepth": 10000,
+    "arbitrationIntervalNs": 100,
+    "cutThroughDelayNs": 200
+  },
+  "protocolModel": "ns3::NcclProtocolModel",
+  "payloadBuilder": "ns3::NcclProtocolPayloadBuilder",
+  "startupDelay": {
+    "llNs": 65000,
+    "ll128Ns": 67000,
+    "simpleNs": 95000,
+    "llThreshold": 8192,
+    "ll128Threshold": 524288
+  },
+  "credits": {
+    "numVcs": 1,
+    "vcCreditsBytes": 104857600
+  },
+  "sprayChunkSize": 524288
+}
