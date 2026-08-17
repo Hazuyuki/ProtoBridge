@@ -215,6 +215,12 @@ All calibration is H200 NVLink4 (no A800). Under `surrogate/calibration/`:
   (avg 0.92% / max 2.68% APE).
 - `h200_nvls_ar_baseline.json`, `h200_surrogate_calibration.json` — NVLS /
   multi-collective baselines.
+- `c550_surrogate_calibration.json` — derived analytical params for the MetaX
+  C550 MetaXLink profile (fullmesh; allreduce/allgather/alltoall/reduce-scatter
+  × 2/4/8 GPU). Calibrated offline against real MetaX MCCL measurements; only
+  the derived params ship here — the raw measurement data does not, so
+  `--profile c550` produces C550-calibrated predictions but the fit quality
+  itself is not re-checkable from a clean clone.
 - `reference/` — 34 real NCCL measurement files on H200 8-GPU
   (ring/tree/nvls × allreduce/allgather/alltoall/broadcast × LL/LL128/SIMPLE).
 

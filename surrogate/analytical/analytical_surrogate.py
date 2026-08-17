@@ -295,6 +295,58 @@ class AnalyticalSurrogate:
         self._beta_small = None
         self._small_threshold_bytes = None
 
+    # Vendor interconnect block keys, in preference order. NVIDIA profiles use
+    # ``nvlink``; vendor profiles use their own fabric key. This lets the same
+    # loader resolve H200/H100/NVL72 (nvlink), MetaX C550 (metaxlink), Ascend
+    # (ub/hccs), Gaudi3 (roce), MI300X (infinityFabric), and TPU-v4 (ici).
+    _VENDOR_INTERCONNECT_KEYS = (
+        "nvlink", "metaxlink", "ub", "hccs", "roce", "infinityFabric", "ici",
+    )
+
+    def _resolve_interconnect(self, hw_data: Dict) -> Tuple[float, int]:
+        """Resolve (aggregate_bw_gbps, link_latency_ns) from a hardware profile.
+
+        NVIDIA ``nvlink`` exposes ``aggregateBandwidthGBps`` or
+        ``perLinkEffectiveBandwidthGBps`` × ``lanes``. MetaXLink is GPU-count
+        dependent (``perLinkEffectiveBandwidthByGpuCount``) with optional
+        per-collective overrides (``bwOverrideByCollective``); its values are
+        per-direction aggregate GB/s by GPU count. Other vendor blocks fall
+        back to the same aggregate / per-link×lanes fields when present.
+        """
+        block = None
+        for k in self._VENDOR_INTERCONNECT_KEYS:
+            if hw_data.get(k):
+                block = hw_data[k]
+                break
+        if not block:
+            return self.aggregate_bw_gbps, self.link_latency_ns
+
+        latency_ns = block.get("latencyNs", self.link_latency_ns)
+        agg_gb = block.get("aggregateBandwidthGBps", 0)
+        per_link_gb = block.get("perLinkEffectiveBandwidthGBps", 0)
+        lanes = block.get("lanesPerGpu", block.get("numLinks", 1))
+        if agg_gb > 0:
+            agg_gbps = agg_gb * 8  # GB/s -> Gbps per direction
+        elif per_link_gb > 0 and lanes > 0:
+            agg_gbps = per_link_gb * 8 * lanes  # per-link × lanes
+        else:
+            agg_gbps = self.aggregate_bw_gbps
+
+        # MetaXLink: aggregate BW depends on GPU count, optional per-collective
+        # override. Values are per-direction aggregate GB/s by GPU count.
+        by_count = block.get("perLinkEffectiveBandwidthByGpuCount")
+        if by_count:
+            base_gb = by_count.get(str(self.num_gpus),
+                                    by_count.get(self.num_gpus, 0))
+            if base_gb > 0:
+                agg_gbps = base_gb * 8
+            overrides = block.get("bwOverrideByCollective", {})
+            if self.collective_type:
+                ov = overrides.get(f"{self.num_gpus}-{self.collective_type}")
+                if ov is not None and ov > 0:
+                    agg_gbps = ov * 8
+        return agg_gbps, latency_ns
+
     def configure(self, config: Dict):
         """Set model parameters from experiment config dict."""
         optical = config.get("optical", {})
@@ -337,21 +389,16 @@ class AnalyticalSurrogate:
         if hw_path.exists():
             with open(hw_path) as f:
                 hw_data = json.load(f)
-            nvlink = hw_data.get("nvlink", {})
-            agg_bw = nvlink.get("aggregateBandwidthGBps", 0)
-            per_link_gb = nvlink.get("perLinkEffectiveBandwidthGBps", 0)
-            lanes = nvlink.get("lanesPerGpu", nvlink.get("numLinks", 1))
-            if agg_bw > 0:
-                self.aggregate_bw_gbps = agg_bw * 8  # GB/s to Gbps per direction
-            elif per_link_gb > 0 and lanes > 0:
-                self.aggregate_bw_gbps = per_link_gb * 8 * lanes  # per-link × lanes
-            self.link_latency_ns = nvlink.get("latencyNs", 500)
+            agg_gbps, latency_ns = self._resolve_interconnect(hw_data)
+            if agg_gbps > 0:
+                self.aggregate_bw_gbps = agg_gbps
+            self.link_latency_ns = latency_ns
             # Load memory semantic defaults from hardware profile
             mem_sem = hw_data.get("memorySemantic", {})
             if self.mem_access_latency_ns == 0:
                 self.mem_access_latency_ns = mem_sem.get("syncMemLatencyNs", 500)
             if self.mem_bandwidth_GBps == 0:
-                # Default memory BW: aggregate NVLink BW (remote reads via NVLink)
+                # Default memory BW: aggregate fabric BW (remote reads via fabric)
                 self.mem_bandwidth_GBps = self.aggregate_bw_gbps
 
         # Use calibration coefficients if available
@@ -957,9 +1004,12 @@ def main():
                     "baseline and run an optical-reliability demo under a "
                     "hardware profile.")
     parser.add_argument("--profile", default="h200", choices=profile_choices,
-                        help="hardware profile for the optical-reliability demo "
-                             "(choices: %(choices)s). Calibration still fits on the "
-                             "shipped H200 baseline, which is the only one in-repo.")
+                        help="hardware profile for the reliability demo. H200 is "
+                             "the default: the surrogate refits on the shipped H200 "
+                             "ring4 baseline. C550 loads shipped, MetaX MCCL-"
+                             "calibrated params (raw data not in repo). Other "
+                             "profiles fall back to H200-fit alpha/beta while "
+                             "still consuming the profile's interconnect BW.")
     args = parser.parse_args()
 
     surrogate = AnalyticalSurrogate()
@@ -991,17 +1041,36 @@ def main():
     surrogate.save_calibration(str(out_path))
     print(f"\nCalibration saved to {out_path}")
 
-    if args.profile != "h200":
-        print(f"\nNote: --profile={args.profile} loads that profile's memory-semantic "
-              f"defaults for the demo below. The ring-allreduce prediction is "
-              f"BW-bound; its BW and startup come from the shipped H200 calibration "
-              f"and are NOT overridden, so this demo is ~unchanged for non-H200 "
-              f"profiles. Vendor interconnect params (MetaXLink/UB/HCCS/...) are "
-              f"not yet consumed by this surrogate path. No {args.profile} "
-              f"calibration data ships in this repo.")
+    # Resolve the demo config (algorithm/collective/numGpus) + calibration
+    # source for the requested profile. H200 was already refit above; other
+    # profiles either load shipped pre-fit params or fall back to H200 fits.
+    if args.profile == "h200":
+        demo_algo, demo_coll, demo_ngpus = "ring", "allreduce", 4
+    else:
+        params_path = cal_dir / f"{args.profile}_surrogate_calibration.json"
+        if params_path.exists():
+            surrogate.load_calibration(str(params_path))
+            demo_algo, demo_coll, demo_ngpus = _profile_demo_config(
+                args.profile, surrogate)
+            print(f"\nLoaded pre-fit {args.profile} calibration from "
+                  f"{params_path.name} (raw measurement data not shipped in "
+                  f"this repo; derived params only).")
+            print(f"Demo config: {demo_algo}/{demo_coll}/{demo_ngpus}G.")
+        else:
+            fb = cal_dir / "h200_ring4_surrogate_calibration.json"
+            if fb.exists():
+                surrogate.load_calibration(str(fb))
+            demo_algo, demo_coll, demo_ngpus = "ring", "allreduce", 4
+            print(f"\nNote: no {args.profile} calibration ships in this repo. "
+                  f"The demo loads H200-fit alpha/beta as a fallback; the "
+                  f"{args.profile} interconnect bandwidth and memory-semantic "
+                  f"defaults ARE read from the profile, but the regression "
+                  f"coefficients are H200-calibrated, so treat these "
+                  f"non-H200/non-c550 predictions as approximate.")
 
-    # Optical reliability demo: FEC/retry amplification on a 1 MB allreduce.
-    print(f"\n--- Optical Reliability Predictions ({args.profile}, 1 MB allreduce, 4 GPU) ---")
+    # Reliability demo: FEC/retry amplification on a 1 MB collective.
+    print(f"\n--- Reliability Predictions ({args.profile}, 1 MB {demo_coll}, "
+          f"{demo_ngpus} GPU) ---")
     test_configs = [
         ("baseline (BER=0)", 0, False, False),
         ("FEC+SACK (BER=1e-9)", 1e-9, True, True),
@@ -1010,9 +1079,9 @@ def main():
     ]
     for name, ber, fec, retry in test_configs:
         surrogate.configure({
-            "hardware": {"numGpus": 4, "profile": args.profile},
-            "topology": {"algorithm": "ring"},
-            "collective": {"type": "allreduce"},
+            "hardware": {"numGpus": demo_ngpus, "profile": args.profile},
+            "topology": {"algorithm": demo_algo},
+            "collective": {"type": demo_coll},
             "optical": {"ber": ber},
             "fec": {"N": 544 if fec else 0, "K": 514 if fec else 0, "T": 15 if fec else 0},
             "retry": {"enabled": retry, "mode": "sack"},
@@ -1021,6 +1090,21 @@ def main():
         result = surrogate.predict_latency_us(1048576)
         p50 = result["p50"] if result["p50"] != float('inf') else "FAIL"
         print(f"  {name:<25} P50={p50:>8} us  retry_factor={result['breakdown']['retry_factor']:.2f}")
+
+
+def _profile_demo_config(profile: str, surrogate) -> Tuple[str, str, int]:
+    """Pick a (algorithm, collective, numGpus) demo config from the profile
+    defaults and the loaded calibration params."""
+    prof_path = Path(__file__).parent / "profiles" / f"{profile}.json"
+    algo = "ring"
+    if prof_path.exists():
+        with open(prof_path) as f:
+            algo = json.load(f).get("algorithm", "ring")
+    coll = "allreduce"
+    avail = sorted(n for (a, c, n) in surrogate.calibration_params
+                   if a == algo and c == coll)
+    ngpus = avail[-1] if avail else 4
+    return algo, coll, ngpus
 
 
 if __name__ == "__main__":

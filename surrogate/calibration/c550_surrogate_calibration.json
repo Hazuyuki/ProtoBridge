@@ -1,0 +1,129 @@
+{
+  "calibrated": true,
+  "params": {
+    "fullmesh_allgather_2gpu": {
+      "alpha": 71.96317277636395,
+      "beta": 0.4656828541685436,
+      "gamma": -6.880364576757236e-07,
+      "num_points": 141,
+      "bw_gbps": 696,
+      "alpha_small": 7.269270316440252,
+      "beta_small": 0.9120334892104469,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_allgather_4gpu": {
+      "alpha": 69.15067507638464,
+      "beta": 0.6919484952058801,
+      "gamma": 2.3354363194259765e-06,
+      "num_points": 141,
+      "bw_gbps": 1080,
+      "alpha_small": 8.195705957319886,
+      "beta_small": 1.4925801160766243,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_allgather_8gpu": {
+      "alpha": 89.05130188675122,
+      "beta": 0.7493676740860364,
+      "gamma": -7.659947749078351e-07,
+      "num_points": 141,
+      "bw_gbps": 2120,
+      "alpha_small": 9.299479378508092,
+      "beta_small": 2.8745649172829544,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_allreduce_2gpu": {
+      "alpha": 41.66353251137655,
+      "beta": 0.9405374783442803,
+      "gamma": -2.9047053503041215e-07,
+      "num_points": 141,
+      "bw_gbps": 696,
+      "alpha_small": 7.822020662165463,
+      "beta_small": 1.4329404258001528,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_allreduce_4gpu": {
+      "alpha": 126.09074693867542,
+      "beta": 1.3144870446348738,
+      "gamma": 4.2442798138454495e-06,
+      "num_points": 141,
+      "bw_gbps": 1080,
+      "alpha_small": 10.038535752054011,
+      "beta_small": 2.2644736534818803,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_allreduce_8gpu": {
+      "alpha": 146.18788513937494,
+      "beta": 1.5187485119730382,
+      "gamma": -6.005947528251585e-06,
+      "num_points": 141,
+      "bw_gbps": 2120,
+      "alpha_small": 13.349484530491601,
+      "beta_small": 3.018016729871769,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_alltoall_2gpu": {
+      "alpha": 50.3293469636267,
+      "beta": 0.4970166935046324,
+      "gamma": 1.8815770237412893e-08,
+      "num_points": 141,
+      "bw_gbps": 376,
+      "alpha_small": 7.647239892621811,
+      "beta_small": 0.7653451953032703,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_alltoall_4gpu": {
+      "alpha": 64.44633701047177,
+      "beta": 0.7308120311896223,
+      "gamma": -5.664185895763039e-07,
+      "num_points": 141,
+      "bw_gbps": 1080,
+      "alpha_small": 9.219123620488627,
+      "beta_small": 1.3644139515626017,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_alltoall_8gpu": {
+      "alpha": 55.34584396441981,
+      "beta": 0.7997856419760196,
+      "gamma": -8.748342264036999e-06,
+      "num_points": 141,
+      "bw_gbps": 1832,
+      "alpha_small": 11.651032294801919,
+      "beta_small": 1.7769176525021746,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_reducescatter_2gpu": {
+      "alpha": 56.722137571600314,
+      "beta": 0.47792760782783433,
+      "gamma": 1.1736736868757625e-08,
+      "num_points": 141,
+      "bw_gbps": 696,
+      "alpha_small": 7.260328371159739,
+      "beta_small": 0.9748424098818194,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_reducescatter_4gpu": {
+      "alpha": 83.99953911035439,
+      "beta": 0.7177608702299247,
+      "gamma": 3.049915668055631e-06,
+      "num_points": 141,
+      "bw_gbps": 1080,
+      "alpha_small": 8.257860299899672,
+      "beta_small": 1.5204008113368375,
+      "small_threshold_bytes": 4194304
+    },
+    "fullmesh_reducescatter_8gpu": {
+      "alpha": 68.93519809933976,
+      "beta": 0.8223868056385253,
+      "gamma": 3.3773994901549707e-06,
+      "num_points": 141,
+      "bw_gbps": 2120,
+      "alpha_small": 10.003389733994958,
+      "beta_small": 2.824202210655152,
+      "small_threshold_bytes": 4194304
+    }
+  },
+  "tail_calibration": {
+    "calibrated": false,
+    "groups": {}
+  }
+}
