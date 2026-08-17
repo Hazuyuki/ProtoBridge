@@ -8,6 +8,7 @@
 #include "gpu-cluster-helper.h"
 
 #include "ns3/fabric-endpoint.h"
+#include "ns3/fabric-switch.h"
 #include "ns3/nvswitch.h"
 #include "ns3/contention-model.h"
 #include "ns3/log.h"
@@ -107,12 +108,27 @@ NvSwitchHelper::SetAttribute(std::string name, const AttributeValue& value)
     m_factory.Set(name, value);
 }
 
+void
+NvSwitchHelper::SetSwitchType(const std::string& typeId)
+{
+    NS_LOG_FUNCTION(this << typeId);
+    // Validate the TypeId exists and is a FabricSwitch subclass so a typo
+    // fails loudly at configuration time rather than as a null install.
+    TypeId tid = TypeId::LookupByName(typeId);
+    if (!tid.IsChildOf(FabricSwitch::GetTypeId()) && tid != FabricSwitch::GetTypeId())
+    {
+        NS_FATAL_ERROR("NvSwitchHelper::SetSwitchType: " << typeId
+                      << " is not a ns3::FabricSwitch subclass");
+    }
+    m_factory.SetTypeId(typeId);
+}
+
 Ptr<NetDevice>
 NvSwitchHelper::Install(Ptr<Node> node) const
 {
     NS_LOG_FUNCTION(node);
 
-    Ptr<NvSwitch> sw = m_factory.Create<NvSwitch>();
+    Ptr<FabricSwitch> sw = m_factory.Create<FabricSwitch>();
     sw->SetNode(node);
     node->AddDevice(sw);
 
@@ -124,7 +140,7 @@ NvSwitchHelper::AddPort(Ptr<NetDevice> switchDevice, Ptr<NetDevice> portDevice) 
 {
     NS_LOG_FUNCTION(switchDevice << portDevice);
 
-    Ptr<NvSwitch> sw = DynamicCast<NvSwitch>(switchDevice);
+    Ptr<FabricSwitch> sw = DynamicCast<FabricSwitch>(switchDevice);
     if (sw)
     {
         return sw->AddPort(portDevice);

@@ -106,7 +106,18 @@ class NvSwitchHelper
     void SetAttribute(std::string name, const AttributeValue& value);
 
     /**
-     * @brief Install NvSwitch on a node
+     * @brief Set the switch implementation's TypeId.
+     *
+     * Default is "ns3::NvSwitch". Pass a different FabricSwitch subclass
+     * TypeId to plug an alternative switch architecture (e.g. an AMD
+     * Infinity Fabric switch, a Clos spine model, an OCS model). The
+     * subclass must derive from FabricSwitch and register a TypeId.
+     * @param typeId A FabricSwitch subclass TypeId string (e.g. "ns3::NvSwitch")
+     */
+    void SetSwitchType(const std::string& typeId);
+
+    /**
+     * @brief Install a switch on a node
      * @param node The node to install on
      * @return The installed NetDevice (switch device)
      */
@@ -114,7 +125,7 @@ class NvSwitchHelper
 
     /**
      * @brief Add a port to the switch
-     * @param switchDevice The NvSwitch device
+     * @param switchDevice The switch device (a FabricSwitch)
      * @param portDevice The NetDevice to add as a port
      * @return Port number assigned
      */
@@ -130,7 +141,7 @@ class NvSwitchHelper
                          Ptr<Channel> channel) const;
 
   private:
-    ObjectFactory m_factory; ///< Object factory for NvSwitch
+    ObjectFactory m_factory; ///< Object factory for the switch (default ns3::NvSwitch)
 };
 
 /**

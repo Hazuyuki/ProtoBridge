@@ -198,6 +198,34 @@ A link's effective reliability is the composition of FEC + link-level retry
 Control packets (CREDIT/ACK/NACK/RETRY_*) always bypass BER sampling, so
 flow-control credit never deadlocks under a degrading link.
 
+## Extension seams: flow control, arbitration, switching
+
+The PEX datapath exposes three polymorphic hooks so an alternative flow-control
+policy, arbitration algorithm, or switch architecture can be plugged in
+without touching the validated datapath or its call sites. Each has a default
+that reproduces the simulator's historical (calibration-identical) behavior.
+
+- **Arbitration — `Arbiter` strategy.** `Arbiter` (abstract, `arbiter.h`) decides
+  which output ports a switch drains each wake-up:
+  `SelectGrants(voqs, outputBusyUntil, now)`. `NvSwitch::Arbitrate()` delegates
+  grant-selection to a `Ptr<Arbiter>` (forwarding + rescheduling stay in the
+  switch). The default `RoundRobinArbiter` grants every port whose VOQ is
+  non-empty and whose egress link is free — the non-blocking crossbar model.
+  Install another policy on a switch via `NvSwitch::SetArbiter()` (or, on the
+  multi-node path, `MultiNodeTopologyHelper::SetArbiter()` / the `--arbiter`
+  CLI flag, e.g. `--arbiter=ns3::WfqArbiter`).
+- **Flow control — virtual send-gate hook.** `FabricEndpoint::FlowControlGate`
+  is `virtual`. The built-in `FlowControlPolicy` enum (CREDIT/WINDOW/RATE) is
+  the 3-policy fast path; a subclass can override `FlowControlGate` to plug an
+  arbitrary policy beyond the enum without editing the base or the single
+  send-gate call site.
+- **Switching — `FabricSwitch` abstract base + type selector.** Every switch
+  derives from `FabricSwitch` (pure virtuals: `AddPort`, `GetNPorts`, `GetPort`,
+  `AddStaticRoute`, `GetVendorName`). `NvSwitchHelper::SetSwitchType(typeId)`
+  selects any `FabricSwitch` subclass as the switch implementation (default
+  `ns3::NvSwitch`); `Install`/`AddPort` operate on the `FabricSwitch` base so a
+  non-`NvSwitch` subclass plugs in directly.
+
 ## Topology grammar
 
 `surrogate/topo/topo_grammar.py` enumerates 12 topology families across their

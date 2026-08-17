@@ -81,6 +81,10 @@ class MultiNodeTopologyHelper
     void SetSwitchVoqDepth(uint32_t depth);
     void SetSwitchArbInterval(uint32_t intervalNs);
     void SetSwitchCutThroughDelay(uint64_t delayNs);
+    /// Set the crossbar arbitration strategy on every built switch (default
+    /// RoundRobinArbiter). Pass an ns3::Arbiter subclass to adapt a different
+    /// arbitration method.
+    void SetArbiter(Ptr<Arbiter> arbiter);
 
     // Inter-node configuration
     void SetNumNodes(uint32_t numNodes);
@@ -119,6 +123,7 @@ class MultiNodeTopologyHelper
     uint32_t m_switchVoqDepth;
     uint32_t m_switchArbIntervalNs;
     uint64_t m_switchCutThroughDelayNs;
+    Ptr<Arbiter> m_arbiter;
 
     std::string m_intraNodeDataRate;
     std::string m_intraNodeDelay;

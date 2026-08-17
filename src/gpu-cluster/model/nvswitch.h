@@ -12,6 +12,8 @@
 #include "fabric-switch.h"
 #include "fec-model.h"
 #include "link-degradation.h"
+#include "voq-entry.h"
+#include "arbiter.h"
 
 #include "ns3/mac48-address.h"
 #include "ns3/node.h"
@@ -59,16 +61,8 @@ struct MacRankPairHash
 
 /**
  * @ingroup gpu-cluster
- * @brief Virtual Output Queue entry
+ * @brief Wire vs effective chunk size for a per-GPU All-Reduce contribution
  */
-struct VoqEntry
-{
-    Ptr<Packet> packet;     ///< The packet
-    Mac48Address srcAddr;   ///< Source MAC address
-    Mac48Address dstAddr;   ///< Destination MAC address
-    uint32_t inPort;        ///< Input port number
-};
-
 struct AllReduceChunkSize
 {
     uint32_t wireBytes;
@@ -132,6 +126,22 @@ class NvSwitch : public FabricSwitch
      * @param interval Arbitration interval in nanoseconds
      */
     void SetArbitrationInterval(uint64_t intervalNs);
+
+    /**
+     * @brief Set the crossbar arbitration strategy.
+     *
+     * Default is RoundRobinArbiter (the historical non-blocking crossbar
+     * model). Pass a subclass of Arbiter (e.g. a weighted / strict-priority
+     * policy) to adapt a different arbitration method without touching the
+     * switch datapath. Must be set before the simulation starts.
+     * @param arbiter The arbitration strategy (must not be null)
+     */
+    void SetArbiter(Ptr<Arbiter> arbiter);
+
+    /**
+     * @brief Get the crossbar arbitration strategy in use.
+     */
+    Ptr<Arbiter> GetArbiter() const;
 
     /**
      * @brief Set cut-through forwarding delay
@@ -428,6 +438,7 @@ class NvSwitch : public FabricSwitch
     EventId m_arbitrationEvent;                     ///< Scheduled arbitration event
     uint32_t m_currentArbitrationPort;              ///< Current port for RR arbitration
     std::vector<Time> m_outputBusyUntil;            ///< Per-port egress busy time (serialization)
+    Ptr<Arbiter> m_arbiter;                         ///< Crossbar arbitration strategy (default: RoundRobinArbiter)
 
     /**
      * @brief Process All-Gather packets (NVLS concatenation + multicast)

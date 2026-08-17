@@ -105,6 +105,12 @@ NvSwitch::NvSwitch()
       m_routeUnavailableDrops(0)
 {
     NS_LOG_FUNCTION(this);
+    // Default arbitration strategy: the historical non-blocking crossbar.
+    // A config-provided "Arbiter" attribute or SetArbiter() overrides this.
+    if (!m_arbiter)
+    {
+        m_arbiter = CreateObject<RoundRobinArbiter>();
+    }
 }
 
 NvSwitch::~NvSwitch()
@@ -182,6 +188,22 @@ void
 NvSwitch::SetArbitrationInterval(uint64_t intervalNs)
 {
     m_arbitrationIntervalNs = intervalNs;
+}
+
+void
+NvSwitch::SetArbiter(Ptr<Arbiter> arbiter)
+{
+    NS_LOG_FUNCTION(this << arbiter);
+    if (arbiter)
+    {
+        m_arbiter = arbiter;
+    }
+}
+
+Ptr<Arbiter>
+NvSwitch::GetArbiter() const
+{
+    return m_arbiter;
 }
 
 void
@@ -705,17 +727,24 @@ NvSwitch::Arbitrate()
 {
     NS_LOG_FUNCTION(this);
 
-    // Per-output-port matching: forward one packet per free output port.
-    // This models the crossbar fabric that can connect multiple input-output
-    // pairs in parallel, but each output port can only serve one packet at a
-    // time (egress serialization).
-    for (uint32_t port = 0; port < m_voqs.size(); ++port)
+    // Ask the arbitration strategy which output ports to drain this cycle.
+    // The strategy decides grants; the switch drains the VOQ front packet
+    // onto the wire (egress serialization) — forwarding + rescheduling stay
+    // here. The default RoundRobinArbiter reproduces the historical
+    // non-blocking crossbar (one packet per free, non-empty output port).
+    if (m_arbiter)
     {
-        if (!m_voqs[port].empty() && Simulator::Now() >= m_outputBusyUntil[port])
+        std::vector<ArbiterGrant> grants =
+            m_arbiter->SelectGrants(m_voqs, m_outputBusyUntil, Simulator::Now());
+        for (const ArbiterGrant& g : grants)
         {
-            VoqEntry entry = m_voqs[port].front();
-            m_voqs[port].pop();
-            ForwardPacket(entry.packet, entry.srcAddr, entry.dstAddr, port);
+            if (g.port >= m_voqs.size() || m_voqs[g.port].empty())
+            {
+                continue;
+            }
+            VoqEntry entry = m_voqs[g.port].front();
+            m_voqs[g.port].pop();
+            ForwardPacket(entry.packet, entry.srcAddr, entry.dstAddr, g.port);
         }
     }
 

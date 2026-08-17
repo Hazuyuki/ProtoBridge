@@ -32,6 +32,10 @@
 #include "ns3/protocol-profile.h"
 #include "ns3/protocol-config.h"
 #include "ns3/flow-control-policy.h"
+#include "ns3/arbiter.h"
+#include "ns3/nvswitch.h"
+#include "ns3/fabric-switch.h"
+#include "ns3/object-factory.h"
 
 #include <fstream>
 
@@ -3562,6 +3566,142 @@ class ProtocolConfigRunTest : public TestCase
     int64_t m_durationNs{0};
 };
 
+// ---------------------------------------------------------------------------
+// Extension seams: flow-control / arbitration / switching interfaces.
+// These do not exercise a full collective; they assert the polymorphic hooks
+// exist and route through the default strategy, so a future subclass can plug
+// an alternative method without touching the validated datapath.
+// ---------------------------------------------------------------------------
+
+// A custom Arbiter subclass that records it was consulted and grants nothing.
+class NullRecordingArbiter : public Arbiter
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::NullRecordingArbiter")
+            .SetParent<Arbiter>()
+            .SetGroupName("GpuCluster")
+            .AddConstructor<NullRecordingArbiter>();
+        return tid;
+    }
+    NullRecordingArbiter() = default;
+    std::vector<ArbiterGrant>
+    SelectGrants(const std::vector<std::queue<VoqEntry>>& /*voqs*/,
+                 const std::vector<Time>& /*outputBusyUntil*/,
+                 Time /*now*/) override
+    {
+        m_consulted = true;
+        return {}; // grant nothing
+    }
+    std::string GetName() const override { return "null-recording"; }
+    bool m_consulted{false};
+};
+
+NS_OBJECT_ENSURE_REGISTERED(NullRecordingArbiter);
+
+class ArbiterSeamTest : public TestCase
+{
+  public:
+    ArbiterSeamTest() : TestCase("Arbiter strategy seam (default + override)") {}
+    void DoRun() override
+    {
+        // Default: an NvSwitch is born with a RoundRobinArbiter.
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        NS_TEST_ASSERT_MSG_NE(sw->GetArbiter(), nullptr, "default arbiter must exist");
+        NS_TEST_ASSERT_MSG_EQ(sw->GetArbiter()->GetName(), "roundrobin",
+                              "default arbiter must be RoundRobinArbiter");
+
+        // RoundRobinArbiter grants a port whose VOQ is non-empty and egress is free.
+        std::vector<std::queue<VoqEntry>> voqs(2);
+        std::vector<Time> busyUntil{Seconds(0), Seconds(0)};
+        VoqEntry e{Create<Packet>(100), Mac48Address("00:00:00:00:00:01"),
+                   Mac48Address("00:00:00:00:00:02"), 0};
+        voqs[0].push(e);
+        auto grants = sw->GetArbiter()->SelectGrants(voqs, busyUntil, Seconds(0));
+        NS_TEST_ASSERT_MSG_EQ(grants.size(), 1u, "RR must grant the one ready port");
+        NS_TEST_ASSERT_MSG_EQ(grants[0].port, 0u, "granted port must be 0");
+
+        // Override: a custom arbiter is installed and consulted.
+        Ptr<NullRecordingArbiter> custom = CreateObject<NullRecordingArbiter>();
+        sw->SetArbiter(custom);
+        NS_TEST_ASSERT_MSG_EQ(sw->GetArbiter(), custom, "SetArbiter must install the strategy");
+        voqs[0].push(e);
+        auto grants2 = sw->GetArbiter()->SelectGrants(voqs, busyUntil, Seconds(0));
+        NS_TEST_ASSERT_MSG_EQ(grants2.size(), 0u, "custom null arbiter grants nothing");
+        NS_TEST_ASSERT_MSG_EQ(custom->m_consulted, true, "custom arbiter must be consulted");
+    }
+};
+
+class SwitchTypeSeamTest : public TestCase
+{
+  public:
+    SwitchTypeSeamTest() : TestCase("NvSwitchHelper::SetSwitchType seam") {}
+    void DoRun() override
+    {
+        // Default helper builds an NvSwitch that is-a FabricSwitch.
+        NvSwitchHelper helper;
+        Ptr<Node> node = CreateObject<Node>();
+        Ptr<NetDevice> dev = helper.Install(node);
+        NS_TEST_ASSERT_MSG_NE(dev, nullptr, "default switch install must succeed");
+        Ptr<FabricSwitch> fs = DynamicCast<FabricSwitch>(dev);
+        NS_TEST_ASSERT_MSG_NE(fs, nullptr, "default switch must be a FabricSwitch");
+        NS_TEST_ASSERT_MSG_EQ(fs->GetVendorName(), std::string("NVIDIA"),
+                              "default switch vendor must be NVIDIA");
+
+        // SetSwitchType to NvSwitch explicitly round-trips.
+        helper.SetSwitchType("ns3::NvSwitch");
+        Ptr<Node> node2 = CreateObject<Node>();
+        Ptr<NetDevice> dev2 = helper.Install(node2);
+        NS_TEST_ASSERT_MSG_NE(DynamicCast<NvSwitch>(dev2), nullptr,
+                              "SetSwitchType(ns3::NvSwitch) must build an NvSwitch");
+    }
+};
+
+// A FabricEndpoint subclass overriding the virtual FlowControlGate hook.
+class EndpointFlowControlOverride : public FabricEndpoint
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::EndpointFlowControlOverride")
+            .SetParent<FabricEndpoint>()
+            .SetGroupName("GpuCluster")
+            .AddConstructor<EndpointFlowControlOverride>();
+        return tid;
+    }
+    EndpointFlowControlOverride() = default;
+    bool FlowControlGate(uint8_t, uint32_t, bool) override
+    {
+        m_gated = true;
+        return true; // admit
+    }
+    bool m_gated{false};
+};
+
+NS_OBJECT_ENSURE_REGISTERED(EndpointFlowControlOverride);
+
+class FlowControlVirtualHookTest : public TestCase
+{
+  public:
+    FlowControlVirtualHookTest() : TestCase("FlowControlGate virtual override hook") {}
+    void DoRun() override
+    {
+        // Base endpoint uses the credit-dispatch gate (smoke: admits on bypass).
+        Ptr<FabricEndpoint> base = CreateObject<FabricEndpoint>();
+        NS_TEST_ASSERT_MSG_EQ(base->FlowControlGate(0, 1, true), true,
+                              "base gate must admit on creditBypass");
+
+        // Subclass override is actually dispatched through the base pointer.
+        Ptr<FabricEndpoint> sub = CreateObject<EndpointFlowControlOverride>();
+        NS_TEST_ASSERT_MSG_EQ(sub->FlowControlGate(0, 1, false), true,
+                              "overridden gate must admit");
+        Ptr<EndpointFlowControlOverride> typed = DynamicCast<EndpointFlowControlOverride>(sub);
+        NS_TEST_ASSERT_MSG_EQ(typed->m_gated, true,
+                              "the virtual override, not the base dispatch, must run");
+    }
+};
+
 class GpuClusterTestSuite : public TestSuite
 {
   public:
@@ -3707,6 +3847,9 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ProtocolProfileBundleTest, TestCase::Duration::QUICK);
     AddTestCase(new ProtocolConfigCompileTest, TestCase::Duration::QUICK);
     AddTestCase(new ProtocolConfigRunTest, TestCase::Duration::QUICK);
+    AddTestCase(new ArbiterSeamTest, TestCase::Duration::QUICK);
+    AddTestCase(new SwitchTypeSeamTest, TestCase::Duration::QUICK);
+    AddTestCase(new FlowControlVirtualHookTest, TestCase::Duration::QUICK);
 }
 
 static GpuClusterTestSuite g_gpuClusterTestSuite;

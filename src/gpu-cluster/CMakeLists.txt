@@ -5,6 +5,7 @@ build_lib(
     model/fabric-endpoint.cc
     model/fabric-endpoint-send.cc
     model/nvswitch.cc
+    model/arbiter.cc
     model/credit-manager.cc
     model/reorder-buffer.cc
     model/link-degradation.cc
@@ -55,6 +56,8 @@ build_lib(
     model/device-type.h
     model/fabric-switch.h
     model/nvswitch.h
+    model/voq-entry.h
+    model/arbiter.h
     model/credit-manager.h
     model/reorder-buffer.h
     model/link-degradation.h

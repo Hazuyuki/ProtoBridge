@@ -30,6 +30,7 @@ MultiNodeTopologyHelper::MultiNodeTopologyHelper()
       m_switchVoqDepth(10000),
       m_switchArbIntervalNs(100),
       m_switchCutThroughDelayNs(200),
+      m_arbiter(nullptr),
       m_intraNodeDataRate("3600Gbps"),
       m_intraNodeDelay("400ns"),
       m_intraNodeFabricType(FabricType::NVLINK),
@@ -55,6 +56,7 @@ void MultiNodeTopologyHelper::SetVcCredits(uint32_t credits) { m_vcCredits = cre
 void MultiNodeTopologyHelper::SetSwitchVoqDepth(uint32_t depth) { m_switchVoqDepth = depth; }
 void MultiNodeTopologyHelper::SetSwitchArbInterval(uint32_t intervalNs) { m_switchArbIntervalNs = intervalNs; }
 void MultiNodeTopologyHelper::SetSwitchCutThroughDelay(uint64_t delayNs) { m_switchCutThroughDelayNs = delayNs; }
+void MultiNodeTopologyHelper::SetArbiter(Ptr<Arbiter> arbiter) { m_arbiter = arbiter; }
 void MultiNodeTopologyHelper::SetNumNodes(uint32_t numNodes) { m_numNodes = numNodes; }
 void MultiNodeTopologyHelper::SetInterNodeDataRate(const std::string& rate) { m_interNodeDataRate = rate; }
 void MultiNodeTopologyHelper::SetInterNodeDelay(const std::string& delay) { m_interNodeDelay = delay; }
@@ -259,6 +261,10 @@ MultiNodeTopologyHelper::BuildIntraNodeSwitched(uint32_t nodeId, NodeInfo& info)
     {
         info.nvSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
     }
+    if (m_arbiter)
+    {
+        info.nvSwitch->SetArbiter(m_arbiter);
+    }
 
     // Create p2p helper for intra-node links
     PointToPointHelper p2p;
@@ -445,6 +451,10 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
             if (m_switchCutThroughDelayNs > 0)
             {
                 hostSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
+            }
+            if (m_arbiter)
+            {
+                hostSwitch->SetArbiter(m_arbiter);
             }
             m_interNodeSwitchNodes[nodeId] = switchNode;
             m_interNodeSwitches[nodeId] = hostSwitch;

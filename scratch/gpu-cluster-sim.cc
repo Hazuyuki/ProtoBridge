@@ -195,6 +195,7 @@ main(int argc, char* argv[])
     uint32_t switchVoqDepth = 10000;
     uint64_t switchArbIntervalNs = 100;
     uint64_t switchCutThroughDelayNs = 200;
+    std::string arbiterType = "roundrobin"; // crossbar arbitration strategy
     uint64_t sharpAggregationDelayNs = 500;
     uint32_t nvlsNumPartitions = 8;
     uint64_t segmentSizeBytes = 524288;
@@ -405,6 +406,7 @@ main(int argc, char* argv[])
     cmd.AddValue("switchVoqDepth", "NVSwitch VOQ depth", switchVoqDepth);
     cmd.AddValue("switchArbInterval", "NVSwitch arbitration interval in ns", switchArbIntervalNs);
     cmd.AddValue("switchCutThroughDelay", "NVSwitch cut-through forwarding delay in ns (0=store-and-forward)", switchCutThroughDelayNs);
+    cmd.AddValue("arbiter", "Crossbar arbitration strategy: roundrobin (default) or an ns3::Arbiter TypeId string", arbiterType);
     cmd.AddValue("sharpAggregationDelay", "SHARP in-switch reduction latency in ns", sharpAggregationDelayNs);
     cmd.AddValue("nvlsNumPartitions", "Number of partitions for pipelined NVLS AllReduce multicast (0=single, 8=pipelined)", nvlsNumPartitions);
     cmd.AddValue("segmentSize", "AlltoAll segment size in bytes", segmentSizeBytes);
@@ -711,6 +713,27 @@ main(int argc, char* argv[])
         multiTopo.SetSwitchVoqDepth(switchVoqDepth);
         multiTopo.SetSwitchArbInterval(switchArbIntervalNs);
         if (switchCutThroughDelayNs > 0) { multiTopo.SetSwitchCutThroughDelay(switchCutThroughDelayNs); }
+        // Select the crossbar arbitration strategy (default roundrobin is the
+        // NvSwitch's built-in default, so only override for a non-default type).
+        if (arbiterType != "roundrobin" && !arbiterType.empty())
+        {
+            std::string tid = (arbiterType == "wfq" || arbiterType == "weighted")
+                               ? "ns3::RoundRobinArbiter"  // placeholder until a WfqArbiter ships
+                               : (arbiterType.find("::") == std::string::npos
+                                  ? std::string("ns3::") + arbiterType
+                                  : arbiterType);
+            ObjectFactory af(tid);
+            Ptr<Arbiter> arbiter = af.Create<Arbiter>();
+            if (arbiter)
+            {
+                multiTopo.SetArbiter(arbiter);
+            }
+            else
+            {
+                std::cerr << "Warning: could not create arbiter '" << tid
+                          << "'; using default roundrobin" << std::endl;
+            }
+        }
         multiTopo.SetInterNodeDataRate(std::to_string(interNodeBandwidthGbps) + "Gbps");
         multiTopo.SetInterNodeDelay(std::to_string(interNodeLatencyNs) + "ns");
         multiTopo.SetInterNodeFabricType(interNodeFabricType);

@@ -81,7 +81,16 @@ RESULT_END
 Key flags: `--topology` (ring/fullmesh/switched/fattree/leafspine/nvl72/
 hypercube/torus/mesh/…), `--algorithm` (ring/tree/sharp/nvls/fullmesh/auto),
 `--numGpus`, `--dataSize`, `--ber` + `--fecN/--fecK/--fecT` (resilience),
-`--llrEnabled --llrMode=gobackn|sack`, `--protocolModel`.
+`--llrEnabled --llrMode=gobackn|sack`, `--protocolModel`,
+`--arbiter` (crossbar arbitration strategy, default `roundrobin`).
+
+> **Extending the datapath.** Three polymorphic seams let you plug an
+> alternative flow-control policy (`FabricEndpoint::FlowControlGate` is
+> `virtual`), arbitration algorithm (subclass `Arbiter`; select via
+> `NvSwitch::SetArbiter` / `--arbiter`), or switch architecture (subclass
+> `FabricSwitch`; select via `NvSwitchHelper::SetSwitchType`). Each default
+> reproduces the calibrated behavior. See
+> [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md#extension-seams).
 
 ### Load a hardware profile
 

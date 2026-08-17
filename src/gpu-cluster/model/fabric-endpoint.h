@@ -275,8 +275,12 @@ class FabricEndpoint : public Application
      *        (credit consumed under CREDIT); false => caller backpressures.
      *        WINDOW/RATE are admitted (stub) and log a warning.
      *        creditBypass=true skips credit accounting (NVLS/SHARP packets).
+     *
+     *        Virtual so a FabricEndpoint subclass can plug an arbitrary flow
+     *        control method (beyond the CREDIT/WINDOW/RATE enum) without
+     *        editing this base or the send-gate call sites.
      */
-    bool FlowControlGate(uint8_t vcId, uint32_t seqNum, bool creditBypass);
+    virtual bool FlowControlGate(uint8_t vcId, uint32_t seqNum, bool creditBypass);
     void SetLaunchDelay(uint64_t delayNs);
     void SetBulkChunkSize(uint32_t bytes);
 
