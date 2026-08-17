@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * nccl-protocol-model.h
  *
  * NVIDIA NCCL protocol model. Derives from ProtocolModel and implements

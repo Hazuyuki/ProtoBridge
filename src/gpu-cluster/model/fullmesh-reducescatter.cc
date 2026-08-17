@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * fullmesh-reducescatter.cc
  *
  * Full-Mesh ReduceScatter: each GPU sends its chunk to all N-1 others simultaneously.

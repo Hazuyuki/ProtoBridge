@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * sharp-allreduce.h
  *
  * SHARP (Scalable Hierarchical Aggregation and Reduction Protocol) AllReduce.

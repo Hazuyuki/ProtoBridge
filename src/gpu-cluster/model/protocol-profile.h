@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * protocol-profile.h
  *
  * Config-driven protocol bundle builder. Reads a simple `key = value`

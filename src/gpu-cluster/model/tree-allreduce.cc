@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * tree-allreduce.cc
  *
  * Pipelined Binary Tree AllReduce: bottom-up reduce + top-down broadcast.

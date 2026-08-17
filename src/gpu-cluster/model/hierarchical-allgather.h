@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * hierarchical-allgather.h
  *
  * Hierarchical AllGather for multi-node GPU clusters.

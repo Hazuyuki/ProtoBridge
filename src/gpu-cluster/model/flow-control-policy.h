@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * flow-control-policy.h
  *
  * Flow-control policy seam. The endpoint's send gate dispatches on this

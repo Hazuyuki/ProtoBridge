@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * llr-manager.h
  *
  * Link Layer Retry (LLR) Manager for reliable packet transmission.

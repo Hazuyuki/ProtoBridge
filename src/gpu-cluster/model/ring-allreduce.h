@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ring-allreduce.h
  *
  * Pipelined Ring AllReduce Coordinator. Derives from CollectiveInjector.

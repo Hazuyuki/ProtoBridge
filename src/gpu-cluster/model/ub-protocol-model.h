@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ub-protocol-model.h
  *
  * Simplified UB (Unified Bus) protocol model for Huawei's SuperPod interconnect.

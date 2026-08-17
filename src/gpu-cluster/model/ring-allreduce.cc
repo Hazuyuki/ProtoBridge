@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ring-allreduce.cc
  *
  * Pipelined Ring AllReduce Coordinator with protocol-aware sending.

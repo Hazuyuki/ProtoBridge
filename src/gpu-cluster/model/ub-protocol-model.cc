@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ub-protocol-model.cc
  *
  * Simplified UB Protocol Model implementation

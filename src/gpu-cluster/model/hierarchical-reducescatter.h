@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * hierarchical-reducescatter.h
  *
  * Hierarchical ReduceScatter for multi-node GPU clusters.

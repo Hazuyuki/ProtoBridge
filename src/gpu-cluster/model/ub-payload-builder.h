@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ub-payload-builder.h
  *
  * Simplified UB payload builder for Flit-level transmission and transaction framing.

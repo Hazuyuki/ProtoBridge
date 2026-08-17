@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * fabric-switch.h
  *
  * Abstract base class for vendor-specific fabric switches.

@@ -1,0 +1,39 @@
+name: build-and-test
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ python3 python3-pip ccache
+
+      - name: Configure ns-3 (examples + tests)
+        run: ./ns3 configure --enable-examples --enable-tests -d optimized
+
+      - name: Build
+        run: ./ns3 build
+
+      - name: C++ test suites
+        run: |
+          ./ns3 run "test-runner --test-name=gpu-cluster"
+          ./ns3 run "test-runner --test-name=gpu-cluster-integration"
+
+      - name: Smoke (interconnect collective)
+        run: |
+          out=$(./ns3 run "gpu-cluster-sim --numGpus=8 --topology=switched --algorithm=auto --dataSize=1048576")
+          echo "$out"
+          echo "$out" | grep -q "simTimeUs=" || { echo "no RESULT line"; exit 1; }
+
+      - name: Python surrogate tests
+        run: python3 -m pytest surrogate/test/ -q

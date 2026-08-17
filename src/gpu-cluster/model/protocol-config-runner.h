@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * protocol-config-runner.h
  *
  * The generic graph runner: binds a compiled ProtocolConfig graph to a set

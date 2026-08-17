@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ring-broadcast.cc
  *
  * Pipelined Ring Broadcast with protocol-aware sending.

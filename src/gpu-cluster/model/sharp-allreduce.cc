@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * sharp-allreduce.cc
  *
  * SHARP AllReduce: tree-based reduction through NVSwitch.

@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * protocol-config-runner.cc
  *
  * Generic graph runner. Binds a config-compiled ProtocolTransactionGraph to

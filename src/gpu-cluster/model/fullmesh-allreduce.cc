@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * fullmesh-allreduce.cc
  *
  * Full-Mesh AllReduce: each GPU sends to all N-1 others simultaneously.

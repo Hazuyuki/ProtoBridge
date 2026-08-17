@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * fullmesh-allreduce.h
  *
  * Full-Mesh AllReduce: utilizes all N-1 links simultaneously.

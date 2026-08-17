@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * nccl-protocol-payload-builder.cc
  *
  * Builds protocol-aware payloads for NCCL protocols.

@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * fullmesh-allgather.cc
  *
  * Full-Mesh AllGather: each GPU sends its chunk to all N-1 others simultaneously.

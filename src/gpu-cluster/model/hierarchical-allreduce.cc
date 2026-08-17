@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * hierarchical-allreduce.cc
  *
  * Hierarchical AllReduce implementation for multi-node GPU clusters.

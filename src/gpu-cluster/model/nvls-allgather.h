@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * nvls-allgather.h
  *
  * NVLS AllGather: switch-based concatenation through NVSwitch.

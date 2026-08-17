@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * Raw MCCL payload segmentation for MetaX C500 systems.
  */
 

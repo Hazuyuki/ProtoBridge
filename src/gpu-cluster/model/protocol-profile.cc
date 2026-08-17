@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * protocol-profile.cc
  *
  * Implementation of the ProtocolProfile config loader. Pure composition:

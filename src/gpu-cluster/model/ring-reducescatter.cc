@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ring-reducescatter.cc
  *
  * Pipelined Ring ReduceScatter with protocol-aware sending.

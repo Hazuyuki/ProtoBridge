@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * protocol-config.h
  *
  * Config-driven protocol stack. This is the OTP (operation-to-packet)

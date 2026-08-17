@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ring-broadcast.h
  *
  * Ring Broadcast injector. Derives from CollectiveInjector.

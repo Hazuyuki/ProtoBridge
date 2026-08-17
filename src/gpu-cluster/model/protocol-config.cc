@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * protocol-config.cc
  *
  * The OTP compiler. Parses a `.cfg` and compiles its `[op]` stencil into a

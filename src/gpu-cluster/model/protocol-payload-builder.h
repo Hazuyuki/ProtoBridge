@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * protocol-payload-builder.h
  *
  * Abstract base class for vendor-specific payload builders.

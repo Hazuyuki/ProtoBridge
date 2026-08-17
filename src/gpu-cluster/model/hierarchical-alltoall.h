@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * hierarchical-alltoall.h
  *
  * Hierarchical AlltoAll for multi-node GPU clusters.

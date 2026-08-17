@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * alltoall-injector.cc
  *
  * AlltoAll collective injector supporting two modes:

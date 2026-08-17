@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ring-reduce.h
  *
  * Pipelined Ring Reduce injector. Derives from CollectiveInjector.

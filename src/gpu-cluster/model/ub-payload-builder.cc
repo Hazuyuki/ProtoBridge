@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * ub-payload-builder.cc
  *
  * Simplified UB Payload Builder implementation

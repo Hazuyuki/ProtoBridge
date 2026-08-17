@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-only
  * nvls-allgather.cc
  *
  * NVLS AllGather: each GPU sends dataSize/N to NVSwitch,
