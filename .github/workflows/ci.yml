@@ -18,11 +18,30 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ python3 python3-pip ccache
 
-      - name: Configure ns-3 (examples + tests)
-        run: ./ns3 configure --enable-examples --enable-tests -d optimized
+      - name: ccache env
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          ccache --set-config=compress=true 2>/dev/null || true
+          ccache --set-config=max_size=1G 2>/dev/null || true
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Configure ns-3 (examples + tests, ccache launcher)
+        run: |
+          ./ns3 configure --enable-examples --enable-tests -d optimized -- \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: ./ns3 build
+
+      - name: ccache stats
+        run: ccache -s || true
 
       - name: C++ test suites
         run: |

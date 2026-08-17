@@ -946,7 +946,22 @@ class AnalyticalSurrogate:
 
 
 def main():
-    """Calibrate and validate the analytical surrogate against the H200 ring baseline."""
+    """Calibrate and validate the analytical surrogate against the H200 ring
+    baseline, then run an optical-reliability demo under a selectable hardware
+    profile."""
+    import argparse
+    profiles_dir = Path(__file__).parent / "profiles"
+    profile_choices = sorted(p.stem for p in profiles_dir.glob("*.json"))
+    parser = argparse.ArgumentParser(
+        description="Calibrate the analytical surrogate on the shipped H200 "
+                    "baseline and run an optical-reliability demo under a "
+                    "hardware profile.")
+    parser.add_argument("--profile", default="h200", choices=profile_choices,
+                        help="hardware profile for the optical-reliability demo "
+                             "(choices: %(choices)s). Calibration still fits on the "
+                             "shipped H200 baseline, which is the only one in-repo.")
+    args = parser.parse_args()
+
     surrogate = AnalyticalSurrogate()
     cal_dir = Path(__file__).parent.parent / "calibration"
     cal_path = cal_dir / "h200_ring4_ar_baseline.json"
@@ -976,8 +991,17 @@ def main():
     surrogate.save_calibration(str(out_path))
     print(f"\nCalibration saved to {out_path}")
 
+    if args.profile != "h200":
+        print(f"\nNote: --profile={args.profile} loads that profile's memory-semantic "
+              f"defaults for the demo below. The ring-allreduce prediction is "
+              f"BW-bound; its BW and startup come from the shipped H200 calibration "
+              f"and are NOT overridden, so this demo is ~unchanged for non-H200 "
+              f"profiles. Vendor interconnect params (MetaXLink/UB/HCCS/...) are "
+              f"not yet consumed by this surrogate path. No {args.profile} "
+              f"calibration data ships in this repo.")
+
     # Optical reliability demo: FEC/retry amplification on a 1 MB allreduce.
-    print("\n--- Optical Reliability Predictions (H200, 1 MB allreduce, 4 GPU) ---")
+    print(f"\n--- Optical Reliability Predictions ({args.profile}, 1 MB allreduce, 4 GPU) ---")
     test_configs = [
         ("baseline (BER=0)", 0, False, False),
         ("FEC+SACK (BER=1e-9)", 1e-9, True, True),
@@ -986,7 +1010,7 @@ def main():
     ]
     for name, ber, fec, retry in test_configs:
         surrogate.configure({
-            "hardware": {"numGpus": 4, "profile": "h200"},
+            "hardware": {"numGpus": 4, "profile": args.profile},
             "topology": {"algorithm": "ring"},
             "collective": {"type": "allreduce"},
             "optical": {"ber": ber},

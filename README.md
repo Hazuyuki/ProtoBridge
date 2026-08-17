@@ -38,17 +38,21 @@ Different protocol configurations are therefore compared on a common ns-3
 simulation substrate by changing only the input configuration; the application
 layer drives `NetDevice` `Send()` / `ReceiveCallback()` directly over a custom
 bare-metal fabric header, with no TCP/IP stack. ProtoBridge matches measured
-superpod communication latency with **17.8% MAPE on H200 NVLink4** and
-**10.3% on C500 MetaXLink** (1 KB–1 GB), and **1.76% on NVL72** (512 MB–8 GB).
+superpod communication latency with **17.8% MAPE on H200 NVLink4** across
+1 KB–1 GB — the H200 calibration data ships in this repository
+(`surrogate/calibration/`), so this number is reproducible from a fresh clone.
+Cross-platform validation on MetaXLink (C500/C550) and NVL72, the surrogate's
+accuracy relative to the latency-bandwidth baseline, and the coarse-to-fine
+design workflow (with case studies on scale-up memory pools and co-packaged
+optics) are described in an accompanying paper, in preparation.
 
 For fast design exploration, ProtoBridge ships a **protocol-defined latency
 surrogate** that combines OTP parameters (startup, effective bandwidth) with
-analytical models of each PEX mechanism. It reduces MAPE from 55.7% for the
-latency-bandwidth model to 11.8%, and cuts per-operation evaluation from
-2.38–75.70 s to 20.5 µs. A coarse-to-fine workflow sweeps designs with the
-surrogate and validates configurations near the estimated frontier with
-ProtoBridge — 38,232 designs in one hour — with case studies on scale-up memory
-pools and co-packaged optics (CPO).
+analytical models of each PEX mechanism. It is calibrated on the H200 NVLink4
+reference included here and predicts per-operation latency in microseconds —
+fast enough to sweep many designs where the packet simulator cannot. See
+[doc/SURROGATE.md](doc/SURROGATE.md) for the derivations and
+[doc/CALIBRATION.md](doc/CALIBRATION.md) for the in-repo H200 calibration data.
 
 ## What this is (and is not)
 
@@ -105,6 +109,12 @@ FabricHeader layout, the four-tier resilience model, and the topology grammar.
 ./ns3 configure --enable-examples --enable-tests -d debug
 ./ns3 build
 ```
+
+> **Repo scope.** This repository bundles the full ns-3.47 framework, so it
+> builds standalone — `./ns3` and `CMakeLists.txt` are the ns-3 build system.
+> The ProtoBridge-specific code is `src/gpu-cluster/` (OTP + PEX + NVSwitch +
+> injectors), `surrogate/` (latency models), `configs/`, and the two `scratch/`
+> entry points; everything else is stock ns-3.
 
 ### Run one collective
 
