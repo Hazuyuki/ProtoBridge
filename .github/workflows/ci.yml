@@ -18,6 +18,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ python3 python3-pip ccache
 
+      - name: Install Python deps
+        run: |
+          # The ubuntu-latest system python3 does not ship numpy, and
+          # analytical_surrogate.py needs it for np.linalg.lstsq. ubuntu-24.04
+          # marks pip as externally-managed, so --break-system-packages is
+          # required to install into the system interpreter that runs the tests.
+          pip3 install --break-system-packages -r surrogate/requirements.txt
+
       - name: ccache env
         run: |
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"

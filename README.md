@@ -201,7 +201,8 @@ See [doc/SURROGATE.md](doc/SURROGATE.md) for the derivations and
 ./ns3 run "test-runner --suite=gpu-cluster"
 ./ns3 run "test-runner --suite=gpu-cluster-integration"
 
-# Python surrogate tests
+# Python surrogate tests (needs numpy — see surrogate/requirements.txt)
+pip3 install -r surrogate/requirements.txt
 python3 -m pytest surrogate/test/ -v
 ```
 
