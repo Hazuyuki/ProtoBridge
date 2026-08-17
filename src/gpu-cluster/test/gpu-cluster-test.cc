@@ -36,8 +36,29 @@
 #include "ns3/nvswitch.h"
 #include "ns3/fabric-switch.h"
 #include "ns3/object-factory.h"
+#include "ns3/config.h"
+#include "ns3/protocol-model.h"
+#include "ns3/protocol-payload-builder.h"
+#include "ns3/ring-allreduce.h"
+#include "ns3/ring-allgather.h"
+#include "ns3/ring-reducescatter.h"
+#include "ns3/ring-broadcast.h"
+#include "ns3/tree-allreduce.h"
+#include "ns3/sharp-allreduce.h"
+#include "ns3/nvls-allgather.h"
+#include "ns3/fullmesh-allreduce.h"
+#include "ns3/fullmesh-allgather.h"
+#include "ns3/alltoall-injector.h"
+#include "ns3/hierarchical-allreduce.h"
+#include "ns3/mccl-payload-builder.h"
+#include "ns3/ub-payload-builder.h"
+#include "ns3/ub-protocol-model.h"
+#include "ns3/traffic-pattern.h"
+#include "ns3/gateway-endpoint.h"
+#include "ns3/point-to-point-net-device.h"
 
 #include <fstream>
+#include <functional>
 
 using namespace ns3;
 
@@ -3702,6 +3723,802 @@ class FlowControlVirtualHookTest : public TestCase
     }
 };
 
+// ============================================================================
+// P0-P3 coverage gap fillers (plan: floating-inventing-sparrow).
+// Additive test code only — no model/datapath edits; calibration invariants
+// (default ring 88.2us, config ring 44.6us) untouched.
+// ============================================================================
+
+// Small-message size used by the collective-injector correctness tests.
+// 1 MiB under forced SIMPLE (100% efficiency) -> 2 chunks of 512 KiB; the
+// real Simulator::Run() completes in milliseconds at N=4.
+static constexpr uint64_t COLLECTIVE_TEST_DATA_SIZE = 1 * 1024 * 1024;
+
+// Force the link BER to 0 globally: an unrecoverable BER>0 without FEC/LLR
+// aborts FabricEndpoint::StartApplication. The collective tests do not
+// exercise resilience, so silence that gate.
+static void
+DisableLinkErrorsGlobally()
+{
+    Config::SetDefault("ns3::LinkDegradationModel::Ber", DoubleValue(0.0));
+}
+
+// Shared wiring for the collective-injector tests. Mirrors the per-endpoint
+// setup in scratch/gpu-cluster-sim.cc (NcclProtocolModel + SIMPLE forced,
+// 1 VC with ample credits, bypass reorder buffer, bulk chunk 8 MiB) at a
+// 4-GPU scale. `switched` selects BuildFullyConnected (NvSwitch fabric) vs
+// BuildFullMesh (direct peer-to-peer).
+struct CollectiveCluster
+{
+    ApplicationContainer apps;
+    std::vector<Ptr<FabricEndpoint>> endpoints;
+    Ptr<ProtocolModel> protoModel;
+    Ptr<ProtocolPayloadBuilder> payloadBuilder;
+    NodeContainer switchNodes;
+};
+
+static CollectiveCluster
+BuildCollectiveCluster(uint32_t numGpus, bool switched)
+{
+    DisableLinkErrorsGlobally();
+    GpuClusterTopologyHelper helper(numGpus, switched ? 1 : 0);
+    helper.SetLinkDataRate("100Gbps");
+    helper.SetLinkDelay("500ns");
+
+    CollectiveCluster ctx;
+    ObjectFactory protoFactory("ns3::NcclProtocolModel");
+    ctx.protoModel = protoFactory.Create<ProtocolModel>();
+    ctx.protoModel->SetForceProtocolId(static_cast<uint8_t>(3)); // SIMPLE
+    ObjectFactory payloadFactory("ns3::NcclProtocolPayloadBuilder");
+    ctx.payloadBuilder = payloadFactory.Create<ProtocolPayloadBuilder>();
+
+    NodeContainer nodes = switched ? helper.BuildFullyConnected() : helper.BuildFullMesh();
+    (void)nodes;
+    ctx.apps = helper.GetEndpoints();
+    ctx.switchNodes = helper.GetSwitchNodes();
+
+    for (uint32_t i = 0; i < ctx.apps.GetN(); ++i)
+    {
+        Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(ctx.apps.Get(i));
+        ep->SetNumVirtualChannels(1);
+        ep->SetVcCredits(0, 10000);
+        ep->SetBypassReorderBuffer(true);
+        ep->SetProtocolModel(ctx.protoModel);
+        ep->SetProtocolPayloadBuilder(ctx.payloadBuilder);
+        ep->SetBulkChunkSize(8 * 1024 * 1024);
+        ctx.endpoints.push_back(ep);
+    }
+    // Initialize() schedules StartApplication at the default start time (0s),
+    // which wires the NetDevice promisc-receive hook the endpoints need to
+    // pull packets off the channel.
+    for (auto& ep : ctx.endpoints)
+    {
+        ep->Initialize();
+    }
+    return ctx;
+}
+
+static Ptr<NvSwitch>
+GetFirstSwitch(const NodeContainer& switchNodes)
+{
+    for (uint32_t n = 0; n < switchNodes.GetN(); ++n)
+    {
+        Ptr<Node> node = switchNodes.Get(n);
+        for (uint32_t d = 0; d < node->GetNDevices(); ++d)
+        {
+            Ptr<NvSwitch> sw = DynamicCast<NvSwitch>(node->GetDevice(d));
+            if (sw)
+            {
+                return sw;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Drive one collective injector to completion on a 4-GPU fabric. Returns
+// whether the completion callback fired, the reported duration, and the
+// per-rank receive-packet counts (for the participation gate).
+template <typename InjectorT>
+static void
+RunCollective(bool switched,
+              uint64_t dataSize,
+              const std::function<void(Ptr<NvSwitch>)>& switchSetup,
+              bool& completed,
+              uint64_t& durationNs,
+              std::vector<uint32_t>& rxPerRank)
+{
+    constexpr uint32_t N = 4;
+    CollectiveCluster ctx = BuildCollectiveCluster(N, switched);
+    if (switched && switchSetup)
+    {
+        Ptr<NvSwitch> sw = GetFirstSwitch(ctx.switchNodes);
+        if (sw)
+        {
+            switchSetup(sw);
+        }
+    }
+
+    Ptr<InjectorT> inj = CreateObject<InjectorT>();
+    completed = false;
+    durationNs = 0;
+    inj->Initialize(N, dataSize, ctx.endpoints);
+    inj->SetCompletionCallback(
+        [&completed, &durationNs](uint64_t d) {
+            durationNs = d;
+            completed = true;
+        });
+    inj->SetStartupDelay(NanoSeconds(0));
+    inj->Start();
+
+    Simulator::Stop(MilliSeconds(500));
+    Simulator::Run();
+
+    rxPerRank.clear();
+    for (auto& ep : ctx.endpoints)
+    {
+        rxPerRank.push_back(ep->GetRxPackets());
+    }
+    Simulator::Destroy();
+}
+
+// Symmetric-collective participation gate: every rank received > 0 packets.
+// Returns a plain bool (the NS_TEST macros need TestCase member scope, so
+// the macro assertion lives in each DoRun, not here).
+static bool
+AllRanksReceived(const std::vector<uint32_t>& rxPerRank)
+{
+    if (rxPerRank.size() != 4)
+    {
+        return false;
+    }
+    for (auto c : rxPerRank)
+    {
+        if (c == 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Broadcast participation gate: every non-root rank received > 0 packets.
+static bool
+NonRootReceived(const std::vector<uint32_t>& rxPerRank, uint16_t root)
+{
+    if (rxPerRank.size() != 4)
+    {
+        return false;
+    }
+    for (uint32_t i = 0; i < rxPerRank.size(); ++i)
+    {
+        if (i == root)
+        {
+            continue;
+        }
+        if (rxPerRank[i] == 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+class RingAllReduceCorrectnessTest : public TestCase
+{
+  public:
+    RingAllReduceCorrectnessTest()
+        : TestCase("Ring AllReduce correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        RunCollective<RingAllReduce>(false, COLLECTIVE_TEST_DATA_SIZE, {}, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "Ring AllReduce did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "Ring AllReduce reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "Ring AllReduce" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class RingAllGatherCorrectnessTest : public TestCase
+{
+  public:
+    RingAllGatherCorrectnessTest()
+        : TestCase("Ring AllGather correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        RunCollective<RingAllGather>(false, COLLECTIVE_TEST_DATA_SIZE, {}, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "Ring AllGather did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "Ring AllGather reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "Ring AllGather" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class RingReduceScatterCorrectnessTest : public TestCase
+{
+  public:
+    RingReduceScatterCorrectnessTest()
+        : TestCase("Ring ReduceScatter correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        RunCollective<RingReduceScatter>(false, COLLECTIVE_TEST_DATA_SIZE, {}, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "Ring ReduceScatter did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "Ring ReduceScatter reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "Ring ReduceScatter" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class RingBroadcastCorrectnessTest : public TestCase
+{
+  public:
+    RingBroadcastCorrectnessTest()
+        : TestCase("Ring Broadcast correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        RunCollective<RingBroadcast>(false, COLLECTIVE_TEST_DATA_SIZE, {}, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "Ring Broadcast did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "Ring Broadcast reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(NonRootReceived(rx, 0), true, "Ring Broadcast" ": a non-root rank received no broadcast traffic");
+    }
+};
+
+// Regression for the degenerate-tree bug (tree completed at ~15us flat with
+// no traffic because the embedded tree was degenerate).
+class TreeAllReduceCorrectnessTest : public TestCase
+{
+  public:
+    TreeAllReduceCorrectnessTest()
+        : TestCase("Tree AllReduce correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        RunCollective<TreeAllReduce>(false, COLLECTIVE_TEST_DATA_SIZE, {}, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "Tree AllReduce did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "Tree AllReduce reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "Tree AllReduce" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class FullMeshAllReduceCorrectnessTest : public TestCase
+{
+  public:
+    FullMeshAllReduceCorrectnessTest()
+        : TestCase("FullMesh AllReduce correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        RunCollective<FullMeshAllReduce>(false, COLLECTIVE_TEST_DATA_SIZE, {}, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "FullMesh AllReduce did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "FullMesh AllReduce reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "FullMesh AllReduce" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class FullMeshAllGatherCorrectnessTest : public TestCase
+{
+  public:
+    FullMeshAllGatherCorrectnessTest()
+        : TestCase("FullMesh AllGather correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        RunCollective<FullMeshAllGather>(false, COLLECTIVE_TEST_DATA_SIZE, {}, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "FullMesh AllGather did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "FullMesh AllGather reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "FullMesh AllGather" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class AlltoallInjectorCorrectnessTest : public TestCase
+{
+  public:
+    AlltoallInjectorCorrectnessTest()
+        : TestCase("Alltoall injector correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        RunCollective<AlltoAllInjector>(false, COLLECTIVE_TEST_DATA_SIZE, {}, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "Alltoall did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "Alltoall reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "Alltoall" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class SharpAllReduceCorrectnessTest : public TestCase
+{
+  public:
+    SharpAllReduceCorrectnessTest()
+        : TestCase("SHARP AllReduce correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        // Enable in-switch SHARP aggregation on the NvSwitch so the offloaded
+        // ALLREDUCE packets are aggregated and multicast back to all ranks.
+        auto setup = [](Ptr<NvSwitch> sw) {
+            sw->SetAllReduceEnabled(true);
+            sw->SetAllReduceThreshold(4);
+            sw->SetAllReduceAggregationDelay(1000);
+            sw->SetAllReduceDataSize(COLLECTIVE_TEST_DATA_SIZE);
+            // numPartitions must be >= 2: NvSwitch::ProcessAllReduce only emits
+            // the pipelined SHARP multicast when numPartitions >= 2 (a value of
+            // 1 falls into a no-result legacy branch at this 4-GPU scale). The
+            // reference sim (scratch/gpu-cluster-sim.cc) defaults this to 8.
+            sw->SetAllReduceNumPartitions(8);
+        };
+        RunCollective<SharpAllReduce>(true, COLLECTIVE_TEST_DATA_SIZE, setup, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "SHARP AllReduce did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "SHARP AllReduce reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "SHARP AllReduce" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class NvlsAllGatherCorrectnessTest : public TestCase
+{
+  public:
+    NvlsAllGatherCorrectnessTest()
+        : TestCase("NVLS AllGather correctness")
+    {
+    }
+    void DoRun() override
+    {
+        bool done = false;
+        uint64_t dur = 0;
+        std::vector<uint32_t> rx;
+        auto setup = [](Ptr<NvSwitch> sw) {
+            sw->SetAllGatherEnabled(true);
+            sw->SetAllGatherThreshold(4);
+            sw->SetAllGatherChunkSize(COLLECTIVE_TEST_DATA_SIZE / 4);
+            sw->SetAllGatherDataSize(COLLECTIVE_TEST_DATA_SIZE);
+        };
+        RunCollective<NvlsAllGather>(true, COLLECTIVE_TEST_DATA_SIZE, setup, done, dur, rx);
+        NS_TEST_EXPECT_MSG_EQ(done, true, "NVLS AllGather did not complete");
+        NS_TEST_EXPECT_MSG_EQ(dur > 0, true, "NVLS AllGather reported zero duration");
+        NS_TEST_EXPECT_MSG_EQ(AllRanksReceived(rx), true, "NVLS AllGather" ": some rank received no traffic (degenerate collective)");
+    }
+};
+
+class HierarchicalAllReduceCorrectnessTest : public TestCase
+{
+  public:
+    HierarchicalAllReduceCorrectnessTest()
+        // DROPPED (documented): HierarchicalAllReduce is a *multi-node*
+        // collective — the reference sim aborts unless numNodes > 1 and every
+        // rank is mapped to a node id via SetNodeIdForRank (gpu-cluster-sim.cc
+        // "Hierarchical AllReduce requires numNodes > 1"). The shared
+        // BuildCollectiveCluster helper builds a flat 4-GPU fullmesh with no
+        // node grouping, which cannot exercise the two-level reduce; driving
+        // it there degenerates to no traffic. Exercising it properly needs a
+        // leafspine/3levelhierarchical build with per-rank node ids, which is
+        // out of scope for this unit-correctness sweep (the plan flagged this
+        // exact case as a drop candidate). The class is kept (not deleted) so
+        // the registration site reads as intentional.
+        : TestCase("Hierarchical AllReduce correctness (SKIPPED: needs multi-node topo)")
+    {
+    }
+    void DoRun() override
+    {
+        // No assertion: the case is inert by design (see ctor comment).
+    }
+};
+
+// ---------------------------------------------------------------------------
+// P1: NvSwitch microarchitecture.
+// ---------------------------------------------------------------------------
+
+// Forwarding + no-spurious-TTL-drop: a 4-GPU switched fabric forwards GPU0's
+// DATA to GPU1, the switch counts rx/tx, and GetTtlDrops()==0 (TTL is hardcoded
+// to 64 in every send path, so the ttl<=1 drop branch at nvswitch.cc:524 is
+// not reachable through the public send API — surfaced as a coverage gap
+// rather than asserted as dropping behavior).
+class NvSwitchForwardingTest : public TestCase
+{
+  public:
+    NvSwitchForwardingTest()
+        : TestCase("NvSwitch forwarding + TTL path"),
+          m_received(0)
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        GpuClusterTopologyHelper helper(4, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("500ns");
+        NodeContainer nodes = helper.BuildFullyConnected();
+        (void)nodes;
+        ApplicationContainer apps = helper.GetEndpoints();
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+        }
+
+        m_received = 0;
+        Ptr<FabricEndpoint> ep1 = DynamicCast<FabricEndpoint>(apps.Get(1));
+        ep1->SetReceiveCallback(MakeCallback(&NvSwitchForwardingTest::OnRx, this));
+
+        Ptr<FabricEndpoint> ep0 = DynamicCast<FabricEndpoint>(apps.Get(0));
+        uint8_t data[] = {0xAB, 0xCD};
+        ep0->SendData(1, data, sizeof(data), 0, 0);
+
+        Simulator::Stop(MicroSeconds(200));
+        Simulator::Run();
+
+        NS_TEST_EXPECT_MSG_EQ(m_received >= 1, true, "switched fabric must deliver GPU0->GPU1");
+
+        Ptr<NvSwitch> sw = GetFirstSwitch(helper.GetSwitchNodes());
+        NS_TEST_ASSERT_MSG_NE(sw, nullptr, "switched build must expose an NvSwitch");
+        NS_TEST_EXPECT_MSG_EQ(sw->GetRxPackets() >= 1, true, "switch must count the inbound packet");
+        NS_TEST_EXPECT_MSG_EQ(sw->GetTxPackets() >= 1, true, "switch must forward the packet");
+        NS_TEST_EXPECT_MSG_EQ(sw->GetTtlDrops(), 0, "TTL=64 must not drop on a 1-hop path");
+
+        Simulator::Destroy();
+    }
+  private:
+    void OnRx(uint16_t, Ptr<Packet>, FabricHeader) { m_received++; }
+    uint32_t m_received;
+};
+
+// VOQ output-port contention: two flows (GPU0->GPU2, GPU1->GPU2) contend for
+// the same switch egress to GPU2 and must serialize (second arrival strictly
+// after the first), not arrive concurrently.
+class NvSwitchVoqContentionTest : public TestCase
+{
+  public:
+    NvSwitchVoqContentionTest()
+        : TestCase("NvSwitch VOQ output-port contention")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        GpuClusterTopologyHelper helper(3, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("500ns");
+        NodeContainer nodes = helper.BuildFullyConnected();
+        (void)nodes;
+        ApplicationContainer apps = helper.GetEndpoints();
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+        }
+
+        m_arrivalNs.clear();
+        Ptr<FabricEndpoint> ep2 = DynamicCast<FabricEndpoint>(apps.Get(2));
+        ep2->SetReceiveCallback(MakeCallback(&NvSwitchVoqContentionTest::OnRx, this));
+
+        Ptr<FabricEndpoint> ep0 = DynamicCast<FabricEndpoint>(apps.Get(0));
+        Ptr<FabricEndpoint> ep1 = DynamicCast<FabricEndpoint>(apps.Get(1));
+        uint8_t data[] = {0x01, 0x02, 0x03, 0x04};
+        // Two flows to the same destination contend for the GPU2 output port.
+        ep0->SendData(2, data, sizeof(data), 0, 0);
+        ep1->SendData(2, data, sizeof(data), 1, 0);
+
+        Simulator::Stop(MicroSeconds(200));
+        Simulator::Run();
+
+        NS_TEST_EXPECT_MSG_EQ(m_arrivalNs.size() >= 2, true,
+                              "both contending flows must reach GPU2");
+        if (m_arrivalNs.size() >= 2)
+        {
+            // The two arrivals are not simultaneous — the output-port VOQ
+            // serializes them.
+            NS_TEST_EXPECT_MSG_EQ(m_arrivalNs[1] > m_arrivalNs[0], true,
+                                  "second flow must arrive strictly after the first (VOQ serialization)");
+        }
+
+        Simulator::Destroy();
+    }
+  private:
+    void OnRx(uint16_t, Ptr<Packet>, FabricHeader)
+    {
+        m_arrivalNs.push_back(Simulator::Now().GetNanoSeconds());
+    }
+    std::vector<uint64_t> m_arrivalNs;
+};
+
+// ---------------------------------------------------------------------------
+// P2: non-NCCL vendor payload-builder round-trips (base-class interface).
+// ---------------------------------------------------------------------------
+
+class McclPayloadBuilderTest : public TestCase
+{
+  public:
+    McclPayloadBuilderTest()
+        : TestCase("MCCL payload builder round-trip")
+    {
+    }
+    void DoRun() override
+    {
+        Ptr<McclPayloadBuilder> builder = CreateObject<McclPayloadBuilder>();
+        const uint64_t dataSize = 4096;
+        const uint64_t chunkSize = 1024;
+        std::vector<uint8_t> data(dataSize);
+        for (uint64_t i = 0; i < dataSize; ++i)
+        {
+            data[i] = static_cast<uint8_t>(i & 0xFF);
+        }
+
+        const uint8_t proto = static_cast<uint8_t>(McclProtocol::SIMPLE);
+        auto chunks = builder->BuildChunks(data.data(), dataSize, proto, chunkSize);
+        NS_TEST_EXPECT_MSG_EQ(chunks.size(), 4, "4096/1024 -> 4 chunks");
+
+        uint64_t totalExtracted = 0;
+        for (uint32_t c = 0; c < chunks.size(); ++c)
+        {
+            uint64_t chunkData = (c == chunks.size() - 1)
+                                     ? (dataSize - c * chunkSize)
+                                     : chunkSize;
+            // (c) per-packet wire size matches builder->GetWireSize (MCCL: 100%).
+            NS_TEST_EXPECT_MSG_EQ(chunks[c]->GetSize(),
+                                  builder->GetWireSize(chunkData, proto),
+                                  "MCCL packet size must match wire size");
+            std::vector<uint8_t> out(chunkData, 0);
+            uint64_t got = builder->ExtractData(chunks[c], proto, out.data(), out.size());
+            NS_TEST_EXPECT_MSG_EQ(got, chunkData, "MCCL ExtractData returns chunk size");
+            totalExtracted += got;
+            for (uint64_t i = 0; i < chunkData; ++i)
+            {
+                NS_TEST_EXPECT_MSG_EQ(out[i], data[c * chunkSize + i],
+                                      "MCCL extracted content must match input");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(totalExtracted, dataSize,
+                              "MCCL: sum of extracted bytes must equal input size");
+    }
+};
+
+class UbPayloadBuilderTest : public TestCase
+{
+  public:
+    UbPayloadBuilderTest()
+        : TestCase("UB payload builder round-trip")
+    {
+    }
+    void DoRun() override
+    {
+        Ptr<UbPayloadBuilder> builder = CreateObject<UbPayloadBuilder>();
+        const uint64_t dataSize = 4096;
+        const uint64_t chunkSize = 1024;
+        std::vector<uint8_t> data(dataSize);
+        for (uint64_t i = 0; i < dataSize; ++i)
+        {
+            data[i] = static_cast<uint8_t>((i * 7 + 3) & 0xFF);
+        }
+
+        const uint8_t proto = static_cast<uint8_t>(UbTransaction::MESSAGE);
+        auto chunks = builder->BuildChunks(data.data(), dataSize, proto, chunkSize);
+        NS_TEST_EXPECT_MSG_EQ(chunks.size(), 4, "4096/1024 -> 4 UB chunks");
+
+        uint64_t totalExtracted = 0;
+        for (uint32_t c = 0; c < chunks.size(); ++c)
+        {
+            uint64_t chunkData = (c == chunks.size() - 1)
+                                     ? (dataSize - c * chunkSize)
+                                     : chunkSize;
+            // UB BuildChunks frames each chunk as header + raw data (no 2%
+            // expansion at build time), so packet size == header + chunkData.
+            // GetWireSize reports header + ceil(data/0.98); the build/extract
+            // round-trip is byte-exact, but packet size != GetWireSize — assert
+            // the round-trip (exact) and a lower bound on size instead.
+            NS_TEST_EXPECT_MSG_EQ(chunks[c]->GetSize() >= chunkData, true,
+                                  "UB packet must carry at least the chunk payload");
+            std::vector<uint8_t> out(chunkData, 0);
+            uint64_t got = builder->ExtractData(chunks[c], proto, out.data(), out.size());
+            NS_TEST_EXPECT_MSG_EQ(got, chunkData, "UB ExtractData returns chunk size");
+            totalExtracted += got;
+            for (uint64_t i = 0; i < chunkData; ++i)
+            {
+                NS_TEST_EXPECT_MSG_EQ(out[i], data[c * chunkSize + i],
+                                      "UB extracted content must match input");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(totalExtracted, dataSize,
+                              "UB: sum of extracted bytes must equal input size");
+    }
+};
+
+// ---------------------------------------------------------------------------
+// P3: standalone models.
+// ---------------------------------------------------------------------------
+
+class ContentionModelTest : public TestCase
+{
+  public:
+    ContentionModelTest()
+        : TestCase("ContentionModel WFQ")
+    {
+    }
+    void DoRun() override
+    {
+        Ptr<ContentionModel> cm = CreateObject<ContentionModel>();
+        const uint64_t BW = 100ULL * 1000 * 1000 * 1000 / 8; // 100 Gbit/s -> 12.5 GB/s
+        cm->SetBandwidth(BW);
+        cm->SetWeight(TrafficClass::COLLECTIVE, 0.75);
+        cm->SetWeight(TrafficClass::MEMORY, 0.25);
+
+        // Classify: collective packets -> COLLECTIVE; memory reads -> MEMORY.
+        // Cast to int: TrafficClass has no ostream operator, which the
+        // NS_TEST_EXPECT_MSG_EQ macro needs to format the failure message.
+        NS_TEST_EXPECT_MSG_EQ(
+            static_cast<int>(ContentionModel::ClassifyPacket(static_cast<uint8_t>(FabricPacketType::ALLREDUCE))),
+            static_cast<int>(TrafficClass::COLLECTIVE), "ALLREDUCE classifies as COLLECTIVE");
+        NS_TEST_EXPECT_MSG_EQ(
+            static_cast<int>(ContentionModel::ClassifyPacket(static_cast<uint8_t>(FabricPacketType::MEMORY_READ))),
+            static_cast<int>(TrafficClass::MEMORY), "MEMORY_READ classifies as MEMORY");
+
+        // Single active class -> no WFQ penalty, full bandwidth.
+        cm->IncrementBacklog(TrafficClass::COLLECTIVE);
+        NS_TEST_EXPECT_MSG_EQ(cm->GetNumActiveClasses(), 1, "one class active");
+        NS_TEST_EXPECT_MSG_EQ(cm->ComputeServiceTime(1000, TrafficClass::COLLECTIVE).IsZero(),
+                              true, "single active class -> zero WFQ penalty");
+        NS_TEST_EXPECT_MSG_EQ(cm->GetEffectiveBandwidth(TrafficClass::COLLECTIVE), BW,
+                              "sole active class gets full bandwidth");
+
+        // Two active classes -> WFQ penalty and weighted bandwidth.
+        cm->IncrementBacklog(TrafficClass::MEMORY);
+        NS_TEST_EXPECT_MSG_EQ(cm->GetNumActiveClasses(), 2, "two classes active");
+        Time penalty = cm->ComputeServiceTime(1000, TrafficClass::COLLECTIVE);
+        NS_TEST_EXPECT_MSG_EQ(penalty.IsZero(), false,
+                              "two active classes -> non-zero WFQ penalty");
+        NS_TEST_EXPECT_MSG_EQ(
+            cm->GetEffectiveBandwidth(TrafficClass::COLLECTIVE),
+            static_cast<uint64_t>(0.75 * static_cast<double>(BW)),
+            "collective gets its weighted share");
+        NS_TEST_EXPECT_MSG_EQ(
+            cm->GetEffectiveBandwidth(TrafficClass::MEMORY),
+            static_cast<uint64_t>(0.25 * static_cast<double>(BW)),
+            "memory gets its weighted share");
+
+        // Backlog decrement deactivates a class.
+        cm->DecrementBacklog(TrafficClass::MEMORY);
+        NS_TEST_EXPECT_MSG_EQ(cm->GetNumActiveClasses(), 1, "memory deactivated");
+
+        // Weight round-trip.
+        cm->SetWeight(TrafficClass::P2P, 0.5);
+        NS_TEST_EXPECT_MSG_EQ_TOL(cm->GetWeight(TrafficClass::P2P), 0.5, 1e-9,
+                                  "P2P weight round-trips");
+    }
+};
+
+// Minimal TrafficPattern subclass to exercise Start/Stop/IsRunning/complete.
+class TestTrafficPattern : public TrafficPattern
+{
+  public:
+    TestTrafficPattern()
+        : m_started(false)
+    {
+    }
+    void DoStart() override { m_started = true; }
+    void DoStop() override { m_started = false; }
+    void FireComplete() { NotifyComplete(); }
+    bool m_started;
+};
+
+class TrafficPatternTest : public TestCase
+{
+  public:
+    TrafficPatternTest()
+        : TestCase("TrafficPattern lifecycle"),
+          m_completeFired(false)
+    {
+    }
+    void DoRun() override
+    {
+        auto tp = CreateObject<TestTrafficPattern>();
+        m_completeFired = false;
+        tp->SetCompleteCallback(MakeCallback(&TrafficPatternTest::OnComplete, this));
+
+        NS_TEST_EXPECT_MSG_EQ(tp->IsRunning(), false, "idle before Start");
+        tp->Start();
+        NS_TEST_EXPECT_MSG_EQ(tp->IsRunning(), true, "running after Start");
+        NS_TEST_EXPECT_MSG_EQ(tp->m_started, true, "DoStart ran");
+
+        // NotifyComplete() only fires the callback while the pattern is
+        // running (it self-stops on completion); fire it before Stop().
+        tp->FireComplete();
+        NS_TEST_EXPECT_MSG_EQ(m_completeFired, true, "NotifyComplete fires the callback");
+        NS_TEST_EXPECT_MSG_EQ(tp->IsRunning(), false, "NotifyComplete self-stops");
+
+        tp->Stop(); // no-op after self-stop; must stay safe
+        NS_TEST_EXPECT_MSG_EQ(tp->IsRunning(), false, "idle after Stop");
+    }
+  private:
+    void OnComplete() { m_completeFired = true; }
+    bool m_completeFired;
+};
+
+class GatewayEndpointTest : public TestCase
+{
+  public:
+    GatewayEndpointTest()
+        : TestCase("GatewayEndpoint cross-fabric routing")
+    {
+    }
+    void DoRun() override
+    {
+        Ptr<GatewayEndpoint> gw = CreateObject<GatewayEndpoint>();
+
+        Ptr<PointToPointNetDevice> nvDev = CreateObject<PointToPointNetDevice>();
+        Ptr<PointToPointNetDevice> ethDev = CreateObject<PointToPointNetDevice>();
+        gw->AddFabricDevice(FabricType::NVLINK, nvDev);
+        NS_TEST_EXPECT_MSG_EQ(gw->GetNFabrics(), 1, "one fabric after first add");
+        gw->AddFabricDevice(FabricType::ETHERNET, ethDev);
+        NS_TEST_EXPECT_MSG_EQ(gw->GetNFabrics(), 2, "two fabrics after second add");
+        NS_TEST_EXPECT_MSG_EQ(gw->GetFabricDevice(FabricType::NVLINK), nvDev,
+                              "GetFabricDevice returns the NVLink device");
+        NS_TEST_EXPECT_MSG_EQ(gw->GetFabricDevice(FabricType::ETHERNET), ethDev,
+                              "GetFabricDevice returns the Ethernet device");
+        NS_TEST_EXPECT_MSG_EQ(gw->GetFabricDevice(FabricType::HYBRID), nullptr,
+                              "unset fabric returns null");
+
+        // Cross-fabric route lands in the hybrid routing table.
+        Ptr<HybridRoutingTable> table = CreateObject<HybridRoutingTable>();
+        gw->SetHybridRoutingTable(table);
+        gw->SetCrossFabricRoute(7, FabricType::ETHERNET, 3);
+        auto route = table->LookupRoute(7);
+        NS_TEST_EXPECT_MSG_EQ(route.has_value(), true, "route to rank 7 must exist");
+        if (route.has_value())
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<int>(route->fabric),
+                                  static_cast<int>(FabricType::ETHERNET),
+                                  "route fabric matches");
+            NS_TEST_EXPECT_MSG_EQ(route->deviceIndex, 3, "route device index matches");
+            NS_TEST_EXPECT_MSG_EQ(route->isCrossFabric, true, "route is cross-fabric");
+        }
+
+        // Gateway delay round-trip.
+        gw->SetGatewayDelay(NanoSeconds(1500));
+        NS_TEST_EXPECT_MSG_EQ(gw->GetGatewayDelay().GetNanoSeconds(), 1500,
+                              "gateway delay round-trips");
+    }
+};
+
 class GpuClusterTestSuite : public TestSuite
 {
   public:
@@ -3850,6 +4667,32 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ArbiterSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchTypeSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new FlowControlVirtualHookTest, TestCase::Duration::QUICK);
+
+    // P0: collective-injector correctness (real sims; EXTENSIVE).
+    AddTestCase(new RingAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new RingAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new RingReduceScatterCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new RingBroadcastCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new TreeAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new FullMeshAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new FullMeshAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new AlltoallInjectorCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new SharpAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new NvlsAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
+
+    // P1: NvSwitch microarchitecture.
+    AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new NvSwitchVoqContentionTest, TestCase::Duration::EXTENSIVE);
+
+    // P2: non-NCCL vendor payload builders.
+    AddTestCase(new McclPayloadBuilderTest, TestCase::Duration::QUICK);
+    AddTestCase(new UbPayloadBuilderTest, TestCase::Duration::QUICK);
+
+    // P3: standalone models.
+    AddTestCase(new ContentionModelTest, TestCase::Duration::QUICK);
+    AddTestCase(new TrafficPatternTest, TestCase::Duration::QUICK);
+    AddTestCase(new GatewayEndpointTest, TestCase::Duration::QUICK);
 }
 
 static GpuClusterTestSuite g_gpuClusterTestSuite;
