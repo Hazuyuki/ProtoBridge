@@ -1,5 +1,10 @@
 {
   "calibrated": true,
+  "modelType": "piecewise",
+  "thresholdBytes": 4194304,
+  "numBaselinePoints": 1692,
+  "avgError_pct": 2.3415112813025556,
+  "maxError_pct": 40.63108091474676,
   "params": {
     "fullmesh_allgather_2gpu": {
       "alpha": 28.120370967802014,
@@ -9,7 +14,18 @@
       "bw_gbps": 696,
       "alpha_small": 7.269270316440252,
       "beta_small": 0.9120334892104469,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 2.413192386072211,
+      "maxError_pct": 28.68459952986137,
+      "bwRegion_avgError_pct": 1.514612445175606,
+      "bwRegion_maxError_pct": 13.30995413126215,
+      "startupRegion_avgError_pct": 12.072926750710721,
+      "startupRegion_maxError_pct": 28.68459952986137,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_allgather_4gpu": {
       "alpha": 32.50171117634771,
@@ -19,7 +35,18 @@
       "bw_gbps": 1080,
       "alpha_small": 8.195705957319886,
       "beta_small": 1.4925801160766243,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 2.2191118809967585,
+      "maxError_pct": 16.81146130551083,
+      "bwRegion_avgError_pct": 1.7322813995721542,
+      "bwRegion_maxError_pct": 14.088555229072636,
+      "startupRegion_avgError_pct": 7.452539556311227,
+      "startupRegion_maxError_pct": 16.81146130551083,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_allgather_8gpu": {
       "alpha": 42.21849896381099,
@@ -29,7 +56,18 @@
       "bw_gbps": 2120,
       "alpha_small": 9.299479378508092,
       "beta_small": 2.8745649172829544,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 2.9550502847907163,
+      "maxError_pct": 37.232242897941305,
+      "bwRegion_avgError_pct": 2.706856756260048,
+      "bwRegion_maxError_pct": 37.232242897941305,
+      "startupRegion_avgError_pct": 5.623130716495402,
+      "startupRegion_maxError_pct": 16.53692674835207,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_allreduce_2gpu": {
       "alpha": 41.66353251137655,
@@ -39,7 +77,18 @@
       "bw_gbps": 696,
       "alpha_small": 7.822020662165463,
       "beta_small": 1.4329404258001528,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 1.6833565772029349,
+      "maxError_pct": 27.997127623747247,
+      "bwRegion_avgError_pct": 0.3811331449882117,
+      "bwRegion_maxError_pct": 19.580176999685694,
+      "startupRegion_avgError_pct": 15.6822584735112,
+      "startupRegion_maxError_pct": 27.997127623747247,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_allreduce_4gpu": {
       "alpha": 38.19340730883969,
@@ -49,7 +98,18 @@
       "bw_gbps": 1080,
       "alpha_small": 10.038535752054011,
       "beta_small": 2.2644736534818803,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 3.276214600815091,
+      "maxError_pct": 38.93651891637212,
+      "bwRegion_avgError_pct": 2.093654926438693,
+      "bwRegion_maxError_pct": 15.616181877488156,
+      "startupRegion_avgError_pct": 15.988731100361356,
+      "startupRegion_maxError_pct": 38.93651891637212,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": false
     },
     "fullmesh_allreduce_8gpu": {
       "alpha": 35.38439766441267,
@@ -59,7 +119,18 @@
       "bw_gbps": 2120,
       "alpha_small": 13.349484530491601,
       "beta_small": 3.018016729871769,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 4.562466954162755,
+      "maxError_pct": 40.63108091474676,
+      "bwRegion_avgError_pct": 2.930165738932347,
+      "bwRegion_maxError_pct": 13.278258835020873,
+      "startupRegion_avgError_pct": 22.109705017889677,
+      "startupRegion_maxError_pct": 40.63108091474676,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_alltoall_2gpu": {
       "alpha": 50.3293469636267,
@@ -69,7 +140,18 @@
       "bw_gbps": 376,
       "alpha_small": 7.647239892621811,
       "beta_small": 0.7653451953032703,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 0.7627130926454198,
+      "maxError_pct": 33.357070893046284,
+      "bwRegion_avgError_pct": 0.6553444543826362,
+      "bwRegion_maxError_pct": 33.357070893046284,
+      "startupRegion_avgError_pct": 1.916925953970343,
+      "startupRegion_maxError_pct": 5.03203658593275,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_alltoall_4gpu": {
       "alpha": 28.352528078017176,
@@ -79,7 +161,18 @@
       "bw_gbps": 1080,
       "alpha_small": 9.219123620488627,
       "beta_small": 1.3644139515626017,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 1.4468419333184506,
+      "maxError_pct": 10.088080581173013,
+      "bwRegion_avgError_pct": 1.2456134785991009,
+      "bwRegion_maxError_pct": 10.088080581173013,
+      "startupRegion_avgError_pct": 3.610047821551469,
+      "startupRegion_maxError_pct": 8.057420658763556,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_alltoall_8gpu": {
       "alpha": 29.154969390106285,
@@ -89,7 +182,18 @@
       "bw_gbps": 1832,
       "alpha_small": 11.651032294801919,
       "beta_small": 1.7769176525021746,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 1.8915469700360124,
+      "maxError_pct": 22.29272399028181,
+      "bwRegion_avgError_pct": 1.740360502429017,
+      "bwRegion_maxError_pct": 22.29272399028181,
+      "startupRegion_avgError_pct": 3.5168014968112113,
+      "startupRegion_maxError_pct": 9.258426311813327,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_reducescatter_2gpu": {
       "alpha": 30.819452844103964,
@@ -99,7 +203,18 @@
       "bw_gbps": 696,
       "alpha_small": 7.260328371159739,
       "beta_small": 0.9748424098818194,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 2.0795833887483433,
+      "maxError_pct": 28.652797037903156,
+      "bwRegion_avgError_pct": 1.1845012654336189,
+      "bwRegion_maxError_pct": 16.633409123942517,
+      "startupRegion_avgError_pct": 11.701716214381614,
+      "startupRegion_maxError_pct": 28.652797037903156,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     },
     "fullmesh_reducescatter_4gpu": {
       "alpha": 32.39484849386833,
@@ -109,7 +224,18 @@
       "bw_gbps": 1080,
       "alpha_small": 8.257860299899672,
       "beta_small": 1.5204008113368375,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 2.484453684669397,
+      "maxError_pct": 16.31747898305036,
+      "bwRegion_avgError_pct": 2.187065952590859,
+      "bwRegion_maxError_pct": 16.31747898305036,
+      "startupRegion_avgError_pct": 5.681371804513685,
+      "startupRegion_maxError_pct": 15.245293744680563,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": false
     },
     "fullmesh_reducescatter_8gpu": {
       "alpha": 41.26030496585948,
@@ -119,7 +245,18 @@
       "bw_gbps": 2120,
       "alpha_small": 10.003389733994958,
       "beta_small": 2.824202210655152,
-      "small_threshold_bytes": 4194304
+      "small_threshold_bytes": 4194304,
+      "modelType": "piecewise",
+      "thresholdBytes": 4194304,
+      "numBaselinePoints": 141,
+      "avgError_pct": 2.323603622172576,
+      "maxError_pct": 36.24813466922071,
+      "bwRegion_avgError_pct": 2.0702019845203314,
+      "bwRegion_maxError_pct": 36.24813466922071,
+      "startupRegion_avgError_pct": 5.047671226934203,
+      "startupRegion_maxError_pct": 16.54747601973665,
+      "ac4_full_pass": false,
+      "ac4_subset_pass": true
     }
   },
   "tail_calibration": {

@@ -851,6 +851,28 @@ class AnalyticalSurrogate:
                 alpha_small = None
                 beta_small = None
 
+            # Piecewise fit-quality metrics (in-sample, baseline BER=0/no-FEC):
+            # split per-point APE by the small/large threshold so each group
+            # reports startup-region and BW-region accuracy separately, mirroring
+            # the H200 calibration card. At baseline the FEC/retry/memory
+            # overlays are all zero, so predict == alpha_used + beta_used*x +
+            # gamma_used*x^2 (the small model below T, the large model at/above).
+            all_apes, startup_apes, bw_apes = [], [], []
+            for _sz, _t in points:
+                _x = _sz / bw_bytes_per_us
+                if (alpha_small is not None and beta_small is not None
+                        and threshold_bytes is not None and _sz < threshold_bytes):
+                    _p = alpha_small + beta_small * _x
+                else:
+                    _p = alpha + beta * _x + gamma * _x * _x
+                _ape = abs(_p - _t) / _t * 100.0
+                all_apes.append(_ape)
+                if threshold_bytes is not None and _sz < threshold_bytes:
+                    startup_apes.append(_ape)
+                else:
+                    bw_apes.append(_ape)
+            _within = sum(1 for a in all_apes if a <= 10.0)
+
             self.calibration_params[key] = {
                 "alpha": float(alpha),
                 "beta": float(beta),
@@ -860,10 +882,25 @@ class AnalyticalSurrogate:
                 "alpha_small": alpha_small,
                 "beta_small": beta_small,
                 "small_threshold_bytes": threshold_bytes,
+                # Piecewise-model metadata (mirrors the H200 calibration card):
+                # model type, the small/large threshold, per-region in-sample
+                # APE, and AC4 acceptance gates (within 10% tolerance).
+                "modelType": "piecewise" if threshold_bytes is not None else "quadratic",
+                "thresholdBytes": threshold_bytes,
+                "numBaselinePoints": len(points),
+                "avgError_pct": sum(all_apes) / len(all_apes),
+                "maxError_pct": max(all_apes),
+                "bwRegion_avgError_pct": (sum(bw_apes) / len(bw_apes)) if bw_apes else 0.0,
+                "bwRegion_maxError_pct": max(bw_apes) if bw_apes else 0.0,
+                "startupRegion_avgError_pct": (sum(startup_apes) / len(startup_apes)) if startup_apes else 0.0,
+                "startupRegion_maxError_pct": max(startup_apes) if startup_apes else 0.0,
+                "ac4_full_pass": max(all_apes) <= 10.0,
+                "ac4_subset_pass": (_within / len(all_apes) * 100.0) >= 90.0,
             }
             print(f"Calibrated ({key[0]}, {key[1]}, {key[2]}G): "
                   f"alpha={alpha:.2f}µs, beta={beta:.3f}, gamma={gamma:.6f}, "
-                  f"n={len(points)} points")
+                  f"n={len(points)} points, avgAPE={sum(all_apes)/len(all_apes):.2f}%, "
+                  f"maxAPE={max(all_apes):.2f}%")
 
         self.calibrated = True
         # Calibrate tail factors from ns-3 P50/P95/P99 data (if available)
@@ -980,9 +1017,28 @@ class AnalyticalSurrogate:
         }
 
     def save_calibration(self, filepath: str):
-        """Save calibration parameters to JSON, including tail calibration."""
+        """Save calibration parameters to JSON, including tail calibration.
+
+        Emits card-level piecewise-model metadata (modelType, thresholdBytes,
+        numBaselinePoints, aggregate avg/max APE) mirroring the H200
+        calibration card; per-group region-split APE lives in each param entry.
+        """
+        # Card-level model metadata (shared across groups: calibrate() uses a
+        # single 4MB small/large threshold). Pull from the first group if set.
+        first = next(iter(self.calibration_params.values()), {}) if self.calibration_params else {}
+        total_points = sum(v.get("numBaselinePoints", v.get("num_points", 0))
+                           for v in self.calibration_params.values())
+        all_avg = [v["avgError_pct"] for v in self.calibration_params.values()
+                   if "avgError_pct" in v]
+        all_max = [v["maxError_pct"] for v in self.calibration_params.values()
+                   if "maxError_pct" in v]
         out = {
             "calibrated": self.calibrated,
+            "modelType": first.get("modelType", "piecewise"),
+            "thresholdBytes": first.get("thresholdBytes", 4194304),
+            "numBaselinePoints": total_points,
+            "avgError_pct": (sum(all_avg) / len(all_avg)) if all_avg else 0.0,
+            "maxError_pct": max(all_max) if all_max else 0.0,
             "params": {},
             "tail_calibration": {
                 "calibrated": self._queuing_estimator._tail_calibrated,
