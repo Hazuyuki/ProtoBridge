@@ -1,5 +1,8 @@
 # Python dependencies for the surrogate models + tests.
-# numpy is used by analytical_surrogate.py for least-squares regression
-# fitting (np.linalg.lstsq) during calibration. Install before running
-# `python3 -m pytest surrogate/test/`.
+# numpy: used by analytical_surrogate.py for least-squares regression
+#   fitting (np.linalg.lstsq) during calibration.
+# pytest: the test runner invoked by `python3 -m pytest surrogate/test/`.
+# The ubuntu-latest system python3 ships neither; install both before running
+# the tests (CI: pip3 install --break-system-packages -r this file).
 numpy
+pytest
