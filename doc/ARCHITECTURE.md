@@ -168,6 +168,49 @@ default). See [configs/protocol_configs/](../configs/protocol_configs) and
 `MEMORY_READ`, `MEMORY_WRITE`, `MEMORY_RESP`, `RETRY_REQUEST`, `RETRY_ACK`,
 `PERMANENT_LOSS`.
 
+### Why `FabricHeader` is necessary: the unified-abstraction contract
+
+`FabricHeader` is **not** an attempt to model any one hardware wire format
+(real NVLink flits are 1280-bit units with a vendor routing overlay; that
+layout is not publicly fixed and varies by vendor). Its role is different and
+load-bearing: it is the **vendor-agnostic control-plane contract** that lets
+one datapath serve all vendors, topologies, and protocols at once.
+
+The target of this simulator is a *single* datapath spanning 7 vendor
+protocols × ring/tree/SHARP/NVLS/full-mesh/hierarchical topologies ×
+credit/window/rate flow control × the 4-tier resilience model. If every
+vendor/topology pair defined its own header fields, the datapath would explode
+into N×M specialized switch/reorder/credit/FEC/LLR paths. The only way to
+collapse that combinatorial space is to lift the *semantic* fields the control
+plane needs — packet type, end-to-end GPU address, sequence/flow/VC key, TTL,
+payload vs effective size — into one common schema, independent of any
+vendor's on-wire bit layout. `FabricHeader` is that schema.
+
+Two facts make the spine/plug relationship concrete:
+
+- Of `FabricHeader`'s 16 fields, **only `Protocol` (1 byte) carries vendor
+  identity.** The other 15 are vendor-agnostic control semantics. Vendor
+  encoding is delegated to the `ProtocolPayloadBuilder`; the heavy datapath
+  logic (NVSwitch routing/VOQ/arbiter, reorder buffer, credit manager, FEC
+  model, LLR, collective dispatch) runs entirely on the common schema. This is
+  why plugging in a vendor protocol is a *local* change (the `Protocol` byte
+  + a payload builder), not a rewrite of the spine.
+- `effectiveDataSize` is kept separate from `payloadSize` so that
+  overhead protocols (LL/LL128) can vary their wire size without disturbing
+  collective-progress accounting, which must stay consistent across vendors.
+
+### Contract vs. encoding (swappable wire bytes)
+
+`FabricHeader`-as-contract is necessary and not optional — the unified model
+cannot exist without it. `FabricHeader`-as-39-byte-wire-encoding is the
+*default encoding* of that contract and is separable: if a real flit layout
+becomes available, the on-wire bytes (and the serialization overhead they
+model) can be swapped without touching the control semantics, which would then
+flow through a side channel (a `PacketTag`) rather than the wire header. The
+default 39-byte encoding is what the calibration invariants (88.2 µs / 44.6 µs)
+are pinned to; swapping the wire encoding requires re-calibration. **Contract
+≠ encoding.**
+
 ## Credit-based flow control + packet spraying + reorder
 
 - **Credit gating.** Each VC maintains a credit counter initialized to the
