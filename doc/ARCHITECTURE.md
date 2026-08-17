@@ -22,9 +22,8 @@ tree-allreduce, nvls-allgather, sharp-allreduce, fullmesh, alltoall, …)
 decomposes a tensor operation into a stream of fabric packets. For each packet
 it asks:
 
-- `ProtocolModel` (one of 7 vendor models: `NcclProtocolModel`,
-  `UbProtocolModel`, `HccsProtocolModel`, `IfProtocolModel`,
-  `McclProtocolModel`, `RoceProtocolModel`, `IciProtocolModel`) to select the
+- `ProtocolModel` (one of 3 vendor models validated in the paper:
+  `NcclProtocolModel`, `UbProtocolModel`, `McclProtocolModel`) to select the
   wire protocol (e.g. NCCL LL / LL128 / SIMPLE) and wire efficiency.
 - `ProtocolPayloadBuilder` to pack the tensor chunk into the payload.
 - `FabricHeader` to stamp packet type, sequence number, flow ID, virtual

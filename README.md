@@ -5,7 +5,7 @@ large-scale GPU clusters (100-card-class super-nodes built on NVSwitch /
 NVLink). It strips the TCP/IP stack entirely: applications drive `NetDevice`
 `Send()` / `ReceiveCallback()` directly over a custom bare-metal fabric header,
 modeling the wire behavior of vendor collective protocols (NVIDIA NCCL, Huawei
-UB, Intel oneAPI/CXL, AMD Infinity Fabric, MetaXLink MCCCL, RoCE, ICI).
+UB, MetaXLink MCCCL — the three validated in the paper).
 
 It ships three latency surrogates calibrated against an H200 NVLink4 reference,
 so you can predict collective latency without running the full ns-3 sweep.
@@ -27,7 +27,7 @@ reduce / reduce-scatter) against the fabric.
 ```
             ┌─────────────────────────────────────────────────────┐
    App ───▶ │  OTP: operation → packet                             │
- (collective│   ProtocolModel (7 vendors) + ProtocolPayloadBuilder │
+ (collective│   ProtocolModel (3 vendors) + ProtocolPayloadBuilder │
   injector) │   FabricHeader (type/seq/flow/VC)                    │
             └──────────────────────┬──────────────────────────────┘
                                    ▼
@@ -43,7 +43,7 @@ reduce / reduce-scatter) against the fabric.
 
 - **OTP** turns a collective operation into a stream of fabric packets:
   `ProtocolModel` selects the vendor wire format / protocol (LL / LL128 /
-  SIMPLE for NCCL; HCCS for Huawei; …), `ProtocolPayloadBuilder` packs the
+  SIMPLE for NCCL; …), `ProtocolPayloadBuilder` packs the
   tensor chunks, and `FabricHeader` carries Packet Type (DATA/CREDIT),
   Sequence Number, Flow ID, and Virtual Channel ID.
 - **PEX** executes those packets: `FecModel` (RS codes), `CreditManager`

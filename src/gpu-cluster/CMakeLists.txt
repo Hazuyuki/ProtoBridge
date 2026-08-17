@@ -25,16 +25,8 @@ build_lib(
     model/fabric-switch.cc
     model/nccl-protocol-model.cc
     model/nccl-protocol-payload-builder.cc
-    model/ici-protocol-model.cc
-    model/ici-payload-builder.cc
-    model/hccs-protocol-model.cc
-    model/hccs-payload-builder.cc
-    model/if-protocol-model.cc
-    model/if-payload-builder.cc
     model/mccl-protocol-model.cc
     model/mccl-payload-builder.cc
-    model/roce-protocol-model.cc
-    model/roce-payload-builder.cc
     model/ub-protocol-model.cc
     model/ub-payload-builder.cc
     model/llr-manager.cc
@@ -85,16 +77,8 @@ build_lib(
     model/protocol-transaction.h
     model/nccl-protocol-model.h
     model/nccl-protocol-payload-builder.h
-    model/ici-protocol-model.h
-    model/ici-payload-builder.h
-    model/hccs-protocol-model.h
-    model/hccs-payload-builder.h
-    model/if-protocol-model.h
-    model/if-payload-builder.h
     model/mccl-protocol-model.h
     model/mccl-payload-builder.h
-    model/roce-protocol-model.h
-    model/roce-payload-builder.h
     model/ub-protocol-model.h
     model/ub-payload-builder.h
     model/llr-manager.h

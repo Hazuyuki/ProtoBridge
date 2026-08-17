@@ -37,17 +37,9 @@
 #include "ns3/protocol-config.h"
 #include "ns3/protocol-config-runner.h"
 #include "ns3/nccl-protocol-model.h"
-#include "ns3/ici-protocol-model.h"
-#include "ns3/hccs-protocol-model.h"
-#include "ns3/if-protocol-model.h"
-#include "ns3/roce-protocol-model.h"
 #include "ns3/ub-protocol-model.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/nccl-protocol-payload-builder.h"
-#include "ns3/ici-payload-builder.h"
-#include "ns3/hccs-payload-builder.h"
-#include "ns3/if-payload-builder.h"
-#include "ns3/roce-payload-builder.h"
 #include "ns3/ub-payload-builder.h"
 
 #include "ns3/link-degradation.h"
@@ -275,7 +267,7 @@ main(int argc, char* argv[])
     cmd.AddValue("topology", "Topology: ring/fullmesh/switched/fattree/railfattree/leafspine/nvl72/torus/mesh/hypercube/2dfullmesh/ndfullmesh/2dfullmeshclos", topology);
     cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce", collective);
     cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain", algorithm);
-    cmd.AddValue("protocolModel", "Protocol model type: ns3::NcclProtocolModel/ns3::IciProtocolModel/ns3::HccsProtocolModel/ns3::IfProtocolModel/ns3::McclProtocolModel/ns3::RoceProtocolModel/ns3::UbProtocolModel", protocolModelType);
+    cmd.AddValue("protocolModel", "Protocol model type: ns3::NcclProtocolModel/ns3::UbProtocolModel/ns3::McclProtocolModel", protocolModelType);
     cmd.AddValue("protocolWireEfficiency", "Protocol payload bytes divided by transmitted bytes", protocolWireEfficiency);
     cmd.AddValue("fabricType", "Fabric type: NVLink/ETH/ICI/HCCS/xGMI/MetaXLink/RoCE/UB", fabricTypeStr);
     cmd.AddValue("deviceType", "Device type: GPU/CPU/TPU/NPU/Gaudi/UB_NPU", deviceTypeStr);
@@ -577,30 +569,6 @@ main(int argc, char* argv[])
             Config::SetDefault("ns3::NcclProtocolModel::PerGpuStartupDelayNs", UintegerValue(startupPerGpuNs));
         }
     }
-    else if (protocolModelType == "ns3::HccsProtocolModel")
-    {
-        Config::SetDefault("ns3::HccsProtocolModel::StartupDelayNs", UintegerValue(startupSIMPLENs));
-        if (startupPerGpuNs > 0)
-        {
-            Config::SetDefault("ns3::HccsProtocolModel::PerGpuStartupDelayNs", UintegerValue(startupPerGpuNs));
-        }
-    }
-    else if (protocolModelType == "ns3::IciProtocolModel")
-    {
-        Config::SetDefault("ns3::IciProtocolModel::StartupDelayNs", UintegerValue(startupSIMPLENs));
-        if (startupPerGpuNs > 0)
-        {
-            Config::SetDefault("ns3::IciProtocolModel::PerGpuStartupDelayNs", UintegerValue(startupPerGpuNs));
-        }
-    }
-    else if (protocolModelType == "ns3::IfProtocolModel")
-    {
-        Config::SetDefault("ns3::IfProtocolModel::StartupDelayNs", UintegerValue(startupSIMPLENs));
-        if (startupPerGpuNs > 0)
-        {
-            Config::SetDefault("ns3::IfProtocolModel::PerGpuStartupDelayNs", UintegerValue(startupPerGpuNs));
-        }
-    }
     else if (protocolModelType == "ns3::McclProtocolModel")
     {
         Config::SetDefault("ns3::McclProtocolModel::StartupDelayNs", UintegerValue(startupSIMPLENs));
@@ -608,14 +576,6 @@ main(int argc, char* argv[])
         if (startupPerGpuNs > 0)
         {
             Config::SetDefault("ns3::McclProtocolModel::PerGpuStartupDelayNs", UintegerValue(startupPerGpuNs));
-        }
-    }
-    else if (protocolModelType == "ns3::RoceProtocolModel")
-    {
-        Config::SetDefault("ns3::RoceProtocolModel::StartupDelayNs", UintegerValue(startupSIMPLENs));
-        if (startupPerGpuNs > 0)
-        {
-            Config::SetDefault("ns3::RoceProtocolModel::PerGpuStartupDelayNs", UintegerValue(startupPerGpuNs));
         }
     }
     else if (protocolModelType == "ns3::UbProtocolModel")
@@ -697,25 +657,9 @@ main(int argc, char* argv[])
     {
         payloadBuilderType = "ns3::NcclProtocolPayloadBuilder";
     }
-    else if (protocolModelType == "ns3::IciProtocolModel")
-    {
-        payloadBuilderType = "ns3::IciPayloadBuilder";
-    }
-    else if (protocolModelType == "ns3::HccsProtocolModel")
-    {
-        payloadBuilderType = "ns3::HccsPayloadBuilder";
-    }
-    else if (protocolModelType == "ns3::IfProtocolModel")
-    {
-        payloadBuilderType = "ns3::IfPayloadBuilder";
-    }
     else if (protocolModelType == "ns3::McclProtocolModel")
     {
         payloadBuilderType = "ns3::McclPayloadBuilder";
-    }
-    else if (protocolModelType == "ns3::RoceProtocolModel")
-    {
-        payloadBuilderType = "ns3::RocePayloadBuilder";
     }
     else if (protocolModelType == "ns3::UbProtocolModel")
     {

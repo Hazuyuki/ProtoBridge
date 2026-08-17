@@ -174,25 +174,9 @@ ProtocolProfile::Build() const
     {
         pbType = "ns3::NcclProtocolPayloadBuilder";
     }
-    else if (effTid == "ns3::IciProtocolModel")
-    {
-        pbType = "ns3::IciPayloadBuilder";
-    }
-    else if (effTid == "ns3::HccsProtocolModel")
-    {
-        pbType = "ns3::HccsPayloadBuilder";
-    }
-    else if (effTid == "ns3::IfProtocolModel")
-    {
-        pbType = "ns3::IfPayloadBuilder";
-    }
     else if (effTid == "ns3::McclProtocolModel")
     {
         pbType = "ns3::McclPayloadBuilder";
-    }
-    else if (effTid == "ns3::RoceProtocolModel")
-    {
-        pbType = "ns3::RocePayloadBuilder";
     }
     else if (effTid == "ns3::UbProtocolModel")
     {
