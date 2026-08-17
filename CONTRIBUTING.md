@@ -1,3 +1,49 @@
+# Contributing to ProtoBridge
+
+**About this repository.** ProtoBridge is a bare-metal L2/MAC GPU-fabric
+interconnect simulator built on the [ns-3](https://www.nsnam.org/) framework.
+This repo bundles a trimmed ns-3.47 framework plus our self-authored
+`src/gpu-cluster/` module (OTP/PEX packet-execution layer, NVSwitch model,
+collective injectors, credit flow control, four-tier FEC/retry resilience),
+the `surrogate/` latency models (calibrated on H200 NVLink4), and `configs/`
+profiles. **Everything outside `src/gpu-cluster/`, `surrogate/`,
+`configs/protocol_profiles/`, `scratch/gpu-cluster-sim.cc`, and
+`scratch/protocol-profile-demo.cc` is stock ns-3** — direct those questions to
+the upstream ns-3 project, not here.
+
+**Where to contribute.** Contributions are welcome against:
+- `src/gpu-cluster/` — the fabric models (NVSwitch, FabricEndpoint, FecModel,
+  CreditManager, LlrManager, collective injectors, protocol models).
+- `surrogate/` — the theory / analytical / topology-aware latency surrogates
+  and their pytest suite.
+- `configs/` — example `.profile` / `.cfg` files.
+
+**Build & verify before opening a PR** (CI runs the same):
+```bash
+./ns3 configure --enable-examples --enable-tests -d debug && ./ns3 build
+./ns3 run "test-runner --test-name=gpu-cluster"
+./ns3 run "test-runner --test-name=gpu-cluster-integration"
+python3 -m pytest surrogate/test/ -q
+```
+Calibration must stay byte-identical: the H200 8-GPU switched ring at 1 MiB is
+**88.2 µs**, the config-path ring is **44.6 µs**. A change that shifts these
+is a behavior change, not a refactor — call it out in the PR description.
+
+**Extension seams.** Flow-control (`FabricEndpoint::FlowControlGate` is
+virtual), arbitration (`ns3::Arbiter` strategy, default `RoundRobinArbiter`),
+and switching (`FabricSwitch` abstract base + `NvSwitchHelper::SetSwitchType`)
+are designed to be subclassed — prefer extending via these seams over editing
+the validated datapath. See `doc/ARCHITECTURE.md` ("Extension seams").
+
+**No TCP/IP stack, no A800.** Per the project constraints: never install
+`InternetStackHelper` (applications drive `NetDevice::Send`/`ReceiveCallback`
+directly), and all calibration is H200 NVLink4 (no A800 references).
+
+The rest of this file is the upstream ns-3 contributing guide, retained
+verbatim for the framework portions of the repo.
+
+---
+
 # Contributing to ns-3
 
 *This file is heavily inspired by Atom's [CONTRIBUTING.md file](https://raw.githubusercontent.com/atom/atom/master/CONTRIBUTING.md).*
