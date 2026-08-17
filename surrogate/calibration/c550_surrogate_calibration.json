@@ -2,9 +2,9 @@
   "calibrated": true,
   "params": {
     "fullmesh_allgather_2gpu": {
-      "alpha": 71.96317277636395,
-      "beta": 0.4656828541685436,
-      "gamma": -6.880364576757236e-07,
+      "alpha": 28.120370967802014,
+      "beta": 0.4796100017928916,
+      "gamma": -1.632932470509226e-06,
       "num_points": 141,
       "bw_gbps": 696,
       "alpha_small": 7.269270316440252,
@@ -12,9 +12,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_allgather_4gpu": {
-      "alpha": 69.15067507638464,
-      "beta": 0.6919484952058801,
-      "gamma": 2.3354363194259765e-06,
+      "alpha": 32.50171117634771,
+      "beta": 0.7102411976912377,
+      "gamma": 4.339581807045949e-07,
       "num_points": 141,
       "bw_gbps": 1080,
       "alpha_small": 8.195705957319886,
@@ -22,9 +22,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_allgather_8gpu": {
-      "alpha": 89.05130188675122,
-      "beta": 0.7493676740860364,
-      "gamma": -7.659947749078351e-07,
+      "alpha": 42.21849896381099,
+      "beta": 0.7948711934034094,
+      "gamma": -1.0129985783723438e-05,
       "num_points": 141,
       "bw_gbps": 2120,
       "alpha_small": 9.299479378508092,
@@ -42,9 +42,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_allreduce_4gpu": {
-      "alpha": 126.09074693867542,
-      "beta": 1.3144870446348738,
-      "gamma": 4.2442798138454495e-06,
+      "alpha": 38.19340730883969,
+      "beta": 1.3582764763768997,
+      "gamma": -3.162816256861494e-07,
       "num_points": 141,
       "bw_gbps": 1080,
       "alpha_small": 10.038535752054011,
@@ -52,9 +52,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_allreduce_8gpu": {
-      "alpha": 146.18788513937494,
-      "beta": 1.5187485119730382,
-      "gamma": -6.005947528251585e-06,
+      "alpha": 35.38439766441267,
+      "beta": 1.6262762894217229,
+      "gamma": -2.8160985672123316e-05,
       "num_points": 141,
       "bw_gbps": 2120,
       "alpha_small": 13.349484530491601,
@@ -72,9 +72,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_alltoall_4gpu": {
-      "alpha": 64.44633701047177,
-      "beta": 0.7308120311896223,
-      "gamma": -5.664185895763039e-07,
+      "alpha": 28.352528078017176,
+      "beta": 0.7486522614169744,
+      "gamma": -2.4393804745490086e-06,
       "num_points": 141,
       "bw_gbps": 1080,
       "alpha_small": 9.219123620488627,
@@ -82,9 +82,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_alltoall_8gpu": {
-      "alpha": 55.34584396441981,
-      "beta": 0.7997856419760196,
-      "gamma": -8.748342264036999e-06,
+      "alpha": 29.154969390106285,
+      "beta": 0.8214721125788946,
+      "gamma": -1.2659756509567288e-05,
       "num_points": 141,
       "bw_gbps": 1832,
       "alpha_small": 11.651032294801919,
@@ -92,9 +92,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_reducescatter_2gpu": {
-      "alpha": 56.722137571600314,
-      "beta": 0.47792760782783433,
-      "gamma": 1.1736736868757625e-08,
+      "alpha": 30.819452844103964,
+      "beta": 0.4861955861799387,
+      "gamma": -5.464736333805764e-07,
       "num_points": 141,
       "bw_gbps": 696,
       "alpha_small": 7.260328371159739,
@@ -102,9 +102,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_reducescatter_4gpu": {
-      "alpha": 83.99953911035439,
-      "beta": 0.7177608702299247,
-      "gamma": 3.049915668055631e-06,
+      "alpha": 32.39484849386833,
+      "beta": 0.7435038715698128,
+      "gamma": 3.724575220239235e-07,
       "num_points": 141,
       "bw_gbps": 1080,
       "alpha_small": 8.257860299899672,
@@ -112,9 +112,9 @@
       "small_threshold_bytes": 4194304
     },
     "fullmesh_reducescatter_8gpu": {
-      "alpha": 68.93519809933976,
-      "beta": 0.8223868056385253,
-      "gamma": 3.3773994901549707e-06,
+      "alpha": 41.26030496585948,
+      "beta": 0.8493955608474011,
+      "gamma": -2.155677017601909e-06,
       "num_points": 141,
       "bw_gbps": 2120,
       "alpha_small": 10.003389733994958,

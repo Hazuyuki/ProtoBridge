@@ -767,46 +767,14 @@ class AnalyticalSurrogate:
             small_mask = sizes < threshold_bytes
             large_mask = sizes >= threshold_bytes
 
-            # Fit BW-dominated model on large sizes
-            large_sizes = sizes[large_mask]
-            large_x = x[large_mask]
-            large_x2 = large_x * large_x
-            large_y = y[large_mask]
-
-            if len(large_sizes) >= 3:
-                # Quadratic regression: y = alpha + beta * x + gamma * x^2
-                A = np.column_stack([np.ones(len(large_x)), large_x, large_x2])
-                result = np.linalg.lstsq(A, large_y, rcond=None)
-                coeffs = result[0]
-                alpha = coeffs[0]  # Startup + latency overhead (µs)
-                beta = coeffs[1]   # BW efficiency factor
-                gamma = coeffs[2]  # Size-dependent overhead factor
-            elif len(large_sizes) >= 2:
-                # Linear regression (insufficient points for quadratic)
-                A = np.column_stack([np.ones(len(large_x)), large_x])
-                result = np.linalg.lstsq(A, large_y, rcond=None)
-                coeffs = result[0]
-                alpha = coeffs[0]
-                beta = coeffs[1]
-                gamma = 0.0
-            else:
-                # Use all data points for standard fit
-                A = np.column_stack([np.ones(len(x)), x, x2])
-                result = np.linalg.lstsq(A, y, rcond=None)
-                coeffs = result[0]
-                alpha = coeffs[0]
-                beta = coeffs[1]
-                gamma = coeffs[2]
-                threshold_bytes = None  # No piecewise model
-
-            # Fit small-size model on small sizes (linear: simpler for few points)
+            # Fit the small-size model FIRST (linear: lower startup at small
+            # sizes due to incomplete pipeline fill).
             small_sizes = sizes[small_mask]
             small_x = x[small_mask]
             small_y = y[small_mask]
-
             alpha_small = None
             beta_small = None
-            if len(small_sizes) >= 2 and threshold_bytes is not None:
+            if len(small_sizes) >= 2:
                 A_small = np.column_stack([np.ones(len(small_x)), small_x])
                 result_small = np.linalg.lstsq(A_small, small_y, rcond=None)
                 alpha_small = float(result_small[0][0])
@@ -814,6 +782,74 @@ class AnalyticalSurrogate:
                 print(f"  Small-size model ({key[0]}, {key[1]}, {key[2]}G): "
                       f"alpha_small={alpha_small:.2f}µs, beta_small={beta_small:.3f}, "
                       f"n={len(small_sizes)} points")
+            else:
+                threshold_bytes = None  # too few small points -> no piecewise
+
+            large_sizes = sizes[large_mask]
+            large_x = x[large_mask]
+            large_y = y[large_mask]
+
+            # Threshold-continuity gap: the relative divergence between the
+            # large model and the small model at the threshold T. A large gap
+            # means the large-fit intercept is inflated (effective BW ramps up
+            # with size, so a quadratic over the wide [T, max] range bends and
+            # lifts alpha, spiking latency just above T). Only then do we
+            # refit the large model with a continuity constraint at T; this
+            # keeps well-behaved groups (e.g. the sparse H200 baseline, whose
+            # unconstrained alpha is already small) on the original fit.
+            def _gap(_alpha, _beta, _gamma, _x_T, _y_T):
+                pred_T = _alpha + _beta * _x_T + _gamma * _x_T * _x_T
+                return abs(pred_T - _y_T) / max(_y_T, 1e-9)
+
+            constrained = False
+            if len(large_sizes) >= 3:
+                A = np.column_stack([np.ones(len(large_x)), large_x,
+                                     large_x * large_x])
+                coeffs = np.linalg.lstsq(A, large_y, rcond=None)[0]
+                alpha = float(coeffs[0])  # Startup + latency overhead (µs)
+                beta = float(coeffs[1])    # BW efficiency factor
+                gamma = float(coeffs[2])  # Size-dependent overhead factor
+                if alpha_small is not None and beta_small is not None:
+                    x_T = threshold_bytes / bw_bytes_per_us
+                    y_T = alpha_small + beta_small * x_T
+                    if _gap(alpha, beta, gamma, x_T, y_T) > 0.4:
+                        dx = large_x - x_T
+                        Ac = np.column_stack([dx, dx * dx])
+                        res = np.linalg.lstsq(Ac, large_y - y_T,
+                                              rcond=None)[0]
+                        beta = float(res[0])
+                        gamma = float(res[1])
+                        alpha = y_T - beta * x_T - gamma * x_T * x_T
+                        constrained = True
+            elif len(large_sizes) >= 2:
+                A = np.column_stack([np.ones(len(large_x)), large_x])
+                coeffs = np.linalg.lstsq(A, large_y, rcond=None)[0]
+                alpha = float(coeffs[0])
+                beta = float(coeffs[1])
+                gamma = 0.0
+                if alpha_small is not None and beta_small is not None:
+                    x_T = threshold_bytes / bw_bytes_per_us
+                    y_T = alpha_small + beta_small * x_T
+                    if _gap(alpha, beta, gamma, x_T, y_T) > 0.4:
+                        dx = large_x - x_T
+                        Ac = np.column_stack([dx])
+                        res = np.linalg.lstsq(Ac, large_y - y_T,
+                                              rcond=None)[0]
+                        beta = float(res[0])
+                        gamma = 0.0
+                        alpha = y_T - beta * x_T
+                        constrained = True
+            else:
+                # Use all data points for standard fit (no piecewise model)
+                A = np.column_stack([np.ones(len(x)), x, x2])
+                result = np.linalg.lstsq(A, y, rcond=None)
+                coeffs = result[0]
+                alpha = float(coeffs[0])
+                beta = float(coeffs[1])
+                gamma = float(coeffs[2])
+                threshold_bytes = None
+                alpha_small = None
+                beta_small = None
 
             self.calibration_params[key] = {
                 "alpha": float(alpha),
