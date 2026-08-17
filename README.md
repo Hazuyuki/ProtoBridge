@@ -1,14 +1,54 @@
-# ProtoBridge — Bare-Metal GPU-Fabric Interconnect Simulator
+# ProtoBridge — An ns-3-Based LLM-to-Packet Simulator for Superpod Interconnect Exploration
 
-ProtoBridge is a discrete-event simulator for the L2/MAC fabric communication of
-large-scale GPU clusters (100-card-class super-nodes built on NVSwitch /
-NVLink). It strips the TCP/IP stack entirely: applications drive `NetDevice`
-`Send()` / `ReceiveCallback()` directly over a custom bare-metal fabric header,
-modeling the wire behavior of vendor collective protocols (NVIDIA NCCL, Huawei
-UB, MetaXLink MCCCL — the three validated in the paper).
+Larger LLMs and longer contexts exceed the memory of a single GPU, so serving
+systems partition weights, key-value cache, and activations across many
+devices. Partitioning relieves memory pressure but introduces collective,
+point-to-point, and remote-memory communication that bounds serving latency and
+throughput — motivating *superpods* that connect tens to thousands of GPUs over
+high-bandwidth, low-latency scale-up fabrics.
 
-It ships three latency surrogates calibrated against an H200 NVLink4 reference,
-so you can predict collective latency without running the full ns-3 sweep.
+Superpod interconnect design has not converged: products and proposals differ in
+link technology, topology, and scale-up protocol stack, so architects must
+accurately compare a wide range of designs for target LLM workloads. But the two
+usual tools both fall short:
+
+- **Latency-bandwidth models** estimate each operation from message size and
+  effective bandwidth with a fixed startup. They are fast but inaccurate (up to
+  ~40% error) and cannot distinguish one scale-up protocol from another.
+- **Packet-level simulators** such as ns-3 model routing, queueing, and packet
+  timing, but each scale-up protocol stack requires a separate LLM-to-packet
+  implementation — so protocols cannot be compared on a common substrate — and
+  detailed simulation takes 2.38–75.70 s per operation, while one serving
+  configuration invokes thousands: hours or days per design.
+
+**ProtoBridge** closes this gap. It is an ns-3-based LLM-to-packet simulator
+that makes protocol effects explicit through two abstraction layers separating
+protocol-specific behavior from a shared ns-3 path:
+
+1. **Operation-to-Packet (OTP)** — translates each communication step into
+   packet transfers and defines step dependencies and completion rules,
+   capturing the protocol-specific packet exchange (vendor wire formats:
+   NVIDIA NCCL/NVLink LL·LL128·SIMPLE, Huawei Unified Bus, MetaXLink MCCCL).
+2. **Packet-Execution (PEX)** — carries the shared packet-level mechanisms —
+   credit-based flow control, FEC + go-back-N/SACK retry, per-link BER
+   degradation, and an NVSwitch model (input VOQs, crossbar arbiter, SHARP
+   in-network allreduce) — and drives the ns-3 event system.
+
+Different protocol configurations are therefore compared on a common ns-3
+simulation substrate by changing only the input configuration; the application
+layer drives `NetDevice` `Send()` / `ReceiveCallback()` directly over a custom
+bare-metal fabric header, with no TCP/IP stack. ProtoBridge matches measured
+superpod communication latency with **17.8% MAPE on H200 NVLink4** and
+**10.3% on C500 MetaXLink** (1 KB–1 GB), and **1.76% on NVL72** (512 MB–8 GB).
+
+For fast design exploration, ProtoBridge ships a **protocol-defined latency
+surrogate** that combines OTP parameters (startup, effective bandwidth) with
+analytical models of each PEX mechanism. It reduces MAPE from 55.7% for the
+latency-bandwidth model to 11.8%, and cuts per-operation evaluation from
+2.38–75.70 s to 20.5 µs. A coarse-to-fine workflow sweeps designs with the
+surrogate and validates configurations near the estimated frontier with
+ProtoBridge — 38,232 designs in one hour — with case studies on scale-up memory
+pools and co-packaged optics (CPO).
 
 ## What this is (and is not)
 
@@ -17,8 +57,10 @@ control, packet spraying + reorder, NVSwitch VOQ/crossbar/SHARP, a four-tier
 FEC/retry resilience model, link BER degradation, and a parametric topology
 grammar spanning 12 families.
 
-**Is not:** a full system simulator. There is no TCP/IP stack, no LLM serving /
-KV-cache / memory-hierarchy / PD-split model, no DSE harness. The application
+**Is not:** a full system simulator. There is no TCP/IP stack and no LLM serving
+runtime (no model execution, KV-cache, memory-hierarchy, or PD-split model);
+the latency surrogate and topology sweep here are interconnect-only, not the
+end-to-end multi-model DSE used in the paper's case studies. The application
 layer issues direct collectives (allreduce / allgather / alltoall / broadcast /
 reduce / reduce-scatter) against the fabric.
 
