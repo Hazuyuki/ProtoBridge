@@ -1032,12 +1032,12 @@ class McclProtocolModelTest : public TestCase
     void DoRun() override
     {
         Ptr<McclProtocolModel> model = CreateObject<McclProtocolModel>();
-        model->SetAttribute("StartupDelayNs", UintegerValue(4130));
+        model->SetAttribute("StartupDelayNs", UintegerValue(1000));
         model->SetAttribute("WireEfficiency", DoubleValue(0.8));
 
         uint8_t protocol = model->GetProtocolId(1024);
         NS_TEST_EXPECT_MSG_EQ(model->GetStartupDelayNs(protocol),
-                              4130,
+                              1000,
                               "Configured MCCL startup delay");
         NS_TEST_EXPECT_MSG_EQ(model->GetWireSize(1000, protocol),
                               1250,
