@@ -39,19 +39,41 @@ import math
 
 
 class TheoryDerivedSurrogate:
-    """Factorized analytical surrogate with a fixed platform profile.
+    """Mechanism-structured latency surrogate with a fixed hardware profile.
 
-    Configured or platform-profiled parameters:
-      - packet_bw: physical packet bandwidth used by retransmission
-      - ring_bw: effective ring transfer bandwidth (bytes/µs)
-      - tree_bw_per_level: effective tree bandwidth per active level
-      - nvls_bw: aggregate NVLS transfer-work bandwidth
-      - lat: link propagation latency (µs)
-      - credit_bdp_ring/tree: packets needed to fill the schedule path
-      - chunk_size: spray chunk size (bytes)
-      - num_lanes: NVLink lanes per GPU
-      - T_min_switch: NVSwitch pipeline fill (VOQ + arbiter, µs)
-      - T_fec_encode, T_fec_decode: FEC pipeline latency (µs)
+    Hardware is supplied at construction. The ``make_*_theory()`` factories bake
+    in the calibrated H200 / 1024-optical values; pass ``**overrides`` to a
+    factory to define custom hardware on top of that anchor
+    (``make_h200_ring_theory(num_lanes=8, startup_us=7)``), or construct this
+    class directly for a from-scratch profile. Every parameter below is an
+    ``__init__`` keyword (units shown), with the H200 ring value in parentheses
+    and the latency path it affects:
+
+      Bandwidth — serialized-bytes term (bytes/µs):
+        packet_bw_bytes_per_us         (177000)  retransmission chunk serialize (ber>0)
+        ring_bw_bytes_per_us           (94000)   ring per-step transfer        [ring mean]
+        tree_bw_per_level_bytes_per_us (26250)   tree per-level transfer       [tree mean]
+        nvls_bw_bytes_per_us           (535500)  NVLS aggregate transfer       [nvls mean]
+      Latency — fixed term (µs unless noted):
+        link_latency_us                (0.4 = 400 ns) per-hop propagation  [ring/nvls mean]
+        t_min_switch_us                 (1.1)    NVSwitch pipeline fill      [tree mean]
+        startup_us                      (15.0)   protocol startup (LL/LL128) [all mean]
+        nvls_startup_us                 (23.0)   NVLS startup (used for nvls) [nvls mean]
+        fec_encode_ns / fec_decode_ns   (50 / 80 ns) FEC pipeline latency   [FEC on]
+      Flow control:
+        credit_bdp_ring_packets         (91.5)   ring credit BDP -> Phi_credit [ring mean]
+        credit_bdp_tree_packets         (35.5)   tree credit BDP -> Phi_credit [tree mean]
+      Retransmission / FEC surface (active only at ber>0 or with fec/llr on):
+        spray_chunk_bytes               (128 KiB) spray chunk size
+        bulk_chunk_bytes                (8 MiB)   bulk-transfer / retry-buffer sizing
+        num_lanes                        (4 ring; 18 tree, nvls) NVLink lanes/GPU
+        fec_n / fec_k / fec_t            (544 / 514 / 15) RS code
+        fec_symbol_bits                  (10)     GF(2^10) symbol
+        retry_source_bw_bytes_per_us     (4.8e6)  source-reload bandwidth
+        retry_source_latency_us          (0.3)    source-reload latency
+
+    ``predict()`` (mean) is the published path; ``predict_tail()`` (CLT/Pareto,
+    not in the paper) lazily imports scipy.stats.
     """
 
     def __init__(self,
@@ -685,9 +707,16 @@ class TheoryDerivedSurrogate:
 
 # ---- Factory functions ----
 
-def make_h200_ring_theory():
-    """H200 profile used for ring, tree, and NVLS predictions."""
-    return TheoryDerivedSurrogate(
+def make_h200_ring_theory(**overrides):
+    """H200 NVLink4 ring profile.
+
+    Optional ``overrides`` replace any hardware parameter listed in
+    ``TheoryDerivedSurrogate.__init__`` (e.g.
+    ``make_h200_ring_theory(num_lanes=8, startup_us=7)``), so a user can
+    define custom hardware on top of the calibrated H200 anchor. Unknown
+    keys raise ``TypeError`` from the constructor.
+    """
+    defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=94000,
         tree_bw_per_level_bytes_per_us=26250,
@@ -701,18 +730,26 @@ def make_h200_ring_theory():
         t_min_switch_us=1.1,
         startup_us=15.0,
     )
+    defaults.update(overrides)
+    return TheoryDerivedSurrogate(**defaults)
 
 
-def make_h200_tree_theory():
-    """H200 tree: NVSwitch bisection bandwidth and link credit pressure."""
-    model = make_h200_ring_theory()
-    model.num_lanes = 18
-    return model
+def make_h200_tree_theory(**overrides):
+    """H200 tree profile: NVSwitch bisection bandwidth + link credit pressure.
+
+    Accepts the same ``overrides`` as the ring profile (defaults to
+    ``num_lanes=18``).
+    """
+    overrides.setdefault('num_lanes', 18)
+    return make_h200_ring_theory(**overrides)
 
 
-def make_h200_nvls_theory():
-    """H200 NVLS: hardware multicast, no credit flow control."""
-    return TheoryDerivedSurrogate(
+def make_h200_nvls_theory(**overrides):
+    """H200 NVLS profile: hardware multicast, no credit flow control.
+
+    Accepts the same ``overrides`` as the ring profile.
+    """
+    defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=94000,
         tree_bw_per_level_bytes_per_us=26250,
@@ -727,11 +764,16 @@ def make_h200_nvls_theory():
         startup_us=23.0,
         nvls_startup_us=23.0,
     )
+    defaults.update(overrides)
+    return TheoryDerivedSurrogate(**defaults)
 
 
-def make_1024_optical_fattree_theory():
-    """Profile for the 1024-GPU, 600-Gbps fat-tree optical study."""
-    return TheoryDerivedSurrogate(
+def make_1024_optical_fattree_theory(**overrides):
+    """Profile for the 1024-GPU, 600-Gbps fat-tree optical study.
+
+    Accepts the same ``overrides`` as the ring profile.
+    """
+    defaults = dict(
         packet_bw_bytes_per_us=75000,
         ring_bw_bytes_per_us=75000,
         tree_bw_per_level_bytes_per_us=20725,
@@ -745,15 +787,17 @@ def make_1024_optical_fattree_theory():
         t_min_switch_us=1.1,
         startup_us=65.0,
     )
+    defaults.update(overrides)
+    return TheoryDerivedSurrogate(**defaults)
 
 
-def make_surrogate(algo):
-    """Factory by algorithm name."""
+def make_surrogate(algo, **overrides):
+    """Factory by algorithm name; passes ``overrides`` to the chosen profile."""
     if algo in ('ring', 'rin'):
-        return make_h200_ring_theory()
+        return make_h200_ring_theory(**overrides)
     elif algo in ('tree', 'tre'):
-        return make_h200_tree_theory()
+        return make_h200_tree_theory(**overrides)
     elif algo in ('nvls', 'nvl'):
-        return make_h200_nvls_theory()
+        return make_h200_nvls_theory(**overrides)
     else:
-        return make_h200_ring_theory()
+        return make_h200_ring_theory(**overrides)

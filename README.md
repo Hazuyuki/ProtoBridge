@@ -181,6 +181,9 @@ A latency surrogate lives under `surrogate/`, grounded in H200 NVLink4
 ```bash
 # Predict ring allreduce latency at 4 GPU / 1 MiB (theory model, lower bound).
 PYTHONPATH=surrogate/theory python3 -c 'import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory().predict(1<<20,4,"ring",credits=32,ber=0))'
+
+# Custom hardware: override any H200 parameter (see doc/SURROGATE.md).
+PYTHONPATH=surrogate/theory python3 -c 'import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory(num_lanes=8, startup_us=7).predict(1<<20,4,"ring",credits=32,ber=0))'
 ```
 
 See [doc/SURROGATE.md](doc/SURROGATE.md) for the derivation and

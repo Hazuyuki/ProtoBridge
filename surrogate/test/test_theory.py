@@ -54,3 +54,35 @@ def test_theory_within_physical_band_of_ns3():
     pred = s.predict(pt["dataSize"], 4, "ring", credits=32, ber=0)
     ratio = pred / pt["simTimeUs"]
     assert 0.3 <= ratio <= 2.0, f"theory {pred:.1f}us vs ns3 {pt['simTimeUs']}us, ratio {ratio:.2f}"
+
+
+def test_factory_default_lane_counts_preserved():
+    """The **overrides refactor must keep the calibrated default lanes."""
+    assert wb.make_h200_ring_theory().num_lanes == 4
+    assert wb.make_h200_tree_theory().num_lanes == 18
+    assert wb.make_h200_nvls_theory().num_lanes == 18
+
+
+def test_hardware_override_applies():
+    """A passed hardware override reaches the constructed surrogate."""
+    assert wb.make_h200_ring_theory(num_lanes=8).num_lanes == 8
+    assert wb.make_h200_ring_theory(startup_us=7).S_startup == 7
+    # tree delegates to ring; its default-18 survives, and a user override wins.
+    assert wb.make_h200_tree_theory(num_lanes=12).num_lanes == 12
+
+
+def test_higher_bandwidth_lowers_latency():
+    """ring_bw is the serialized-bytes term: more bandwidth -> less latency."""
+    s_default = wb.make_h200_ring_theory()
+    s_fast = wb.make_h200_ring_theory(ring_bw_bytes_per_us=200000)  # > 94000
+    lat_default = s_default.predict(1 << 22, 8, "ring", credits=32, ber=0)
+    lat_fast = s_fast.predict(1 << 22, 8, "ring", credits=32, ber=0)
+    assert lat_fast < lat_default
+
+
+def test_startup_override_is_additive():
+    """startup_us is an additive fixed term: +35us startup -> +~35us latency."""
+    base = wb.make_h200_ring_theory().predict(1 << 20, 4, "ring", credits=32, ber=0)
+    raised = wb.make_h200_ring_theory(startup_us=50.0).predict(
+        1 << 20, 4, "ring", credits=32, ber=0)
+    assert abs((raised - base) - 35.0) < 0.5

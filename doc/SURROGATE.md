@@ -35,6 +35,46 @@ Because it is a physical derivation (no firmware/arbiter/VOQ overhead), it is a
 **lower bound** on the ns-3 measurement — typically 0.6–0.75× the simulated
 latency. Use it for ordering and trend analysis, not absolute prediction.
 
+## Defining custom hardware
+
+The factories bake in calibrated H200 (or 1024-GPU optical) values. To model
+different hardware, pass `**overrides` — any `__init__` keyword replaces the
+anchor value (the full list, with units and the H200 value, is in the
+`TheoryDerivedSurrogate` class docstring):
+
+```python
+import whitebox_surrogate_v2 as wb
+# H200 ring profile, but with 8 NVLink lanes and a 7us protocol startup:
+s = wb.make_h200_ring_theory(num_lanes=8, startup_us=7)
+# or construct from scratch for a non-H200 platform:
+s = wb.TheoryDerivedSurrogate(ring_bw_bytes_per_us=120000, link_latency_us=0.3,
+                              credit_bdp_ring_packets=60, startup_us=10.0,
+                              num_lanes=8)
+lat_us = s.predict(1<<20, 4, "ring", credits=32, ber=0)
+```
+
+The parameters that move the clean (ber=0) mean latency:
+
+| Parameter | Units | Affects | H200 ring |
+|-----------|-------|---------|-----------|
+| `ring_bw_bytes_per_us` | bytes/µs | ring serialization | 94000 |
+| `tree_bw_per_level_bytes_per_us` | bytes/µs | tree serialization | 26250 |
+| `nvls_bw_bytes_per_us` | bytes/µs | NVLS serialization | 535500 |
+| `link_latency_us` | µs (400 ns = 0.4) | ring/nvls propagation | 0.4 |
+| `t_min_switch_us` | µs | tree fixed (NVSwitch fill) | 1.1 |
+| `credit_bdp_ring_packets` | packets | ring credit pressure Φ_credit | 91.5 |
+| `credit_bdp_tree_packets` | packets | tree credit pressure Φ_credit | 35.5 |
+| `startup_us` / `nvls_startup_us` | µs | protocol startup (fixed) | 15.0 / 23.0 |
+
+The remaining knobs (`packet_bw_bytes_per_us`, `spray_chunk_bytes`,
+`bulk_chunk_bytes`, `num_lanes`, `fec_*`, `retry_source_*`) only take effect
+under link degradation (ber>0) or with FEC/LLR enabled.
+
+> **Note:** the bandwidth parameters are *effective* transfer rates already
+> incorporating protocol efficiency and spray — not raw per-link × lanes
+> products — and the H200 values are the calibrated anchor. Custom values yield
+> a physically-plausible-but-uncalibrated lower bound.
+
 ## Tests
 
 ```bash
