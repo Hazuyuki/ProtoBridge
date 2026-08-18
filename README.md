@@ -39,31 +39,29 @@ simulation substrate by changing only the input configuration; the application
 layer drives `NetDevice` `Send()` / `ReceiveCallback()` directly over a custom
 bare-metal fabric header, with no TCP/IP stack. ProtoBridge matches measured
 superpod communication latency with **17.8% MAPE on H200 NVLink4** across
-1 KB–1 GB — the H200 calibration data ships in this repository
-(`surrogate/calibration/`), so this number is reproducible from a fresh clone.
-Cross-platform validation on MetaXLink (C500/C550) and NVL72, the surrogate's
-accuracy relative to the latency-bandwidth baseline, and the coarse-to-fine
-design workflow (with case studies on scale-up memory pools and co-packaged
-optics) are described in an accompanying paper, in preparation.
+1 KB–1 GB. The accompanying paper (in preparation) reports the full validation
+against real NCCL measurements, the surrogate's accuracy relative to the
+latency-bandwidth baseline, and the coarse-to-fine design workflow (with case
+studies on scale-up memory pools and co-packaged optics).
 
 For fast design exploration, ProtoBridge ships a **protocol-defined latency
 surrogate** that combines OTP parameters (startup, effective bandwidth) with
-analytical models of each PEX mechanism. It is calibrated on the H200 NVLink4
-reference included here and predicts per-operation latency in microseconds —
+analytical models of each PEX mechanism. It is grounded in the H200 NVLink4
+reference and predicts per-operation latency in microseconds —
 fast enough to sweep many designs where the packet simulator cannot. See
-[doc/SURROGATE.md](doc/SURROGATE.md) for the derivations and
+[doc/SURROGATE.md](doc/SURROGATE.md) for the derivation and
 [doc/CALIBRATION.md](doc/CALIBRATION.md) for the in-repo H200 calibration data.
 
 ## What this is (and is not)
 
-**Is:** an interconnect-only simulator + surrogate models. Credit-based flow
+**Is:** an interconnect-only simulator + a surrogate model. Credit-based flow
 control, packet spraying + reorder, NVSwitch VOQ/crossbar/SHARP, a four-tier
 FEC/retry resilience model, link BER degradation, and a parametric topology
 grammar spanning 12 families.
 
 **Is not:** a full system simulator. There is no TCP/IP stack and no LLM serving
 runtime (no model execution, KV-cache, memory-hierarchy, or PD-split model);
-the latency surrogate and topology sweep here are interconnect-only, not the
+the latency surrogate here is interconnect-only, not the
 end-to-end multi-model DSE used in the paper's case studies. The application
 layer issues direct collectives (allreduce / allgather / alltoall / broadcast /
 reduce / reduce-scatter) against the fabric.
@@ -113,7 +111,7 @@ FabricHeader layout, the four-tier resilience model, and the topology grammar.
 > **Repo scope.** This repository bundles the full ns-3.47 framework, so it
 > builds standalone — `./ns3` and `CMakeLists.txt` are the ns-3 build system.
 > The ProtoBridge-specific code is `src/gpu-cluster/` (OTP + PEX + NVSwitch +
-> injectors), `surrogate/` (latency models), `configs/`, and the two `scratch/`
+> injectors), `surrogate/` (latency model), `configs/`, and the two `scratch/`
 > entry points; everything else is stock ns-3.
 
 ### Run one collective
@@ -171,27 +169,21 @@ ring) and `h200-request-response.cfg` (a two-leg ping-pong). See
 [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the `.cfg` schema and the
 OTP/PEX transaction-graph seam.
 
-## Surrogate models
+## Surrogate model
 
-Three latency surrogates live under `surrogate/`, calibrated on H200 NVLink4
+A latency surrogate lives under `surrogate/`, grounded in H200 NVLink4
 (18 NVLinks/GPU, 900 GB/s peak aggregate per direction, 400 ns link latency):
 
 | Model | Location | What it is | Accuracy |
 |-------|----------|------------|----------|
 | Theory-derived | `surrogate/theory/whitebox_surrogate_v2.py` | First-principles physical bound (startup + serialization + credit round-trip + FEC/retry terms) | lower bound, ~0.6–0.75× ns-3 |
-| Analytical | `surrogate/analytical/analytical_surrogate.py` | Piecewise small/large-size regression + FEC/retry amplification overlay | **0.9% mean / 2.7% max APE** (27 pts, 64 KiB–1 GiB) |
-| Topology-aware | `surrogate/topo/dse_topo_surrogate.py` | Decomposes latency into hop × bandwidth × step-count physical terms + a small per-group residual | 0.47% MAPE (H200 128-GPU ring sweep) |
 
 ```bash
-# Run the analytical surrogate: calibrate + validate against the H200 baseline.
-python3 surrogate/analytical/analytical_surrogate.py
-
-# Predict latency across message sizes for the first feasible topology.
-python3 surrogate/topo/dse_topo_surrogate.py
-python3 surrogate/topo/dse_topo_surrogate.py --all            # one size, all feasible specs
+# Predict ring allreduce latency at 4 GPU / 1 MiB (theory model, lower bound).
+PYTHONPATH=surrogate/theory python3 -c 'import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory().predict(1<<20,4,"ring",credits=32,ber=0))'
 ```
 
-See [doc/SURROGATE.md](doc/SURROGATE.md) for the derivations and
+See [doc/SURROGATE.md](doc/SURROGATE.md) for the derivation and
 [doc/CALIBRATION.md](doc/CALIBRATION.md) for the H200 calibration data.
 
 ## Tests
@@ -201,7 +193,7 @@ See [doc/SURROGATE.md](doc/SURROGATE.md) for the derivations and
 ./ns3 run "test-runner --suite=gpu-cluster"
 ./ns3 run "test-runner --suite=gpu-cluster-integration"
 
-# Python surrogate tests (needs numpy — see surrogate/requirements.txt)
+# Python surrogate tests (needs pytest — see surrogate/requirements.txt)
 pip3 install -r surrogate/requirements.txt
 python3 -m pytest surrogate/test/ -v
 ```
@@ -212,21 +204,6 @@ All calibration is H200 NVLink4 (no A800). Under `surrogate/calibration/`:
 
 - `h200_ring4_ar_baseline.json` — 27 raw ns-3 ring-allreduce points (4 GPU,
   64 KiB–1 GiB, 3 seeds each).
-- `h200_ring4_surrogate_calibration.json` — pre-fit analytical params
-  (avg 0.92% / max 2.68% APE).
-- `h200_nvls_ar_baseline.json`, `h200_surrogate_calibration.json` — NVLS /
-  multi-collective baselines.
-- `c550_surrogate_calibration.json` — derived analytical params for the MetaX
-  C550 MetaXLink profile (fullmesh; allreduce/allgather/alltoall/reduce-scatter
-  × 2/4/8 GPU). Calibrated offline against real MetaX MCCL measurements
-  (2.34% MAPE across 1692 points); the card carries the same piecewise-model
-  metadata as the H200 card (`modelType`, `thresholdBytes`, per-region
-  `bwRegion_*` / `startupRegion_*` APE, AC4 gates). Only derived params ship
-  here — the raw measurement data does not, so `--profile c550` produces
-  C550-calibrated predictions but the fit quality itself is not re-checkable
-  from a clean clone.
-- `reference/` — 34 real NCCL measurement files on H200 8-GPU
-  (ring/tree/nvls × allreduce/allgather/alltoall/broadcast × LL/LL128/SIMPLE).
 
 ## Architecture constraints
 
@@ -243,7 +220,7 @@ All calibration is H200 NVLink4 (no A800). Under `surrogate/calibration/`:
 src/gpu-cluster/        OTP + PEX + NVSwitch + collective injectors + tests
 scratch/                gpu-cluster-sim.cc (simulator entry), protocol-profile-demo.cc
 configs/                protocol_profiles/ (h200-ll128.profile), dse/topo_specs.csv
-surrogate/              theory/  analytical/  topo/  calibration/  test/
+surrogate/              theory/  calibration/  test/
 doc/                    ARCHITECTURE / CALIBRATION / SURROGATE (+ ns-3 manual)
 ```
 

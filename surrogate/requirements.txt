@@ -1,8 +1,10 @@
-# Python dependencies for the surrogate models + tests.
-# numpy: used by analytical_surrogate.py for least-squares regression
-#   fitting (np.linalg.lstsq) during calibration.
+# Python dependencies for the surrogate tests.
 # pytest: the test runner invoked by `python3 -m pytest surrogate/test/`.
-# The ubuntu-latest system python3 ships neither; install both before running
+# The ubuntu-latest system python3 does not ship it; install before running
 # the tests (CI: pip3 install --break-system-packages -r this file).
-numpy
+#
+# The theory surrogate (surrogate/theory/whitebox_surrogate_v2.py) uses only
+# the stdlib (math) for the published mean-latency path. Its predict_tail()
+# (CLT/Pareto, not used by the paper or the shipped tests) lazily imports
+# scipy.stats; install scipy separately only if you exercise that path.
 pytest

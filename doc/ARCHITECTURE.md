@@ -271,18 +271,13 @@ that reproduces the simulator's historical (calibration-identical) behavior.
 
 ## Topology grammar
 
-`surrogate/topo/topo_grammar.py` enumerates 12 topology families across their
-parametric variations and link technologies (electrical / optical, NVLink /
-RoCE / ICI), yielding the topology axis of the design space:
+The `--topology` flag selects the fabric the simulator builds, spanning the
+scale-up design space across direct-connect and switched families:
 
-`ring`, `fullmesh`, `hypercube`, `3d_torus`, `mesh2d`, `2dfullmesh`,
-`switched` (single NVSwitch), `nvl72`, `multiplane`, `leafspine`,
-`3levelhier`, `fattree`, `railfattree`, `dragonflyplus`, `2dfullmeshclos`.
+`ring`, `fullmesh`, `hypercube`, `torus`, `mesh`, `2dfullmesh`,
+`2dfullmeshclos`, `switched` (single NVSwitch), `nvl72`, `multiplane`,
+`leafspine`, `3levelhierarchical`, `fattree`, `railfattree`, `dragonflyplus`.
 
-Each `TopoSpec` exports physical terms the surrogate consumes: `hop_count`,
-`bw_eff_gbps`, `step_count`, `is_switched`, `supports_nvls`, plus a
-`to_ns3_cli()` that emits the exact `--topology=…` + link-tech flags the
-simulator understands. Feasibility is enforced against shipping hardware
-limits: ≤72 GPUs for a single NVLink fabric (NVL72), ≤18 NVLinks/GPU (H200
-NVLink4), ≤576 ports/switch chassis, and NVLS only within a single
-NVSwitch ASIC domain (≤8 GPUs).
+The design space is bounded by shipping hardware limits: ≤72 GPUs for a
+single NVLink fabric (NVL72), ≤18 NVLinks/GPU (H200 NVLink4), and NVLS only
+within a single NVSwitch ASIC domain (≤8 GPUs).

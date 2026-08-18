@@ -21,10 +21,10 @@ jobs:
 
       - name: Install Python deps
         run: |
-          # The ubuntu-latest system python3 does not ship numpy, and
-          # analytical_surrogate.py needs it for np.linalg.lstsq. ubuntu-24.04
-          # marks pip as externally-managed, so --break-system-packages is
-          # required to install into the system interpreter that runs the tests.
+          # ubuntu-24.04 marks pip as externally-managed, so
+          # --break-system-packages is required to install pytest (the only
+          # dependency in surrogate/requirements.txt) into the system
+          # interpreter that runs the tests.
           pip3 install --break-system-packages -r surrogate/requirements.txt
 
       - name: ccache env
