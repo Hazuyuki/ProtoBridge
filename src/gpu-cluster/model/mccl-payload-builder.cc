@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-only
- * Raw MCCL payload segmentation for MetaX C500 systems.
+ * Raw MCCL payload segmentation for MetaX GPU systems.
  */
 
 #include "mccl-payload-builder.h"

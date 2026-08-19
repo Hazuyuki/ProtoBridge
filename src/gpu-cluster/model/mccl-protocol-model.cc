@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-only
- * MCCL collective protocol profile for MetaX C500 systems.
+ * MCCL collective protocol profile for MetaX GPU systems.
  */
 
 #include "mccl-protocol-model.h"
