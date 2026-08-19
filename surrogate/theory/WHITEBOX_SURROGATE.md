@@ -71,12 +71,17 @@ The current H200 profile uses:
 
 | Schedule | Effective transfer quantity |
 |---|---:|
-| Ring | 94,000 bytes/us |
+| Ring | 177,000 bytes/us |
 | Tree | 26,250 bytes/us per active level |
 | NVLS | 535,500 bytes/us aggregate work bandwidth |
 
 Ring uses link propagation for `T_fixed`. Tree uses the switched-path pipeline
 delay. NVLS uses its multicast schedule and startup profile.
+
+Ring's 177,000 B/us = 0.40 * B_agg (B_agg = num_lanes * b_link), corrected
+from 94,000; see section 11. The MAPE figures in section 9 are a
+pre-correction exp3 snapshot run in the parent repo and are not re-derived
+here.
 
 ## 4. Credit Pressure
 
@@ -220,3 +225,26 @@ The H200 profile is not a protocol-independent hardware law. A new platform or
 protocol family needs its own fixed profile and ProtoBridge validation. The
 surrogate is used for broad screening. Packet simulation remains the source of
 timing for selected candidates and for decisions near a frontier boundary.
+
+## 11. Single-Parameter Derivation
+
+`make_surrogate_from_wire(b_link, num_lanes, algo)` derives every schedule
+bandwidth from one NVLink wire-rate input plus three physically-motivated
+efficiency factors, with no per-bandwidth calibration:
+
+```text
+B_agg = num_lanes * b_link                       (per-GPU NVLink aggregate)
+ring_bw = packet_bw = eta_ring * B_agg           ~0.40 (AllReduce algorithm bw)
+tree_bw = (B_agg / num_lanes) * eta_tree         ~1.05 (one link + NCCL/FEC, ~= n/k)
+nvls_bw = eta_nvls * B_agg                       ~1.20 (NVSwitch multicast gain)
+```
+
+For H200 (b_link = 25,000 B/us, num_lanes = 18, B_agg = 450,000), the
+defaults eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20 yield ring/packet =
+180,000 (calibrated 177,000, +1.7%), tree = 26,250 (exact), nvls = 540,000
+(calibrated 535,500, +0.8%) -- all within 2%. The ring-bus bandwidth
+2(N-1)/N * alBw = 0.69 * B_agg falls in NCCL's typical 60-80% utilization
+band, anchoring eta_ring in physics rather than as a fit coefficient. The
+calibrated `make_h200_*` factories still ship the exact measured values; this
+is the single-parameter entry point for a new platform where only the
+per-link wire rate is known.

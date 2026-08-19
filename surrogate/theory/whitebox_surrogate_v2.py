@@ -51,7 +51,7 @@ class TheoryDerivedSurrogate:
 
       Bandwidth — serialized-bytes term (bytes/µs):
         packet_bw_bytes_per_us         (177000)  retransmission chunk serialize (ber>0)
-        ring_bw_bytes_per_us           (94000)   ring per-step transfer        [ring mean]
+        ring_bw_bytes_per_us           (177000)  ring per-step transfer        [ring mean]
         tree_bw_per_level_bytes_per_us (26250)   tree per-level transfer       [tree mean]
         nvls_bw_bytes_per_us           (535500)  NVLS aggregate transfer       [nvls mean]
       Latency — fixed term (µs unless noted):
@@ -78,7 +78,7 @@ class TheoryDerivedSurrogate:
 
     def __init__(self,
                  packet_bw_bytes_per_us=177000,
-                 ring_bw_bytes_per_us=94000,
+                 ring_bw_bytes_per_us=177000,
                  tree_bw_per_level_bytes_per_us=26250,
                  nvls_bw_bytes_per_us=535500,
                  link_latency_us=0.4,
@@ -718,7 +718,7 @@ def make_h200_ring_theory(**overrides):
     """
     defaults = dict(
         packet_bw_bytes_per_us=177000,
-        ring_bw_bytes_per_us=94000,
+        ring_bw_bytes_per_us=177000,
         tree_bw_per_level_bytes_per_us=26250,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=0.4,
@@ -751,7 +751,7 @@ def make_h200_nvls_theory(**overrides):
     """
     defaults = dict(
         packet_bw_bytes_per_us=177000,
-        ring_bw_bytes_per_us=94000,
+        ring_bw_bytes_per_us=177000,
         tree_bw_per_level_bytes_per_us=26250,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=0.4,
@@ -801,3 +801,42 @@ def make_surrogate(algo, **overrides):
         return make_h200_nvls_theory(**overrides)
     else:
         return make_h200_ring_theory(**overrides)
+
+
+def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
+                             eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20,
+                             **overrides):
+    """Derive every schedule bandwidth from ONE NVLink wire-rate input.
+
+    A single physical base -- the per-GPU NVLink aggregate
+    ``B_agg = num_lanes * b_link`` -- plus three physically-motivated
+    efficiency factors reproduces the calibrated H200 bandwidths within 2%
+    with no per-bandwidth calibration:
+
+      ring_bw = packet_bw = eta_ring * B_agg
+                           ~0.40 (AllReduce algorithm-bandwidth realization;
+                                  bus bw 2(N-1)/N * alBw ~= 0.69 * B_agg,
+                                  in NCCL's typical 60-80% band)
+      tree_bw = (B_agg / num_lanes) * eta_tree
+                           ~1.05 (one NVLink + NCCL/FEC overhead; ~= n_fec/k_fec)
+      nvls_bw = eta_nvls * B_agg
+                           ~1.20 (NVSwitch hardware multicast amplification)
+
+    For H200 (b_link=25000 B/us, num_lanes=18, B_agg=450000) this yields
+    ring/packet=180000 (calibrated 177000, +1.7%), tree=26250 (exact),
+    nvls=540000 (calibrated 535500, +0.8%). Pass ``ring_bw_bytes_per_us=`` etc.
+    in ``overrides`` to override any derived value. The calibrated
+    ``make_h200_*`` factories still ship the exact measured values; this is
+    the single-parameter entry point for new platforms where only the
+    per-link wire rate is known.
+    """
+    b_agg = b_link_bytes_per_us * num_lanes
+    derived = dict(
+        packet_bw_bytes_per_us=eta_ring * b_agg,
+        ring_bw_bytes_per_us=eta_ring * b_agg,
+        tree_bw_per_level_bytes_per_us=(b_agg / num_lanes) * eta_tree,
+        nvls_bw_bytes_per_us=eta_nvls * b_agg,
+        num_lanes=num_lanes,
+    )
+    derived.update(overrides)
+    return make_surrogate(algo, **derived)

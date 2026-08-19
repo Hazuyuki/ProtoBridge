@@ -74,7 +74,7 @@ def test_hardware_override_applies():
 def test_higher_bandwidth_lowers_latency():
     """ring_bw is the serialized-bytes term: more bandwidth -> less latency."""
     s_default = wb.make_h200_ring_theory()
-    s_fast = wb.make_h200_ring_theory(ring_bw_bytes_per_us=200000)  # > 94000
+    s_fast = wb.make_h200_ring_theory(ring_bw_bytes_per_us=200000)  # > default 177000
     lat_default = s_default.predict(1 << 22, 8, "ring", credits=32, ber=0)
     lat_fast = s_fast.predict(1 << 22, 8, "ring", credits=32, ber=0)
     assert lat_fast < lat_default
@@ -86,3 +86,22 @@ def test_startup_override_is_additive():
     raised = wb.make_h200_ring_theory(startup_us=50.0).predict(
         1 << 20, 4, "ring", credits=32, ber=0)
     assert abs((raised - base) - 35.0) < 0.5
+
+
+def test_surrogate_from_wire_derives_h200_bandwidths():
+    """One wire-rate input + num_lanes derives all schedule BWs within 2.5%
+    of the calibrated H200 values -- formula, not per-bandwidth fit."""
+    s = wb.make_surrogate_from_wire(
+        b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
+    assert abs(s.ring_bw - 177000) / 177000 <= 0.025
+    assert abs(s.tree_bw_per_level - 26250) / 26250 <= 0.025
+    assert abs(s.nvls_bw - 535500) / 535500 <= 0.025
+
+
+def test_surrogate_from_wire_reproduces_h200_ring_measurement():
+    """The un-calibrated derived profile reproduces the 256MB@8-GPU H200
+    AllReduce measurement (1347.65us) within 5% from one wire-rate input."""
+    s = wb.make_surrogate_from_wire(
+        b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
+    pred = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)
+    assert abs(pred - 1347.65) / 1347.65 <= 0.05
