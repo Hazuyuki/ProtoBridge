@@ -43,7 +43,15 @@ jobs:
 
       - name: Configure ns-3 (examples + tests, ccache launcher)
         run: |
-          ./ns3 configure --enable-examples --enable-tests -d optimized -- \
+          # release, not optimized: the optimized profile enables
+          # -march=native -mtune=native (CMakeLists.txt NS3_NATIVE_OPTIMIZATIONS),
+          # and the cross-SHA ccache restore-keys then share those objects
+          # across GitHub-hosted runners with divergent CPU microarchitectures
+          # (the "native" string hashes identically, so ccache hits a
+          # different runner's objects) -> SIGILL in the test-runner.
+          # release keeps -O3 (CMAKE_BUILD_TYPE=release) but drops
+          # -march=native, so every runner runs the same baseline ISA.
+          ./ns3 configure --enable-examples --enable-tests -d release -- \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
