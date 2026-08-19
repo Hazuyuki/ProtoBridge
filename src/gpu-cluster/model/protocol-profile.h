@@ -122,7 +122,8 @@ class ProtocolProfile
 
     /// Read one key with a fallback. Public so the simulator can source
     /// profile values (PEX + fabric hardware) into its CLI variables when a
-    /// `.cfg` op delegates to a calibrated inline injector (`builtin = ...`).
+    /// `.cfg` op delegates to a calibrated inline injector (`collective =`
+    /// + `algorithm =`).
     std::string Get(const std::string& key, const std::string& fallback) const;
 
   private:

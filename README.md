@@ -116,7 +116,7 @@ FabricHeader layout, the four-tier resilience model, and the topology grammar.
 
 ### Run a collective from a config (primary form)
 
-A `.cfg` is the primary input: it names a calibrated builtin collective, the
+A `.cfg` is the primary input: it names a calibrated collective + algorithm, the
 fabric topology, and — via the `[stack]` profile — the PEX bundle and fabric
 hardware, so a one-line run reproduces a measured H200 latency with no per-run
 flags.
@@ -136,11 +136,12 @@ RESULT_END
 
 This reproduces the H200 NVLink4 measurement (37.24 µs) to ~3% and is
 **bit-identical** to the inline path run with the profile's values as flags —
-`test/parity/test_config_builtin_parity.py` asserts exact `simTimeNs` equality
-across `{ring, tree, nvls}` × sizes × GPU counts. Three builtins ship:
-`h200-ring-allreduce.cfg` (`builtin=ring`), `h200-tree-allreduce.cfg`
-(`builtin=tree`), `h200-nvls-allgather.cfg` (`builtin=nvls`). `numGpus` and
-`dataSize` stay on the CLI. See [doc/CONFIG_GUIDE.md](doc/CONFIG_GUIDE.md).
+`test/parity/test_config_vs_inline_parity.py` asserts exact `simTimeNs`
+equality across `{ring, tree, nvls}` × sizes × GPU counts. Three calibrated
+ops ship: `h200-ring-allreduce.cfg` (`collective=allreduce`/`algorithm=ring`),
+`h200-tree-allreduce.cfg` (`collective=allreduce`/`algorithm=tree`),
+`h200-nvls-allgather.cfg` (`collective=allgather`/`algorithm=nvls`). `numGpus`
+and `dataSize` stay on the CLI. See [doc/CONFIG_GUIDE.md](doc/CONFIG_GUIDE.md).
 
 ### Equivalent inline flags
 
@@ -181,13 +182,14 @@ credit flow control, LLR off.
 
 ### Define a custom protocol stencil in config
 
-A `.cfg` whose `[op]` lists transfers (no `builtin=`) compiles to a transaction
-graph run by the generic runner — the "define a protocol in tens of lines of
-config" seam; the validated PEX topology/BER/FEC wiring is reused unchanged.
-`h200-request-response.cfg` (a two-leg ping-pong) ships as the stencil example;
-the ring/tree/nvls `.cfg`s above use `builtin=` to delegate to the calibrated
-injectors. See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the `.cfg` schema
-and the OTP/PEX transaction-graph seam.
+A `.cfg` whose `[op]` lists transfers (no `collective=`/`algorithm=`) compiles
+to a transaction graph run by the generic runner — the "define a protocol in
+tens of lines of config" seam; the validated PEX topology/BER/FEC wiring is
+reused unchanged. `h200-request-response.cfg` (a two-leg ping-pong) ships as
+the stencil example; the ring/tree/nvls `.cfg`s above use
+`collective=`+`algorithm=` to delegate to the calibrated injectors. See
+[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the `.cfg` schema and the
+OTP/PEX transaction-graph seam.
 
 ## Surrogate model
 
@@ -244,7 +246,7 @@ src/gpu-cluster/        OTP + PEX + NVSwitch + collective injectors + tests
 scratch/                gpu-cluster-sim.cc (simulator entry), protocol-profile-demo.cc
 configs/                protocol_profiles/ (h200-ll128.profile), protocol_configs/ (.cfg), dse/topo_specs.csv
 surrogate/              theory/  calibration/  test/
-test/parity/            test_config_builtin_parity.py (config-vs-inline bit-identity gate)
+test/parity/            test_config_vs_inline_parity.py (config-vs-inline bit-identity gate)
 doc/                    ARCHITECTURE / CALIBRATION / CONFIG_GUIDE / SURROGATE (+ ns-3 manual)
 ```
 

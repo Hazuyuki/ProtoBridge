@@ -43,10 +43,11 @@ llrMode = gobackn                        # gobackn (cumulative) | sack (selectiv
 
 # --- fabric hardware (consumed by the simulator's topology builder, not the
 # PEX bundle; reserved so Build() does not forward them as protocol attrs).
-# These let a `builtin = ...` op reproduce a calibrated fabric without per-run
-# CLI flags. Values mirror configs/hardware/h200.json. bandwidthGbps is the
-# 8-GPU effective per-link rate (375 GB/s aggregate / 18 lanes ~= 166 Gbps;
-# rounded to the empirical sweep best, reproduces ring allreduce to ~4-5%).
+# These let a `collective =` / `algorithm =` op reproduce a calibrated fabric
+# without per-run CLI flags. Values mirror configs/hardware/h200.json.
+# bandwidthGbps is the 8-GPU effective per-link rate (375 GB/s aggregate /
+# 18 lanes ~= 166 Gbps; rounded to the empirical sweep best, reproduces ring
+# allreduce to ~4-5%).
 bandwidthGbps = 170
 latencyNs = 400
 numLanes = 18

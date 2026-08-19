@@ -40,6 +40,10 @@
  *
  *   complete       = all
  *
+ *   Alternatively, [op] may declare collective = / algorithm = (topology =
+ *   optional) to delegate to a calibrated inline injector instead of a
+ *   transfer stencil -- no transfer.* / replicate.* then.
+ *
  * Symbolic expressions support integer literals, identifiers (loop vars,
  * params, `numGpus`, `dataSize`), `+ - * / mod` and parentheses. Integer
  * arithmetic, evaluated at compile time.
@@ -87,10 +91,13 @@ class ProtocolConfig
     /// Stack-section key/value overrides beyond `profile` (for the caller).
     const std::unordered_map<std::string, std::string>& GetStackValues() const;
 
-    /// The `[op] builtin = ...` value (empty => use the transfer stencil;
-    /// otherwise delegate to the named calibrated injector: ring/tree/sharp/
-    /// nvls/hierarchical/...).
-    const std::string& GetBuiltin() const;
+    /// The `[op] collective = ...` value (empty => use the transfer stencil;
+    /// otherwise the named collective: allreduce/allgather/alltoall/...).
+    const std::string& GetCollective() const;
+
+    /// The `[op] algorithm = ...` value (ring/tree/sharp/nvls/...; paired with
+    /// a collective to delegate to a calibrated inline injector).
+    const std::string& GetAlgorithm() const;
 
     /// The `[op] topology = ...` value (empty => caller's default fabric).
     const std::string& GetTopology() const;
@@ -144,7 +151,8 @@ class ProtocolConfig
     std::string m_startup{"auto"};
     std::string m_perStepDelay{"0"};
     std::string m_complete{"all"};
-    std::string m_builtin;       // [op] builtin = ... (delegate to calibrated injector)
+    std::string m_collective;    // [op] collective = ... (delegate to a calibrated injector)
+    std::string m_algorithm;     // [op] algorithm = ... (paired with m_collective)
     std::string m_topology;      // [op] topology = ... (fabric the op runs on)
     std::string m_currentSection;
 };

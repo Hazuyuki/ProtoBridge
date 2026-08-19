@@ -129,25 +129,28 @@ transfer.0.vc    = 0
 complete = all
 ```
 
-### Builtin delegation (`builtin = ...`)
+### Collective + algorithm delegation (`collective =` + `algorithm =`)
 
-Instead of a transfer stencil, an `[op]` may set `builtin = <ring|tree|sharp|
-hierarchical|nvls>` to delegate to a calibrated inline injector. The simulator
-sources the profile's PEX + fabric-hardware keys into the same local CLI
-variables the inline path consumes, then runs the injector verbatim — so a
-`.cfg` run is **bit-identical** to the inline path with the profile's values
-as flags (verified by `test/parity/test_config_builtin_parity.py`). The
-`topology =` key overrides the CLI fabric (ring allreduce needs `topology=ring`;
-tree and NVLS use `topology=switched`). `numGpus` and `dataSize` stay on the
-CLI. This is the **primary** form for reproducing a measured collective.
+Instead of a transfer stencil, an `[op]` may set `collective = <c>` +
+`algorithm = <a>` (ring/tree/sharp/hierarchical/nvls) to delegate to a
+calibrated inline injector. The simulator sources the profile's PEX +
+fabric-hardware keys into the same local CLI variables the inline path
+consumes, then runs the injector verbatim — so a `.cfg` run is
+**bit-identical** to the inline path with the profile's values as flags
+(verified by `test/parity/test_config_vs_inline_parity.py`). The
+`topology =` key overrides the CLI fabric (ring allreduce needs
+`topology=ring`; tree and NVLS use `topology=switched`). `numGpus` and
+`dataSize` stay on the CLI. This is the **primary** form for reproducing a
+measured collective.
 
 ```
 [stack]
 profile = configs/protocol_profiles/h200-ll128.profile
 
 [op]
-builtin  = ring        # delegate to the calibrated RingAllReduce injector
-topology = ring
+collective = allreduce   # delegate to the calibrated RingAllReduce injector
+algorithm  = ring
+topology   = ring
 ```
 
 Run either form with the validated PEX wiring on the profile side:
@@ -157,12 +160,13 @@ Run either form with the validated PEX wiring on the profile side:
 configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
 ```
 
-Three builtin configs ship — `h200-ring-allreduce.cfg` (`builtin=ring`),
-`h200-tree-allreduce.cfg` (`builtin=tree`), `h200-nvls-allgather.cfg`
-(`builtin=nvls`) — plus `h200-request-response.cfg` (a two-leg ping-pong
-stencil, showing the stencil form is not ring-specific). Because the builtins
-source the profile's protocol-specific startup (LL 15 µs / LL128 25 µs /
-SIMPLE 46 µs / NVLS 23 µs) and fabric hardware, their latency is
+Three calibrated configs ship — `h200-ring-allreduce.cfg`
+(`collective=allreduce`/`algorithm=ring`), `h200-tree-allreduce.cfg`
+(`collective=allreduce`/`algorithm=tree`), `h200-nvls-allgather.cfg`
+(`collective=allgather`/`algorithm=nvls`) — plus `h200-request-response.cfg`
+(a two-leg ping-pong stencil, showing the stencil form is not ring-specific).
+Because these ops source the profile's protocol-specific startup (LL 15 µs /
+LL128 25 µs / SIMPLE 46 µs / NVLS 23 µs) and fabric hardware, their latency is
 **bit-identical** to the inline path and reproduces the H200 measurement
 (8-GPU 1 MiB ring → 38.3 µs vs 37.24 µs measured). See
 [doc/CONFIG_GUIDE.md](CONFIG_GUIDE.md) for the user-facing guide, and

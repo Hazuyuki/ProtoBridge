@@ -475,15 +475,16 @@ main(int argc, char* argv[])
 
         // Source the profile's PEX + fabric-hardware values into the same
         // local CLI variables the validated inline path consumes, so a `.cfg`
-        // whose [op] declares `builtin = <ring|tree|sharp|nvls|hierarchical>`
-        // runs the calibrated inline injector with config-sourced params --
-        // bit-identical to the inline path run with the equivalent CLI flags
-        // (same code, same values). numGpus/dataSize stay on the CLI. Keys
-        // absent from the profile fall back to the CLI default already in the
-        // variable. vcCredits/vcCount/flowControl are PEX-bundle values
-        // consumed only by the stencil runner's ApplyBundle below; the builtin
-        // path keeps the inline 1-VC fabric model (matching the calibrated
-        // inline path), so they are intentionally NOT sourced here.
+        // whose [op] declares `collective =` + `algorithm =` (topology =
+        // optional) runs the calibrated inline injector with config-sourced
+        // params -- bit-identical to the inline path run with the equivalent
+        // CLI flags (same code, same values). numGpus/dataSize stay on the
+        // CLI. Keys absent from the profile fall back to the CLI default
+        // already in the variable. vcCredits/vcCount/flowControl are PEX-bundle
+        // values consumed only by the stencil runner's ApplyBundle below; a
+        // collective/algorithm op keeps the inline 1-VC fabric model (matching
+        // the calibrated inline path), so they are intentionally NOT sourced
+        // here.
         auto applyU64 = [&prof](uint64_t& v, const char* k) {
             const std::string s = prof.Get(k, "");
             if (!s.empty()) v = std::stoull(s);
@@ -534,26 +535,19 @@ main(int argc, char* argv[])
         }
         applyS(llrModeStr, "llrMode");
 
-        // A `builtin = ...` op delegates to a calibrated inline injector: map
-        // the name to (collective, algorithm) so the inline dispatch below runs
-        // the right injector, and let the .cfg topology override the CLI fabric.
-        // A stencil .cfg leaves builtin empty, so collective/algorithm/topology
-        // come from the CLI exactly as before.
-        const std::string& builtin = pconfig.GetBuiltin();
-        if (!builtin.empty())
+        // A `.cfg` whose [op] declares `collective =` / `algorithm =` (and
+        // optionally `topology =`) overrides the CLI values, then falls through
+        // to the validated inline injector branches below -- bit-identical to
+        // the inline path run with the equivalent CLI flags. A stencil .cfg
+        // leaves these unset, so collective/algorithm/topology come from the
+        // CLI exactly as before.
         {
-            if (builtin == "ring")              { collective = "allreduce"; algorithm = "ring"; }
-            else if (builtin == "tree")         { collective = "allreduce"; algorithm = "tree"; }
-            else if (builtin == "sharp")        { collective = "allreduce"; algorithm = "sharp"; }
-            else if (builtin == "hierarchical") { collective = "allreduce"; algorithm = "hierarchical"; }
-            else if (builtin == "nvls")         { collective = "allgather"; algorithm = "nvls"; }
-            else { NS_ABORT_MSG("unknown builtin '" << builtin
-                                << "': expected ring/tree/sharp/hierarchical/nvls"); }
-        }
-        const std::string& cfgTopology = pconfig.GetTopology();
-        if (!cfgTopology.empty())
-        {
-            topology = cfgTopology;
+            const std::string& cfgCollective = pconfig.GetCollective();
+            if (!cfgCollective.empty()) collective = cfgCollective;
+            const std::string& cfgAlgorithm = pconfig.GetAlgorithm();
+            if (!cfgAlgorithm.empty()) algorithm = cfgAlgorithm;
+            const std::string& cfgTopology = pconfig.GetTopology();
+            if (!cfgTopology.empty()) topology = cfgTopology;
         }
     }
 
@@ -1259,11 +1253,11 @@ main(int argc, char* argv[])
                   << " -> " << algo << std::endl;
     }
     // Stencil path: only when the .cfg declares a transfer stencil (no
-    // `builtin =`). A builtin .cfg has already sourced the profile's values
-    // into the local vars above and mapped builtin -> (collective, algorithm),
+    // `collective =` / `algorithm =` in [op]). A three-axis .cfg has already
+    // sourced the profile's values + the op axes into the local vars above,
     // so it falls through to the validated inline injector branches below
     // (bit-identical to the inline path run with the equivalent CLI flags).
-    if (configMode && pconfig.GetBuiltin().empty())
+    if (configMode && pconfig.GetCollective().empty() && pconfig.GetAlgorithm().empty())
     {
         // Apply the profile's PEX bundle to the endpoints (overrides the inline
         // 1-VC convenience credit setup with the profile's VC count + per-VC

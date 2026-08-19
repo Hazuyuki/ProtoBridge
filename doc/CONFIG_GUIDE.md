@@ -1,9 +1,10 @@
 # Config Guide — the `.cfg` / `.profile` primary input
 
 ProtoBridge's primary user input is a **protocol config** (`.cfg`) that names a
-calibrated collective and the fabric it runs on, plus a **protocol profile**
-(`.profile`) that bundles the protocol / FEC / credit / BER / hardware values.
-A one-line run reproduces a measured H200 latency with no per-run CLI flags:
+calibrated collective + algorithm and the fabric it runs on, plus a **protocol
+profile** (`.profile`) that bundles the protocol / FEC / credit / BER / hardware
+values. A one-line run reproduces a measured H200 latency with no per-run CLI
+flags:
 
 ```bash
 ./ns3 run "gpu-cluster-sim --protocolConfig=\
@@ -21,35 +22,36 @@ A `.cfg` has two sections:
 | Section | Layer | What it carries |
 |---------|-------|-----------------|
 | `[stack]` | PEX (packet execution) | a `profile = …` reference to a `.profile` (protocol model, FEC, credits, BER, LLR, **fabric hardware**) |
-| `[op]` | OTP (operation → packet) | either `builtin = <name>` (delegate to a calibrated injector) **or** a transfer stencil |
+| `[op]` | OTP (operation → packet) | either `collective =` + `algorithm =` (delegate to a calibrated injector) **or** a transfer stencil |
 
 ```ini
 [stack]
 profile = configs/protocol_profiles/h200-ll128.profile
 
 [op]
-builtin  = ring        # delegate, OR leave empty and declare a stencil
-topology = ring        # optional: overrides the CLI fabric
+collective = allreduce   # delegate, OR leave empty and declare a stencil
+algorithm  = ring
+topology   = ring         # optional: overrides the CLI fabric
 ```
 
 ## 2. The two `[op]` forms
 
-### 2a. Builtin delegation (primary, calibrated, bit-identical)
+### 2a. Collective + algorithm delegation (primary, calibrated, bit-identical)
 
-`builtin = <ring|tree|sharp|hierarchical|nvls>` delegates to the calibrated
+Declaring `collective = <c>` + `algorithm = <a>` delegates to the calibrated
 inline injector. The simulator sources the profile's PEX + fabric-hardware
 keys into the same local CLI variables the inline path consumes, then runs the
 injector **verbatim**. Because every sourced key maps 1:1 to an inline CLI
 flag, the `.cfg` run is **bit-identical** to the inline path with the
 profile's values as flags (same code, same values, same `RngRun`).
 
-| `builtin` | collective | algorithm | `topology` | shipped `.cfg` |
-|-----------|-----------|-----------|------------|-----------------|
-| `ring` | allreduce | ring | `ring` | `h200-ring-allreduce.cfg` |
-| `tree` | allreduce | tree | `switched` | `h200-tree-allreduce.cfg` |
-| `sharp` | allreduce | sharp | `switched` | — |
-| `hierarchical` | allreduce | hierarchical | `switched` | — |
-| `nvls` | allgather | nvls | `switched` | `h200-nvls-allgather.cfg` |
+| `collective` | `algorithm` | `topology` | shipped `.cfg` |
+|--------------|------------|------------|-----------------|
+| allreduce | ring | `ring` | `h200-ring-allreduce.cfg` |
+| allreduce | tree | `switched` | `h200-tree-allreduce.cfg` |
+| allreduce | sharp | `switched` | — |
+| allreduce | hierarchical | `switched` | — |
+| allgather | nvls | `switched` | `h200-nvls-allgather.cfg` |
 
 > `topology` is part of the calibration: ring allreduce on `switched` does
 > **not** reproduce the measurement (it runs ~6× slower). Tree and NVLS use
@@ -57,22 +59,22 @@ profile's values as flags (same code, same values, same `RngRun`).
 
 ### 2b. Custom transfer stencil (define a new protocol)
 
-Leave `builtin` empty and declare `param` / `replicate` / `transfer.*` lines.
-A compiler (`ProtocolConfig::Compile`) expands the stencil through the vendor
-`ProtocolModel` into a transaction graph run by the generic runner. See
-[ARCHITECTURE.md](ARCHITECTURE.md#config-driven-protocol-stack-cfg) for the
-full stencil schema; `h200-request-response.cfg` is a worked two-leg
+Leave `collective`/`algorithm` unset and declare `param` / `replicate` /
+`transfer.*` lines. A compiler (`ProtocolConfig::Compile`) expands the stencil
+through the vendor `ProtocolModel` into a transaction graph run by the generic
+runner. See [ARCHITECTURE.md](ARCHITECTURE.md#config-driven-protocol-stack-cfg)
+for the full stencil schema; `h200-request-response.cfg` is a worked two-leg
 ping-pong example.
 
 ## 3. The `.profile` keys
 
 `h200-ll128.profile` mirrors `configs/hardware/h200.json`. Keys fall into two
-groups; both are **sourced** into the inline path when a `[op]` uses
-`builtin=`:
+groups; both are **sourced** into the inline path when an `[op]` declares
+`collective=`+`algorithm=`:
 
 **PEX bundle** (drive the protocol stack — applied to the bundle / endpoint,
-not sourced into CLI vars for the builtin path, since the builtin path keeps
-the inline 1-VC fabric model):
+not sourced into CLI vars for the collective/algorithm path, since that path
+keeps the inline 1-VC fabric model):
 
 ```
 protocolModel      = ns3::NcclProtocolModel
@@ -118,22 +120,22 @@ berInterRackOptical     = 1e-9
 
 ## 4. The bit-identity guarantee
 
-A `builtin=` `.cfg` sources the profile's values into the local variables the
-inline path consumes, then runs the same injector. The two paths must produce
-identical `simTimeNs`. `test/parity/test_config_builtin_parity.py` is the
-gate — it parses the profile, emits the equivalent inline flags, runs both
-paths for `{ring, tree, nvls}` × sizes × GPU counts, and asserts exact
+A `collective=`+`algorithm=` `.cfg` sources the profile's values into the local
+variables the inline path consumes, then runs the same injector. The two paths
+must produce identical `simTimeNs`. `test/parity/test_config_vs_inline_parity.py`
+is the gate — it parses the profile, emits the equivalent inline flags, runs
+both paths for `{ring, tree, nvls}` × sizes × GPU counts, and asserts exact
 `simTimeNs` equality:
 
 ```bash
-python3 -m pytest test/parity/test_config_builtin_parity.py -q
-# or: python3 test/parity/test_config_builtin_parity.py
+python3 -m pytest test/parity/test_config_vs_inline_parity.py -q
+# or: python3 test/parity/test_config_vs_inline_parity.py
 ```
 
 Verified cases (config `==` inline, `simTimeNs`):
 
-| builtin | size | GPUs | simTimeNs | measured |
-|---------|------|------|-----------|----------|
+| op | size | GPUs | simTimeNs | measured |
+|----|------|------|-----------|----------|
 | ring | 1 MiB | 8 | 38308 | 37.24 µs |
 | ring | 256 MiB | 8 | 1353580 | 1347.65 µs |
 | ring | 1 MiB | 4 | 33028 | — |
@@ -155,16 +157,17 @@ a `configs/hardware/*.json` spec), and reference it from a `.cfg`
 for the target GPU count (H200 8-GPU: 375 GB/s aggregate ÷ 18 lanes ≈ 166,
 rounded to the empirical sweep best 170).
 
-### A new builtin op
+### A new calibrated op
 
-Add the name to the `builtin → (collective, algorithm)` map in
-`scratch/gpu-cluster-sim.cc` (the `if (!builtin.empty())` block) and ship a
-`.cfg` with `builtin = <name>` + the calibrated `topology`. The injector must
-be the one the inline dispatch already runs for that `(collective, algorithm)`.
+Ship a `.cfg` with `collective = <c>` + `algorithm = <a>` + the calibrated
+`topology`. The `(collective, algorithm)` pair must be one the inline dispatch
+already handles (so the same injector runs, now with profile-sourced vars); see
+the `else if (collective == …)` branches in `scratch/gpu-cluster-sim.cc`. Add a
+new `(collective, algorithm)` pair only by extending that inline dispatch.
 
 ### A new custom protocol
 
-Author a `.cfg` with an `[op]` transfer stencil (no `builtin=`). The stencil
-runs through the generic runner with the profile's PEX bundle applied — see
-[ARCHITECTURE.md](ARCHITECTURE.md#config-driven-protocol-stack-cfg) and
-`h200-request-response.cfg`.
+Author a `.cfg` with an `[op]` transfer stencil (no `collective=`/`algorithm=`).
+The stencil runs through the generic runner with the profile's PEX bundle
+applied — see [ARCHITECTURE.md](ARCHITECTURE.md#config-driven-protocol-stack-cfg)
+and `h200-request-response.cfg`.

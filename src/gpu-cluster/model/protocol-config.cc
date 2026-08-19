@@ -235,7 +235,8 @@ ProtocolConfig::Clear()
     m_startup = "auto";
     m_perStepDelay = "0";
     m_complete = "all";
-    m_builtin.clear();
+    m_collective.clear();
+    m_algorithm.clear();
     m_topology.clear();
     m_currentSection.clear();
 }
@@ -305,7 +306,8 @@ ProtocolConfig::Load(const std::string& path, std::string* error)
             else if (key == "startup") m_startup = val;
             else if (key == "per_step_delay") m_perStepDelay = val;
             else if (key == "complete") m_complete = val;
-            else if (key == "builtin") m_builtin = val;       // delegate to a calibrated injector
+            else if (key == "collective") m_collective = val; // delegate to a calibrated injector
+            else if (key == "algorithm")  m_algorithm = val;  // paired with collective
             else if (key == "topology") m_topology = val;     // fabric the op runs on
             else
             {
@@ -316,11 +318,18 @@ ProtocolConfig::Load(const std::string& path, std::string* error)
         // Sections other than [stack]/[op] are ignored.
     }
 
-    // A `builtin = ...` op delegates to a calibrated injector and needs no
-    // transfer stencil; otherwise the [op] stencil must declare >=1 transfer.
-    if (m_builtin.empty() && m_transfer.empty())
+    // A `[op] collective =` / `algorithm =` op delegates to a calibrated inline
+    // injector and needs no transfer stencil; otherwise the [op] stencil must
+    // declare >=1 transfer. The two axes must be declared together.
+    const bool hasAxes = !m_collective.empty() || !m_algorithm.empty();
+    if (hasAxes && (m_collective.empty() || m_algorithm.empty()))
     {
-        if (error) *error = "config has no transfer.* entries in [op] and no builtin=";
+        if (error) *error = "[op] collective= and algorithm= must both be set (or neither)";
+        return false;
+    }
+    if (!hasAxes && m_transfer.empty())
+    {
+        if (error) *error = "config has no transfer.* entries in [op] and no collective=/algorithm=";
         return false;
     }
     return true;
@@ -339,9 +348,15 @@ ProtocolConfig::GetStackValues() const
 }
 
 const std::string&
-ProtocolConfig::GetBuiltin() const
+ProtocolConfig::GetCollective() const
 {
-    return m_builtin;
+    return m_collective;
+}
+
+const std::string&
+ProtocolConfig::GetAlgorithm() const
+{
+    return m_algorithm;
 }
 
 const std::string&

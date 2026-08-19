@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Bit-identical parity test: a `.cfg` builtin op vs the inline CLI path.
+"""Bit-identical parity test: a `.cfg` op vs the inline CLI path.
 
-A `.cfg` whose ``[op]`` declares ``builtin = <ring|tree|nvls>`` delegates to a
-calibrated inline injector: the simulator sources the ``[stack]`` profile's
-PEX + fabric-hardware values into the same local CLI variables the inline path
-consumes, then runs the injector verbatim. Because every sourced profile key
-maps 1:1 to an inline CLI flag, the two paths must be bit-identical (same code,
-same values, same RNG seed) -- i.e. the simTimeNs of ``--protocolConfig=...cfg``
-must equal the simTimeNs of the inline command built from the profile's values.
+A `.cfg` whose ``[op]`` declares ``collective = <c>`` + ``algorithm = <a>``
+(topology optional) delegates to a calibrated inline injector: the simulator
+sources the ``[stack]`` profile's PEX + fabric-hardware values into the same
+local CLI variables the inline path consumes, then runs the injector verbatim.
+Because every sourced profile key maps 1:1 to an inline CLI flag, the two paths
+must be bit-identical (same code, same values, same RNG seed) -- i.e. the
+simTimeNs of ``--protocolConfig=...cfg`` must equal the simTimeNs of the inline
+command built from the profile's values.
 
 This is the gate that makes the config-file form a *primary* input: a user's
 ``.cfg`` reproduces the calibrated inline path exactly, not approximately.
 
 Run:
-    python3 -m pytest test/parity/test_config_builtin_parity.py -v
+    python3 -m pytest test/parity/test_config_vs_inline_parity.py -v
     # or directly:
-    python3 test/parity/test_config_builtin_parity.py
+    python3 test/parity/test_config_vs_inline_parity.py
 
 The test parses ``configs/protocol_profiles/h200-ll128.profile``, emits the
-equivalent inline CLI flags, runs ``gpu-cluster-sim`` twice per case
-(config-builtin vs inline) for a matrix of {ring, tree, nvls} x {size} x
-{numGpus}, and asserts simTimeNs is exactly equal.
+equivalent inline CLI flags, runs ``gpu-cluster-sim`` twice per case (config
+vs inline) for a matrix of {ring, tree, nvls} x {size} x {numGpus}, and
+asserts simTimeNs is exactly equal.
 """
 
 import glob
@@ -70,20 +71,19 @@ PROFILE_TO_FLAG = {
     "llrMode": "--llrMode",
 }
 # vcCredits / vcCount / flowControl are PEX-bundle values consumed only by the
-# stencil runner's ApplyBundle; the builtin path keeps the inline 1-VC fabric
-# model (matching the calibrated inline path), so they are intentionally NOT
-# sourced and NOT in this map.
+# stencil runner's ApplyBundle; a collective/algorithm op keeps the inline 1-VC
+# fabric model (matching the calibrated inline path), so they are intentionally
+# NOT sourced and NOT in this map.
 
-# builtin -> (cfg file, topology, collective, algorithm) for the inline
-# baseline. Mirrors the C++ builtin->(collective,algorithm) map + the .cfg's
-# topology line.
-BUILTIN_CASES = {
+# op (algorithm) -> (cfg file, topology, collective, algorithm) for the inline
+# baseline. Mirrors the .cfg's [op] collective=/algorithm=/topology= lines.
+OP_CASES = {
     "ring": ("h200-ring-allreduce.cfg", "ring", "allreduce", "ring"),
     "tree": ("h200-tree-allreduce.cfg", "switched", "allreduce", "tree"),
     "nvls": ("h200-nvls-allgather.cfg", "switched", "allgather", "nvls"),
 }
 
-# (builtin, dataSizeBytes, numGpus). Ring is exercised across the full
+# (op, dataSizeBytes, numGpus). Ring is exercised across the full
 # {1MiB, 256MiB} x {4, 8} matrix (the calibrated primary path); tree and nvls
 # are smoke-checked at 1MiB / 8-GPU (their switched path is known bit-identical
 # and larger NVLS sizes are time-bounded in ns-3).
@@ -158,8 +158,8 @@ def run_sim(args, timeout=300):
     return status, sim_ns, out
 
 
-def run_config_builtin(builtin, num_gpus, data_size):
-    cfg = BUILTIN_CASES[builtin][0]
+def run_config(op, num_gpus, data_size):
+    cfg = OP_CASES[op][0]
     cfg_path = os.path.join("configs", "protocol_configs", cfg)
     args = [
         "--protocolConfig={}".format(cfg_path),
@@ -170,8 +170,8 @@ def run_config_builtin(builtin, num_gpus, data_size):
     return run_sim(args)
 
 
-def run_inline(builtin, num_gpus, data_size, profile):
-    _, topology, collective, algorithm = BUILTIN_CASES[builtin]
+def run_inline(op, num_gpus, data_size, profile):
+    _, topology, collective, algorithm = OP_CASES[op]
     args = [
         "--topology={}".format(topology),
         "--collective={}".format(collective),
@@ -183,10 +183,10 @@ def run_inline(builtin, num_gpus, data_size, profile):
     return run_sim(args)
 
 
-def check_parity(builtin, num_gpus, data_size, profile):
-    cs, cn, _ = run_config_builtin(builtin, num_gpus, data_size)
-    is_, in_, _ = run_inline(builtin, num_gpus, data_size, profile)
-    label = "{} {}B {}gpu".format(builtin, data_size, num_gpus)
+def check_parity(op, num_gpus, data_size, profile):
+    cs, cn, _ = run_config(op, num_gpus, data_size)
+    is_, in_, _ = run_inline(op, num_gpus, data_size, profile)
+    label = "{} {}B {}gpu".format(op, data_size, num_gpus)
     assert cs == "complete", "{}: config status={} (expected complete)".format(label, cs)
     assert is_ == "complete", "{}: inline status={} (expected complete)".format(label, is_)
     assert cn is not None and in_ is not None, "{}: missing simTimeNs (config={}, inline={})".format(
@@ -200,14 +200,14 @@ def check_parity(builtin, num_gpus, data_size, profile):
     return cn
 
 
-def test_config_builtin_parity():
+def test_config_vs_inline_parity():
     profile = parse_profile(PROFILE)
     assert profile, "failed to parse profile {}".format(PROFILE)
     # Sanity: the keys the C++ sources are all present in the profile.
     missing = [k for k in PROFILE_TO_FLAG if k not in profile]
     assert not missing, "profile missing sourced keys: {}".format(missing)
-    for builtin, data_size, num_gpus in PARITY_MATRIX:
-        check_parity(builtin, num_gpus, data_size, profile)
+    for op, data_size, num_gpus in PARITY_MATRIX:
+        check_parity(op, num_gpus, data_size, profile)
 
 
 if __name__ == "__main__":
@@ -221,11 +221,11 @@ if __name__ == "__main__":
         print("FAIL: profile missing sourced keys: {}".format(missing))
         sys.exit(1)
     ok = True
-    for builtin, data_size, num_gpus in PARITY_MATRIX:
+    for op, data_size, num_gpus in PARITY_MATRIX:
         try:
-            ns = check_parity(builtin, num_gpus, data_size, profile)
+            ns = check_parity(op, num_gpus, data_size, profile)
             print("PASS  {:6s} {:>10}B {}gpu  simTimeNs={}  (config==inline)".format(
-                builtin, data_size, num_gpus, ns))
+                op, data_size, num_gpus, ns))
         except AssertionError as e:
             ok = False
             print("FAIL  {}".format(e))
