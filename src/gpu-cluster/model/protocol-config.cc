@@ -235,6 +235,8 @@ ProtocolConfig::Clear()
     m_startup = "auto";
     m_perStepDelay = "0";
     m_complete = "all";
+    m_builtin.clear();
+    m_topology.clear();
     m_currentSection.clear();
 }
 
@@ -303,6 +305,8 @@ ProtocolConfig::Load(const std::string& path, std::string* error)
             else if (key == "startup") m_startup = val;
             else if (key == "per_step_delay") m_perStepDelay = val;
             else if (key == "complete") m_complete = val;
+            else if (key == "builtin") m_builtin = val;       // delegate to a calibrated injector
+            else if (key == "topology") m_topology = val;     // fabric the op runs on
             else
             {
                 if (error) *error = "line " + std::to_string(lineNo) + ": unknown op key '" + key + "'";
@@ -312,9 +316,11 @@ ProtocolConfig::Load(const std::string& path, std::string* error)
         // Sections other than [stack]/[op] are ignored.
     }
 
-    if (m_transfer.empty())
+    // A `builtin = ...` op delegates to a calibrated injector and needs no
+    // transfer stencil; otherwise the [op] stencil must declare >=1 transfer.
+    if (m_builtin.empty() && m_transfer.empty())
     {
-        if (error) *error = "config has no transfer.* entries in [op]";
+        if (error) *error = "config has no transfer.* entries in [op] and no builtin=";
         return false;
     }
     return true;
@@ -330,6 +336,18 @@ const std::unordered_map<std::string, std::string>&
 ProtocolConfig::GetStackValues() const
 {
     return m_stack;
+}
+
+const std::string&
+ProtocolConfig::GetBuiltin() const
+{
+    return m_builtin;
+}
+
+const std::string&
+ProtocolConfig::GetTopology() const
+{
+    return m_topology;
 }
 
 bool

@@ -23,11 +23,20 @@
  *   flowControl             credit | window | rate (send-gate policy)
  *   llrEnabled              0/1, enable link-level retry on the endpoints
  *   llrMode                 gobackn | sack (GBN cumulative vs SACK selective)
+ *   bandwidthGbps           per-link effective bandwidth (Gbps) -- fabric hw
+ *   latencyNs               per-link latency (ns) -- fabric hw
+ *   numLanes                 physical lanes per logical link -- fabric hw
+ *   linksPerGpu             links per GPU to the switch -- fabric hw
+ *   sprayChunkSize          spray chunk size (bytes) -- fabric hw
+ *   switchVoqDepth          NVSwitch VOQ depth -- fabric hw
+ *   switchArbIntervalNs     NVSwitch arbitration interval (ns) -- fabric hw
  *
- * Any other key is applied to the ProtocolModel object as a String-typed
- * attribute via SetAttributeFailSafe, so vendor-specific attributes
- * (StartupDelayLL, LlThreshold, ...) work generically without a per-vendor
- * case list.
+ * The fabric-hw keys are consumed by the simulator's topology builder (not
+ * protocol attributes); they let a `.cfg` run reproduce a calibrated fabric
+ * without per-run CLI flags. Any other key is applied to the ProtocolModel
+ * object as a String-typed attribute via SetAttributeFailSafe, so
+ * vendor-specific attributes (StartupDelayLL, LlThreshold, ...) work
+ * generically without a per-vendor case list.
  */
 
 #ifndef PROTOCOL_PROFILE_H
@@ -111,8 +120,12 @@ class ProtocolProfile
     /// Set or override a single key programmatically (before Build()).
     void Set(const std::string& key, const std::string& value);
 
-  private:
+    /// Read one key with a fallback. Public so the simulator can source
+    /// profile values (PEX + fabric hardware) into its CLI variables when a
+    /// `.cfg` op delegates to a calibrated inline injector (`builtin = ...`).
     std::string Get(const std::string& key, const std::string& fallback) const;
+
+  private:
     static std::string Trim(const std::string& s);
 
     std::unordered_map<std::string, std::string> m_kv;

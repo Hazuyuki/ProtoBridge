@@ -24,10 +24,17 @@ the upstream ns-3 project, not here.
 ./ns3 run "test-runner --test-name=gpu-cluster"
 ./ns3 run "test-runner --test-name=gpu-cluster-integration"
 python3 -m pytest surrogate/test/ -q
+python3 -m pytest test/parity/test_config_builtin_parity.py -q
 ```
-Calibration must stay byte-identical: the H200 8-GPU switched ring at 1 MiB is
-**88.2 µs**, the config-path ring is **44.6 µs**. A change that shifts these
-is a behavior change, not a refactor — call it out in the PR description.
+Calibration must stay **bit-identical**: the config-file form
+(`--protocolConfig=…h200-ring-allreduce.cfg`) sources the `[stack]` profile
+into the same local variables the inline CLI path consumes and runs the
+calibrated injector verbatim, so the two must produce identical `simTimeNs`
+(same code, same values, same `RngRun`). `test_config_builtin_parity.py`
+asserts this across `{ring, tree, nvls}` × sizes × GPU counts, and pins the
+8-GPU 1 MiB ring at **38.3 µs** (H200 measurement 37.24 µs). A change that
+shifts the config-vs-inline `simTimeNs` equality is a behavior change, not a
+refactor — call it out in the PR description.
 
 **Extension seams.** Flow-control (`FabricEndpoint::FlowControlGate` is
 virtual), arbitration (`ns3::Arbiter` strategy, default `RoundRobinArbiter`),

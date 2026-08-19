@@ -34,7 +34,10 @@ static const char* RESERVED[] = {
     "fecEncodeLatencyNs", "fecDecodeLatencyNs",
     "vcCount", "vcCredits",
     "berIntraNodeElectrical", "berIntraRackElectrical", "berInterRackOptical",
-    "flowControl", "llrEnabled", "llrMode"};
+    "flowControl", "llrEnabled", "llrMode",
+    // Fabric hardware (consumed by the sim's topology builder, not protocol attrs).
+    "bandwidthGbps", "latencyNs", "numLanes", "linksPerGpu",
+    "sprayChunkSize", "switchVoqDepth", "switchArbIntervalNs"};
 static bool
 IsReserved(const std::string& k)
 {

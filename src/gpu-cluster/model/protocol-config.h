@@ -87,6 +87,14 @@ class ProtocolConfig
     /// Stack-section key/value overrides beyond `profile` (for the caller).
     const std::unordered_map<std::string, std::string>& GetStackValues() const;
 
+    /// The `[op] builtin = ...` value (empty => use the transfer stencil;
+    /// otherwise delegate to the named calibrated injector: ring/tree/sharp/
+    /// nvls/hierarchical/...).
+    const std::string& GetBuiltin() const;
+
+    /// The `[op] topology = ...` value (empty => caller's default fabric).
+    const std::string& GetTopology() const;
+
     /**
      * @brief Compile the `[op]` stencil into `graph`.
      *
@@ -136,6 +144,8 @@ class ProtocolConfig
     std::string m_startup{"auto"};
     std::string m_perStepDelay{"0"};
     std::string m_complete{"all"};
+    std::string m_builtin;       // [op] builtin = ... (delegate to calibrated injector)
+    std::string m_topology;      // [op] topology = ... (fabric the op runs on)
     std::string m_currentSection;
 };
 

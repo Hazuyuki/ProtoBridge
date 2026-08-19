@@ -129,20 +129,44 @@ transfer.0.vc    = 0
 complete = all
 ```
 
-Run it with the validated topology / BER / FEC wiring kept on the PEX side:
+### Builtin delegation (`builtin = ...`)
+
+Instead of a transfer stencil, an `[op]` may set `builtin = <ring|tree|sharp|
+hierarchical|nvls>` to delegate to a calibrated inline injector. The simulator
+sources the profile's PEX + fabric-hardware keys into the same local CLI
+variables the inline path consumes, then runs the injector verbatim — so a
+`.cfg` run is **bit-identical** to the inline path with the profile's values
+as flags (verified by `test/parity/test_config_builtin_parity.py`). The
+`topology =` key overrides the CLI fabric (ring allreduce needs `topology=ring`;
+tree and NVLS use `topology=switched`). `numGpus` and `dataSize` stay on the
+CLI. This is the **primary** form for reproducing a measured collective.
+
+```
+[stack]
+profile = configs/protocol_profiles/h200-ll128.profile
+
+[op]
+builtin  = ring        # delegate to the calibrated RingAllReduce injector
+topology = ring
+```
+
+Run either form with the validated PEX wiring on the profile side:
 
 ```
 ./ns3 run "gpu-cluster-sim --protocolConfig=\
 configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
 ```
 
-Two example configs ship: `h200-ring-allreduce.cfg` (reproduces the
-hand-written ring) and `h200-request-response.cfg` (a two-leg ping-pong
-showing the stencil is not ring-specific). The config path uses the
-profile's PEX parameters (4 VCs × 64 credits, RS(544,514,15) FEC, 15 µs
-startup), so its latency is profile-canonical rather than bit-identical to
-the default-path injector (which uses the protocol model's 65 µs startup
-default). See [configs/protocol_configs/](../configs/protocol_configs) and
+Three builtin configs ship — `h200-ring-allreduce.cfg` (`builtin=ring`),
+`h200-tree-allreduce.cfg` (`builtin=tree`), `h200-nvls-allgather.cfg`
+(`builtin=nvls`) — plus `h200-request-response.cfg` (a two-leg ping-pong
+stencil, showing the stencil form is not ring-specific). Because the builtins
+source the profile's protocol-specific startup (LL 15 µs / LL128 25 µs /
+SIMPLE 46 µs / NVLS 23 µs) and fabric hardware, their latency is
+**bit-identical** to the inline path and reproduces the H200 measurement
+(8-GPU 1 MiB ring → 38.3 µs vs 37.24 µs measured). See
+[doc/CONFIG_GUIDE.md](CONFIG_GUIDE.md) for the user-facing guide, and
+[configs/protocol_configs/](../configs/protocol_configs) /
 [configs/protocol_profiles/](../configs/protocol_profiles).
 
 ## FabricHeader layout

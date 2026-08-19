@@ -114,18 +114,46 @@ FabricHeader layout, the four-tier resilience model, and the topology grammar.
 > injectors), `surrogate/` (latency model), `configs/`, and the two `scratch/`
 > entry points; everything else is stock ns-3.
 
-### Run one collective
+### Run a collective from a config (primary form)
+
+A `.cfg` is the primary input: it names a calibrated builtin collective, the
+fabric topology, and — via the `[stack]` profile — the PEX bundle and fabric
+hardware, so a one-line run reproduces a measured H200 latency with no per-run
+flags.
 
 ```bash
-./ns3 run "gpu-cluster-sim --numGpus=8 --topology=switched --algorithm=auto --dataSize=1048576"
+./ns3 run "gpu-cluster-sim --protocolConfig=\
+configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
 ```
 
-Output (interconnect-only direct-collective mode):
+Output (8-GPU 1 MiB ring allreduce):
 
 ```
 RESULT_START
-simTimeUs=88.2
+simTimeUs=38.3
 RESULT_END
+```
+
+This reproduces the H200 NVLink4 measurement (37.24 µs) to ~3% and is
+**bit-identical** to the inline path run with the profile's values as flags —
+`test/parity/test_config_builtin_parity.py` asserts exact `simTimeNs` equality
+across `{ring, tree, nvls}` × sizes × GPU counts. Three builtins ship:
+`h200-ring-allreduce.cfg` (`builtin=ring`), `h200-tree-allreduce.cfg`
+(`builtin=tree`), `h200-nvls-allgather.cfg` (`builtin=nvls`). `numGpus` and
+`dataSize` stay on the CLI. See [doc/CONFIG_GUIDE.md](doc/CONFIG_GUIDE.md).
+
+### Equivalent inline flags
+
+The config form sources the profile into the same local variables the inline
+path consumes, so the two are interchangeable. The ring `.cfg` is bit-identical
+to:
+
+```bash
+./ns3 run "gpu-cluster-sim --topology=ring --collective=allreduce --algorithm=ring \
+  --numGpus=8 --dataSize=1048576 \
+  --bandwidth=170 --latency=400 --numLanes=18 --linksPerGpu=1 \
+  --startupLL=15000 --startupLL128=25000 --startupSIMPLE=46000 \
+  --forceProtocol=0 --fecN=544 --fecK=514 --fecT=15 ..."   # full set in test/parity/
 ```
 
 Key flags: `--topology` (ring/fullmesh/switched/fattree/leafspine/nvl72/
@@ -151,23 +179,15 @@ hypercube/torus/mesh/…), `--algorithm` (ring/tree/sharp/nvls/fullmesh/auto),
 Prints the resolved bundle: vendor, FEC (544/514/15), 4 VCs × 64 credits,
 credit flow control, LLR off.
 
-### Define a protocol in config
+### Define a custom protocol stencil in config
 
-A `.cfg` declares the two layers in one file — a `[stack]` PEX bundle (by
-reference to a profile) and an `[op]` OTP stencil of replicated transfers —
-which a compiler turns into a transaction graph run by the generic runner.
-This is the "define a protocol in tens of lines of config" seam; the
-validated PEX topology/BER/FEC wiring is reused unchanged.
-
-```bash
-./ns3 run "gpu-cluster-sim --protocolConfig=\
-configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
-```
-
-Two examples ship: `h200-ring-allreduce.cfg` (reproduces the hand-written
-ring) and `h200-request-response.cfg` (a two-leg ping-pong). See
-[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the `.cfg` schema and the
-OTP/PEX transaction-graph seam.
+A `.cfg` whose `[op]` lists transfers (no `builtin=`) compiles to a transaction
+graph run by the generic runner — the "define a protocol in tens of lines of
+config" seam; the validated PEX topology/BER/FEC wiring is reused unchanged.
+`h200-request-response.cfg` (a two-leg ping-pong) ships as the stencil example;
+the ring/tree/nvls `.cfg`s above use `builtin=` to delegate to the calibrated
+injectors. See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the `.cfg` schema
+and the OTP/PEX transaction-graph seam.
 
 ## Surrogate model
 
@@ -222,9 +242,10 @@ All calibration is H200 NVLink4 (no A800). Under `surrogate/calibration/`:
 ```
 src/gpu-cluster/        OTP + PEX + NVSwitch + collective injectors + tests
 scratch/                gpu-cluster-sim.cc (simulator entry), protocol-profile-demo.cc
-configs/                protocol_profiles/ (h200-ll128.profile), dse/topo_specs.csv
+configs/                protocol_profiles/ (h200-ll128.profile), protocol_configs/ (.cfg), dse/topo_specs.csv
 surrogate/              theory/  calibration/  test/
-doc/                    ARCHITECTURE / CALIBRATION / SURROGATE (+ ns-3 manual)
+test/parity/            test_config_builtin_parity.py (config-vs-inline bit-identity gate)
+doc/                    ARCHITECTURE / CALIBRATION / CONFIG_GUIDE / SURROGATE (+ ns-3 manual)
 ```
 
 ## License
