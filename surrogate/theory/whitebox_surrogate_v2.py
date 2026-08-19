@@ -891,3 +891,240 @@ def make_topology(bisection_gbps=None, hop_count=1.0):
     """
     bsec = bisection_gbps * 1000.0 if bisection_gbps is not None else float('inf')
     return Topology(bisection_bw_bytes_per_us=bsec, hop_count=hop_count)
+
+
+# ---------------------------------------------------------------------------
+# Topology from a family NAME (formulas copied from scripts/topo_grammar.py).
+#
+# These replicate TopoSpec._bisection_bw / _default_links_per_gpu and the
+# FAMILIES hop functions verbatim, so a caller gives a topology name plus
+# physical numbers and gets a Topology instead of hand-computing the two
+# values for make_topology().  The hop_count reproduces the representative
+# per-step hop of the EMBEDDED collective (ring follows a locality-preserving
+# order so consecutive ranks are physically local; leaf-tiers add one 2-hop
+# jump per leaf transition).
+#
+# UNIT CONVENTION: pass ``per_link_gbps`` as the per-link UNIDIRECTIONAL wire
+# rate in GB/s, i.e. b_link_bytes_per_us / 1000 (25 for H200 NVLink4).  The DSE
+# grammar instead keys per-link BW off a link_tech table whose NVLink entry is
+# the bidirectional 100 GB/s sheet figure; the two are not interchangeable
+# because here the bisection caps the theory surrogate's OWN algo bandwidth
+# (built from b_link), so the units must agree with b_link, not the grammar.
+# ---------------------------------------------------------------------------
+
+_TOPO_FAMILIES = (
+    "ring", "fullmesh", "hypercube", "3d_torus", "mesh2d", "2dfullmesh",
+    "switched", "nvl72", "multiplane", "leafspine", "3levelhier", "fattree",
+    "railfattree", "dragonflyplus", "2dfullmeshclos",
+)
+
+# Non-blocking NVSwitch fabrics: bisection never caps the schedule rate, so
+# the result is the ideal fabric (byte-identical to topology=None).
+_NONBLOCKING_FAMILIES = ("switched", "nvl72", "multiplane")
+
+
+def _default_links_per_gpu(family, N, **p):
+    """Per-family default links-per-GPU (copy of TopoSpec._default_links_per_gpu)."""
+    if family == "hypercube":
+        return p.get("hypercube_dims") or 7
+    if family == "3d_torus":
+        return 6
+    if family == "mesh2d":
+        return 4
+    if family == "2dfullmesh":
+        return 4
+    if family == "ring":
+        return 2
+    if family == "fullmesh":
+        return N - 1
+    if family == "switched":
+        return 18
+    if family == "nvl72":
+        return p.get("num_planes") or 18
+    if family == "multiplane":
+        return (p.get("num_planes") or 4) * 4
+    if family == "leafspine":
+        return 8
+    if family == "3levelhier":
+        return 8
+    if family == "fattree":
+        return p.get("radix") or 8
+    if family == "railfattree":
+        return 1
+    if family == "dragonflyplus":
+        return 8
+    if family == "2dfullmeshclos":
+        return 8
+    return 1
+
+
+def _bisection_bw_gbps(family, N, links_per_gpu, per_link_gbps, **p):
+    """Per-family bisection bandwidth in GB/s (copy of TopoSpec._bisection_bw)."""
+    lpg = links_per_gpu
+    if family in ("fullmesh", "switched", "nvl72", "railfattree"):
+        return N * lpg * per_link_gbps / 2          # full bisection
+    if family == "hypercube":
+        return N * per_link_gbps / 2                 # 1-dim cut
+    if family in ("3d_torus", "mesh2d", "2dfullmesh"):
+        dims = [d for d in (p.get("dims") or ()) if d > 0] or [1]
+        cut_gpus = N // min(dims)                    # cut across smallest dim
+        return cut_gpus * per_link_gbps / 2
+    if family == "ring":
+        return 2 * per_link_gbps                     # cut = 2 links
+    # leafspine / 3levelhier / fattree / dragonflyplus / 2dfullmeshclos
+    return N * lpg * per_link_gbps / 8               # bisection ~ inter-tier links
+
+
+def _leaftier_hop(N, leaf):
+    """Copy of topo_grammar._leaftier_hop: ring is NodeId-sorted so same-leaf
+    ranks are contiguous (1 hop); one 2-hop jump per leaf transition."""
+    steps = N - 1
+    if steps <= 0:
+        return 1.0
+    inter = leaf
+    avg = ((steps - inter) * 1 + inter * 2) / steps
+    return max(1.0, avg)
+
+
+def _rail_fattree_defaults(N, rails=8, nodes_per_leaf=32):
+    """Copy of topo_grammar._rail_fattree_defaults: published switch counts."""
+    nodes = math.ceil(N / rails)
+    total_leaves = rails * math.ceil(nodes / nodes_per_leaf)
+    if total_leaves <= 64:
+        spines = next(candidate
+                      for candidate in (4, 8, 16, 32)
+                      if candidate >= math.ceil(total_leaves / 2))
+        return spines, 32 // spines, 0
+    return total_leaves, 1, total_leaves // 2
+
+
+def _rail_fattree_shape(N, rails, nodes_per_leaf, rail_num_core,
+                        num_spine, rail_links_per_spine):
+    """Copy of topo_grammar._rail_fattree_shape: leaves/spines/cores/links."""
+    nodes = math.ceil(N / rails)
+    leaves_per_rail = math.ceil(nodes / nodes_per_leaf)
+    total_leaves = rails * leaves_per_rail
+    default_spines, default_links, default_cores = _rail_fattree_defaults(
+        N, rails, nodes_per_leaf)
+    spines = num_spine or default_spines
+    cores = rail_num_core or default_cores
+    links_per_spine = rail_links_per_spine or default_links
+    return leaves_per_rail, total_leaves, spines, cores, links_per_spine
+
+
+def _railfattree_hop(N, **p):
+    """Copy of topo_grammar._railfattree_hop: count switch hops along the
+    rail-major collective order (1 within a leaf, 2 within a group, 3 across
+    the core tier)."""
+    rails = p.get("rail_count") or 8
+    enclosures = N // rails
+    order = [node * rails + rail
+             for rail in range(rails)
+             for node in range(enclosures)]
+    nodes_per_leaf = p.get("rail_nodes_per_leaf") or 32
+    leaves_per_rail, _, _, cores, _ = _rail_fattree_shape(
+        N, rails, nodes_per_leaf, p.get("rail_num_core"),
+        p.get("num_spine"), p.get("rail_links_per_spine"))
+
+    def leaf(rank):
+        node, rail = divmod(rank, rails)
+        return rail * leaves_per_rail + node // nodes_per_leaf
+
+    hops = []
+    for source, destination in zip(order, order[1:]):
+        source_leaf = leaf(source)
+        destination_leaf = leaf(destination)
+        if source_leaf == destination_leaf:
+            hops.append(1.0)
+        elif cores and source_leaf // 32 != destination_leaf // 32:
+            hops.append(3.0)
+        else:
+            hops.append(2.0)
+    return sum(hops) / len(hops) if hops else 1.0
+
+
+def _hop_count(family, N, **p):
+    """Representative per-step hop of the embedded collective
+    (copy of the FAMILIES hop functions in scripts/topo_grammar.py)."""
+    if family in ("ring", "fullmesh", "hypercube", "3d_torus",
+                  "mesh2d", "2dfullmesh"):
+        return 1.0                                     # _direct_hop
+    if family in _NONBLOCKING_FAMILIES:
+        return 1.0                                     # _switched_hop
+    if family in ("leafspine", "3levelhier", "fattree",
+                  "dragonflyplus", "2dfullmeshclos"):
+        return _leaftier_hop(N, p.get("num_leaf") or 1)
+    if family == "railfattree":
+        return _railfattree_hop(N, **p)
+    return 1.0
+
+
+def make_topology_from_family(family, N, links_per_gpu=None,
+                              per_link_gbps=None, **params):
+    """Build a ``Topology`` from a fabric family NAME plus physical numbers.
+
+    Encodes the per-family bisection-bandwidth and hop-count formulas of the
+    DSE topology grammar (``scripts/topo_grammar.py::TopoSpec``) so a caller
+    gives a topology name and physical inputs and gets back a ``Topology``,
+    instead of hand-computing the two numbers for :func:`make_topology`.
+
+    Parameters
+    ----------
+    family : str
+        One of: ``ring``, ``fullmesh``, ``hypercube``, ``3d_torus``,
+        ``mesh2d``, ``2dfullmesh``, ``switched``, ``nvl72``, ``multiplane``,
+        ``leafspine``, ``3levelhier``, ``fattree``, ``railfattree``,
+        ``dragonflyplus``, ``2dfullmeshclos``.
+    N : int
+        Participating GPU count.
+    links_per_gpu : int, optional
+        Physical links per GPU. Defaults per family (ring=2, switched=18,
+        fullmesh=N-1, ...); pass to override.
+    per_link_gbps : float, optional
+        Per-link UNIDIRECTIONAL wire rate in GB/s, i.e.
+        ``b_link_bytes_per_us / 1000`` (e.g. 25 for H200 NVLink4). Required
+        for bisection-bound families (ring/torus/mesh/leaf-tiers); optional
+        for non-blocking NVSwitch fabrics (``switched``/``nvl72``/
+        ``multiplane``), whose bisection never caps the schedule rate.
+    **params
+        Family-specific builder params (all optional, defaulted): ``dims``
+        (tuple, torus/mesh/2dfullmesh), ``hypercube_dims``, ``radix``
+        (fattree), ``num_leaf``/``num_spine``/``num_mid`` (leafspine/hier3/
+        dragonfly), ``num_planes`` (nvl72/multiplane), ``num_racks``/
+        ``rack_rows`` (2dfullmeshclos), ``rail_count``/``rail_nodes_per_leaf``/
+        ``rail_links_per_spine``/``rail_num_core`` (railfattree).
+
+    Returns
+    -------
+    Topology
+        ``bisection_bw_bytes_per_us`` = family bisection (GB/s x1000) capping
+        the schedule rate; ``hop_count`` = representative per-step hop. For a
+        non-blocking NVSwitch fabric the bisection is effectively infinite and
+        ``hop_count`` = 1, so the result is byte-identical to ``topology=None``.
+
+    Notes
+    -----
+    The bisection formula and hop functions are copied verbatim from
+    ``topo_grammar.TopoSpec``; the only divergence is the per-link unit
+    convention (unidirectional GB/s here vs the grammar's link_tech table),
+    kept so the cap is consistent with the surrogate's ``b_link``-derived
+    bandwidth. ``N < 2`` is degenerate (no collective bisection) and returns
+    the ideal fabric.
+    """
+    if family not in _TOPO_FAMILIES:
+        raise ValueError(
+            f"unknown topology family {family!r}; "
+            f"expected one of {_TOPO_FAMILIES}")
+    if N < 2:
+        return make_topology()                         # degenerate: no fabric
+    if per_link_gbps is None:
+        if family in _NONBLOCKING_FAMILIES:
+            return make_topology(bisection_gbps=None, hop_count=1.0)
+        raise ValueError(
+            f"per_link_gbps is required for {family!r} "
+            "(per-link unidirectional GB/s, e.g. 25 for H200 NVLink4 "
+            "= b_link_bytes_per_us / 1000)")
+    lpg = links_per_gpu or _default_links_per_gpu(family, N, **params)
+    bisection_gbps = _bisection_bw_gbps(family, N, lpg, per_link_gbps, **params)
+    hop = _hop_count(family, N, **params)
+    return make_topology(bisection_gbps=bisection_gbps, hop_count=hop)

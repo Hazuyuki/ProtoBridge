@@ -150,3 +150,72 @@ def test_make_topology_unit_conversion():
     assert wb.make_topology(bisection_gbps=50).bisection_bw_bytes_per_us == 50000.0
     assert wb.make_topology(bisection_gbps=50).hop_count == 1.0
     assert wb.make_topology(bisection_gbps=None).bisection_bw_bytes_per_us == float('inf')
+
+
+# ---- make_topology_from_family (name + params auto-compute) ----
+
+def test_make_topology_from_family_switched_is_ideal():
+    """A non-blocking NVSwitch fabric needs no per_link and equals the ideal."""
+    t = wb.make_topology_from_family("switched", N=8)
+    assert t.bisection_bw_bytes_per_us == float('inf')
+    assert t.hop_count == 1.0
+    s = wb.make_surrogate_from_wire(25000, 18, "ring")
+    ideal = s.predict(1 << 24, 8, "ring", credits=128, ber=0)
+    named = s.predict(1 << 24, 8, "ring", credits=128, ber=0, topology=t)
+    assert named == ideal  # byte-identical to topology=None
+
+
+def test_make_topology_from_family_ring_matches_hand_computed():
+    """ring(N=8, per_link=25) -> bisection 2*25=50 GB/s, hop 1 (the doc example)."""
+    t = wb.make_topology_from_family("ring", N=8, per_link_gbps=25)
+    assert t.bisection_bw_bytes_per_us == 50000.0       # 50 GB/s x1000
+    assert t.hop_count == 1.0
+    assert t == wb.make_topology(bisection_gbps=50, hop_count=1)
+
+
+def test_make_topology_from_family_ring_slower_than_ideal():
+    """A ring topology's tight bisection caps the rate -> higher latency."""
+    s = wb.make_surrogate_from_wire(25000, 18, "ring")
+    ideal = s.predict(1 << 24, 8, "ring", credits=128, ber=0)
+    t = wb.make_topology_from_family("ring", N=8, per_link_gbps=25)
+    capped = s.predict(1 << 24, 8, "ring", credits=128, ber=0, topology=t)
+    assert capped > ideal
+
+
+def test_make_topology_from_family_fullmesh_no_cap():
+    """fullmesh(N=8) bisection = 8*7*25/2=700 GB/s >> ring_bw -> uncapped."""
+    t = wb.make_topology_from_family("fullmesh", N=8, per_link_gbps=25)
+    assert t.bisection_bw_bytes_per_us == 700000.0
+    assert t.hop_count == 1.0
+    s = wb.make_surrogate_from_wire(25000, 18, "ring")
+    ideal = s.predict(1 << 24, 8, "ring", credits=128, ber=0)
+    named = s.predict(1 << 24, 8, "ring", credits=128, ber=0, topology=t)
+    assert named == ideal
+
+
+def test_make_topology_from_family_torus_bisection():
+    """3d_torus(N=64, dims=(4,4,4)) bisection = (64//4)*25/2 = 200 GB/s."""
+    t = wb.make_topology_from_family(
+        "3d_torus", N=64, per_link_gbps=25, dims=(4, 4, 4))
+    assert t.bisection_bw_bytes_per_us == 200000.0
+    assert t.hop_count == 1.0
+
+
+def test_make_topology_from_family_leaftier_hop_and_bisection():
+    """leafspine(N=32, num_leaf=8): hop = (23*1+8*2)/31 = 39/31; bisection = 32*8*25/8."""
+    t = wb.make_topology_from_family(
+        "leafspine", N=32, per_link_gbps=25, num_leaf=8)
+    assert abs(t.hop_count - 39.0 / 31.0) < 1e-9
+    assert t.bisection_bw_bytes_per_us == 800000.0          # 800 GB/s x1000
+
+
+def test_make_topology_from_family_ring_requires_per_link():
+    """A bisection-bound family raises without per_link_gbps."""
+    with pytest.raises(ValueError):
+        wb.make_topology_from_family("ring", N=8)
+
+
+def test_make_topology_from_family_unknown_raises():
+    """An unknown family name raises ValueError."""
+    with pytest.raises(ValueError):
+        wb.make_topology_from_family("bogus", N=8, per_link_gbps=25)

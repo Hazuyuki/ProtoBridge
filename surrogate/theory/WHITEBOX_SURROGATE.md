@@ -330,7 +330,52 @@ to the ideal-fabric model, so the calibrated H200 numbers in Section 11 are
 unchanged. The bisection cap applies to the mean serialization term
 (`T_serial`); the `ber > 0` retransmission path keeps the construction
 bandwidth, so for the common `ber = 0` (calibration) regime the mean path is
-fully topology-aware. The two physical numbers can be read from a fuller
-topology module (e.g. `TopoSpec.to_surrogate_params()["bisection_bw_gbps"]` in
-the DSE layer's `topo_grammar`) or supplied by hand; this module ships no
-per-family bisection table.
+fully topology-aware. The two physical numbers can be supplied by hand, or —
+preferred — computed from a topology name via Section 13.
+
+## 13. Topology from a Name
+
+Instead of hand-computing `bisection_gbps` and `hop_count`, give a fabric
+**name** plus physical numbers and let `make_topology_from_family` apply the
+per-family bisection-bandwidth and hop-count formulas copied from the DSE
+topology grammar (`scripts/topo_grammar.py::TopoSpec`):
+
+```python
+from whitebox_surrogate_v2 import make_surrogate_from_wire, make_topology_from_family
+
+s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
+
+# 8-GPU ring fabric: bisection = 2 links x 25 GB/s = 50 GB/s, hop = 1.
+t = make_topology_from_family("ring", N=8, per_link_gbps=25)
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # ~4718 us
+
+# Non-blocking NVSwitch fabric: bisection never caps -> ideal, no per_link needed.
+t_sw = make_topology_from_family("switched", N=8)
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t_sw)  # == topology=None
+```
+
+`family` is one of `ring`, `fullmesh`, `hypercube`, `3d_torus`, `mesh2d`,
+`2dfullmesh`, `switched`, `nvl72`, `multiplane`, `leafspine`, `3levelhier`,
+`fattree`, `railfattree`, `dragonflyplus`, `2dfullmeshclos`. `links_per_gpu`
+defaults per family (ring=2, switched=18, fullmesh=N-1, ...); override it only
+when the fabric is non-standard. Family-specific builder params
+(`dims`/`radix`/`num_leaf`/`num_planes`/`rail_count`/...) are optional kwargs
+with the grammar's defaults.
+
+| `per_link_gbps` convention | Value |
+|---|---|
+| H200 NVLink4 unidirectional | 25 (= `b_link_bytes_per_us / 1000`) |
+
+`per_link_gbps` is the per-link **unidirectional** wire rate in GB/s, matching
+the `b_link_bytes_per_us` used to build the surrogate (`b_link / 1000`). The
+DSE grammar instead keys per-link BW off a `link_tech` table whose NVLink entry
+is the bidirectional 100 GB/s sheet figure; the two are not interchangeable
+because here the bisection caps the surrogate's own algo bandwidth (built from
+`b_link`), so the units must agree with `b_link`, not the grammar. The bisection
+**formula** and the hop **functions** are copied verbatim from `TopoSpec`, so a
+name here and `TopoSpec.to_surrogate_params()` in the DSE layer agree on the
+same fabric geometry (modulo the per-link unit convention above). For
+non-blocking NVSwitch fabrics (`switched`/`nvl72`/`multiplane`) the bisection is
+effectively infinite and `hop_count` = 1, so the result is byte-identical to
+`topology=None`; `per_link_gbps` may be omitted for those families. `N < 2` is
+degenerate and returns the ideal fabric.
