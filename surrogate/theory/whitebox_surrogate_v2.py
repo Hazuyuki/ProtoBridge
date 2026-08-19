@@ -36,6 +36,31 @@ Key derivations (see WHITEBOX_SURROGATE.md for the complete equations):
 """
 
 import math
+from dataclasses import dataclass
+
+
+@dataclass
+class Topology:
+    """Optional fabric-topology descriptor for ``predict(topology=...)``.
+
+    Captures the two physical quantities by which the interconnect topology
+    influences latency, so the theory model (otherwise calibrated to an ideal
+    non-blocking NVSwitch fabric) can honor a real fabric:
+
+    * ``bisection_bw_bytes_per_us`` caps the schedule's effective serialization
+      rate via ``min(<algo_bw>, bisection)``. A non-blocking NVSwitch fabric has
+      effectively infinite bisection (no cap); a ring / 2-D torus has a tight
+      bisection that caps the per-GPU usable bandwidth down.
+    * ``hop_count`` adds ``(hop_count - 1) * link_latency`` of per-step link
+      propagation. The default 1.0 (one switch traversal) reproduces the
+      ideal-fabric model; a k-tier fat-tree / leaf-spine sets it to its depth.
+
+    Units are bytes/µs (matching ``ring_bw`` etc.); ``make_topology`` accepts the
+    more natural GB/s. Defaults (``Topology()``) reproduce ``topology=None``,
+    so omitting the descriptor is byte-identical to the calibrated model.
+    """
+    bisection_bw_bytes_per_us: float = float('inf')
+    hop_count: float = 1.0
 
 
 class TheoryDerivedSurrogate:
@@ -147,21 +172,29 @@ class TheoryDerivedSurrogate:
 
     # ---- Step time (T_step) ----
 
-    def _step_time(self, per_step, N, algo):
+    def _step_time(self, per_step, N, algo, topology=None):
         """Per-step transfer time (µs).
 
         Ring: T_step = per_step / B_ring + lat
         Tree: T_step = T_min_switch + per_step / (B_tree × log₂N)
         NVLS: T_step = (N × per_step) / B_nvls + lat
+
+        With ``topology`` the schedule bandwidth is capped by the fabric
+        bisection (``min(<algo_bw>, bisection)``) and ``(hop_count - 1) * lat``
+        of multi-hop propagation is added; ``topology=None`` is byte-identical.
         """
+        bsec = (topology.bisection_bw_bytes_per_us
+                if topology is not None else float('inf'))
+        hop = topology.hop_count if topology is not None else 1.0
+        extra_lat = (hop - 1.0) * self.lat
         if algo == 'tree':
             log2N = max(1, int(math.log2(N)))
-            bw_tree = self.tree_bw_per_level * log2N
-            return self.T_min_switch + per_step / bw_tree
+            bw_tree = min(self.tree_bw_per_level * log2N, bsec)
+            return self.T_min_switch + extra_lat + per_step / bw_tree
         elif algo == 'nvls':
-            return (per_step * N) / self.nvls_bw + self.lat
+            return extra_lat + self.lat + (per_step * N) / min(self.nvls_bw, bsec)
         else:
-            return per_step / self.ring_bw + self.lat
+            return extra_lat + self.lat + per_step / min(self.ring_bw, bsec)
 
     # ---- Credit pressure (Phi_credit) ----
 
@@ -559,7 +592,7 @@ class TheoryDerivedSurrogate:
                      fec_t=None, retry_mode='gobackn', retry_buffer_entries=None,
                      retry_buffer_bytes=None,
                      optical_fraction=1.0, optical_hops=1.0,
-                     strict_reliability=False, retry_limit=None):
+                     strict_reliability=False, retry_limit=None, topology=None):
         """Predict tail latency (pXX) in microseconds."""
         if competing_bw is None:
             competing_bw = mem_bw
@@ -572,12 +605,13 @@ class TheoryDerivedSurrogate:
             fec_n=fec_n, fec_k=fec_k, fec_t=fec_t,
             retry_mode=retry_mode, retry_buffer_entries=retry_buffer_entries,
             optical_fraction=optical_fraction, optical_hops=optical_hops,
-            strict_reliability=strict_reliability, retry_limit=retry_limit)
+            strict_reliability=strict_reliability, retry_limit=retry_limit,
+            topology=topology)
         if not math.isfinite(mean):
             return mean
         steps = self._steps(num_gpus, algo)
         T_step = self._step_time(self._per_step(data_bytes, num_gpus, algo, steps),
-                                  num_gpus, algo)
+                                  num_gpus, algo, topology)
         var_step = self._step_variance(T_step, data_bytes, num_gpus, algo,
                                         credits, ber, competing_bw, llr_enabled,
                                         fec_enabled, fec_n, fec_k, fec_t,
@@ -616,7 +650,8 @@ class TheoryDerivedSurrogate:
                 optical_fraction=1.0, optical_hops=1.0,
                 strict_reliability=False, retry_limit=None,
                 include_credit=True, include_fec=True,
-                include_retransmission=True, include_contention=True):
+                include_retransmission=True, include_contention=True,
+                topology=None):
         """Predict mean collective latency (µs).
 
         L = S_startup
@@ -636,16 +671,20 @@ class TheoryDerivedSurrogate:
         steps = self._steps(num_gpus, algo)
         per_step = self._per_step(data_bytes, num_gpus, algo, steps)
 
+        bsec = (topology.bisection_bw_bytes_per_us
+                if topology is not None else float('inf'))
+        hop = topology.hop_count if topology is not None else 1.0
+
         if algo == 'tree':
             log2N = max(1, int(math.log2(num_gpus)))
-            T_fixed_step = self.T_min_switch
-            T_serial_step = per_step / (self.tree_bw_per_level * log2N)
+            T_fixed_step = self.T_min_switch + (hop - 1.0) * self.lat
+            T_serial_step = per_step / min(self.tree_bw_per_level * log2N, bsec)
         elif algo == 'nvls':
-            T_fixed_step = self.lat
-            T_serial_step = (per_step * num_gpus) / self.nvls_bw
+            T_fixed_step = self.lat + (hop - 1.0) * self.lat
+            T_serial_step = (per_step * num_gpus) / min(self.nvls_bw, bsec)
         else:
-            T_fixed_step = self.lat
-            T_serial_step = per_step / self.ring_bw
+            T_fixed_step = self.lat + (hop - 1.0) * self.lat
+            T_serial_step = per_step / min(self.ring_bw, bsec)
 
         Phi_cr = (self._credit_pressure(
             data_bytes, num_gpus, algo, credits) if include_credit else 1.0)
@@ -840,3 +879,15 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
     )
     derived.update(overrides)
     return make_surrogate(algo, **derived)
+
+
+def make_topology(bisection_gbps=None, hop_count=1.0):
+    """Build a ``Topology`` from a bisection bandwidth in GB/s.
+
+    1 GB/s = 1000 bytes/µs (the surrogate's bandwidth units). ``bisection_gbps``
+    is the fabric's bisection bandwidth; pass ``None`` (default) for a
+    non-blocking fabric whose bisection never caps the schedule rate.
+    ``hop_count`` is the fabric path length in link hops (1 = single switch).
+    """
+    bsec = bisection_gbps * 1000.0 if bisection_gbps is not None else float('inf')
+    return Topology(bisection_bw_bytes_per_us=bsec, hop_count=hop_count)

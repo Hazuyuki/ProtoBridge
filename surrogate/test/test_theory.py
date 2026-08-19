@@ -105,3 +105,48 @@ def test_surrogate_from_wire_reproduces_h200_ring_measurement():
         b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
     pred = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)
     assert abs(pred - 1347.65) / 1347.65 <= 0.05
+
+
+# ---- topology kwarg (bisection cap on bandwidth + hop latency) ----
+
+def test_topology_none_byte_identical():
+    """Omitting topology and passing topology=None give the same prediction."""
+    s = wb.make_h200_ring_theory()
+    a = s.predict(1 << 22, 8, "ring", credits=32, ber=0)
+    b = s.predict(1 << 22, 8, "ring", credits=32, ber=0, topology=None)
+    assert a == b
+
+
+def test_topology_default_reproduces_ideal():
+    """Topology() with defaults (inf bisection, hop=1) == ideal fabric."""
+    s = wb.make_h200_ring_theory()
+    a = s.predict(1 << 22, 8, "ring", credits=32, ber=0)
+    b = s.predict(1 << 22, 8, "ring", credits=32, ber=0, topology=wb.Topology())
+    assert a == b
+
+
+def test_topology_bisection_caps_bandwidth():
+    """A tight fabric bisection caps the schedule rate -> higher latency."""
+    s = wb.make_h200_ring_theory()
+    ideal = s.predict(1 << 24, 8, "ring", credits=128, ber=0)
+    # 8-GPU ring topology: bisection = 2 links x 25 GB/s = 50 GB/s
+    t = wb.make_topology(bisection_gbps=50, hop_count=1)
+    capped = s.predict(1 << 24, 8, "ring", credits=128, ber=0, topology=t)
+    assert capped > ideal
+
+
+def test_topology_hop_count_adds_latency():
+    """A multi-hop fabric (hop_count>1) adds per-step link propagation."""
+    s = wb.make_h200_ring_theory()
+    ideal = s.predict(1 << 24, 8, "ring", credits=128, ber=0)
+    t = wb.make_topology(bisection_gbps=None, hop_count=3)
+    multi = s.predict(1 << 24, 8, "ring", credits=128, ber=0, topology=t)
+    # ring: 2(N-1)=14 steps, each adds (hop-1)*link_lat = (3-1)*0.4us -> +11.2us
+    assert abs((multi - ideal) - 14 * (3 - 1) * 0.4) < 1e-6
+
+
+def test_make_topology_unit_conversion():
+    """make_topology takes bisection in GB/s and stores bytes/us (x1000)."""
+    assert wb.make_topology(bisection_gbps=50).bisection_bw_bytes_per_us == 50000.0
+    assert wb.make_topology(bisection_gbps=50).hop_count == 1.0
+    assert wb.make_topology(bisection_gbps=None).bisection_bw_bytes_per_us == float('inf')

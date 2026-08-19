@@ -285,3 +285,52 @@ band, anchoring eta_ring in physics rather than as a fit coefficient. The
 calibrated `make_h200_*` factories still ship the exact measured values; this
 is the single-parameter entry point for a new platform where only the
 per-link wire rate is known.
+
+## 12. Topology (optional)
+
+By default the model assumes an ideal non-blocking NVSwitch fabric: the
+schedule bandwidths (`ring_bw`/`tree_bw`/`nvls_bw` = `eta * B_agg`) are the
+per-GPU injection rate on a fabric with effectively infinite bisection, and
+the per-step fixed latency is one switch traversal. Pass an optional
+`topology` descriptor to `predict()` to model how a real interconnect topology
+influences those two parameters:
+
+```python
+from whitebox_surrogate_v2 import make_surrogate_from_wire, make_topology
+
+s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
+
+# Ideal NVSwitch fabric (the default): 256 MiB ring AllReduce on 8 GPUs.
+ideal = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)            # ~1325 us
+
+# Same ring algorithm on an actual 8-GPU ring topology: bisection = 2 links
+# x 25 GB/s = 50 GB/s, which caps the schedule rate down.
+ring_topo = make_topology(bisection_gbps=50, hop_count=1)
+slow = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0,
+                 topology=ring_topo)                                        # ~4718 us
+```
+
+`Topology` carries the two physical quantities by which topology influences
+latency:
+
+| Field | Effect | Default |
+|---|---|---|
+| `bisection_bw_bytes_per_us` | caps the schedule's serialization rate via `min(<algo_bw>, bisection)` | `inf` (no cap) |
+| `hop_count` | adds `(hop_count - 1) * link_latency` of per-step propagation | `1.0` (one switch) |
+
+A non-blocking NVSwitch fabric leaves `bisection` infinite (no cap, `hop=1`);
+a ring / 2-D torus has a tight bisection that caps the per-GPU usable
+bandwidth; a k-tier fat-tree / leaf-spine sets `hop_count` to its depth.
+`make_topology(bisection_gbps=…, hop_count=…)` accepts the bisection in GB/s
+(1 GB/s = 1000 B/µs) and converts; the raw `Topology` field is in B/µs to
+match the bandwidth parameters.
+
+Omitting `topology` (or passing `Topology()` with defaults) is byte-identical
+to the ideal-fabric model, so the calibrated H200 numbers in Section 11 are
+unchanged. The bisection cap applies to the mean serialization term
+(`T_serial`); the `ber > 0` retransmission path keeps the construction
+bandwidth, so for the common `ber = 0` (calibration) regime the mean path is
+fully topology-aware. The two physical numbers can be read from a fuller
+topology module (e.g. `TopoSpec.to_surrogate_params()["bisection_bw_gbps"]` in
+the DSE layer's `topo_grammar`) or supplied by hand; this module ships no
+per-family bisection table.
