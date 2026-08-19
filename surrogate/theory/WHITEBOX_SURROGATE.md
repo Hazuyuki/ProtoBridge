@@ -5,6 +5,43 @@ This document specifies the surrogate implemented in
 communication operation. It is used to screen broad design spaces before
 selected candidates are evaluated with ProtoBridge.
 
+## Quick Start — Recommended Entry
+
+The recommended way to construct a surrogate for any platform is the
+single-wire-rate factory `make_surrogate_from_wire`. It derives every
+schedule bandwidth from one physical input — the per-GPU NVLink
+aggregate `B_agg = num_lanes * b_link` — plus three N-independent
+efficiency factors, so no per-bandwidth calibration is required:
+
+```python
+from whitebox_surrogate_v2 import make_surrogate_from_wire
+
+# H200 NVLink4: 25 GB/s per link, 18 links per GPU
+s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
+
+# Mean latency of a 256 MiB ring AllReduce on 8 GPUs
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)
+```
+
+| Input | Meaning | H200 |
+|---|---|---|
+| `b_link_bytes_per_us` | single NVLink unidirectional wire rate | 25000 |
+| `num_lanes` | NVLink links per GPU | 18 |
+| `algo` | ring / tree / nvls | — |
+| `eta_ring`, `eta_tree`, `eta_nvls` (optional, defaulted) | efficiency factors | 0.40 / 1.05 / 1.20 |
+
+Derived bandwidths: `ring_bw = packet_bw = eta_ring * B_agg`,
+`tree_bw = (B_agg / num_lanes) * eta_tree`, `nvls_bw = eta_nvls * B_agg`
+(all within 2% of the calibrated H200 values; the efficiency factors are
+N-independent — N enters only the collective topology in `predict()`, see
+Section 3 and Section 11).
+
+The `make_h200_ring_theory` / `make_h200_tree_theory` /
+`make_h200_nvls_theory` factories are preset profiles that ship the exact
+calibrated H200 numbers — use them when you want the measured values rather
+than the wire-rate derivation. `predict()` then takes the operation inputs
+(`data_bytes`, `num_gpus`, `algo`, `credits`, ...) described in Section 2.
+
 ## 1. Design Rule
 
 The surrogate keeps fixed latency separate from serialized packet work:
