@@ -4,6 +4,12 @@ ProtoBridge ships a latency surrogate so broad design spaces can be screened
 without running the full ns-3 sweep. It is grounded in the H200 NVLink4
 reference (see [CALIBRATION.md](CALIBRATION.md)).
 
+> **New here?** [`surrogate/theory/USER_GUIDE.md`](../surrogate/theory/USER_GUIDE.md)
+> is the human-friendly getting-started guide (30-second quickstart, full input
+> reference, copy-paste recipes). This page is a short overview + parameter
+> table; the full derivation is in
+> [`surrogate/theory/WHITEBOX_SURROGATE.md`](../surrogate/theory/WHITEBOX_SURROGATE.md).
+
 ## Theory-derived surrogate — `surrogate/theory/`
 
 `whitebox_surrogate_v2.py` is a first-principles physical model. The full
@@ -23,7 +29,14 @@ L_hat = S_protocol                              # protocol startup (LL/LL128 ~15
 ```
 
 H200 factory functions: `make_h200_ring_theory()`, `make_h200_tree_theory()`,
-`make_h200_nvls_theory()`, `make_1024_optical_fattree_theory()`.
+`make_h200_nvls_theory()`, `make_1024_optical_fattree_theory()`. For a new
+platform where only the per-link wire rate is known, the **recommended** entry
+is the single-wire-rate factory `make_surrogate_from_wire(b_link, num_lanes,
+algo)`, which derives every schedule bandwidth from one input (see §11 of
+`WHITEBOX_SURROGATE.md`). Pass an optional `topology=` descriptor (built via
+`make_topology_from_family(family, N, per_link_gbps=...)`) to model a real
+fabric's bisection cap and hop count; omit it for the default ideal NVSwitch
+fabric (byte-identical to the pre-topology model).
 
 ```python
 import whitebox_surrogate_v2 as wb
@@ -57,7 +70,7 @@ The parameters that move the clean (ber=0) mean latency:
 
 | Parameter | Units | Affects | H200 ring |
 |-----------|-------|---------|-----------|
-| `ring_bw_bytes_per_us` | bytes/µs | ring serialization | 94000 |
+| `ring_bw_bytes_per_us` | bytes/µs | ring serialization | 177000 |
 | `tree_bw_per_level_bytes_per_us` | bytes/µs | tree serialization | 26250 |
 | `nvls_bw_bytes_per_us` | bytes/µs | NVLS serialization | 535500 |
 | `link_latency_us` | µs (400 ns = 0.4) | ring/nvls propagation | 0.4 |
