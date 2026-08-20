@@ -5,16 +5,11 @@ calibration in this release.
 
 ## Hardware reference
 
-| Parameter | Value |
-|-----------|-------|
-| GPU | NVIDIA H200 |
-| NVLink generation | NVLink4 |
-| Links per GPU | 18 |
-| Peak aggregate bandwidth | 900 GB/s bidirectional (450 GB/s per direction; 7200 Gbps) |
-| Link latency | 400 ns |
-| FEC | RS(544, 514, 15) |
-| Per-TypeId startup delay | LL 15000 / LL128 25000 / SIMPLE 46000 / NVLS 23000 ns |
-| Protocol profile | `configs/protocol_profiles/h200-ll128.profile` |
+H200 NVLink4 is the calibration reference; the fabric-hardware + protocol
+values live in
+[`configs/protocol_profiles/h200-ll128.profile`](../configs/protocol_profiles/h200-ll128.profile)
+(annotated in [`doc/CONFIG_GUIDE.md`](CONFIG_GUIDE.md) §3). The 4-GPU baseline
+recipe below carries the exact runtime values it uses.
 
 ## Calibration data (`surrogate/calibration/`)
 
