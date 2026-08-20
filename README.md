@@ -1,5 +1,11 @@
 # ProtoBridge — An ns-3-Based LLM-to-Packet Simulator for Superpod Interconnect Exploration
 
+> **Repo scope.** This repository bundles the full ns-3.47 framework, so it
+> builds standalone — `./ns3` and `CMakeLists.txt` are the ns-3 build system.
+> The ProtoBridge-specific code is `src/gpu-cluster/` (OTP + PEX + NVSwitch +
+> injectors), `surrogate/` (latency model), `configs/`, and the two `scratch/`
+> entry points; everything else is stock ns-3.
+
 Larger LLMs and longer contexts exceed the memory of a single GPU, so serving
 systems partition weights, key-value cache, and activations across many
 devices. Partitioning relieves memory pressure but introduces collective,
@@ -107,12 +113,6 @@ FabricHeader layout, the four-tier resilience model, and the topology grammar.
 ./ns3 configure --enable-examples --enable-tests -d debug
 ./ns3 build
 ```
-
-> **Repo scope.** This repository bundles the full ns-3.47 framework, so it
-> builds standalone — `./ns3` and `CMakeLists.txt` are the ns-3 build system.
-> The ProtoBridge-specific code is `src/gpu-cluster/` (OTP + PEX + NVSwitch +
-> injectors), `surrogate/` (latency model), `configs/`, and the two `scratch/`
-> entry points; everything else is stock ns-3.
 
 ### Run a collective from a config (primary form)
 

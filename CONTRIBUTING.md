@@ -8,9 +8,13 @@ collective injectors, credit flow control, four-tier FEC/retry resilience),
 the `surrogate/` latency models (calibrated on H200 NVLink4), and `configs/`
 profiles. **Everything outside `src/gpu-cluster/`, `surrogate/`,
 `configs/protocol_profiles/`, `configs/protocol_configs/`, `configs/dse/`,
-`test/parity/`, `doc/`, `scratch/gpu-cluster-sim.cc`, and
+`test/parity/`, `doc/ARCHITECTURE.md`, `doc/CALIBRATION.md`,
+`doc/CONFIG_GUIDE.md`, `scratch/gpu-cluster-sim.cc`, and
 `scratch/protocol-profile-demo.cc` is stock ns-3** — direct those questions to
-the upstream ns-3 project, not here.
+the upstream ns-3 project, not here. The root-level `README.md`,
+`CONTRIBUTING.md`, `CHANGES.md`, `RELEASE_NOTES.md`, and `AUTHORS`, plus
+`.github/workflows/ci.yml`, are also ProtoBridge-maintained (the rest of `doc/`
+is the stock ns-3 manual/tutorial tree).
 
 **Where to contribute.** Contributions are welcome against:
 - `src/gpu-cluster/` — the fabric models (NVSwitch, FabricEndpoint, FecModel,
