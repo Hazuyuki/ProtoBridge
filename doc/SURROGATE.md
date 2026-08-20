@@ -21,8 +21,8 @@ work:
 L_hat = S_protocol                              # protocol startup (LL/LL128 ~15us, SIMPLE ~65us)
         + steps * T_fixed                        # per-step fixed (hop × link latency + sw overhead)
         + steps * T_serial * Phi_credit          # serialized bytes / effective_bw
-                         * Phi_fec               #   × FEC bandwidth overhead (K/N)
-                         * Phi_share             #   × contention share (WFQ)
+                         * Phi_fec               #   × FEC bandwidth overhead (N/K)
+                         * Phi_share             #   × contention share (residual capacity, 1/(1−ρ))
         + T_retransmission                       # GBN/SACK retransmission tail
         + T_reload                               # LLR buffer reload
         + T_fec_latency                         # FEC encode + decode latency
@@ -33,20 +33,22 @@ H200 factory functions: `make_h200_ring_theory()`, `make_h200_tree_theory()`,
 platform where only the per-link wire rate is known, the **recommended** entry
 is the single-wire-rate factory `make_surrogate_from_wire(b_link, num_lanes,
 algo)`, which derives every schedule bandwidth from one input (see §11 of
-`WHITEBOX_SURROGATE.md`). Pass an optional `topology=` descriptor (built via
-`make_topology_from_family(family, N, per_link_gbps=...)`) to model a real
+`WHITEBOX_SURROGATE.md`). Pass an optional `topology=` descriptor — a
+`Topology` dataclass built via `make_topology(bisection_gbps=, hop_count=)` or
+`make_topology_from_family(family, N, per_link_gbps=...)` — to model a real
 fabric's bisection cap and hop count; omit it for the default ideal NVSwitch
 fabric (byte-identical to the pre-topology model).
 
 ```python
-import whitebox_surrogate_v2 as wb
+from surrogate.theory import whitebox_surrogate_v2 as wb
 s = wb.make_h200_ring_theory()
 lat_us = s.predict(data_bytes=1<<20, num_gpus=4, algo="ring", credits=32, ber=0)
 ```
 
 Because it is a physical derivation (no firmware/arbiter/VOQ overhead), it is a
-**lower bound** on the ns-3 measurement — typically 0.6–0.75× the simulated
-latency. Use it for ordering and trend analysis, not absolute prediction.
+**lower bound** on the ns-3 measurement — the theory/ns-3 ratio is
+credit-sensitive (see [CALIBRATION.md](CALIBRATION.md) for the pinned range).
+Use it for ordering and trend analysis, not absolute prediction.
 
 ## Defining custom hardware
 
@@ -56,7 +58,7 @@ anchor value (the full list, with units and the H200 value, is in the
 `TheoryDerivedSurrogate` class docstring):
 
 ```python
-import whitebox_surrogate_v2 as wb
+from surrogate.theory import whitebox_surrogate_v2 as wb
 # H200 ring profile, but with 8 NVLink lanes and a 7us protocol startup:
 s = wb.make_h200_ring_theory(num_lanes=8, startup_us=7)
 # or construct from scratch for a non-H200 platform:

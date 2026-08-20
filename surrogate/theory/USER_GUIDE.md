@@ -18,7 +18,7 @@ absolute single-point prediction.
 ## 1. 30-second quickstart
 
 ```python
-from whitebox_surrogate_v2 import make_surrogate_from_wire
+from surrogate.theory.whitebox_surrogate_v2 import make_surrogate_from_wire
 
 # Build a surrogate for H200 NVLink4: 25 GB/s per link, 18 links per GPU.
 s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
@@ -75,7 +75,7 @@ only the per-link wire rate is known.
 ### H200 measured presets
 
 ```python
-from whitebox_surrogate_v2 import make_h200_ring_theory, make_h200_tree_theory, make_h200_nvls_theory
+from surrogate.theory.whitebox_surrogate_v2 import make_h200_ring_theory, make_h200_tree_theory, make_h200_nvls_theory
 s = make_h200_ring_theory()      # ships the exact calibrated H200 ring numbers
 ```
 
@@ -88,7 +88,7 @@ Pass `**overrides` to either factory to replace any anchor value, or construct
 directly for a non-H200 platform:
 
 ```python
-import whitebox_surrogate_v2 as wb
+from surrogate.theory import whitebox_surrogate_v2 as wb
 s = wb.make_h200_ring_theory(num_lanes=8, startup_us=7)          # H200 ring, 8 lanes, 7us startup
 s = wb.TheoryDerivedSurrogate(ring_bw_bytes_per_us=120000, link_latency_us=0.3,
                               credit_bdp_ring_packets=60, startup_us=10.0, num_lanes=8)
@@ -152,7 +152,7 @@ it, simplest first:
 ### ① Name + physical numbers (recommended)
 
 ```python
-from whitebox_surrogate_v2 import make_topology_from_family
+from surrogate.theory.whitebox_surrogate_v2 import make_topology_from_family
 
 # 8-GPU ring fabric: bisection = 2 links x 25 GB/s = 50 GB/s, hop = 1.
 t = make_topology_from_family("ring", N=8, per_link_gbps=25)
@@ -162,7 +162,7 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # ~471
 `make_topology_from_family(family, N, links_per_gpu=None, per_link_gbps=None, **params)`
 applies the per-family bisection + hop formulas copied from ProtoBridge's DSE
 topology grammar, so a **name** + physical numbers yield a `Topology`. Supports
-14 families: `ring`, `fullmesh`, `hypercube`, `3d_torus`, `mesh2d`,
+15 families: `ring`, `fullmesh`, `hypercube`, `3d_torus`, `mesh2d`,
 `2dfullmesh`, `switched`, `nvl72`, `multiplane`, `leafspine`, `3levelhier`,
 `fattree`, `railfattree`, `dragonflyplus`, `2dfullmeshclos`. Family-specific
 builder params (`dims`, `radix`, `num_leaf`, `num_planes`, `rail_*`, ...) are
@@ -179,14 +179,14 @@ optional kwargs.
 ### ② Hand-computed two numbers
 
 ```python
-from whitebox_surrogate_v2 import make_topology
+from surrogate.theory.whitebox_surrogate_v2 import make_topology
 t = make_topology(bisection_gbps=50, hop_count=1)        # 50 GB/s bisection, 1 hop
 ```
 
 ### ③ Raw dataclass
 
 ```python
-from whitebox_surrogate_v2 import Topology
+from surrogate.theory.whitebox_surrogate_v2 import Topology
 t = Topology(bisection_bw_bytes_per_us=50000.0, hop_count=1.0)   # raw B/us
 ```
 
@@ -216,7 +216,7 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)        # 1325.5 us
 ### B. Same ring algorithm on a real 8-GPU ring fabric (topology bites)
 
 ```python
-from whitebox_surrogate_v2 import make_topology_from_family
+from surrogate.theory.whitebox_surrogate_v2 import make_topology_from_family
 t = make_topology_from_family("ring", N=8, per_link_gbps=25)
 s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # ~4718 us
 ```
@@ -231,9 +231,12 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # == t
 ### D. Link degradation — BER + FEC
 
 ```python
-# Pre-FEC BER 1e-6, RS(544,514,15) FEC enabled, Go-Back-N retransmission.
-s.predict(64 * 1024 * 1024, 8, "ring", credits=128, ber=1e-6,
-         fec_enabled=True, fec_n=544, fec_k=514, fec_t=15, retry_mode="gobackn")
+# Pre-FEC BER 1e-3 (residual post-FEC error > 0), RS(544,514,15) FEC + LLR
+# Go-Back-N retransmission: the ~370us tail is dominated by GBN retransmission
+# (at ber<=1e-4 or without llr_enabled, retransmission is 0).
+s.predict(64 * 1024 * 1024, 8, "ring", credits=128, ber=1e-3,
+         llr_enabled=True, fec_enabled=True, fec_n=544, fec_k=514, fec_t=15,
+         retry_mode="gobackn")
 ```
 
 ### E. Contention from a concurrent flow
@@ -273,7 +276,9 @@ s.predict_tail(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, percentile=99)
 
 **Does not (by design):**
 - Model firmware / arbiter / VOQ drain overhead → it is a **lower bound**
-  (typically 0.6–0.75× ns-3). Use it for ordering/trends, not absolutes.
+  (a lower bound on ns-3; the theory/ns-3 ratio is credit-sensitive — see
+  [CALIBRATION.md](../../doc/CALIBRATION.md)). Use it for ordering/trends, not
+  absolutes.
 - The `ber > 0` retransmission path keeps the **construction** bandwidth
   (topology's effect on retransmission is second-order); only the `ber = 0`
   mean path is fully topology-aware. See §12 of `WHITEBOX_SURROGATE.md`.

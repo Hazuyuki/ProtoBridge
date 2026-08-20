@@ -118,7 +118,8 @@ per_step_delay = 0
 
 # The transfer stencil, evaluated per instance with gpu/step/N/segment in
 # scope. flowId and stageId are assigned by the compiler (baseFlowId +
-# stage counter). kind ∈ DATA | P2P | MEMORY_READ | MEMORY_WRITE.
+# stage counter). kind ∈ DATA (alias SEND_DATA) | P2P | MEMORY_READ |
+# MEMORY_WRITE | COLLECTIVE (collective offload → ALLREDUCE).
 transfer.0.kind  = DATA
 transfer.0.src   = gpu
 transfer.0.dst   = (gpu + 1) mod N
@@ -133,9 +134,10 @@ complete = all
 
 Instead of a transfer stencil, an `[op]` may set `collective = <c>` +
 `algorithm = <a>` (ring/tree/sharp/hierarchical/nvls) to delegate to a
-calibrated inline injector. The simulator sources the profile's PEX +
-fabric-hardware keys into the same local CLI variables the inline path
-consumes, then runs the injector verbatim — so a `.cfg` run is
+calibrated inline injector. The simulator sources the profile's
+fabric-hardware + protocol keys into the same local CLI variables the inline
+path consumes (the PEX-bundle keys go to the bundle object via `Build()`, not
+CLI vars), then runs the injector verbatim — so a `.cfg` run is
 **bit-identical** to the inline path with the profile's values as flags
 (verified by `test/parity/test_config_vs_inline_parity.py`). The
 `topology =` key overrides the CLI fabric (ring allreduce needs
@@ -176,19 +178,24 @@ LL128 25 µs / SIMPLE 46 µs / NVLS 23 µs) and fabric hardware, their latency i
 ## FabricHeader layout
 
 ```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| PacketType(8) | FabricType(8) | VirtualChan(8)| VirtualLane(8)|
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| MemoryAccess(8)|      FlowId(16)              |  SourceRank(16)|
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       SequenceNumber(32)                       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  DestRank(16)  | PayloadSize(16) |  CreditCount(16)            |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Protocol(8) |  TTL(8)  |        EffectiveDataSize(32)          |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  Offset  Field              Width
+    0     PacketType           8
+    1     FabricType            8
+    2     VirtualChannel       8
+    3     VirtualLane           8
+    4     MemoryAccessType      8
+    5     FlowId              16
+    7     SequenceNumber      32
+   11     SourceRank          16
+   13     DestRank            16
+   15     PayloadSize         32
+   19     CreditCount         16
+   21     Protocol             8
+   22     TTL                   8
+   23     EffectiveDataSize   32
+   27     SrcMac              48
+   33     DstMac              48
+                               ── total 39 bytes, 16 fields
 ```
 
 `FabricPacketType` (the first byte): `DATA`, `CREDIT`, `ACK`, `NACK`,
@@ -235,7 +242,7 @@ cannot exist without it. `FabricHeader`-as-39-byte-wire-encoding is the
 becomes available, the on-wire bytes (and the serialization overhead they
 model) can be swapped without touching the control semantics, which would then
 flow through a side channel (a `PacketTag`) rather than the wire header. The
-default 39-byte encoding is what the calibration invariants (88.2 µs / 44.6 µs)
+default 39-byte encoding is what the calibration invariants (the config-vs-inline `simTimeNs` equality asserted by `test/parity/test_config_vs_inline_parity.py`; see [CONTRIBUTING.md](../CONTRIBUTING.md))
 are pinned to; swapping the wire encoding requires re-calibration. **Contract
 ≠ encoding.**
 
@@ -284,7 +291,9 @@ that reproduces the simulator's historical (calibration-identical) behavior.
   non-empty and whose egress link is free — the non-blocking crossbar model.
   Install another policy on a switch via `NvSwitch::SetArbiter()` (or, on the
   multi-node path, `MultiNodeTopologyHelper::SetArbiter()` / the `--arbiter`
-  CLI flag, e.g. `--arbiter=ns3::WfqArbiter`).
+  CLI flag, e.g.
+  `--arbiter=ns3::RoundRobinArbiter`, the only shipped `Arbiter` subclass; pass
+  the TypeId of your own `Arbiter` subclass for a custom policy).
 - **Flow control — virtual send-gate hook.** `FabricEndpoint::FlowControlGate`
   is `virtual`. The built-in `FlowControlPolicy` enum (CREDIT/WINDOW/RATE) is
   the 3-policy fast path; a subclass can override `FlowControlGate` to plug an

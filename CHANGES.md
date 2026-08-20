@@ -1,3 +1,37 @@
+# ProtoBridge module change history
+
+ProtoBridge bundles a self-authored `src/gpu-cluster/` module (OTP/PEX packet
+execution + NVSwitch + collective injectors + four-tier FEC/retry), a
+`surrogate/` latency model, and `configs/` profiles on top of the upstream
+ns-3.47 framework whose change history follows after the separator. Only
+ProtoBridge-visible changes are listed here.
+
+### Breaking — `[op]` declares the three CLI axes directly (22e8edc)
+
+A `.cfg` `[op]` now declares the three real CLI axes directly —
+`collective =` + `algorithm =` (+ optional `topology =`) — instead of the
+opaque single-keyword selector that previously mapped the values
+`ring`/`tree`/`sharp`/`hierarchical`/`nvls` to a preset. That selector, its
+internal map, and the `Get*()` accessors behind it were removed (replaced by
+`GetCollective()`/`GetAlgorithm()`/`GetTopology()`); the parity test was
+renamed `test_config_builtin_parity.py` -> `test_config_vs_inline_parity.py`
+(the case table `BUILTIN_CASES` -> `OP_CASES`). The old single-keyword form
+is no longer accepted; config runs stay bit-identical to the inline path
+(`simTimeNs` equality).
+
+### New — surrogate `topology=` descriptor (98030aa, f3f6478)
+
+`TheoryDerivedSurrogate.predict()` / `predict_tail()` accept an optional
+`topology=` argument (a `Topology` dataclass) that applies a bisection-bandwidth
+cap to the serialization term and `(hop-1) * link_latency` of per-step
+propagation. Build it with `make_topology(bisection_gbps=, hop_count=)` or
+`make_topology_from_family(family, N, per_link_gbps=)` (15 fabric families);
+omitting it is byte-identical to the ideal-fabric default. See `doc/SURROGATE.md`.
+
+See `README.md` and `doc/` for the full module overview.
+
+---
+
 # ns-3: API and model change history
 
 ns-3 is an evolving system and there will be API or behavioral changes from time to time. Users who try to use scripts or models across versions of ns-3 may encounter problems at compile time, run time, or may see the simulation output change.

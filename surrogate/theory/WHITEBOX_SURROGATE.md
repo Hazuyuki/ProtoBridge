@@ -14,7 +14,7 @@ aggregate `B_agg = num_lanes * b_link` — plus three N-independent
 efficiency factors, so no per-bandwidth calibration is required:
 
 ```python
-from whitebox_surrogate_v2 import make_surrogate_from_wire
+from surrogate.theory.whitebox_surrogate_v2 import make_surrogate_from_wire
 
 # H200 NVLink4: 25 GB/s per link, 18 links per GPU
 s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
@@ -115,8 +115,9 @@ The current H200 profile uses:
 Ring uses link propagation for `T_fixed`. Tree uses the switched-path pipeline
 delay. NVLS uses its multicast schedule and startup profile.
 
-Ring's 177,000 B/us = 0.40 * B_agg (B_agg = num_lanes * b_link), corrected
-from 94,000; see section 11. The MAPE figures in section 9 are a
+Ring's 177,000 B/us ≈ 0.40 × B_agg (B_agg = num_lanes * b_link; the wire-rate
+derivation gives 180,000, of which 177,000 is the calibrated value — see
+section 11), corrected from 94,000. The MAPE figures in section 9 are a
 pre-correction exp3 snapshot run in the parent repo and are not re-derived
 here.
 
@@ -296,7 +297,7 @@ the per-step fixed latency is one switch traversal. Pass an optional
 influences those two parameters:
 
 ```python
-from whitebox_surrogate_v2 import make_surrogate_from_wire, make_topology
+from surrogate.theory.whitebox_surrogate_v2 import make_surrogate_from_wire, make_topology
 
 s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
 
@@ -341,7 +342,7 @@ per-family bisection-bandwidth and hop-count formulas copied from the DSE
 topology grammar (`scripts/topo_grammar.py::TopoSpec`):
 
 ```python
-from whitebox_surrogate_v2 import make_surrogate_from_wire, make_topology_from_family
+from surrogate.theory.whitebox_surrogate_v2 import make_surrogate_from_wire, make_topology_from_family
 
 s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
 

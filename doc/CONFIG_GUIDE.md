@@ -39,8 +39,9 @@ topology   = ring         # optional: overrides the CLI fabric
 ### 2a. Collective + algorithm delegation (primary, calibrated, bit-identical)
 
 Declaring `collective = <c>` + `algorithm = <a>` delegates to the calibrated
-inline injector. The simulator sources the profile's PEX + fabric-hardware
-keys into the same local CLI variables the inline path consumes, then runs the
+inline injector. The simulator sources the profile's fabric-hardware + protocol
+keys into the same local CLI variables the inline path consumes (the PEX-bundle
+keys go to the bundle object via `Build()`, not CLI vars), then runs the
 injector **verbatim**. Because every sourced key maps 1:1 to an inline CLI
 flag, the `.cfg` run is **bit-identical** to the inline path with the
 profile's values as flags (same code, same values, same `RngRun`).
@@ -68,22 +69,23 @@ ping-pong example.
 
 ## 3. The `.profile` keys
 
-`h200-ll128.profile` mirrors `configs/hardware/h200.json`. Keys fall into two
-groups; both are **sourced** into the inline path when an `[op]` declares
-`collective=`+`algorithm=`:
+`h200-ll128.profile` carries the H200 PEX bundle + fabric-hardware keys,
+falling into two groups. The fabric-hardware + protocol keys are **sourced**
+into the inline path's local CLI vars when an `[op]` declares
+`collective=`+`algorithm=`; the PEX-bundle keys below are **not** — they are
+applied to the bundle/endpoint object by `Build()` (`SetAttributeFailSafe`),
+since the collective/algorithm path keeps the inline 1-VC fabric model:
 
-**PEX bundle** (drive the protocol stack — applied to the bundle / endpoint,
-not sourced into CLI vars for the collective/algorithm path, since that path
-keeps the inline 1-VC fabric model):
+**PEX bundle** (drive the protocol stack — applied to the bundle / endpoint
+object, not sourced into CLI vars for the collective/algorithm path; the
+fabric-hardware + protocol groups are the sourced ones — see below):
+`PerGpuStartupDelayNs` likewise is applied to the bundle's protocol model via
+`SetAttributeFailSafe`, not as a CLI var:
 
 ```
-protocolModel      = ns3::NcclProtocolModel
-forceProtocol      = 0          # 0=auto (LL<8KB, LL128 8KB..2MB, SIMPLE>2MB)
 vcCount            = 4
 vcCredits          = 64
 flowControl        = credit
-llrEnabled         = 0
-llrMode            = gobackn
 ```
 
 **Fabric hardware + protocol startup + FEC + BER** (sourced into the local CLI
@@ -99,13 +101,18 @@ linksPerGpu             = 1
 sprayChunkSize          = 131072
 switchVoqDepth          = 10000
 switchArbIntervalNs     = 100
-# protocol startup (per-TypeId; mirrors h200.json startupDelay)
+# protocol startup (per-TypeId)
 StartupDelayLL          = 15000
 StartupDelayLL128       = 25000
 StartupDelaySIMPLE      = 46000
 StartupNVLS             = 23000
 LlThreshold             = 8192
 Ll128Threshold          = 2097152
+# protocol model + link-level retry (sourced into CLI vars)
+protocolModel            = ns3::NcclProtocolModel
+forceProtocol            = 0          # 0=auto (LL<8KB, LL128 8KB..2MB, SIMPLE>2MB)
+llrEnabled               = 0
+llrMode                  = gobackn
 # FEC (RS 544/514/15)
 fecN                    = 544
 fecK                    = 514
@@ -151,8 +158,9 @@ re-run the parity test — a divergence is a behavior change, not a refactor.
 
 ### A new hardware profile
 
-Copy `h200-ll128.profile`, change the fabric-hardware + startup keys (mirroring
-a `configs/hardware/*.json` spec), and reference it from a `.cfg`
+Copy `h200-ll128.profile`, change the fabric-hardware + startup keys (using
+the GPU data-sheet values: per-link NVLink rate, lane count, link latency,
+per-TypeId startup delays), and reference it from a `.cfg`
 `[stack] profile =`. The `bandwidthGbps` value is the effective per-link rate
 for the target GPU count (H200 8-GPU: 375 GB/s aggregate ÷ 18 lanes ≈ 166,
 rounded to the empirical sweep best 170).

@@ -57,7 +57,7 @@ fast enough to sweep many designs where the packet simulator cannot. See
 **Is:** an interconnect-only simulator + a surrogate model. Credit-based flow
 control, packet spraying + reorder, NVSwitch VOQ/crossbar/SHARP, a four-tier
 FEC/retry resilience model, link BER degradation, and a parametric topology
-grammar spanning 12 families.
+grammar spanning 15 families.
 
 **Is not:** a full system simulator. There is no TCP/IP stack and no LLM serving
 runtime (no model execution, KV-cache, memory-hierarchy, or PD-split model);
@@ -145,9 +145,10 @@ and `dataSize` stay on the CLI. See [doc/CONFIG_GUIDE.md](doc/CONFIG_GUIDE.md).
 
 ### Equivalent inline flags
 
-The config form sources the profile into the same local variables the inline
-path consumes, so the two are interchangeable. The ring `.cfg` is bit-identical
-to:
+The config form sources the profile's fabric-hardware + protocol keys into the
+same local CLI variables the inline path consumes (the PEX-bundle keys go to the
+bundle object via `Build()`), so the two are interchangeable. The ring `.cfg`
+is bit-identical to:
 
 ```bash
 ./ns3 run "gpu-cluster-sim --topology=ring --collective=allreduce --algorithm=ring \
@@ -194,18 +195,26 @@ OTP/PEX transaction-graph seam.
 ## Surrogate model
 
 A latency surrogate lives under `surrogate/`, grounded in H200 NVLink4
-(18 NVLinks/GPU, 900 GB/s peak aggregate per direction, 400 ns link latency):
+(18 NVLinks/GPU, 900 GB/s peak aggregate bidirectional — 450 GB/s per direction — 400 ns link latency):
 
 | Model | Location | What it is | Accuracy |
 |-------|----------|------------|----------|
-| Theory-derived | `surrogate/theory/whitebox_surrogate_v2.py` | First-principles physical bound (startup + serialization + credit round-trip + FEC/retry terms) | lower bound, ~0.6–0.75× ns-3 |
+| Theory-derived | `surrogate/theory/whitebox_surrogate_v2.py` | First-principles physical bound (startup + serialization + credit round-trip + FEC/retry terms) | lower bound (see [CALIBRATION.md](doc/CALIBRATION.md) for the credit-pinned ratio) |
+
+For topology-aware prediction, pass an optional `topology=` descriptor to
+`predict()` — the `Topology` dataclass (built via
+`make_topology(bisection_gbps=, hop_count=)` or
+`make_topology_from_family(family, N, per_link_gbps=)` over 15 fabric families)
+applies a bisection-bandwidth cap and hop-count propagation; omitting it is
+byte-identical to the ideal-fabric model. See
+[doc/SURROGATE.md](doc/SURROGATE.md).
 
 ```bash
 # Predict ring allreduce latency at 4 GPU / 1 MiB (theory model, lower bound).
-PYTHONPATH=surrogate/theory python3 -c 'import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory().predict(1<<20,4,"ring",credits=32,ber=0))'
+python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory().predict(1<<20,4,"ring",credits=32,ber=0))'
 
 # Custom hardware: override any H200 parameter (see doc/SURROGATE.md).
-PYTHONPATH=surrogate/theory python3 -c 'import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory(num_lanes=8, startup_us=7).predict(1<<20,4,"ring",credits=32,ber=0))'
+python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory(num_lanes=8, startup_us=7).predict(1<<20,4,"ring",credits=32,ber=0))'
 ```
 
 See [doc/SURROGATE.md](doc/SURROGATE.md) for the derivation and

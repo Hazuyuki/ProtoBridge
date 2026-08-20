@@ -58,6 +58,19 @@ model directly.
      `collective`+`algorithm`+`topology` into the local `collective`/
      `algorithm`/`topology`. Config values win over CLI defaults (config is
      primary); numGpus/dataSize stay CLI.
+     > **Sourcing scope (verified against `scratch/gpu-cluster-sim.cc`).** The
+     > configMode block sources 25 profile keys into the inline CLI vars (7
+     > fabric-hardware + 8 protocol/startup/threshold + 5 FEC + 3 BER + 2 LLR).
+     > The PEX-bundle keys `vcCredits`/`vcCount`/`flowControl` are NOT promoted
+     > to CLI vars on the collective/algorithm path (they are applied to the
+     > bundle object by `ProtocolProfile::Build()` via `SetAttributeFailSafe`,
+     > keeping the inline 1-VC fabric = the spec credits); `llrBufferSize`
+     > stays CLI-only (`--llrBufferSize`), and `perGpuStartupDelayNs` is
+     > likewise applied to the bundle's protocol model via `SetAttributeFailSafe`
+     > (not via this block nor `Config::SetDefault`; the `Config::SetDefault`
+     > path is driven by the separate `--startupPerGpuNs` CLI flag). The
+     > authoritative 1:1 map is `PROFILE_TO_FLAG` in
+     > `test/parity/test_config_vs_inline_parity.py`.
    - In the injector-dispatch block: the stencil gate is
      `if (configMode && pconfig.GetCollective().empty() && pconfig.GetAlgorithm().empty())`
      so a `collective`+`algorithm` config SKIPS the stencil branch

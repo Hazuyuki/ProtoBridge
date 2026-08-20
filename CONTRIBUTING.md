@@ -7,7 +7,8 @@ This repo bundles a trimmed ns-3.47 framework plus our self-authored
 collective injectors, credit flow control, four-tier FEC/retry resilience),
 the `surrogate/` latency models (calibrated on H200 NVLink4), and `configs/`
 profiles. **Everything outside `src/gpu-cluster/`, `surrogate/`,
-`configs/protocol_profiles/`, `scratch/gpu-cluster-sim.cc`, and
+`configs/protocol_profiles/`, `configs/protocol_configs/`, `configs/dse/`,
+`test/parity/`, `doc/`, `scratch/gpu-cluster-sim.cc`, and
 `scratch/protocol-profile-demo.cc` is stock ns-3** — direct those questions to
 the upstream ns-3 project, not here.
 
@@ -31,8 +32,10 @@ Calibration must stay **bit-identical**: the config-file form
 into the same local variables the inline CLI path consumes and runs the
 calibrated injector verbatim, so the two must produce identical `simTimeNs`
 (same code, same values, same `RngRun`). `test_config_vs_inline_parity.py`
-asserts this across `{ring, tree, nvls}` × sizes × GPU counts, and pins the
-8-GPU 1 MiB ring at **38.3 µs** (H200 measurement 37.24 µs). A change that
+asserts EXACT `simTimeNs` equality (config == inline) across
+`{ring, tree, nvls}` (ring across {1 MiB, 256 MiB} × {4, 8} GPU; tree/nvls
+smoke-checked at 1 MiB / 8-GPU); the 8-GPU 1 MiB ring produces **~38.3 µs**
+(H200 measurement 37.24 µs). A change that
 shifts the config-vs-inline `simTimeNs` equality is a behavior change, not a
 refactor — call it out in the PR description.
 
