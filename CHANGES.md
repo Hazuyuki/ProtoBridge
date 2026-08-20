@@ -26,7 +26,7 @@ is no longer accepted; config runs stay bit-identical to the inline path
 cap to the serialization term and `(hop-1) * link_latency` of per-step
 propagation. Build it with `make_topology(bisection_gbps=, hop_count=)` or
 `make_topology_from_family(family, N, per_link_gbps=)` (15 fabric families);
-omitting it is byte-identical to the ideal-fabric default. See `doc/SURROGATE.md`.
+omitting it is byte-identical to the ideal-fabric default. See `surrogate/theory/USER_GUIDE.md`.
 
 See `README.md` and `doc/` for the full module overview.
 

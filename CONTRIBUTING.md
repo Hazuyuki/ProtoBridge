@@ -39,6 +39,19 @@ smoke-checked at 1 MiB / 8-GPU); the 8-GPU 1 MiB ring produces **~38.3 µs**
 shifts the config-vs-inline `simTimeNs` equality is a behavior change, not a
 refactor — call it out in the PR description.
 
+**Why delegation, not stencil-fix (design note).** A config `[op]` declares
+`collective=`+`algorithm=` and delegates to the calibrated inline injector
+rather than running the generic transfer-stencil runner, because the stencil
+path diverges physically: with matched H200 hardware (400/400/18) + startup
+(15000) + protocol (auto), inline = 107.4 µs but the stencil config path =
+24.9 µs at 1 MiB, the gap widening with size (inline 4727 µs vs config 161 µs
+at 64 MiB) — the stencil runner rate-limits on aggregate multi-lane bandwidth
+(~18× = numLanes) instead of per-link, a divergence in
+`SendBulkWireTransferSize`/`ApplyBundle`'s spray/rate-limiting. Fixing the
+stencil wire-model is high-risk; delegation bypasses it by running the inline
+injector's correct per-link wire model directly, which is why the config-vs-
+inline path is bit-identical by construction.
+
 **Extension seams.** Flow-control (`FabricEndpoint::FlowControlGate` is
 virtual), arbitration (`ns3::Arbiter` strategy, default `RoundRobinArbiter`),
 and switching (`FabricSwitch` abstract base + `NvSwitchHelper::SetSwitchType`)

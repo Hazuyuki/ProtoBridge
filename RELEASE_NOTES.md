@@ -1,20 +1,8 @@
 # ProtoBridge release notes
 
-ProtoBridge is a bare-metal L2/MAC GPU-fabric interconnect simulator bundled on
-the upstream ns-3.47 framework (upstream release notes follow after the
-separator). Recent user-visible ProtoBridge features:
-
-- **Config-axis input** (22e8edc): a `.cfg` `[op]` declares `collective =` +
-  `algorithm =` (+ optional `topology =`) directly, replacing the prior
-  opaque single-keyword selector (breaking). Config runs are bit-identical to
-  the inline path. See `doc/CONFIG_GUIDE.md`.
-- **Surrogate `topology=` descriptor** (98030aa, f3f6478): `predict()` takes an
-  optional `topology=` (`Topology` dataclass) applying a bisection cap + hop
-  latency; `make_topology` / `make_topology_from_family` (15 families) build it.
-  See `doc/SURROGATE.md` and `surrogate/theory/USER_GUIDE.md`.
-
-See `README.md` for the module overview and `doc/CALIBRATION.md` for the H200
-calibration data.
+ProtoBridge's change history is consolidated in [CHANGES.md](CHANGES.md)
+(ProtoBridge section at the top). Upstream ns-3.47 release notes follow after
+the separator.
 
 ---
 

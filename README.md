@@ -49,7 +49,7 @@ surrogate** that combines OTP parameters (startup, effective bandwidth) with
 analytical models of each PEX mechanism. It is grounded in the H200 NVLink4
 reference and predicts per-operation latency in microseconds —
 fast enough to sweep many designs where the packet simulator cannot. See
-[doc/SURROGATE.md](doc/SURROGATE.md) for the derivation and
+[surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md) for the guide and
 [doc/CALIBRATION.md](doc/CALIBRATION.md) for the in-repo H200 calibration data.
 
 ## What this is (and is not)
@@ -207,17 +207,17 @@ For topology-aware prediction, pass an optional `topology=` descriptor to
 `make_topology_from_family(family, N, per_link_gbps=)` over 15 fabric families)
 applies a bisection-bandwidth cap and hop-count propagation; omitting it is
 byte-identical to the ideal-fabric model. See
-[doc/SURROGATE.md](doc/SURROGATE.md).
+[surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md).
 
 ```bash
 # Predict ring allreduce latency at 4 GPU / 1 MiB (theory model, lower bound).
 python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory().predict(1<<20,4,"ring",credits=32,ber=0))'
 
-# Custom hardware: override any H200 parameter (see doc/SURROGATE.md).
+# Custom hardware: override any H200 parameter (see surrogate/theory/USER_GUIDE.md).
 python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory(num_lanes=8, startup_us=7).predict(1<<20,4,"ring",credits=32,ber=0))'
 ```
 
-See [doc/SURROGATE.md](doc/SURROGATE.md) for the derivation and
+See [surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md) for the guide and
 [doc/CALIBRATION.md](doc/CALIBRATION.md) for the H200 calibration data.
 
 ## Tests

@@ -95,8 +95,27 @@ s = wb.TheoryDerivedSurrogate(ring_bw_bytes_per_us=120000, link_latency_us=0.3,
 ```
 
 The full `__init__` parameter list (21 knobs, all defaulted) is in the
-`TheoryDerivedSurrogate` class docstring; the ones that move the clean
-(`ber=0`) mean latency are tabulated in `../../doc/SURROGATE.md`.
+`TheoryDerivedSurrogate` class docstring. The parameters that move the clean
+(`ber=0`) mean latency:
+
+| Parameter | Units | Affects | H200 ring |
+|-----------|-------|---------|-----------|
+| `ring_bw_bytes_per_us` | bytes/µs | ring serialization | 177000 |
+| `tree_bw_per_level_bytes_per_us` | bytes/µs | tree serialization | 26250 |
+| `nvls_bw_bytes_per_us` | bytes/µs | NVLS serialization | 535500 |
+| `link_latency_us` | µs (400 ns = 0.4) | ring/nvls propagation | 0.4 |
+| `t_min_switch_us` | µs | tree fixed (NVSwitch fill) | 1.1 |
+| `credit_bdp_ring_packets` | packets | ring credit pressure Φ_credit | 91.5 |
+| `credit_bdp_tree_packets` | packets | tree credit pressure Φ_credit | 35.5 |
+| `startup_us` / `nvls_startup_us` | µs | protocol startup (fixed) | 15.0 / 23.0 |
+
+The remaining knobs (`packet_bw_bytes_per_us`, `spray_chunk_bytes`,
+`bulk_chunk_bytes`, `num_lanes`, `fec_*`, `retry_source_*`) only take effect
+under link degradation (ber>0) or with FEC/LLR enabled. The bandwidth
+parameters are *effective* transfer rates already incorporating protocol
+efficiency and spray (not raw per-link × lanes products); the H200 values are
+the calibrated anchor, so custom values yield a physically-plausible but
+uncalibrated lower bound.
 
 ---
 
@@ -306,5 +325,3 @@ error paths).
   rule, and the per-family topology formulas (§12, §13).
 - [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) — how the H200 anchor
   numbers were measured.
-- [`../../doc/SURROGATE.md`](../../doc/SURROGATE.md) — short overview +
-  the `__init__` parameter table that moves the clean mean latency.
