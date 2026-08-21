@@ -84,6 +84,38 @@ onto the credit-gated sender. Lossless + full-rate is the RoCE v2 latency
 lower bound; congestion dynamics are a separable future work unit for
 incast/multi-flow fidelity. WU3 of the scale-out effort.
 
+### New — scale-out Ethernet RoCEv2 fabric wiring (WU4)
+
+The multi-node path now builds a real switched Ethernet RoCEv2 So fabric
+instead of the fake P2P-fullmesh + NCCL-timing stand-in.
+`MultiNodeTopologyHelper` gains `SetInterNodeSwitchType(typeId)`: the switched
+inter-node topology ("host" = one ToR switch per node + a full mesh of
+switches, non-blocking) now selects the switch subtype, so
+`scratch/gpu-cluster-sim` sets `ns3::EthernetSwitch` (WU2) when
+`--interNodeFabricType=RoCE`. Because EthernetSwitch derives from NvSwitch,
+the existing VOQ/arbiter/cut-through datapath + static-route wiring is reused
+unchanged (default TypeId stays NvSwitch, so prior "host" behavior is
+byte-identical). Each endpoint also receives a `RoceProtocolModel` via
+`SetInterNodeProtocolModel` (WU3) so the inter-node phase honors the Ethernet
+~0.95 wire efficiency; local-rank traffic keeps the scale-up NCCL model. No
+new CLI flags — the existing `--interNodeTopology` (host/fullmesh/ring),
+`--interNodeBandwidth`, `--interNodeLatency`, `--interNodeFabricType`,
+`--interNodeStartup` drive the So fabric. Verified e2e: `--numNodes={2,4,8}
+--gpusPerNode=8 --interNodeTopology=host --interNodeFabricType=RoCE
+--collective=allreduce --algorithm=hierarchical --dataSize=268435456` completes
+losslessly (switchDroppedPackets=0, no retransmits) at 15.3/13.4/13.1 ms —
+multi-node latency >> single-node Su (4.1 ms), and the plateau with N is the
+expected non-blocking-fullmesh property (the per-node NIC, not the
+inter-switch fabric, is the bottleneck). The hierarchical injectors'
+inter-node phase auto-routes on the So fabric via `GetFabricTypeForDest` — no
+injector edits. WU4 of the scale-out effort.
+
+Deferred: a true 2-tier spine-leaf So topology (which would show N-scaling via
+oversubscription) is not added — the "host" fullmesh-of-switches is the
+non-blocking lower-bound So fabric, sufficient for the
+uncalibrated-lower-bound calibration; the surrogate's `so_spineleaf` family
+covers the analytical case.
+
 ### Breaking — `[op]` declares the three CLI axes directly (22e8edc)
 
 A `.cfg` `[op]` now declares the three real CLI axes directly —

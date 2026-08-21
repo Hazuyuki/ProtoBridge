@@ -62,6 +62,7 @@ void MultiNodeTopologyHelper::SetInterNodeDataRate(const std::string& rate) { m_
 void MultiNodeTopologyHelper::SetInterNodeDelay(const std::string& delay) { m_interNodeDelay = delay; }
 void MultiNodeTopologyHelper::SetInterNodeFabricType(FabricType type) { m_interNodeFabricType = type; }
 void MultiNodeTopologyHelper::SetInterNodeTopology(const std::string& topo) { m_interNodeTopology = topo; }
+void MultiNodeTopologyHelper::SetInterNodeSwitchType(const std::string& typeId) { m_interNodeSwitchType = typeId; }
 
 uint32_t MultiNodeTopologyHelper::GetTotalNumGpus() const { return m_numNodes * m_gpusPerNode; }
 uint16_t MultiNodeTopologyHelper::GetGlobalRank(uint32_t nodeId, uint32_t localIdx) const
@@ -433,6 +434,7 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
     else if (m_interNodeTopology == "host")
     {
         NvSwitchHelper switchHelper;
+        switchHelper.SetSwitchType(m_interNodeSwitchType);
         m_interNodeSwitchNodes.resize(m_numNodes);
         m_interNodeSwitches.resize(m_numNodes);
         std::vector<std::vector<uint32_t>> gpuPorts(

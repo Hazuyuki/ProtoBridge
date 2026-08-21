@@ -92,6 +92,11 @@ class MultiNodeTopologyHelper
     void SetInterNodeDelay(const std::string& delay);
     void SetInterNodeFabricType(FabricType type);
     void SetInterNodeTopology(const std::string& topo); // "fullmesh", "ring", "host"
+    // Switch TypeId for the inter-node (So) fabric's switched topologies (e.g.
+    // "host"). Default "ns3::NvSwitch"; set to "ns3::EthernetSwitch" for a real
+    // Ethernet RoCEv2 So fabric (EthernetSwitch derives from NvSwitch, so the
+    // existing datapath wiring is reused unchanged).
+    void SetInterNodeSwitchType(const std::string& typeId);
 
     // Build
     NodeContainer Build();
@@ -134,6 +139,7 @@ class MultiNodeTopologyHelper
     std::string m_interNodeDelay;
     FabricType m_interNodeFabricType;
     std::string m_interNodeTopology;
+    std::string m_interNodeSwitchType{"ns3::NvSwitch"}; ///< So switch TypeId (NvSwitch default; EthernetSwitch for RoCE)
     std::vector<Ptr<Node>> m_interNodeSwitchNodes;
     std::vector<Ptr<NvSwitch>> m_interNodeSwitches;
 

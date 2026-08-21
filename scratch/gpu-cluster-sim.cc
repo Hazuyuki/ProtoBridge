@@ -38,6 +38,7 @@
 #include "ns3/protocol-config-runner.h"
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/ub-protocol-model.h"
+#include "ns3/roce-protocol-model.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/nccl-protocol-payload-builder.h"
 #include "ns3/ub-payload-builder.h"
@@ -814,11 +815,29 @@ main(int argc, char* argv[])
         multiTopo.SetInterNodeDataRate(std::to_string(interNodeBandwidthGbps) + "Gbps");
         multiTopo.SetInterNodeDelay(std::to_string(interNodeLatencyNs) + "ns");
         multiTopo.SetInterNodeFabricType(interNodeFabricType);
+        if (interNodeFabricType == FabricType::ROCE)
+        {
+            // Real Ethernet RoCEv2 So fabric: switched inter-node topologies
+            // (e.g. "host") use the Ethernet switch subtype (a thin NvSwitch
+            // derivative) instead of the NVLink NvSwitch.
+            multiTopo.SetInterNodeSwitchType("ns3::EthernetSwitch");
+        }
         multiTopo.SetInterNodeTopology(interNodeTopology);
         multiTopo.SetIntraNodeTopology(intraNodeTopology);
 
         NodeContainer nodes = multiTopo.Build();
         multiTopo.PopulateInterNodeRouting();
+
+        // Scale-out (So) RoCEv2 protocol model for inter-node timing. When the
+        // So fabric is RoCE, each endpoint gets a RoceProtocolModel for
+        // remote-rank traffic (Ethernet ~0.95 wire efficiency) while local-rank
+        // traffic keeps the scale-up (NCCL) model. With no So model wired,
+        // GetProtocolModelForDest falls back to the Su model (parity-safe).
+        Ptr<RoceProtocolModel> roceModel;
+        if (interNodeFabricType == FabricType::ROCE)
+        {
+            roceModel = CreateObject<RoceProtocolModel>();
+        }
 
         ApplicationContainer apps = multiTopo.GetAllEndpoints();
         for (uint32_t i = 0; i < apps.GetN(); ++i)
@@ -829,6 +848,10 @@ main(int argc, char* argv[])
             ep->SetBypassReorderBuffer(true);
             ep->SetProtocolModel(protoModel);
             ep->SetProtocolPayloadBuilder(payloadBuilder);
+            if (roceModel)
+            {
+                ep->SetInterNodeProtocolModel(roceModel);
+            }
             ep->SetBulkChunkSize(bulkChunkSize);
             ep->SetDeviceType(deviceType);
 
