@@ -30,6 +30,8 @@ build_lib(
     model/mccl-payload-builder.cc
     model/ub-protocol-model.cc
     model/ub-payload-builder.cc
+    model/roce-protocol-model.cc
+    model/roce-payload-builder.cc
     model/llr-manager.cc
     model/ring-allreduce.cc
     model/sharp-allreduce.cc
@@ -84,6 +86,8 @@ build_lib(
     model/mccl-payload-builder.h
     model/ub-protocol-model.h
     model/ub-payload-builder.h
+    model/roce-protocol-model.h
+    model/roce-payload-builder.h
     model/llr-manager.h
     model/ring-allreduce.h
     model/sharp-allreduce.h

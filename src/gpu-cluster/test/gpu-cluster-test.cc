@@ -18,6 +18,8 @@
 #include "ns3/fabric-type.h"
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/mccl-protocol-model.h"
+#include "ns3/roce-protocol-model.h"
+#include "ns3/roce-payload-builder.h"
 #include "ns3/nccl-protocol-payload-builder.h"
 #include "ns3/protocol-transaction.h"
 #include "ns3/packet.h"
@@ -1049,6 +1051,137 @@ class McclProtocolModelTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(model->GetVendorName(),
                               std::string("MetaX"),
                               "MCCL vendor name");
+    }
+};
+
+/**
+ * @brief Test case for the RoCE v2 protocol model (scale-out fabric).
+ */
+class RoceProtocolModelTest : public TestCase
+{
+  public:
+    RoceProtocolModelTest()
+        : TestCase("RoCE v2 protocol parameters")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RoceProtocolModel> model = CreateObject<RoceProtocolModel>();
+        const uint8_t simple = static_cast<uint8_t>(RoceProtocol::SIMPLE);
+
+        // Spec/NIC-derived defaults (uncalibrated lower-bound).
+        NS_TEST_EXPECT_MSG_EQ(model->GetProtocolId(1024),
+                              simple,
+                              "RoCE is SIMPLE-only");
+        NS_TEST_EXPECT_MSG_EQ(model->GetStartupDelayNs(simple),
+                              40000,
+                              "Default RoCEv2 RDMA startup (40us)");
+        NS_TEST_EXPECT_MSG_EQ(model->GetPerStepLatencyNs(simple),
+                              800,
+                              "Default RoCEv2 per-switch-hop latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetChunkSize(simple),
+                              512 * 1024,
+                              "Default RoCEv2 segment size (512KB)");
+        // Default wire efficiency 0.95: ceil(1000/0.95) = 1053.
+        NS_TEST_EXPECT_MSG_EQ(model->GetWireSize(1000, simple),
+                              1053,
+                              "RoCEv2 wire efficiency expands transmitted bytes");
+        NS_TEST_EXPECT_MSG_EQ_TOL(model->GetEfficiency(simple),
+                                  0.95,
+                                  1e-12,
+                                  "Default RoCEv2 wire efficiency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetVendorName(),
+                              std::string("Ethernet-RoCEv2"),
+                              "RoCEv2 vendor name");
+
+        // Override wire efficiency to 0.8: ceil(1000/0.8) = 1250.
+        model->SetAttribute("WireEfficiency", DoubleValue(0.8));
+        NS_TEST_EXPECT_MSG_EQ(model->GetWireSize(1000, simple),
+                              1250,
+                              "Configured RoCEv2 wire efficiency expands transmitted bytes");
+
+        // Memory-semantic latencies (RDMA remote access).
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::SYNC_LOAD_STORE),
+                              1000,
+                              "RoCEv2 synchronous RDMA load/store latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::ASYNC_URMA),
+                              5000,
+                              "RoCEv2 asynchronous remote memory access latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::DMA_BULK),
+                              0,
+                              "RoCEv2 bulk DMA latency modeled on the wire");
+    }
+};
+
+/**
+ * @brief Test case for the RoCE v2 RDMA payload builder (8B header + round-trip).
+ */
+class RocePayloadBuilderTest : public TestCase
+{
+  public:
+    RocePayloadBuilderTest()
+        : TestCase("RoCE v2 RDMA payload builder")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RocePayloadBuilder> builder = CreateObject<RocePayloadBuilder>();
+
+        // Single 1000-byte segment (chunk size larger than data).
+        std::vector<uint8_t> data(1000);
+        for (size_t i = 0; i < data.size(); ++i)
+        {
+            data[i] = static_cast<uint8_t>(i & 0xFF);
+        }
+        std::vector<Ptr<Packet>> chunks =
+            builder->BuildChunks(data.data(), data.size(), 0, 1 << 20);
+        NS_TEST_EXPECT_MSG_EQ(chunks.size(),
+                              static_cast<size_t>(1),
+                              "Single segment under chunk size");
+        NS_TEST_EXPECT_MSG_EQ(chunks[0]->GetSize(),
+                              1000u + 8u,
+                              "Segment carries 8B RDMA header + data");
+
+        // Round-trip: extract must recover the original data (header stripped).
+        std::vector<uint8_t> recovered(1000, 0);
+        uint64_t extracted = builder->ExtractData(chunks[0], 0, recovered.data(), recovered.size());
+        NS_TEST_EXPECT_MSG_EQ(extracted,
+                              static_cast<uint64_t>(1000),
+                              "Extract recovers all data bytes");
+        bool match = true;
+        for (size_t i = 0; i < data.size(); ++i)
+        {
+            if (recovered[i] != data[i])
+            {
+                match = false;
+                break;
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(match, true, "Extracted data matches original");
+
+        // Multi-segment: 600 bytes at chunkSize 256 -> 3 segments (256, 256, 88).
+        std::vector<uint8_t> data600(600, 0xAB);
+        std::vector<Ptr<Packet>> multi =
+            builder->BuildChunks(data600.data(), data600.size(), 0, 256);
+        NS_TEST_EXPECT_MSG_EQ(multi.size(),
+                              static_cast<size_t>(3),
+                              "600B at 256B chunk = 3 segments");
+        NS_TEST_EXPECT_MSG_EQ(multi[0]->GetSize(),
+                              256u + 8u,
+                              "Seg0 = 256B + 8B header");
+        NS_TEST_EXPECT_MSG_EQ(multi[2]->GetSize(),
+                              88u + 8u,
+                              "Seg2 = 88B + 8B header");
+
+        // Wire-size accessors are flat (timing owned by the protocol model).
+        NS_TEST_EXPECT_MSG_EQ(builder->GetWireSize(1000, 0),
+                              static_cast<uint64_t>(1000),
+                              "Builder wire size is flat");
+        NS_TEST_EXPECT_MSG_EQ(builder->GetVendorName(),
+                              std::string("Ethernet-RoCEv2"),
+                              "RoCEv2 builder vendor name");
     }
 };
 
@@ -4640,6 +4773,8 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new HybridRoutingTableTest, TestCase::Duration::QUICK);
     AddTestCase(new FabricTypeTest, TestCase::Duration::QUICK);
     AddTestCase(new McclProtocolModelTest, TestCase::Duration::QUICK);
+    AddTestCase(new RoceProtocolModelTest, TestCase::Duration::QUICK);
+    AddTestCase(new RocePayloadBuilderTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolHeaderTest, TestCase::Duration::QUICK);

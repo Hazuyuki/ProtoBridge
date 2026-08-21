@@ -186,6 +186,10 @@ ProtocolProfile::Build() const
     {
         pbType = "ns3::UbPayloadBuilder";
     }
+    else if (effTid == "ns3::RoceProtocolModel")
+    {
+        pbType = "ns3::RocePayloadBuilder";
+    }
     if (!pbType.empty())
     {
         ObjectFactory pbFactory(pbType);

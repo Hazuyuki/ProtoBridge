@@ -6,6 +6,24 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — RoCE v2 protocol model + payload builder (scale-out WU1)
+
+`model/roce-protocol-model.{h,cc}` (`: ProtocolModel`) and
+`model/roce-payload-builder.{h,cc}` (`: ProtocolPayloadBuilder`) add the first
+scale-out (Ethernet RoCEv2) protocol to the OTP layer. The model is
+SIMPLE-only with spec/NIC-derived constants (40µs RDMA startup, 512KB
+segment, ~95% wire efficiency for Eth+IP+UDP+BTH+aETH, 800ns per-switch-hop
+serialization, RDMA memory-semantic latencies). The builder prepends an 8-byte
+RDMA transport header (size + chunkIndex) per segment and strips it on extract.
+Registered in `protocol-profile.cc` (RoCE -> RoCE builder) and added to
+`CMakeLists.txt`. Two unit tests (`RoceProtocolModelTest`,
+`RocePayloadBuilderTest`) verify wire-size/efficiency/startup defaults,
+8B-header round-trip, and multi-segment chunking. Uncalibrated lower-bound
+(anchors the So fabric timing to the ns-3 model, not measured HW). WU1 of the
+scale-out RoCEv2 fabric + hierarchical SU->SO collectives effort; the Ethernet
+switch (WU2), PFC/DCQCN + per-fabric model + MTU (WU3), So topology builders
+(WU4), configs/parity (WU5), and surrogate two-stage model (WU6) follow.
+
 ### Breaking — `[op]` declares the three CLI axes directly (22e8edc)
 
 A `.cfg` `[op]` now declares the three real CLI axes directly —
