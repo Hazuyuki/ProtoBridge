@@ -21,7 +21,7 @@ recipe below carries the exact runtime values it uses.
 
 | Surrogate | Calibration set | Metric | Value |
 |-----------|-----------------|--------|-------|
-| Theory-derived (`surrogate/theory/`) | none (physical derivation) | vs ns-3 | lower bound; credit-sensitive — ≈0.20–0.57× at the profile per-VC credit (vcCredits=64; the baseline JSON records no credit value) |
+| Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive (≈0.566× vs 8-GPU ns-3) |
 
 ## Generate fresh ns-3 baselines
 
