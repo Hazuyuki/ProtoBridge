@@ -3841,6 +3841,43 @@ class EthernetSwitchSeamTest : public TestCase
     }
 };
 
+// Per-fabric protocol-model selection: an endpoint with an inter-node (So)
+// model uses it for remote ranks and the scale-up (Su) model for local ranks.
+class InterNodeProtocolModelSeamTest : public TestCase
+{
+  public:
+    InterNodeProtocolModelSeamTest()
+        : TestCase("FabricEndpoint selects per-fabric protocol model by dest rank") {}
+    void DoRun() override
+    {
+        // 8 local GPUs (ranks 0-7 on this node); ranks >= 8 are remote (So fabric).
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 8);
+
+        // Default: no inter-node model -> every dest uses the base (NCCL) model.
+        NS_TEST_ASSERT_MSG_EQ(ep->GetProtocolModelForDest(5)->GetVendorName(),
+                              std::string("NVIDIA"), "local dest uses base NCCL model");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetProtocolModelForDest(10)->GetVendorName(),
+                              std::string("NVIDIA"),
+                              "remote dest falls back to base when no So model is set");
+
+        // Wire a RoCE model for the inter-node (So) fabric.
+        Ptr<RoceProtocolModel> roce = CreateObject<RoceProtocolModel>();
+        ep->SetInterNodeProtocolModel(roce);
+
+        // Local dest still uses the base (Su) NCCL model; remote dest now uses RoCE.
+        NS_TEST_ASSERT_MSG_EQ(ep->GetProtocolModelForDest(5)->GetVendorName(),
+                              std::string("NVIDIA"), "local dest keeps the Su NCCL model");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetProtocolModelForDest(10)->GetVendorName(),
+                              std::string("Ethernet-RoCEv2"), "remote dest uses the So RoCE model");
+        // The So model's wire size honors the 0.95 efficiency (ceil(1000/0.95)=1053);
+        // RoCE ignores the protocol id, so 1 (SIMPLE) is fine here.
+        NS_TEST_ASSERT_MSG_EQ(ep->GetProtocolModelForDest(10)->GetWireSize(1000, /*protocolId=*/1),
+                              1053ULL, "remote So wire size = ceil(1000/0.95)");
+    }
+};
+
 // A FabricEndpoint subclass overriding the virtual FlowControlGate hook.
 class EndpointFlowControlOverride : public FabricEndpoint
 {
@@ -4831,6 +4868,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ArbiterSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchTypeSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchSeamTest, TestCase::Duration::QUICK);
+    AddTestCase(new InterNodeProtocolModelSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new FlowControlVirtualHookTest, TestCase::Duration::QUICK);
 
     // P0: collective-injector correctness (real sims; EXTENSIVE).

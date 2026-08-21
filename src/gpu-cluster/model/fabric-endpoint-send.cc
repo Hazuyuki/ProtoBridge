@@ -757,7 +757,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     NS_LOG_FUNCTION(this << destRank << size << static_cast<int>(protocolId) << flowId << vcId);
 
     // Check if this protocol has no overhead (SIMPLE, NONE, or vendor single-protocol)
-    double efficiency = m_protocolModel->GetEfficiency(protocolId);
+    double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
     if (efficiency >= 1.0)
     {
         // No protocol overhead - use regular SendData
@@ -766,7 +766,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     }
 
     // For protocols with overhead (LL, LL128, etc.), use payload builder
-    uint64_t chunkSize = m_protocolModel->GetChunkSize(protocolId);
+    uint64_t chunkSize = GetProtocolModelForDest(destRank)->GetChunkSize(protocolId);
 
     NS_LOG_INFO("Sending " << size << " bytes with protocol "
                << static_cast<int>(protocolId) << " efficiency=" << efficiency
@@ -811,7 +811,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             else
             {
                 uint32_t dataStillNeeded = thisChunkDataSize - dataAssigned;
-                uint64_t protoChunkSz = m_protocolModel->GetChunkSize(protocolId);
+                uint64_t protoChunkSz = GetProtocolModelForDest(destRank)->GetChunkSize(protocolId);
                 subPacketDataSize = std::min(static_cast<uint32_t>(protoChunkSz), dataStillNeeded);
             }
             dataAssigned += subPacketDataSize;

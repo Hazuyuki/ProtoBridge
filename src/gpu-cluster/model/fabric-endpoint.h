@@ -301,6 +301,14 @@ class FabricEndpoint : public Application
     // Protocol model
     void SetProtocolModel(Ptr<ProtocolModel> model);
     Ptr<ProtocolModel> GetProtocolModel() const;
+    // Scale-out (So) protocol model for inter-node destinations. When set, the
+    // endpoint uses it for remote-rank timing (e.g. Ethernet RoCEv2) while
+    // keeping the scale-up (Su) m_protocolModel for local ranks. Null (default)
+    // -> GetProtocolModelForDest falls back to m_protocolModel everywhere, so
+    // single-node and no-So-model behavior is byte-identical (parity-safe).
+    void SetInterNodeProtocolModel(Ptr<ProtocolModel> model);
+    Ptr<ProtocolModel> GetInterNodeProtocolModel() const;
+    Ptr<ProtocolModel> GetProtocolModelForDest(uint16_t destRank) const;
 
     // Protocol payload builder
     void SetProtocolPayloadBuilder(Ptr<ProtocolPayloadBuilder> builder);
@@ -543,6 +551,7 @@ class FabricEndpoint : public Application
 
     // Protocol model (defaults to NcclProtocolModel)
     Ptr<ProtocolModel> m_protocolModel;               ///< Vendor-specific protocol model
+    Ptr<ProtocolModel> m_interNodeProtocolModel{nullptr}; ///< Inter-node (So) model; null -> use m_protocolModel
 
     // Protocol payload builder (defaults to NcclProtocolPayloadBuilder)
     Ptr<ProtocolPayloadBuilder> m_payloadBuilder;     ///< Vendor-specific payload builder

@@ -206,6 +206,7 @@ FabricEndpoint::DoDispose()
     m_creditManager = nullptr;
     m_payloadBuilder = nullptr;
     m_protocolModel = nullptr;
+    m_interNodeProtocolModel = nullptr;
     m_llrManager = nullptr;
     m_gbnNextAckSeq.clear();
     m_gbnPendingAcks.clear();
@@ -693,6 +694,31 @@ FabricEndpoint::SetProtocolModel(Ptr<ProtocolModel> model)
 Ptr<ProtocolModel>
 FabricEndpoint::GetProtocolModel() const
 {
+    return m_protocolModel;
+}
+
+void
+FabricEndpoint::SetInterNodeProtocolModel(Ptr<ProtocolModel> model)
+{
+    m_interNodeProtocolModel = model;
+}
+
+Ptr<ProtocolModel>
+FabricEndpoint::GetInterNodeProtocolModel() const
+{
+    return m_interNodeProtocolModel;
+}
+
+Ptr<ProtocolModel>
+FabricEndpoint::GetProtocolModelForDest(uint16_t destRank) const
+{
+    // Use the inter-node (So) protocol model only for remote destinations on a
+    // multi-node fabric; otherwise fall back to the scale-up (Su) model so
+    // single-node and no-So-model behavior is byte-identical (parity-safe).
+    if (m_interNodeProtocolModel && !IsLocalRank(destRank) && m_localRankCount > 1)
+    {
+        return m_interNodeProtocolModel;
+    }
     return m_protocolModel;
 }
 
@@ -1967,7 +1993,7 @@ FabricEndpoint::SendDataAutoProtocol(uint16_t destRank, const uint8_t* data, uin
 {
     NS_LOG_FUNCTION(this << destRank << size << flowId << vcId);
 
-    uint8_t protocolId = m_protocolModel->GetProtocolId(size);
+    uint8_t protocolId = GetProtocolModelForDest(destRank)->GetProtocolId(size);
     SendDataInternal(destRank, data, size, protocolId, flowId, vcId);
 }
 
@@ -1994,8 +2020,8 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
 {
     NS_LOG_FUNCTION(this << destRank << dataSize << static_cast<int>(protocolId) << flowId << vcId);
 
-    const double efficiency = m_protocolModel->GetEfficiency(protocolId);
-    const uint64_t wireSize = m_protocolModel->GetWireSize(dataSize, protocolId);
+    const double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
+    const uint64_t wireSize = GetProtocolModelForDest(destRank)->GetWireSize(dataSize, protocolId);
 
     NS_LOG_INFO("Bulk wire transfer: dataSize=" << dataSize << " wireSize=" << wireSize
                << " efficiency=" << efficiency << " protocol=" << static_cast<int>(protocolId));
@@ -2206,7 +2232,7 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
                  << " effectiveSize=" << effectiveSize);
 
     // Check if this protocol has no overhead
-    double efficiency = m_protocolModel->GetEfficiency(protocolId);
+    double efficiency = GetProtocolModelForDest(header.GetSourceRank())->GetEfficiency(protocolId);
     if (efficiency >= 1.0)
     {
         ProcessDataPacket(packet, header);

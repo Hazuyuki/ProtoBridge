@@ -44,6 +44,46 @@ seam: `SetSwitchType("ns3::EthernetSwitch")` builds an object that is-a
 FabricSwitch and is-a NvSwitch with the Ethernet-RoCEv2 vendor name. WU2 of
 the scale-out RoCEv2 effort; WU1 (RoCE model+builder) precedes, WU3+ follow.
 
+### New — per-fabric protocol-model selection for scale-out (WU3)
+
+`FabricEndpoint` now selects its protocol model per destination: a new
+`m_interNodeProtocolModel` (e.g. `RoceProtocolModel`) is consulted for
+remote-rank (inter-node / So) timing, while the existing `m_protocolModel`
+(NCCL) stays for local-rank (Su) traffic. The new
+`GetProtocolModelForDest(destRank)` mirrors the existing `GetFabricTypeForDest`
+gate (active only when `!IsLocalRank && m_localRankCount > 1`), so when no So
+model is wired the endpoint falls back to `m_protocolModel` everywhere and
+single-node / Su behavior is byte-identical (parity-verified:
+`test_config_vs_inline_parity.py` all PASS). The seven model-consultation sites
+on the send path (`SendDataAutoProtocol`, `SendBulkWireTransferSize`,
+`SendDataInternal`) and the receive path (`ProcessProtocolDataPacket`, using
+the packet's source rank for symmetry) now route through
+`GetProtocolModelForDest`. Because the hierarchical inter-node phase uses
+`SendBulkWireTransfer(->Size)`, an So model's `GetWireSize` (ceil(data/0.95))
+now governs the inter-node wire bytes, so the Ethernet+IP+UDP+IB overhead is
+honored. `SetInterNodeProtocolModel`/`GetInterNodeProtocolModel` accessors are
+added; the model is set programmatically (not a TypeId PointerValue attribute,
+per the Construct-nulls-it seam constraint). One unit test
+(`InterNodeProtocolModelSeamTest`) verifies local->NCCL / remote->RoCE
+selection.
+
+Deferred (out of WU3, by design): the coupled RoCEv2 congestion-control
+subsystem (PFC priority flow control, ECN marking, DCQCN rate backoff) and
+real MTU frame packetization are NOT added here. Rationale: (a) the
+FabricHeader has no ECN field and no spare flag bit, so an ECN carrier would
+require either a header-byte change (which perturbs the
+`packet->GetSize()`-based egress serialization for ALL traffic, breaking Su
+parity) or a side-band PacketTag; (b) real 9000B MTU frame splitting on large
+bulk transfers would reintroduce the packet-explosion/memory-thrash that the
+8MB chunk-coalescing was added to prevent, and the per-MTU header overhead is
+already captured in the RoCE model's 0.95 wire efficiency; (c) DCQCN rate
+backoff is quiescent for the non-congested single-collective latency target
+(the lower-bound So model = lossless via the existing per-VC CREDIT flow
+control + full line rate), and its Alpha/CNP state machine does not map cleanly
+onto the credit-gated sender. Lossless + full-rate is the RoCE v2 latency
+lower bound; congestion dynamics are a separable future work unit for
+incast/multi-flow fidelity. WU3 of the scale-out effort.
+
 ### Breaking — `[op]` declares the three CLI axes directly (22e8edc)
 
 A `.cfg` `[op]` now declares the three real CLI axes directly —
