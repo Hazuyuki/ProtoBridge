@@ -357,3 +357,161 @@ def test_make_h200_sendrecv_theory_defaults():
     s = wb.make_h200_sendrecv_theory()
     assert s.S_startup == 15.0
     assert s.num_lanes == 18
+
+
+# ---- scale-out (Ethernet RoCEv2) + hierarchical (Su -> So) ----
+
+def test_wire_efficiency_default_is_unity_byte_identical():
+    """NVLink wire_efficiency defaults to 1.0 (no L3 header); applying it is a
+    no-op, so make_h200_ring_theory is byte-identical to the pre-So model."""
+    s = wb.make_h200_ring_theory()
+    assert s.wire_efficiency == 1.0
+    D = 1 << 22
+    assert s.predict(D, 8, "ring", credits=32, collective="allreduce") == \
+        s.predict(D, 8, "ring", credits=32, collective="allreduce",
+                  topology=None)
+
+
+def test_wire_efficiency_raises_latency():
+    """A lower wire efficiency (more header overhead) must raise latency."""
+    s = wb.make_h200_ring_theory(wire_efficiency=0.95)
+    base = wb.make_h200_ring_theory()
+    D = 1 << 24
+    assert s.predict(D, 8, "ring", credits=128, ber=0,
+                     collective="allreduce") > \
+        base.predict(D, 8, "ring", credits=128, ber=0, collective="allreduce")
+
+
+def test_phase_default_full_byte_identical():
+    """phase='full' (default two-pass) is byte-identical to omitting phase."""
+    s = wb.make_h200_ring_theory()
+    D = 1 << 22
+    assert s.predict(D, 8, "ring", credits=32, collective="allreduce") == \
+        s.predict(D, 8, "ring", credits=32, collective="allreduce",
+                  phase="full")
+
+
+def test_phase_rs_ag_cheaper_than_full():
+    """A single pass (rs/ag) has fewer steps so less fixed latency than the
+    two-pass allreduce; the serial volume (steps x per_step) is invariant."""
+    s = wb.make_h200_ring_theory()
+    D = 1 << 22
+    full = s.predict(D, 8, "ring", credits=32, collective="allreduce")
+    rs = s.predict(D, 8, "ring", credits=32, collective="allreduce", phase="rs")
+    ag = s.predict(D, 8, "ring", credits=32, collective="allreduce", phase="ag")
+    assert rs < full
+    assert ag < full
+    assert abs(rs - ag) < 1e-9          # rs and ag are symmetric single passes
+
+
+def test_roce_theory_defaults():
+    """So RoCEv2 profile: 400GbE-derived ring bw, 40 us startup, 0.95 wire eff,
+    8 NICs/node, ~1 us/hop, 1.5 us switch pipeline."""
+    s = wb.make_h200_roce_theory()
+    assert s.ring_bw == 160000               # 0.4 * 8 NICs * 50000 B/us
+    assert s.S_startup == 40.0
+    assert s.wire_efficiency == 0.95
+    assert s.num_lanes == 8
+    assert s.lat == 1.0
+    assert s.T_min_switch == 1.5
+
+
+def test_so_topology_families_exist():
+    """so_fullmesh / so_spineleaf / so_fattree build Topology objects; the
+    non-blocking fullmesh caps no more than the oversubscribed spine-leaf."""
+    fm = wb.make_topology_from_family("so_fullmesh", 8, links_per_gpu=8,
+                                      per_link_gbps=50.0)
+    sl = wb.make_topology_from_family("so_spineleaf", 8, links_per_gpu=8,
+                                      per_link_gbps=50.0)
+    ft = wb.make_topology_from_family("so_fattree", 8, links_per_gpu=8,
+                                      per_link_gbps=50.0)
+    assert fm.hop_count == 1.0
+    assert sl.hop_count == 2.0
+    assert ft.hop_count == 3.0
+    # fullmesh = full bisection (non-blocking); spine-leaf/fattree = 8:1 cut.
+    assert fm.bisection_bw_bytes_per_us >= sl.bisection_bw_bytes_per_us
+    assert sl.bisection_bw_bytes_per_us == ft.bisection_bw_bytes_per_us
+
+
+def test_hierarchical_collective_required():
+    """collective is required keyword-only on the hierarchical predict too."""
+    h = wb.make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2)
+    with pytest.raises(TypeError):
+        h.predict(1 << 22, "ring", 32)          # no collective=
+
+
+def test_hierarchical_collective_validated():
+    """An invalid collective raises ValueError, not a silent fallback."""
+    h = wb.make_h200_hierarchical_theory()
+    with pytest.raises(ValueError):
+        h.predict(1 << 22, "ring", 32, collective="bogus")
+
+
+def test_hierarchical_allreduce_exceeds_su_only():
+    """The So inter-node phase adds time: hierarchical > Su-only allreduce."""
+    D = 1 << 24
+    su_only = wb.make_h200_ring_theory().predict(
+        D, 8, "ring", credits=128, collective="allreduce")
+    hier = wb.make_h200_hierarchical_theory(
+        gpus_per_node=8, num_nodes=2).predict(
+        D, "ring", credits=128, collective="allreduce")
+    assert hier > su_only
+
+
+def test_hierarchical_monotonic_in_nodes():
+    """More nodes -> more So steps (toward the D/So_bw asymptote), so the
+    hierarchical latency grows with node count."""
+    D = 1 << 24
+    lats = [wb.make_h200_hierarchical_theory(
+        gpus_per_node=8, num_nodes=n).predict(
+        D, "ring", credits=128, collective="allreduce")
+            for n in (2, 4, 8)]
+    assert lats[0] < lats[1] < lats[2]
+
+
+def test_hierarchical_topology_lower_bound_ordering():
+    """Non-blocking so_fullmesh is the lower bound; oversubscribed / multi-hop
+    fabrics add latency, so fullmesh <= spine-leaf <= fat-tree."""
+    D = 1 << 24
+    lats = {fam: wb.make_h200_hierarchical_theory(
+        gpus_per_node=8, num_nodes=4, so_topology_family=fam).predict(
+        D, "ring", credits=128, collective="allreduce")
+        for fam in ("so_fullmesh", "so_spineleaf", "so_fattree")}
+    assert lats["so_fullmesh"] <= lats["so_spineleaf"] <= lats["so_fattree"]
+
+
+def test_hierarchical_decomposition_additive():
+    """The 4-phase allreduce equals the sum of its single-pass sub-phases."""
+    D = 1 << 24
+    h = wb.make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2)
+    su, so = h.su, h.so
+    topo = h.so_topology
+    n_su, n_so = h.n_su, h.n_so
+    phases = (
+        su.predict(D, n_su, "ring", 128, collective="allreduce", phase="rs")
+        + so.predict(D, n_so, "ring", 128, collective="allreduce", phase="rs",
+                     topology=topo)
+        + so.predict(D, n_so, "ring", 128, collective="allreduce", phase="ag",
+                     topology=topo)
+        + su.predict(D, n_su, "ring", 128, collective="allreduce", phase="ag"))
+    assert abs(h.predict(D, "ring", 128, collective="allreduce") - phases) < 1e-6
+
+
+def test_hierarchical_allgather_cheaper_than_allreduce():
+    """Allgather is 3-phase (one fewer So pass) so it is cheaper than the
+    4-phase allreduce on the same fabric."""
+    D = 1 << 24
+    h = wb.make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=4)
+    ag = h.predict(D, "ring", 128, collective="allgather")
+    ar = h.predict(D, "ring", 128, collective="allreduce")
+    assert ag < ar
+
+
+def test_hierarchical_sendrecv_is_so_only():
+    """A single inter-node P2P transfer has no Su stage: it equals the So
+    surrogate's sendrecv on n_so nodes under the So topology."""
+    D = 1 << 22
+    h = wb.make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2)
+    direct = h.so.predict(D, h.n_so, "ring", 32, collective="sendrecv",
+                          topology=h.so_topology)
+    assert abs(h.predict(D, "ring", 32, collective="sendrecv") - direct) < 1e-6

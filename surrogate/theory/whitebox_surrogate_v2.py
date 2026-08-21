@@ -119,7 +119,8 @@ class TheoryDerivedSurrogate:
                  startup_us=15.0,
                  nvls_startup_us=23.0,
                  retry_source_bw_bytes_per_us=4_800_000,
-                 retry_source_latency_us=0.3):
+                 retry_source_latency_us=0.3,
+                 wire_efficiency=1.0):
         # Fixed profile parameters from hardware, ns-3 configuration, or
         # one-time platform calibration.
         self.BW_link = packet_bw_bytes_per_us
@@ -144,6 +145,11 @@ class TheoryDerivedSurrogate:
         self.S_nvls_startup = nvls_startup_us
         self.retry_source_bw = retry_source_bw_bytes_per_us
         self.retry_source_latency = retry_source_latency_us
+        # Per-transfer wire efficiency (<1 accounts for L3/L4/transport header
+        # overhead, e.g. RoCEv2 Eth+IP+UDP+IB ~0.95). Applied to the serial
+        # bandwidth (T_serial /= wire_efficiency); 1.0 is byte-identical to the
+        # scale-up model (NVLink has no such header overhead).
+        self.wire_efficiency = wire_efficiency
 
     # ---- Collective / algorithm step table ----
 
@@ -735,7 +741,7 @@ class TheoryDerivedSurrogate:
                 strict_reliability=False, retry_limit=None,
                 include_credit=True, include_fec=True,
                 include_retransmission=True, include_contention=True,
-                topology=None, *, collective):
+                topology=None, *, collective, phase='full'):
         """Predict mean collective latency (µs).
 
         ``collective`` (required) names the operation (``allreduce`` /
@@ -744,6 +750,13 @@ class TheoryDerivedSurrogate:
         from ``algo`` -- the caller must pass it explicitly; omitting it raises
         ``TypeError`` and an invalid name raises ``ValueError``. Use
         ``collective='alltoall'`` or ``'sendrecv'`` to model those operations.
+
+        ``phase`` (default ``'full'``) selects a sub-collective pass for the
+        hierarchical decomposition: ``'rs'`` (reduce-scatter) / ``'ag'``
+        (allgather) halve the step count (a single pass moves the same total
+        volume over half the steps, so the serial term is unchanged and only
+        the fixed per-step latency halves). ``'full'`` (default) is the
+        two-pass allreduce / allgather -- byte-identical to prior behavior.
 
         L = S_startup
             + steps × T_fixed
@@ -762,6 +775,8 @@ class TheoryDerivedSurrogate:
             self.S_nvls_startup if resolved == 'allgather'
             and algo == 'nvls' else self.S_startup)
         steps = self._steps(num_gpus, algo, collective)
+        if phase in ('rs', 'ag'):
+            steps = max(1, steps // 2)
         per_step = self._per_step(data_bytes, num_gpus, algo, steps, collective)
 
         bsec = (topology.bisection_bw_bytes_per_us
@@ -778,6 +793,10 @@ class TheoryDerivedSurrogate:
         else:
             T_fixed_step = self.lat + (hop - 1.0) * self.lat
             T_serial_step = per_step / min(self.ring_bw, bsec)
+        # RoCEv2 (and any L3 fabric) pays per-transfer header overhead: the
+        # sender serializes data/wire_efficiency wire bytes (ceil(data/0.95) in
+        # the ns-3 RoceProtocolModel). 1.0 (NVLink, no header) is byte-identical.
+        T_serial_step = T_serial_step / self.wire_efficiency
 
         Phi_cr = (self._credit_pressure(
             data_bytes, num_gpus, algo, credits, collective)
@@ -936,6 +955,41 @@ def make_h200_sendrecv_theory(**overrides):
     return make_h200_ring_theory(**overrides)
 
 
+def make_h200_roce_theory(**overrides):
+    """H200-class Ethernet RoCEv2 scale-out (So) fabric profile.
+
+    Spec-derived, UNCALIBRATED lower bound (anchored to ns-3, not real HW):
+    400GbE per-link unidirectional wire rate (50 GB/s = 50000 B/us), 8 NICs
+    per node, ~1 us per-hop propagation (vs NVLink 0.4), ~1.5 us Ethernet
+    switch pipeline (vs NVSwitch 1.1), ~40 us RDMA startup (vs NCCL 15), and
+    0.95 wire efficiency (Eth+IP+UDP+IB header overhead -- mirrors the ns-3
+    RoceProtocolModel's GetWireSize = data/0.95). The schedule bandwidths
+    derive from the Ethernet wire rate the same way NVLink does (ring_bw =
+    eta_ring * B_agg = 0.4 * 8 * 50000 = 160000 B/us). NVLS / tree bandwidths
+    are inherited from the NVLink defaults but are unused on the So stage
+    (NVLS is a scale-up in-network-compute concept; the So ring path is the
+    hierarchical inter-node schedule). Accepts ``**overrides`` to tune any
+    ``__init__`` param (e.g. ``link_latency_us=2.0`` for a longer-reach fabric).
+    """
+    defaults = dict(
+        packet_bw_bytes_per_us=160000,
+        ring_bw_bytes_per_us=160000,
+        tree_bw_per_level_bytes_per_us=26250,
+        nvls_bw_bytes_per_us=535500,
+        link_latency_us=1.0,
+        credit_bdp_ring_packets=91.5,
+        credit_bdp_tree_packets=35.5,
+        spray_chunk_bytes=131072,
+        bulk_chunk_bytes=8 * 1024 * 1024,
+        num_lanes=8,
+        t_min_switch_us=1.5,
+        startup_us=40.0,
+        wire_efficiency=0.95,
+    )
+    defaults.update(overrides)
+    return TheoryDerivedSurrogate(**defaults)
+
+
 def make_1024_optical_fattree_theory(**overrides):
     """Profile for the 1024-GPU, 600-Gbps fat-tree optical study.
 
@@ -1044,6 +1098,12 @@ _TOPO_FAMILIES = (
     "ring", "fullmesh", "hypercube", "3d_torus", "mesh2d", "2dfullmesh",
     "switched", "nvl72", "multiplane", "leafspine", "3levelhier", "fattree",
     "railfattree", "dragonflyplus", "2dfullmeshclos",
+    # Scale-out (inter-node) Ethernet RoCEv2 fabrics. N is the NODE count and
+    # links_per_gpu is NICs-per-node; per_link_gbps is the Ethernet wire rate
+    # (50 = 400GbE unidirectional). These feed the So stage of the hierarchical
+    # surrogate (see HierarchicalSurrogate); the Su stage uses the families
+    # above with N = GPUs-per-node.
+    "so_fullmesh", "so_spineleaf", "so_fattree",
 )
 
 # Non-blocking NVSwitch fabrics: bisection never caps the schedule rate, so
@@ -1083,6 +1143,10 @@ def _default_links_per_gpu(family, N, **p):
         return 8
     if family == "2dfullmeshclos":
         return 8
+    # Scale-out Ethernet fabrics: 8 NICs per node (H200-class dual-port 400GbE
+    # NICs across 8 rails). links_per_gpu here is NICs-per-node; N is node count.
+    if family in ("so_fullmesh", "so_spineleaf", "so_fattree"):
+        return 8
     return 1
 
 
@@ -1099,6 +1163,13 @@ def _bisection_bw_gbps(family, N, links_per_gpu, per_link_gbps, **p):
         return cut_gpus * per_link_gbps / 2
     if family == "ring":
         return 2 * per_link_gbps                     # cut = 2 links
+    # Scale-out Ethernet: so_fullmesh is non-blocking (full bisection, the
+    # per-node NIC is the bottleneck, not the fabric); so_spineleaf / so_fattree
+    # are oversubscribed inter-tier (8:1 cut, like leafspine).
+    if family == "so_fullmesh":
+        return N * lpg * per_link_gbps / 2          # full bisection (non-blocking)
+    if family in ("so_spineleaf", "so_fattree"):
+        return N * lpg * per_link_gbps / 8          # inter-tier oversubscribed cut
     # leafspine / 3levelhier / fattree / dragonflyplus / 2dfullmeshclos
     return N * lpg * per_link_gbps / 8               # bisection ~ inter-tier links
 
@@ -1177,6 +1248,16 @@ def _hop_count(family, N, **p):
     if family in ("ring", "fullmesh", "hypercube", "3d_torus",
                   "mesh2d", "2dfullmesh"):
         return 1.0                                     # _direct_hop
+    # Scale-out Ethernet: so_fullmesh (fullmesh-of-switches) is non-blocking so
+    # its 2-ToR traversal is the lower bound (hop=1, no extra propagation);
+    # so_spineleaf adds 1 inter-switch hop (leaf->spine->leaf = 2), so_fattree
+    # adds 2 (3-tier). These are the So-stage representative per-step hops.
+    if family == "so_fullmesh":
+        return 1.0
+    if family == "so_spineleaf":
+        return 2.0
+    if family == "so_fattree":
+        return 3.0
     if family in _NONBLOCKING_FAMILIES:
         return 1.0                                     # _switched_hop
     if family in ("leafspine", "3levelhier", "fattree",
@@ -1202,7 +1283,10 @@ def make_topology_from_family(family, N, links_per_gpu=None,
         One of: ``ring``, ``fullmesh``, ``hypercube``, ``3d_torus``,
         ``mesh2d``, ``2dfullmesh``, ``switched``, ``nvl72``, ``multiplane``,
         ``leafspine``, ``3levelhier``, ``fattree``, ``railfattree``,
-        ``dragonflyplus``, ``2dfullmeshclos``.
+        ``dragonflyplus``, ``2dfullmeshclos``, or a scale-out Ethernet family
+        (``so_fullmesh`` / ``so_spineleaf`` / ``so_fattree`` -- here ``N`` is
+        the NODE count, ``links_per_gpu`` is NICs-per-node, and
+        ``per_link_gbps`` is the Ethernet wire rate, 50 = 400GbE).
     N : int
         Participating GPU count.
     links_per_gpu : int, optional
@@ -1256,3 +1340,143 @@ def make_topology_from_family(family, N, links_per_gpu=None,
     bisection_gbps = _bisection_bw_gbps(family, N, lpg, per_link_gbps, **params)
     hop = _hop_count(family, N, **params)
     return make_topology(bisection_gbps=bisection_gbps, hop_count=hop)
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical (scale-up Su + scale-out So) collective surrogate.
+#
+# Once a job spans more than one node, NCCL runs the collective hierarchically:
+# each node does the collective locally over NVLink (Su), one representative
+# per node does it across nodes over Ethernet RoCEv2 (So), then the result is
+# redistributed locally (Su). This class composes a Su + a So sub-collective
+# into that hierarchical latency. The So term is an UNCALIBRATED LOWER BOUND
+# anchored to ns-3 (spec-derived RoCEv2 params, not real-HW calibration) --
+# like the NVLS band, the hierarchical latency sits below the ns-3 packet-level
+# simulation (the analytical bus-bandwidth model omits per-packet credit flow,
+# VOQ arbitration, PFC/MTU overhead, and per-phase barrier syncs that ns-3
+# models).
+# ---------------------------------------------------------------------------
+
+class HierarchicalSurrogate:
+    """Two-stage (Su -> So) hierarchical collective latency surrogate.
+
+    The Su stages run on ``su`` (NVLink bandwidth / latency / startup); the So
+    stages run on ``so`` (Ethernet bandwidth / latency / startup /
+    wire-efficiency) under ``so_topology`` (the So fabric's bisection cap +
+    multi-hop propagation). Phase decomposition (each phase is a single ring
+    pass; ``predict`` with ``phase='rs'`` / ``'ag'`` halves the step count so
+    the serial volume is one bus-factor and the fixed per-step latency is that
+    of a single pass):
+
+      allreduce (4-phase): L = L_su(rs) + L_so(rs) + L_so(ag) + L_su(ag)
+      allgather (3-phase): L = L_su(ag) + L_so(ag) + L_su(ag)
+      alltoall  (2-phase): L = L_su(alltoall) + L_so(alltoall)
+      sendrecv          : L = L_so(sendrecv)  (single inter-node hop, no Su stage)
+
+    Each phase is fed the FULL tensor ``data_bytes`` and its participant count
+    (``n_su`` GPUs for Su stages, ``n_so`` nodes for So stages); the per-phase
+    bus-factor volume D*(N-1)/N then comes out correctly from the ring
+    per-step model. ``collective`` stays a REQUIRED keyword-only argument to
+    ``predict`` (never inferred from ``algo``), consistent with
+    :class:`TheoryDerivedSurrogate`.
+    """
+
+    _VALID = ('allreduce', 'allgather', 'alltoall', 'sendrecv')
+
+    def __init__(self, su, so, gpus_per_node, num_nodes, so_topology=None):
+        self.su = su
+        self.so = so
+        self.n_su = gpus_per_node
+        self.n_so = num_nodes
+        self.so_topology = so_topology
+
+    def _phase(self, data_bytes, n, fabric, algo, phase, credits, topology,
+               collective, **kw):
+        """One single-pass ring sub-collective (rs/ag) on ``fabric`` for ``n``
+        participants under ``topology`` (None = Su / ideal fabric)."""
+        return fabric.predict(
+            data_bytes, n, algo, credits, collective=collective,
+            phase=phase, topology=topology, **kw)
+
+    def predict(self, data_bytes, algo, credits, collective, **kw):
+        """Predict hierarchical collective latency (µs).
+
+        ``collective`` (required) selects the phase decomposition. Other
+        kwargs (``ber``, ``fec_enabled``, ``credits`` already positional, ...)
+        forward to each stage's :meth:`TheoryDerivedSurrogate.predict`.
+        """
+        if collective not in self._VALID:
+            raise ValueError(
+                "collective must be one of %s, got %r" % (self._VALID, collective))
+        if collective == 'sendrecv':
+            # A single inter-node point-to-point transfer has no Su stage.
+            return self.so.predict(
+                data_bytes, self.n_so, algo, credits, collective='sendrecv',
+                topology=self.so_topology, **kw)
+        if collective == 'alltoall':
+            # 2-phase: local shuffle across n_su GPUs, then inter-node
+            # permutation across n_so nodes (each a full alltoall).
+            return (self.su.predict(data_bytes, self.n_su, algo, credits,
+                                   collective='alltoall', **kw)
+                    + self.so.predict(data_bytes, self.n_so, algo, credits,
+                                      collective='alltoall',
+                                      topology=self.so_topology, **kw))
+        if collective == 'allreduce':
+            # 4-phase: local RS -> inter-node RS -> inter-node AG -> local AG.
+            return (self._phase(data_bytes, self.n_su, self.su, algo, 'rs',
+                                credits, None, 'allreduce', **kw)
+                    + self._phase(data_bytes, self.n_so, self.so, algo, 'rs',
+                                  credits, self.so_topology, 'allreduce', **kw)
+                    + self._phase(data_bytes, self.n_so, self.so, algo, 'ag',
+                                  credits, self.so_topology, 'allreduce', **kw)
+                    + self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
+                                  credits, None, 'allreduce', **kw))
+        # allgather (3-phase): local AG -> inter-node AG -> local AG.
+        return (self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
+                            credits, None, 'allgather', **kw)
+                + self._phase(data_bytes, self.n_so, self.so, algo, 'ag',
+                              credits, self.so_topology, 'allgather', **kw)
+                + self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
+                              credits, None, 'allgather', **kw))
+
+
+def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
+                                 so_topology_family='so_fullmesh',
+                                 so_per_link_gbps=50.0, so_links_per_gpu=8,
+                                 **so_overrides):
+    """H200-class hierarchical (Su NVLink + So Ethernet RoCEv2) profile.
+
+    Returns a :class:`HierarchicalSurrogate` combining a scale-up H200 NVLink
+    surrogate (``make_h200_ring_theory``) with a scale-out Ethernet RoCEv2
+    surrogate (``make_h200_roce_theory``) under a So topology
+    (``so_fullmesh`` non-blocking lower bound by default; ``so_spineleaf`` /
+    ``so_fattree`` for oversubscribed fabrics whose bisection caps the So
+    schedule rate). The So term is an uncalibrated lower bound anchored to
+    ns-3.
+
+    Parameters
+    ----------
+    gpus_per_node : int
+        Su (intra-node) rank count = GPUs per node.
+    num_nodes : int
+        So (inter-node) rank count = node count.
+    so_topology_family : str
+        So fabric family (``so_fullmesh`` / ``so_spineleaf`` / ``so_fattree``).
+    so_per_link_gbps : float
+        So per-link unidirectional wire rate (50 = 400GbE).
+    so_links_per_gpu : int
+        NICs per node (the So ``links_per_gpu``; N is node count).
+    **so_overrides
+        Forwarded to :func:`make_h200_roce_theory` to tune So startup /
+        latency / wire-efficiency / bandwidth.
+
+    ``collective`` stays required at ``predict`` time (pass it explicitly --
+    it is not inferred from ``algo``); the decomposition is selected by the
+    collective, not the algorithm.
+    """
+    su = make_h200_ring_theory()
+    so = make_h200_roce_theory(**so_overrides)
+    so_topo = make_topology_from_family(
+        so_topology_family, num_nodes,
+        links_per_gpu=so_links_per_gpu, per_link_gbps=so_per_link_gbps)
+    return HierarchicalSurrogate(su, so, gpus_per_node, num_nodes, so_topo)

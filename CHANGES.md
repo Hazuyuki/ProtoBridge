@@ -116,6 +116,75 @@ non-blocking lower-bound So fabric, sufficient for the
 uncalibrated-lower-bound calibration; the surrogate's `so_spineleaf` family
 covers the analytical case.
 
+### New — scale-out So regression test (WU5)
+
+`test/parity/test_so_hierarchical_regression.py` locks in the WU4 So fabric
+behaviour: a hierarchical allreduce over the real EthernetSwitch RoCEv2 fabric
+(2-node + 4-node `--interNodeTopology=host --interNodeFabricType=RoCE
+--collective=allreduce --algorithm=hierarchical`) must (a) complete, (b) be
+lossless (`switchDroppedPackets=0`, `permanentLosses=0`), and (c) cost more
+than the single-node Su ring allreduce (the So inter-node phase adds
+reduce-scatter + allgather across nodes). This is the So-path counterpart to
+`test_config_vs_inline_parity.py`: where that test gates config-vs-inline
+bit-identity of the Su calibrated path, this gates the existence + losslessness
++ latency ordering of the So RoCEv2 fabric.
+
+Deferred: config-primary So parity (a `.cfg` reproducing the hierarchical inline
+path bit-for-bit) is not added. The config-file path sources only single-node
+fabric-hardware keys + the `collective`/`algorithm`/`topology` op axes into the
+validated inline injectors — it does not source `numNodes`/`gpusPerNode`/
+`interNode*`, so a `h200-hierarchical-allreduce.cfg` would fall through to the
+inline hierarchical branch with `numNodes=1` and never exercise the So fabric,
+and a `h200-roce.profile` would mis-apply RoCE wire-efficiency to single-node
+Su (NVLink) traffic. The So fabric is therefore validated via the scratch
+inline path (WU4 e2e + this regression test), not via config parity; config-
+primary So support is a future extension that requires sourcing the multi-node
+axes. WU5 of the scale-out effort.
+
+### New — surrogate two-stage (Su+So) hierarchical model (WU6)
+
+`surrogate/theory/whitebox_surrogate_v2.py` gains a hierarchical
+scale-out model that mirrors the ns-3 WU1-5 work. (1) `wire_efficiency`
+(default 1.0) folds RoCEv2's per-transfer Eth+IP+UDP+IB header overhead into
+the serial bandwidth (`T_serial /= wire_efficiency`); 1.0 is byte-identical to
+the NVLink scale-up model (no header), so all 37 prior surrogate tests stay
+green. (2) `phase='rs'/'ag'` (default `'full'`) selects a single-pass
+sub-collective: it halves the step count so the serial volume stays one
+bus-factor (steps x per_step is invariant) and only the fixed per-step latency
+halves -- the primitive the hierarchical decomposition needs. `'full'` is
+byte-identical to prior behavior. (3) Three scale-out topology families
+(`so_fullmesh` / `so_spineleaf` / `so_fattree`) join `_TOPO_FAMILIES`:
+`N` is the NODE count, `links_per_gpu` is NICs-per-node, `per_link_gbps` is
+the Ethernet wire rate (50 = 400GbE); `so_fullmesh` is the non-blocking lower
+bound (full bisection, hop=1), `so_spineleaf` (hop=2) / `so_fattree` (hop=3)
+are oversubscribed inter-tier fabrics whose bisection caps the So schedule
+rate. (4) `make_h200_roce_theory` is the So profile (400GbE-derived ring bw
+160000 B/us, 40 us RDMA startup, 0.95 wire efficiency, 8 NICs/node, ~1 us/hop,
+1.5 us switch pipeline). (5) `HierarchicalSurrogate` composes the Su + So
+sub-collectives per collective -- allreduce 4-phase (su_rs + so_rs + so_ag +
+su_ag), allgather 3-phase, alltoall 2-phase, sendrecv So-only -- each phase
+fed the full tensor + its participant count. `make_h200_hierarchical_theory`
+is the factory; `collective=` stays required keyword-only (never inferred from
+`algo`), consistent with `TheoryDerivedSurrogate`.
+
+The So term is an UNCALIBRATED LOWER BOUND anchored to ns-3 (spec-derived RoCE
+params, not real-HW calibration) -- like the NVLS band, the hierarchical
+latency sits below the ns-3 packet-level simulation. Verified:
+`test/parity/test_surrogate_vs_ns3_hierarchical.py` runs the ns-3 hierarchical
+allreduce (2/4 node, 256 MiB, default params + RoCE So) and asserts the
+surrogate is at/below ns-3 (2-node ratio 0.30, 4-node 0.40). The band is
+deliberately loose: ns-3 runs with default fabric params (800 GB/s Su) while
+the surrogate uses the HW-calibrated Su ring rate, AND ns-3's hierarchical Su
+phase runs on the switched fabric (which `h200-ring-allreduce.cfg` warns is
+~6x slower than the calibrated P2P ring the surrogate's Su term assumes) --
+both make the surrogate a lower bound. A tight, param-matched anchor (back-
+fitting the So startup/congestion term to ns-3) is deferred (uncalibrated-
+lower-bound scope). `surrogate/test/test_theory.py` adds 14 hierarchical
+tests (monotonicity in nodes, topology lower-bound ordering, 4-phase additive
+decomposition, allgather<allreduce, sendrecv So-only, collective required/
+validated, wire-efficiency + phase parity) -- 51 surrogate tests green. WU6
+of the scale-out effort; the ns-3 + surrogate scale-out work is complete.
+
 ### Breaking — `[op]` declares the three CLI axes directly (22e8edc)
 
 A `.cfg` `[op]` now declares the three real CLI axes directly —
