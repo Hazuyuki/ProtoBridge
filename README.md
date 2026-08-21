@@ -211,10 +211,10 @@ byte-identical to the ideal-fabric model. See
 
 ```bash
 # Predict ring allreduce latency at 4 GPU / 1 MiB (theory model, lower bound).
-python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory().predict(1<<20,4,"ring",credits=32,ber=0))'
+python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory().predict(1<<20,4,"ring",credits=32,ber=0,collective="allreduce"))'
 
 # Custom hardware: override any H200 parameter (see surrogate/theory/USER_GUIDE.md).
-python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory(num_lanes=8, startup_us=7).predict(1<<20,4,"ring",credits=32,ber=0))'
+python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory(num_lanes=8, startup_us=7).predict(1<<20,4,"ring",credits=32,ber=0,collective="allreduce"))'
 ```
 
 See [surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md) for the guide and

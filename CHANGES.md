@@ -28,6 +28,22 @@ propagation. Build it with `make_topology(bisection_gbps=, hop_count=)` or
 `make_topology_from_family(family, N, per_link_gbps=)` (15 fabric families);
 omitting it is byte-identical to the ideal-fabric default. See `surrogate/theory/USER_GUIDE.md`.
 
+### New — surrogate `collective=` (AlltoAll + Send-Recv) is a required argument (4736942)
+
+`TheoryDerivedSurrogate.predict()` / `predict_tail()` take a **required**
+`collective=` keyword (`allreduce` / `allgather` / `alltoall` / `sendrecv`).
+Together with `algorithm` it fixes the step count and per-step volume, so the
+surrogate now models AlltoAll (`N-1` ring/collnetdirect permutation phases, or
+`⌈log₂N⌉` tree rounds; per-GPU volume `D(N-1)/N` — the correction the DSE
+analytical model describes in comments but does not apply) and point-to-point
+Send-Recv (`steps=1`, full payload, no pipeline credit pressure). It is **not
+inferred from `algorithm`** — the caller must name the operation explicitly;
+omitting it raises `TypeError`, an invalid name raises `ValueError`. AlltoAll
+cross-section contention is captured by the existing `topology=` bisection cap
+(no separate bandwidth constant). Build with `make_h200_alltoall_theory()`
+(46 µs SIMPLE startup) / `make_h200_sendrecv_theory()` (15 µs startup). See
+`surrogate/theory/USER_GUIDE.md`.
+
 See `README.md` and `doc/` for the full module overview.
 
 ---

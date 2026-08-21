@@ -20,7 +20,7 @@ from surrogate.theory.whitebox_surrogate_v2 import make_surrogate_from_wire
 s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
 
 # Mean latency of a 256 MiB ring AllReduce on 8 GPUs
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce")
 ```
 
 | Input | Meaning | H200 |
@@ -68,7 +68,8 @@ mechanism-specific or message-size-specific fitted coefficient.
 |---|---|
 | `D` | Operation data size in bytes |
 | `N` | Participating GPU or NPU count |
-| `algorithm` | Ring, tree, or NVLS schedule |
+| `collective` | AllReduce, AllGather, AlltoAll, or Send-Recv (required; not inferred from `algorithm`) |
+| `algorithm` | Ring, tree, NVLS, or collnetdirect schedule |
 | `S_protocol` | Protocol startup latency |
 | `steps` | Number of communication steps |
 | `B_step` | Data transmitted in one step |
@@ -120,6 +121,39 @@ derivation gives 180,000, of which 177,000 is the calibrated value — see
 section 11), corrected from 94,000. The MAPE figures in section 9 are a
 pre-correction exp3 snapshot run in the parent repo and are not re-derived
 here.
+
+### Collective and step model
+
+`predict()` takes a required `collective` (`allreduce` / `allgather` /
+`alltoall` / `sendrecv`); together with `algorithm` it fixes `steps` and
+`B_step`. It is not inferred from `algorithm` — the caller must name it
+explicitly (omitting it raises `TypeError`; an invalid name raises `ValueError`).
+
+| `collective` | `algorithm` | `steps` | `B_step` (bytes/step) | per-GPU volume |
+|---|---|---:|---|---|
+| `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allreduce` | `tree` | `2⌊log₂N⌋` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
+| `alltoall` | `ring` / `collnetdirect` | `N-1` | `D/N` | `D(N-1)/N` |
+| `alltoall` | `tree` | `⌈log₂N⌉` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `sendrecv` | any | `1` | `D` | `D` (single hop) |
+
+AllReduce scatters `D(N-1)/N` per GPU over its `2(N-1)` ring steps
+(reduce-scatter + all-gather); AllGather via NVLS multicast moves `D/N` per
+step over 2 steps; AlltoAll permutes `D(N-1)/N` per GPU — the volume
+correction the DSE analytical model (`bw_model_predict`) describes in comments
+but does not apply. The AlltoAll step count is `N-1` permutation phases
+(ring / `collnetdirect`) or `⌈log₂N⌉` recursive-doubling rounds (tree), not the
+`2(N-1)` an AllReduce routing would imply. Send-Recv is a single
+point-to-point hop: `steps=1`, the full payload, no pipeline credit pressure
+(`Phi_credit = 1`, `C_bdp = ∞`).
+
+The per-step serialization `T_serial = B_step / BW_eff` uses the per-link ring
+rate for AlltoAll and Send-Recv (they serialize over the per-link wire, like
+the ring schedule); AlltoAll's cross-section contention — every GPU exchanges
+with every other simultaneously — is captured by the **topology bisection
+cap** of Section 12 (`min(ring_bw, bisection)`), not a separate bandwidth
+constant, so without a topology AlltoAll is a per-link lower bound.
 
 ## 4. Credit Pressure
 
@@ -302,13 +336,13 @@ from surrogate.theory.whitebox_surrogate_v2 import make_surrogate_from_wire, mak
 s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
 
 # Ideal NVSwitch fabric (the default): 256 MiB ring AllReduce on 8 GPUs.
-ideal = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)            # ~1325 us
+ideal = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce")            # ~1325 us
 
 # Same ring algorithm on an actual 8-GPU ring topology: bisection = 2 links
 # x 25 GB/s = 50 GB/s, which caps the schedule rate down.
 ring_topo = make_topology(bisection_gbps=50, hop_count=1)
 slow = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0,
-                 topology=ring_topo)                                        # ~4718 us
+                 collective="allreduce", topology=ring_topo)                # ~4718 us
 ```
 
 `Topology` carries the two physical quantities by which topology influences
@@ -348,11 +382,11 @@ s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring
 
 # 8-GPU ring fabric: bisection = 2 links x 25 GB/s = 50 GB/s, hop = 1.
 t = make_topology_from_family("ring", N=8, per_link_gbps=25)
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # ~4718 us
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", topology=t)   # ~4718 us
 
 # Non-blocking NVSwitch fabric: bisection never caps -> ideal, no per_link needed.
 t_sw = make_topology_from_family("switched", N=8)
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t_sw)  # == topology=None
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", topology=t_sw)  # == topology=None
 ```
 
 `family` is one of `ring`, `fullmesh`, `hypercube`, `3d_torus`, `mesh2d`,

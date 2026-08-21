@@ -7,11 +7,15 @@ full ns-3. For the full mathematical derivation, see
 [`WHITEBOX_SURROGATE.md`](WHITEBOX_SURROGATE.md); for how the H200 anchor numbers
 were measured, see [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md).
 
-The model predicts the latency of one collective operation (AllReduce /
-AllGather / AlltoAll, scheduled as ring / tree / NVLS). It is a
-first-principles physical derivation, so it is a **lower bound** on ns-3 — use
-it for **ordering and trend analysis across a design space**, not for
-absolute single-point prediction.
+The model predicts the latency of one collective operation — AllReduce,
+AllGather, AlltoAll, or point-to-point Send-Recv — scheduled as ring / tree /
+NVLS. The **collective name and the algorithm together** select the step model:
+pass `collective=` to `predict()` (`'allreduce'` / `'allgather'` /
+`'alltoall'` / `'sendrecv'`). It is a **required** argument — not inferred from
+the algorithm, so the caller must name the operation explicitly. It is a
+first-principles physical derivation, so it
+is a **lower bound** on ns-3 — use it for **ordering and trend analysis across a
+design space**, not for absolute single-point prediction.
 
 ---
 
@@ -24,7 +28,7 @@ from surrogate.theory.whitebox_surrogate_v2 import make_surrogate_from_wire
 s = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
 
 # Predict mean latency of a 256 MiB ring AllReduce on 8 GPUs.
-lat_us = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)
+lat_us = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce")
 # lat_us == 1325.5  (the H200 reference point)
 ```
 
@@ -38,7 +42,7 @@ Everything else on this page is optional.
 | Stage | What you give | Required? |
 |---|---|---|
 | **① Build** a surrogate | per-link wire rate, lane count, algorithm | yes (or use an H200 preset) |
-| **② Query** a latency | data size, GPU count, algorithm, credits | yes (4 inputs) |
+| **② Query** a latency | data size, GPU count, algorithm, credits, `collective` | yes (5 inputs) |
 | **③ Topology** (optional) | a fabric name + physical numbers | no — omit = ideal NVSwitch |
 
 Omitting stage ③ gives the **default fabric**: an ideal non-blocking NVSwitch.
@@ -80,7 +84,10 @@ s = make_h200_ring_theory()      # ships the exact calibrated H200 ring numbers
 ```
 
 Use these when you want the measured H200 values rather than the wire-rate
-derivation. They accept `**overrides` too (any `__init__` keyword).
+derivation. They accept `**overrides` too (any `__init__` keyword). For
+AlltoAll and Send-Recv use `make_h200_alltoall_theory()` (SIMPLE 46 µs
+startup) and `make_h200_sendrecv_theory()` (15 µs startup); both reuse the
+H200 ring anchor with a protocol-appropriate startup.
 
 ### Custom hardware
 
@@ -122,10 +129,10 @@ uncalibrated lower bound.
 ## 4. Query a latency — `predict()`
 
 ```python
-s.predict(data_bytes, num_gpus, algo, credits, ber=0, ..., topology=None)
+s.predict(data_bytes, num_gpus, algo, credits, ber=0, ..., topology=None, *, collective)
 ```
 
-### Required (4)
+### Required (5)
 
 | Input | Meaning |
 |---|---|
@@ -133,6 +140,7 @@ s.predict(data_bytes, num_gpus, algo, credits, ber=0, ..., topology=None)
 | `num_gpus` | participating GPU count N |
 | `algo` | `ring` / `tree` / `nvls` |
 | `credits` | flow-control credit count |
+| `collective` | `'allreduce'` / `'allgather'` / `'alltoall'` / `'sendrecv'` (keyword-only; not inferred from `algo`) |
 
 ### Optional, grouped by mechanism (all defaulted)
 
@@ -147,14 +155,51 @@ s.predict(data_bytes, num_gpus, algo, credits, ber=0, ..., topology=None)
 | Topology | `topology` (see §5) |
 
 For the common case — clean ideal fabric, `ber=0` — you usually pass only the
-four required inputs. The rest engage physical mechanisms only when set.
+five required inputs (`data_bytes`, `num_gpus`, `algo`, `credits`,
+`collective`). The rest engage physical mechanisms only when set.
+
+### Collective — AlltoAll and Send-Recv
+
+The algorithm alone no longer fixes the collective. `collective=` names the
+operation and, with `algo`, fixes the step count and per-step volume. The
+mapping (full formulas in §6 of `WHITEBOX_SURROGATE.md`):
+
+| `collective` | `algo` | steps | per-step volume | per-GPU volume |
+|---|---|---|---|---|
+| `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allreduce` | `tree` | `2⌊log₂N⌋` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
+| `alltoall` | `ring` / `collnetdirect` | `N-1` | `D/N` | `D(N-1)/N` |
+| `alltoall` | `tree` | `⌈log₂N⌉` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `sendrecv` | any | `1` | `D` | `D` (single hop) |
+
+AlltoAll moves `D(N-1)/N` per GPU across `N-1` partner phases (ring) or
+`⌈log₂N⌉` recursive-doubling rounds (tree) — the volume correction the DSE's
+analytical model describes but does not apply. Its per-step serialization uses
+the per-link ring rate; the cross-section **contention** (every GPU talks to
+every other) is captured by the **topology bisection cap** (§5), so without a
+topology AlltoAll is an optimistic lower bound. Send-Recv is one point-to-point
+hop: `steps=1`, full payload, no pipeline credit pressure.
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import make_h200_alltoall_theory
+s = make_h200_alltoall_theory()                         # 46 µs SIMPLE startup
+# 256 MiB AlltoAll on 8 GPUs: 7 partner phases, D/N per phase.
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="alltoall")
+
+# Send-Recv: one hop, latency = startup + D/ring_bw + link_lat.
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="sendrecv")
+```
+
+`collective` is required — omitting it raises `TypeError`, and an unknown
+name raises `ValueError`. It is never inferred from `algo`.
 
 ### Tail latency — `predict_tail()`
 
 Same signature plus `percentile=99` (drops the `include_*` ablation switches):
 
 ```python
-p99 = s.predict_tail(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, percentile=99)
+p99 = s.predict_tail(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", percentile=99)
 ```
 
 ---
@@ -175,7 +220,7 @@ from surrogate.theory.whitebox_surrogate_v2 import make_topology_from_family
 
 # 8-GPU ring fabric: bisection = 2 links x 25 GB/s = 50 GB/s, hop = 1.
 t = make_topology_from_family("ring", N=8, per_link_gbps=25)
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # ~4718 us
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", topology=t)   # ~4718 us
 ```
 
 `make_topology_from_family(family, N, links_per_gpu=None, per_link_gbps=None, **params)`
@@ -229,7 +274,7 @@ Full per-family formulas: §13 of `WHITEBOX_SURROGATE.md`.
 
 ```python
 s = make_surrogate_from_wire(25000, 18, "ring")
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)        # 1325.5 us
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce")        # 1325.5 us
 ```
 
 ### B. Same ring algorithm on a real 8-GPU ring fabric (topology bites)
@@ -237,14 +282,14 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)        # 1325.5 us
 ```python
 from surrogate.theory.whitebox_surrogate_v2 import make_topology_from_family
 t = make_topology_from_family("ring", N=8, per_link_gbps=25)
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # ~4718 us
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", topology=t)   # ~4718 us
 ```
 
 ### C. Non-blocking NVSwitch fabric (== default, no per_link needed)
 
 ```python
 t = make_topology_from_family("switched", N=8)
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # == topology=None
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", topology=t)   # == topology=None
 ```
 
 ### D. Link degradation — BER + FEC
@@ -255,7 +300,7 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, topology=t)   # == t
 # (at ber<=1e-4 or without llr_enabled, retransmission is 0).
 s.predict(64 * 1024 * 1024, 8, "ring", credits=128, ber=1e-3,
          llr_enabled=True, fec_enabled=True, fec_n=544, fec_k=514, fec_t=15,
-         retry_mode="gobackn")
+         retry_mode="gobackn", collective="allreduce")
 ```
 
 ### E. Contention from a concurrent flow
@@ -263,7 +308,7 @@ s.predict(64 * 1024 * 1024, 8, "ring", credits=128, ber=1e-3,
 ```python
 # A background flow offering ~10% of the ring schedule bandwidth (177 GB/s),
 # i.e. ~17.7 GB/s, on the shared bottleneck. competing_bw is in GB/s.
-s.predict(16 * 1024 * 1024, 8, "ring", credits=128, ber=0, competing_bw=17.7)
+s.predict(16 * 1024 * 1024, 8, "ring", credits=128, ber=0, competing_bw=17.7, collective="allreduce")
 ```
 
 ### F. Custom (non-H200) platform from one wire rate
@@ -271,13 +316,36 @@ s.predict(16 * 1024 * 1024, 8, "ring", credits=128, ber=0, competing_bw=17.7)
 ```python
 # A hypothetical 8-link fabric at 50 GB/s/link unidirectional.
 s = make_surrogate_from_wire(b_link_bytes_per_us=50000, num_lanes=8, algo="ring")
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0)
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce")
 ```
 
 ### G. Tail (p99) latency
 
 ```python
-s.predict_tail(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, percentile=99)
+s.predict_tail(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", percentile=99)
+```
+
+### H. AlltoAll — and why a topology matters for it
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import (
+    make_h200_alltoall_theory, make_topology_from_family)
+s = make_h200_alltoall_theory()
+# Ideal fabric: 7 partner phases, D/N each — a lower bound (no cross-section cap).
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="alltoall")
+# Real 8-GPU ring fabric: the tight bisection caps the rate -> much slower.
+t = make_topology_from_family("ring", N=8, per_link_gbps=25)
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0,
+          collective="alltoall", topology=t)
+```
+
+### I. Send-Recv (point-to-point)
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import make_h200_sendrecv_theory
+s = make_h200_sendrecv_theory()
+# One hop: latency = startup(15us) + D/ring_bw + link_lat. No credit, no FEC.
+s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="sendrecv")
 ```
 
 ---
@@ -309,13 +377,17 @@ s.predict_tail(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, percentile=99)
 ## 8. Tests
 
 ```bash
-python3 -m pytest surrogate/test/ -q          # 22 passed
+python3 -m pytest surrogate/test/ -q          # 37 passed
 ```
 
 `test_theory.py` checks the model is finite, monotone in size, within a 2×
-physical band of the ns-3 H200 baseline, and exercises the topology kwarg
-(byte-identity, bisection cap, hop latency, the name→Topology factory, and the
-error paths).
+physical band of the ns-3 H200 baseline, and exercises the topology and
+collective kwargs: `collective` is required (omitting it raises `TypeError`)
+and validated (a bad name raises `ValueError`), an explicit `collective`
+reproduces the calibrated ring/tree/nvls configs, the ber>0 GBN-retransmission
+path runs under an explicit collective, plus AlltoAll step/volume for ring+tree,
+Send-Recv single-hop decomposition, the AlltoAll bisection-cap contention, and
+the topology name→Topology factory + error paths.
 
 ---
 
