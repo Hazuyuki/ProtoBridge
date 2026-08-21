@@ -28,7 +28,7 @@ propagation. Build it with `make_topology(bisection_gbps=, hop_count=)` or
 `make_topology_from_family(family, N, per_link_gbps=)` (15 fabric families);
 omitting it is byte-identical to the ideal-fabric default. See `surrogate/theory/USER_GUIDE.md`.
 
-### New — surrogate `collective=` (AlltoAll + Send-Recv) is a required argument (4736942)
+### New — surrogate `collective=` (AlltoAll + Send-Recv) is a required argument (4989fd1, amended over 4736942)
 
 `TheoryDerivedSurrogate.predict()` / `predict_tail()` take a **required**
 `collective=` keyword (`allreduce` / `allgather` / `alltoall` / `sendrecv`).
