@@ -3812,6 +3812,35 @@ class SwitchTypeSeamTest : public TestCase
     }
 };
 
+// The scale-out (Ethernet RoCEv2) switch is a pluggable FabricSwitch subtype,
+// selected via NvSwitchHelper::SetSwitchType and reusing the NvSwitch datapath.
+class EthernetSwitchSeamTest : public TestCase
+{
+  public:
+    EthernetSwitchSeamTest() : TestCase("Ethernet switch is pluggable via NvSwitchHelper") {}
+    void DoRun() override
+    {
+        // SetSwitchType("ns3::EthernetSwitch") builds an So switch.
+        NvSwitchHelper helper;
+        helper.SetSwitchType("ns3::EthernetSwitch");
+        Ptr<Node> node = CreateObject<Node>();
+        Ptr<NetDevice> dev = helper.Install(node);
+        NS_TEST_ASSERT_MSG_NE(dev, nullptr, "Ethernet switch install must succeed");
+
+        // An Ethernet switch is-a FabricSwitch and is-a NvSwitch (datapath reuse).
+        Ptr<FabricSwitch> fs = DynamicCast<FabricSwitch>(dev);
+        NS_TEST_ASSERT_MSG_NE(fs, nullptr, "Ethernet switch must be a FabricSwitch");
+        Ptr<NvSwitch> nv = DynamicCast<NvSwitch>(dev);
+        NS_TEST_ASSERT_MSG_NE(nv, nullptr, "Ethernet switch must derive from NvSwitch");
+
+        // The So fabric reports as the Ethernet-RoCEv2 vendor (not NVIDIA).
+        NS_TEST_ASSERT_MSG_EQ(fs->GetVendorName(), std::string("Ethernet-RoCEv2"),
+                              "Ethernet switch vendor must be Ethernet-RoCEv2");
+        // A fresh Ethernet switch inherits NvSwitch's empty port set.
+        NS_TEST_ASSERT_MSG_EQ(nv->GetNPorts(), 0u, "fresh Ethernet switch has no ports");
+    }
+};
+
 // A FabricEndpoint subclass overriding the virtual FlowControlGate hook.
 class EndpointFlowControlOverride : public FabricEndpoint
 {
@@ -4801,6 +4830,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ProtocolConfigRunTest, TestCase::Duration::QUICK);
     AddTestCase(new ArbiterSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchTypeSeamTest, TestCase::Duration::QUICK);
+    AddTestCase(new EthernetSwitchSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new FlowControlVirtualHookTest, TestCase::Duration::QUICK);
 
     // P0: collective-injector correctness (real sims; EXTENSIVE).

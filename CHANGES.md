@@ -24,6 +24,26 @@ scale-out RoCEv2 fabric + hierarchical SU->SO collectives effort; the Ethernet
 switch (WU2), PFC/DCQCN + per-fabric model + MTU (WU3), So topology builders
 (WU4), configs/parity (WU5), and surrogate two-stage model (WU6) follow.
 
+### New — Ethernet (RoCEv2) switch fabric for scale-out (WU2)
+
+`model/ethernet-switch.{h,cc}` adds the scale-out switch as a thin
+`EthernetSwitch : public NvSwitch` — a distinct, pluggable TypeId
+("ns3::EthernetSwitch") selected via `NvSwitchHelper::SetSwitchType`, reusing
+the proven L2 MAC-learning + VOQ + crossbar-arbiter + cut-through datapath
+inherited from NvSwitch, but carrying no NVLink in-network compute (SHARP
+all-reduce / NVLS all-gather are scale-up concepts; they default off on
+NvSwitch and stay off here). `GetVendorName()` returns "Ethernet-RoCEv2" so
+the So fabric is distinguishable from the Su NVSwitch ("NVIDIA"). Added to
+`CMakeLists.txt`. The coupled RoCEv2 lossless subsystem (PFC priority flow
+control, ECN marking, DCQCN rate backoff, MTU packetization) is layered on
+the inherited datapath in WU3 (deferred so the FabricHeader — which has no
+ECN field — is touched only once, with its serialization-size impact analyzed
+together, since `packet->GetSize()`-based egress timing is sensitive to a
+header-byte change). One unit test (`EthernetSwitchSeamTest`) verifies the
+seam: `SetSwitchType("ns3::EthernetSwitch")` builds an object that is-a
+FabricSwitch and is-a NvSwitch with the Ethernet-RoCEv2 vendor name. WU2 of
+the scale-out RoCEv2 effort; WU1 (RoCE model+builder) precedes, WU3+ follow.
+
 ### Breaking — `[op]` declares the three CLI axes directly (22e8edc)
 
 A `.cfg` `[op]` now declares the three real CLI axes directly —
