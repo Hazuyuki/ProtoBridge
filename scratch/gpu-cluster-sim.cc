@@ -39,6 +39,7 @@
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/ub-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
+#include "ns3/dcqcn-rate-machine.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/nccl-protocol-payload-builder.h"
 #include "ns3/ub-payload-builder.h"
@@ -266,6 +267,14 @@ main(int argc, char* argv[])
     // The ECN reaction (CNP + DCQCN rate-backoff) is a Phase-B capability, so
     // this knob is inert until the So send path emits SoHeader-bearing packets.
     uint32_t ecnThreshold = 8;
+    // DCQCN rate machine (Phase B). Off by default: with no DcqcnRateMachine
+    // mounted, CNPs are no-ops and SendPacketOnDevice adds zero shaping delay,
+    // so all So runs stay bit-identical to the Phase-A baseline. On, a shared
+    // DcqcnRateMachine is mounted on every So (inter-node) endpoint; the switch
+    // ECN path stamps SoHeader ECN, receivers emit CNPs, and the sender's
+    // ProcessCnpPacket drives the per-flow Alpha rate-backoff folded into the
+    // single SendPacketOnDevice egress chokepoint.
+    bool enableDcqcn = false;
     std::string intraNodeTopology = "switched";
     std::string intraNodeAlgorithm = "fullmesh";
 
@@ -438,6 +447,7 @@ main(int argc, char* argv[])
     cmd.AddValue("interNodeFabricType", "Inter-node fabric type: RoCE/ETH/NVLink", interNodeFabricTypeStr);
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
     cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
+    cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
     cmd.AddValue("intraNodeAlgorithm", "Intra-node algorithm for hierarchical: ring/fullmesh", intraNodeAlgorithm);
     std::string stepTraceFile = "";
@@ -850,6 +860,16 @@ main(int argc, char* argv[])
             roceModel = CreateObject<RoceProtocolModel>();
         }
 
+        // DCQCN rate machine (Phase B). One shared machine across all So
+        // endpoints: state is keyed per flow (destRank,vcId,flowId), so a single
+        // instance is correct and matches a real NIC's per-flow tables. Null
+        // when --dcqcn is off → CNP no-ops + zero shaping delay (parity-safe).
+        Ptr<DcqcnRateMachine> dcqcnMachine;
+        if (interNodeFabricType == FabricType::ROCE && enableDcqcn)
+        {
+            dcqcnMachine = CreateObject<DcqcnRateMachine>();
+        }
+
         ApplicationContainer apps = multiTopo.GetAllEndpoints();
         for (uint32_t i = 0; i < apps.GetN(); ++i)
         {
@@ -862,6 +882,10 @@ main(int argc, char* argv[])
             if (roceModel)
             {
                 ep->SetInterNodeProtocolModel(roceModel);
+            }
+            if (dcqcnMachine)
+            {
+                ep->SetDcqcnRateMachine(dcqcnMachine);
             }
             ep->SetBulkChunkSize(bulkChunkSize);
             ep->SetDeviceType(deviceType);

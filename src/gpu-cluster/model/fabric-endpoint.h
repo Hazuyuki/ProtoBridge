@@ -21,6 +21,7 @@
 #include "protocol-model.h"
 #include "protocol-payload-builder.h"
 #include "flow-control-policy.h"
+#include "dcqcn-rate-machine.h"
 
 #include "ns3/application.h"
 #include "ns3/net-device.h"
@@ -270,6 +271,12 @@ class FabricEndpoint : public Application
     // Flow-control policy seam (send gate dispatches on this)
     void SetFlowControlPolicy(FlowControlPolicy policy);
     FlowControlPolicy GetFlowControlPolicy() const;
+
+    // DCQCN rate machine (scale-out RoCEv2). Mounted only on So endpoints
+    // (via --dcqcn); null => the send path is byte-identical to the unmounted
+    // baseline (parity-safe).
+    void SetDcqcnRateMachine(Ptr<DcqcnRateMachine> machine);
+    Ptr<DcqcnRateMachine> GetDcqcnRateMachine() const;
     /**
      * @brief Send-gate dispatch. Returns true if the packet is admitted
      *        (credit consumed under CREDIT); false => caller backpressures.
@@ -488,6 +495,11 @@ class FabricEndpoint : public Application
     /// SendCreditPacket control-packet shape so it rides the same lossless
     /// control path and bypasses BER/ECN marking.
     void SendCnpPacket(const FabricHeader& markedHeader);
+
+    /// @brief Receive-side handler for an inbound CNP: drives the DCQCN rate
+    ///        machine (per-flow Alpha backoff) for the flow the CNP echoes.
+    ///        No-op when no machine is mounted (dormant baseline).
+    void ProcessCnpPacket(const FabricHeader& cnpHeader);
     void TrySendQueuedPackets();
 
     /**
@@ -540,6 +552,7 @@ class FabricEndpoint : public Application
     // Flow control
     Ptr<CreditManager> m_creditManager;             ///< Credit manager
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
+    Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
     std::unordered_map<uint32_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(VC,flowId) reorder buffers, key=(vcId<<16)|flowId
 
     // Send queue

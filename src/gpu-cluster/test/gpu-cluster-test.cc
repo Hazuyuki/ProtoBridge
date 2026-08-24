@@ -21,6 +21,7 @@
 #include "ns3/roce-protocol-model.h"
 #include "ns3/roce-payload-builder.h"
 #include "ns3/so-header.h"
+#include "ns3/dcqcn-rate-machine.h"
 #include "ns3/nccl-protocol-payload-builder.h"
 #include "ns3/protocol-transaction.h"
 #include "ns3/packet.h"
@@ -60,6 +61,9 @@
 #include "ns3/traffic-pattern.h"
 #include "ns3/gateway-endpoint.h"
 #include "ns3/point-to-point-net-device.h"
+#include "ns3/point-to-point-helper.h"
+#include "ns3/ppp-header.h"
+#include "ns3/net-device-container.h"
 
 #include <fstream>
 #include <functional>
@@ -3960,6 +3964,446 @@ class EthernetSwitchEcnTest : public TestCase
     }
 };
 
+// A FabricEndpoint subclass that exposes the protected receive dispatch for
+// test injection. Mirrors EndpointFlowControlOverride's pattern.
+class CnpTestEndpoint : public FabricEndpoint
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::CnpTestEndpoint")
+                                .SetParent<FabricEndpoint>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<CnpTestEndpoint>();
+        return tid;
+    }
+    CnpTestEndpoint() = default;
+    // Feed a post-peel segment (SoHeader outermost) through the receive
+    // dispatch, exactly as ReceiveFromDevice would after stripping FabricHeader.
+    void InjectDataPacket(Ptr<Packet> packet, const FabricHeader& header)
+    {
+        ProcessDataPacket(packet, header);
+    }
+    // Drive the protected egress chokepoint so tests can observe DCQCN shaping
+    // on the send path (the efficiency-gated ShapingDelay fold).
+    void InjectSend(Ptr<Packet> packet, uint32_t deviceIndex, const Address& dest)
+    {
+        SendPacketOnDevice(packet, deviceIndex, dest);
+    }
+};
+
+NS_OBJECT_ENSURE_REGISTERED(CnpTestEndpoint);
+
+// CNP-reaction: an ECN-marked RoCE segment reaching a receiver's protocol
+// dispatch must trigger a Congestion Notification Packet back to the source.
+// This exercises the WU-SoH3 receive-side link (ProcessProtocolDataPacket ->
+// SoHeader::PeekEcn -> SendCnpPacket) that Seam B (SendBulkWireTransferSize
+// stamps protocol=SIMPLE + a within-budget SoHeader) now makes reachable.
+// Switch-side marking is covered by EthernetSwitchEcnTest and send-side
+// stamping by the parity gate, so this injection isolates the one link that
+// had no test coverage. Run at BER=0 (the CNP is a control packet that bypasses
+// BER sampling regardless), with a low EcnThreshold irrelevant here since the
+// SoHeader is pre-marked.
+class CnpReactionTest : public TestCase
+{
+  public:
+    CnpReactionTest()
+        : TestCase("RoCE ECN-marked segment triggers CNP at receiver")
+    {
+    }
+    void DoRun() override
+    {
+        // Receiver: rank 0 on a node with 8 local GPUs, so a remote source rank
+        // (8) selects the RoCE model (efficiency 0.95 < 1.0 — no efficiency>=1.0
+        // short-circuit) and the So fabric type.
+        Ptr<CnpTestEndpoint> ep = CreateObject<CnpTestEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 8);
+        ep->SetInterNodeProtocolModel(CreateObject<RoceProtocolModel>());
+        ep->SetProtocolPayloadBuilder(CreateObject<RocePayloadBuilder>());
+        ep->SetBypassReorderBuffer(true);
+        ep->SetReceiveCallback(MakeCallback(&CnpReactionTest::OnDelivered, this));
+
+        // One So link so the PointToPointNetDevice is link-up (dev->Send fires
+        // MacTx). The bare peer device just completes the channel; it is not a
+        // FabricEndpoint, so received frames (CNP/CREDIT) are harmlessly dropped.
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        NetDeviceContainer devs = p2p.Install(nodes);
+        Ptr<NetDevice> epDev = devs.Get(0);
+        ep->AddNetDevice(epDev);
+        // Route back to the remote source rank over device 0.
+        ep->SetNeighborMac(8, Mac48Address("00:00:00:00:00:08"));
+        ep->SetRoutingEntry(8, 0);
+        epDev->TraceConnectWithoutContext("MacTx",
+                            MakeCallback(&CnpReactionTest::OnMacTx, this));
+
+        // --- Positive: ECN-marked RoCE segment must trigger a CNP ---
+        InjectMarkedSegment(ep, /*ecn=*/true, /*seq=*/1);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(m_sawCnp, true,
+            "ECN-marked RoCE segment must trigger a CNP back to the source");
+
+        // --- Negative control: unmarked segment must NOT trigger a CNP ---
+        m_sawCnp = false;
+        InjectMarkedSegment(ep, /*ecn=*/false, /*seq=*/2);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(m_sawCnp, false,
+            "Unmarked RoCE segment must NOT trigger a CNP");
+
+        Simulator::Destroy();
+    }
+
+  private:
+    void InjectMarkedSegment(Ptr<CnpTestEndpoint> ep, bool ecn, uint32_t seq)
+    {
+        const uint32_t dataSize = 1000;
+        Ptr<Packet> seg = Create<Packet>(dataSize);
+        SoHeader soh;
+        soh.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        soh.SetEcn(ecn);
+        soh.SetDataSize(dataSize);
+        soh.SetChunkIndex(0);
+        seg->AddHeader(soh); // seg = [SoHeader][data] (post-peel state)
+
+        FabricHeader fh;
+        fh.SetPacketType(FabricPacketType::DATA);
+        fh.SetFabricType(FabricType::ROCE);
+        fh.SetSourceRank(8); // remote So source
+        fh.SetDestRank(0);   // ep is rank 0
+        fh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        fh.SetVirtualChannel(0);
+        fh.SetFlowId(1);
+        fh.SetSequenceNumber(seq);
+        fh.SetPayloadSize(dataSize);
+        fh.SetEffectiveDataSize(dataSize);
+        ep->InjectDataPacket(seg, fh);
+    }
+    void OnMacTx(Ptr<const Packet> p)
+    {
+        // The PointToPointNetDevice prepends a PppHeader on Send; strip it, then
+        // read the FabricHeader to classify the transmitted frame.
+        Ptr<Packet> q = p->Copy();
+        PppHeader ppp;
+        q->RemoveHeader(ppp);
+        FabricHeader fh;
+        q->PeekHeader(fh);
+        if (fh.GetPacketType() == FabricPacketType::CNP)
+        {
+            m_sawCnp = true;
+        }
+    }
+    void OnDelivered(uint16_t, Ptr<Packet>, FabricHeader) {}
+    bool m_sawCnp{false};
+};
+
+// ---- Phase B (WU-SoH5) DCQCN tests ----
+
+// A no-op NetDevice receive callback: PointToPointNetDevice::Receive fires the
+// normal m_rxCallback (after the promisc callback) unconditionally, so give it a
+// safe non-null sink. The CNP is processed via the promisc callback that
+// FabricEndpoint::Initialize wires; this dummy just absorbs the normal call.
+static bool
+DummyNetDeviceRx(Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&)
+{
+    return true; // sink absorbed the call; CNP is handled via the promisc path
+}
+
+static void
+DummyEndpointDelivered(uint16_t, Ptr<Packet>, FabricHeader)
+{
+}
+
+// Build a scale-out (So) receiver endpoint on a real P2P link so a CNP can be
+// injected over the wire (the production lossless control path) and arrive at
+// the endpoint's promisc dispatch -> ReceiveFromDevice -> ProcessCnpPacket.
+// rank 0 owns the flow; rank 8 is the remote receiver that echoes the CNP back.
+struct SoReceiverWire
+{
+    Ptr<CnpTestEndpoint> ep;
+    Ptr<NetDevice> farDev;
+    NodeContainer nodes;
+};
+
+static SoReceiverWire
+MakeSoReceiverWire()
+{
+    SoReceiverWire w;
+    w.ep = CreateObject<CnpTestEndpoint>();
+    w.ep->SetRank(0);
+    w.ep->SetLocalRankRange(0, 8); // ranks 0-7 local (Su); 8+ remote (So/RoCE)
+    w.ep->SetProtocolModel(CreateObject<NcclProtocolModel>());
+    w.ep->SetInterNodeProtocolModel(CreateObject<RoceProtocolModel>());
+    w.ep->SetProtocolPayloadBuilder(CreateObject<RocePayloadBuilder>());
+    w.ep->SetBypassReorderBuffer(true);
+    w.ep->SetReceiveCallback(MakeCallback(&DummyEndpointDelivered));
+
+    w.nodes.Add(CreateObject<Node>());
+    w.nodes.Add(CreateObject<Node>());
+    PointToPointHelper p2p;
+    // Fast link so the CNP arrives before the 50us fast-recovery timer (which
+    // would shrink Alpha and defeat the Alpha=0.5 assertion).
+    p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("1Gbps")));
+    NetDeviceContainer devs = p2p.Install(w.nodes);
+    Ptr<NetDevice> epDev = devs.Get(0);
+    w.ep->AddNetDevice(epDev);
+    w.ep->SetNeighborMac(8, Mac48Address("00:00:00:00:00:08"));
+    w.ep->SetRoutingEntry(8, 0);
+    w.farDev = devs.Get(1);
+    epDev->SetReceiveCallback(MakeCallback(&DummyNetDeviceRx));
+    w.ep->Initialize(); // wire the promisc receive callback on epDev
+    return w;
+}
+
+// Inject a CNP from the bare far device over the P2P wire. SourceRank=8 is the
+// receiver echoing back to the sender (rank 0); ProcessCnpPacket keys on the
+// CNP's source, so the flow key is MakeSeqKey(8,0,1) -- matching the sender's
+// send-path key for destRank=8.
+static void
+InjectCnpOnWire(Ptr<NetDevice> farDev)
+{
+    Ptr<Packet> cnp = Create<Packet>(); // CNP carries no data
+    FabricHeader fh;
+    fh.SetPacketType(FabricPacketType::CNP);
+    fh.SetFabricType(FabricType::ROCE);
+    fh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+    fh.SetSourceRank(8);
+    fh.SetDestRank(0);
+    fh.SetVirtualChannel(0);
+    fh.SetFlowId(1);
+    fh.SetSequenceNumber(1);
+    cnp->AddHeader(fh);
+    farDev->Send(cnp, Mac48Address("00:00:00:00:00:00"), 0x0800);
+}
+
+// (1) Pure DCQCN rate-machine math: OnCnp grows Alpha, ShapingDelay maps Alpha
+// onto an egress delay, an unseen flow stays at Alpha=0 with zero delay (the
+// parity foundation), and the fast-recovery timer multiplicatively shrinks
+// Alpha when the simulator advances. No endpoint or wire needed.
+class DcqcnRateMachineTest : public TestCase
+{
+  public:
+    DcqcnRateMachineTest()
+        : TestCase("DCQCN rate machine Alpha ShapingDelay fast-recovery math") {}
+    void DoRun() override
+    {
+        Ptr<DcqcnRateMachine> m = CreateObject<DcqcnRateMachine>();
+        const DcqcnRateMachine::FlowKey k = 12345;
+
+        // (a) Dormant: unseen flow has Alpha=0 and zero shaping delay -- mounting
+        // a fresh machine is byte-identical to no machine (parity foundation).
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->GetAlpha(k), 0.0, 1e-9,
+            "unseen flow Alpha must be 0");
+        NS_TEST_ASSERT_MSG_EQ(m->ShapingDelay(1000000, k).GetNanoSeconds(), 0,
+            "unseen flow shaping delay must be 0 (parity-safe)");
+
+        // (b) First CNP: Alpha = 0 + (1-0)*gInit = 0.5.
+        m->OnCnp(k);
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->GetAlpha(k), 0.5, 1e-9,
+            "first CNP: Alpha = (1-0)*gInit = 0.5");
+
+        // (c) ShapingDelay at Alpha=0.5: rateFactor = 1 - 0.5/2 = 0.75; delay =
+        // base*(1/rateFactor - 1), base = chunkBytes / MaxRate (50e9 B/s).
+        const uint32_t chunk = 1000000;
+        const double maxRate = 50.0e9;
+        const double baseNs = static_cast<double>(chunk) / maxRate * 1e9;
+        const double expectNs = baseNs * (1.0 / 0.75 - 1.0);
+        NS_TEST_ASSERT_MSG_EQ_TOL(
+            static_cast<double>(m->ShapingDelay(chunk, k).GetNanoSeconds()),
+            expectNs, 100.0,
+            "ShapingDelay must equal base*(1/rateFactor-1) at Alpha=0.5");
+
+        // (d) Fast-recovery timer fires at tFast=50us: g *= gDecay (0.5->0.25),
+        // Alpha = 0.5 - 0.5*0.25 = 0.375.
+        Simulator::Stop(MicroSeconds(60));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->GetAlpha(k), 0.375, 1e-9,
+            "after one fast cycle: Alpha = 0.5 - 0.5*0.25 = 0.375");
+        Simulator::Destroy();
+    }
+};
+
+// (2) CNP received -> ProcessCnpPacket -> OnCnp (NOT ProcessCreditPacket). The
+// CNP is injected over the real P2P wire (ReceiveFromDevice is private); Alpha
+// growing proves the CNP reached the DCQCN rate machine. Had it been misrouted
+// to ProcessCreditPacket, Alpha would stay 0.
+class CnpDispatchTest : public TestCase
+{
+  public:
+    CnpDispatchTest()
+        : TestCase("CNP received dispatches to ProcessCnpPacket (Alpha grows)") {}
+    void DoRun() override
+    {
+        SoReceiverWire w = MakeSoReceiverWire();
+        Ptr<DcqcnRateMachine> machine = CreateObject<DcqcnRateMachine>();
+        w.ep->SetDcqcnRateMachine(machine);
+
+        InjectCnpOnWire(w.farDev);
+
+        Simulator::Stop(MicroSeconds(30)); // < tFast(50us): Alpha stays 0.5
+        Simulator::Run();
+        const DcqcnRateMachine::FlowKey key = FabricEndpoint::MakeSeqKey(8, 0, 1);
+        NS_TEST_ASSERT_MSG_EQ_TOL(machine->GetAlpha(key), 0.5, 1e-9,
+            "CNP must reach ProcessCnpPacket -> OnCnp (Alpha=0.5)");
+        Simulator::Destroy();
+    }
+};
+
+// (3) So-only predicate: the SendPacketOnDevice shaping fold applies only to
+// efficiency<1.0 (So/RoCE) traffic; scale-up (NCCL SIMPLE, eff=1.0) is never
+// shaped even with Alpha charged. This is the parity guard -- a mounted, charged
+// machine must not perturb Su sends. Su fires MacTx synchronously (shaping=0);
+// So fires MacTx deferred by ShapingDelay (shaping>0). PointToPointNetDevice
+// fires m_macTxTrace synchronously in Send (before the queue), so the deferred
+// vs synchronous MacTx timing cleanly distinguishes the two paths.
+class SoOnlyPredicateTest : public TestCase
+{
+  public:
+    SoOnlyPredicateTest()
+        : TestCase("DCQCN shaping applies only to So (eff<1.0), not Su") {}
+    void DoRun() override
+    {
+        Ptr<CnpTestEndpoint> ep = CreateObject<CnpTestEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 8); // 0-7 local (Su, NCCL, eff=1.0); 8+ remote
+        ep->SetProtocolModel(CreateObject<NcclProtocolModel>());
+        ep->SetInterNodeProtocolModel(CreateObject<RoceProtocolModel>());
+        ep->SetProtocolPayloadBuilder(CreateObject<RocePayloadBuilder>());
+        ep->SetBypassReorderBuffer(true);
+
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        NetDeviceContainer devs = p2p.Install(nodes);
+        Ptr<NetDevice> dev = devs.Get(0);
+        ep->AddNetDevice(dev);
+        dev->TraceConnectWithoutContext("MacTx",
+                                        MakeCallback(&SoOnlyPredicateTest::OnMacTx, this));
+
+        Ptr<DcqcnRateMachine> machine = CreateObject<DcqcnRateMachine>();
+        ep->SetDcqcnRateMachine(machine);
+        // Charge Alpha for BOTH the Su flow (destRank=1) and the So flow
+        // (destRank=8). If the efficiency gate were broken, the Su send would
+        // also be delayed; asserting Su is synchronous proves the gate skips Su.
+        const DcqcnRateMachine::FlowKey suKey = FabricEndpoint::MakeSeqKey(1, 0, 1);
+        const DcqcnRateMachine::FlowKey soKey = FabricEndpoint::MakeSeqKey(8, 0, 1);
+        machine->OnCnp(soKey); // Alpha=0.5
+        machine->OnCnp(suKey); // Alpha=0.5
+
+        const uint32_t chunk = 1000000;
+        const Mac48Address destMac("00:00:00:00:00:08");
+
+        // --- Su packet (local dest, NCCL SIMPLE, eff=1.0): no shaping, sync ---
+        Ptr<Packet> suPkt = Create<Packet>(chunk);
+        FabricHeader suFh;
+        suFh.SetPacketType(FabricPacketType::DATA);
+        suFh.SetFabricType(FabricType::NVLINK);
+        suFh.SetSourceRank(0);
+        suFh.SetDestRank(1); // local -> NCCL model -> eff=1.0 -> gate false
+        suFh.SetProtocol(static_cast<uint8_t>(NcclProtocol::SIMPLE));
+        suFh.SetVirtualChannel(0);
+        suFh.SetFlowId(1);
+        suFh.SetSequenceNumber(1);
+        suPkt->AddHeader(suFh);
+
+        m_sawTx = false;
+        const Time suSendNow = Simulator::Now();
+        ep->InjectSend(suPkt, 0, destMac);
+        NS_TEST_ASSERT_MSG_EQ(m_sawTx, true,
+            "Su (eff=1.0) must send synchronously -- no DCQCN shaping");
+        NS_TEST_ASSERT_MSG_EQ(m_txTime.GetNanoSeconds(),
+                              suSendNow.GetNanoSeconds(),
+            "Su MacTx must fire at send time (zero shaping delay)");
+
+        // --- So packet (remote dest, RoCE SIMPLE, eff=0.95): shaped, deferred --
+        Ptr<Packet> soPkt = Create<Packet>(chunk);
+        FabricHeader soFh;
+        soFh.SetPacketType(FabricPacketType::DATA);
+        soFh.SetFabricType(FabricType::ROCE);
+        soFh.SetSourceRank(0);
+        soFh.SetDestRank(8); // remote -> RoCE model -> eff=0.95<1.0 -> gate true
+        soFh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        soFh.SetVirtualChannel(0);
+        soFh.SetFlowId(1);
+        soFh.SetSequenceNumber(2);
+        soPkt->AddHeader(soFh);
+
+        const Time expectShaping = machine->ShapingDelay(soPkt->GetSize(), soKey);
+        NS_TEST_ASSERT_MSG_EQ(expectShaping.IsStrictlyPositive(), true,
+            "charged So flow must have positive shaping delay");
+        m_sawTx = false;
+        ep->InjectSend(soPkt, 0, destMac);
+        NS_TEST_ASSERT_MSG_EQ(m_sawTx, false,
+            "So (eff<1.0, Alpha>0) must defer MacTx by ShapingDelay");
+        Simulator::Stop(MicroSeconds(30)); // < tFast(50us): Alpha stays 0.5
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(m_sawTx, true,
+            "deferred So MacTx must fire after the simulator advances");
+        // Both sends occurred at Now=0, so the deferred fire time == ShapingDelay.
+        NS_TEST_ASSERT_MSG_EQ_TOL(
+            static_cast<double>(m_txTime.GetNanoSeconds()),
+            static_cast<double>(expectShaping.GetNanoSeconds()), 1000.0,
+            "So MacTx must fire at Now + ShapingDelay");
+        Simulator::Destroy();
+    }
+    void OnMacTx(Ptr<const Packet> /*p*/)
+    {
+        m_sawTx = true;
+        m_txTime = Simulator::Now();
+    }
+    bool m_sawTx{false};
+    Time m_txTime{0};
+};
+
+// (4) Dormant: a fresh DcqcnRateMachine is byte-identical to no machine
+// (Alpha=0, zero shaping for unseen flows), and an endpoint with NO machine
+// mounted treats a received CNP as a no-op (ProcessCnpPacket returns before
+// OnCnp). The contrast with CnpDispatchTest proves the null early-return: a
+// second CNP after mounting drives Alpha to 0.5, so the first (unmounted) CNP
+// leaving Alpha=0 is meaningful, not a tautology.
+class DormantTest : public TestCase
+{
+  public:
+    DormantTest()
+        : TestCase("DCQCN dormant: fresh machine zero-delay; null CNP no-op") {}
+    void DoRun() override
+    {
+        // (a) Fresh machine: Alpha=0 and zero shaping for any flow (parity).
+        Ptr<DcqcnRateMachine> m = CreateObject<DcqcnRateMachine>();
+        const DcqcnRateMachine::FlowKey k = 777;
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->GetAlpha(k), 0.0, 1e-9,
+            "fresh machine Alpha must be 0");
+        NS_TEST_ASSERT_MSG_EQ(m->ShapingDelay(1000000, k).GetNanoSeconds(), 0,
+            "fresh machine must impose zero shaping (parity-safe)");
+
+        // (b) Null m_dcqcnRate: CNP is a no-op. CNP #1 arrives at an unmounted
+        // endpoint (ProcessCnpPacket returns early); mounting a fresh machine
+        // afterward still shows Alpha=0. CNP #2 (now mounted) drives Alpha=0.5,
+        // confirming the machine is wired -- so CNP #1 leaving Alpha=0 proves the
+        // null early-return rather than an unwired machine.
+        SoReceiverWire w = MakeSoReceiverWire(); // no machine mounted
+        InjectCnpOnWire(w.farDev);               // CNP #1: unmounted -> no-op
+        Simulator::Stop(MicroSeconds(30));
+        Simulator::Run();
+        Ptr<DcqcnRateMachine> m2 = CreateObject<DcqcnRateMachine>();
+        w.ep->SetDcqcnRateMachine(m2);
+        const DcqcnRateMachine::FlowKey key = FabricEndpoint::MakeSeqKey(8, 0, 1);
+        NS_TEST_ASSERT_MSG_EQ_TOL(m2->GetAlpha(key), 0.0, 1e-9,
+            "CNP #1 at unmounted endpoint must not drive OnCnp (Alpha=0)");
+        InjectCnpOnWire(w.farDev);               // CNP #2: mounted -> OnCnp
+        Simulator::Stop(MicroSeconds(30));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ_TOL(m2->GetAlpha(key), 0.5, 1e-9,
+            "CNP #2 at mounted endpoint must drive OnCnp (Alpha=0.5)");
+        Simulator::Destroy();
+    }
+};
+
 // Per-fabric protocol-model selection: an endpoint with an inter-node (So)
 // model uses it for remote ranks and the scale-up (Su) model for local ranks.
 class InterNodeProtocolModelSeamTest : public TestCase
@@ -4988,6 +5432,11 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SwitchTypeSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchEcnTest, TestCase::Duration::QUICK);
+    AddTestCase(new CnpReactionTest, TestCase::Duration::QUICK);
+    AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
+    AddTestCase(new CnpDispatchTest, TestCase::Duration::QUICK);
+    AddTestCase(new SoOnlyPredicateTest, TestCase::Duration::QUICK);
+    AddTestCase(new DormantTest, TestCase::Duration::QUICK);
     AddTestCase(new InterNodeProtocolModelSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new FlowControlVirtualHookTest, TestCase::Duration::QUICK);
 

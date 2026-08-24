@@ -439,22 +439,17 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
 
     // Apply link degradation model if present for this port.
     // Protocol control and retry packets (CREDIT, ACK, NACK, RETRY_REQUEST,
-    // RETRY_ACK) are reliable against BER corruption — matching real NVLink
-    // behavior where control traffic bypasses CRC/FEC checks.
+    // RETRY_ACK, PERMANENT_LOSS, CNP) are reliable against BER corruption —
+    // matching real NVLink behavior where control traffic bypasses CRC/FEC
+    // checks. CNP must bypass BER so DCQCN feedback cannot be corrupted under
+    // BER>0 (a corrupted CNP would stall the rate machine). The
+    // IsControlPacket()/IsRetryPacket() predicates are the single source of
+    // truth — an inline list here previously omitted CNP.
     // Only data/collective/p2p packets go through BER sampling.
     bool isControlPacket = false;
     if (hasFabricHeader)
     {
-        FabricPacketType pktType = fabricHeader.GetPacketType();
-        if (pktType == FabricPacketType::CREDIT ||
-            pktType == FabricPacketType::ACK ||
-            pktType == FabricPacketType::NACK ||
-            pktType == FabricPacketType::RETRY_REQUEST ||
-            pktType == FabricPacketType::RETRY_ACK ||
-            pktType == FabricPacketType::PERMANENT_LOSS)
-        {
-            isControlPacket = true;
-        }
+        isControlPacket = fabricHeader.IsControlPacket() || fabricHeader.IsRetryPacket();
     }
 
     if (inPort < m_portDegradationModels.size() && m_portDegradationModels[inPort]

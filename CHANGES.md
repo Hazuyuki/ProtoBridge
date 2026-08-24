@@ -102,6 +102,97 @@ fires regardless of threshold. The knob is therefore a no-op on today's So
 traffic and ships parity-safe; it becomes live once Phase B activates the
 SoHeader-bearing send path.
 
+### New — Phase B: activate the live ECN↔CNP↔rate loop + DCQCN rate machine (WU-SoH5)
+
+Phase B closes the loop that Phase A (WU-SoH1..4) built dormant. The two
+activation preconditions of R-SoH-1 are satisfied, the rate consumer is added,
+and the whole ECN→CNP→rate→shaping chain is wired onto the live So send path.
+
+**Activation (Seam B — resolves R-SoH-1).** The production inter-node send path
+`FabricEndpoint::SendBulkWireTransferSize` now stamps a SoHeader (10 B,
+`RoceProtocol::SIMPLE`, inner to FabricHeader) onto every RoCE chunk when
+`efficiency < 1.0 && m_payloadBuilder == RocePayloadBuilder` — i.e. on So
+endpoints only. Su endpoints keep `efficiency == 1.0` (NCCL SIMPLE) and emit no
+SoHeader, so Su parity is untouched. This lifts the dormancy documented under
+WU-SoH3: the WU-SoH2 mark guard (`fh.GetProtocol() == RoCE::SIMPLE`) and the
+WU-SoH3 ECN-peek (`SoHeader::PeekEcn`) now fire on real So traffic.
+
+**DCQCN rate machine (`model/dcqcn-rate-machine.{h,cc}`).** A per-flow Alpha
+state machine keyed by `MakeSeqKey(destRank, vcId, flowId)` (the same 64-bit key
+the reorder buffer uses):
+
+* `OnCnp(flowKey)`: Alpha grows `alpha += (1 - alpha) * G` (G=0.5), capped at 1.
+* Fast-recovery timer (`TFast`=50 µs, ≤5 cycles): each tick multiplicatively
+  shrinks Alpha (`G *= GDecay` (0.5), `alpha -= alpha*G`), modeling the
+  rate-halving→re-ramp of DCQCN.
+* Additive-increase timer (`TAi`=100 µs): drives Alpha toward `AlphaFloor`
+  (0.0) at rate `RAI`=0.01 (linear resume).
+* `ShapingDelay(chunkBytes, flowKey)`: maps Alpha to an egress delay,
+  `rateFactor = clamp(1 - alpha/2, 0.5, 1.0)`, `delay =
+  (chunkBytes/MaxRateBps) * (1/rateFactor - 1)` (MaxRateBps=50 Gbps). At
+  `alpha <= AlphaFloor` (the default, no congestion) the delay is exactly 0,
+  so a mounted-but-idle machine is a pure no-op → mounting is parity-safe.
+
+**Egress chokepoint.** `SendPacketOnDevice` is the sole egress path (three send
+branches: WFQ-scheduled, FEC-only, and immediate). The shaping delay is folded
+into all three, after the per-protocol efficiency already applied — so Su
+packets (eff=1.0) are never shaped, only So packets (eff=0.95) with a charged
+flow. Control/memory/retry packets are explicitly skipped (they bypass shaping
+just as they bypass BER, per [[nvswitch-control-packet-bypass]]).
+
+**CNP→rate dispatch.** `FabricEndpoint::ProcessCnpPacket` peels the CNP, recovers
+the (source, vc, flow) tuple, and calls `m_dcqcnRate->OnCnp(flowKey)`. The CNP
+itself is a `FabricPacketType::CNP` control packet, so it rides the lossless
+control path and bypasses BER sampling and ECN marking (WU-SoH3 invariant
+reconfirmed) — a CNP can never be dropped or re-marked, so the feedback loop
+cannot deadlock.
+
+**CLI + mounting.** `scratch/gpu-cluster-sim` gains `--dcqcn` (bool, default
+false). When on AND `interNodeFabricType == ROCE`, a single shared
+`DcqcnRateMachine` is constructed and mounted on every So endpoint via
+`SetDcqcnRateMachine`. Off (the default) leaves `m_dcqcnRate` null on all
+endpoints → every shaping fold short-circuits → bit-identical to pre-Phase-B.
+
+**Tests (6 green, `./ns3 build` + `--fullness=EXTENSIVE`).** Existing
+`EthernetSwitchEcnTest` (switch marks on backlog, skips control/non-RoCE) and
+`CnpReactionTest` (ECN-marked segment → CNP at receiver). New:
+`DcqcnRateMachineTest` (dormant alpha=0/delay=0; OnCnp→0.5; shaping math at
+alpha=0.5, rateFactor=0.75; fast-timer→0.375 after 60 µs),
+`CnpDispatchTest` (CNP over the real P2P wire → ProcessCnpPacket → alpha=0.5),
+`SoOnlyPredicateTest` (Su packet egresses synchronously unshaped via MacTx;
+So packet egress is deferred by the shaping delay), `DormantTest` (fresh
+machine zero-delay; unmounted CNP is a no-op; a later mounted CNP then charges
+alpha — the contrast proves the null early-return).
+
+**Parity.** `--dcqcn` off is bit-identical to pre-Phase-B across the So
+hierarchical smoke (su 4769616, 2-node 15307388, 4-node 13421212 ns) — the
+default-off null path is a pure no-op.
+
+**End-to-end dormancy under light load (faithful, not a bug — see R-SoH-3).**
+With `--dcqcn` ON, the single-flow hierarchical allreduce smoke test is
+*still* bit-identical (15307388). The mechanism is now fully live-wired —
+SoHeader is stamped on the bulk send, `NvSwitch::EnqueueToVoq` calls
+`OnPacketEnqueue` (the ECN-mark hook) on every transit packet, the receiver
+peeks ECN, and the rate machine is mounted — so the chain *can* fire. It does
+not fire because the So fabric is non-blocking cut-through:
+`EnqueueToVoq` calls `OnPacketEnqueue` with the *arrival* VOQ depth *before*
+the enqueue, and the empty-VOQ fast-path forwards immediately at depth 0, so
+`MarkEcnIfCongested` sees `voqDepth=0 < threshold` → no mark. ECN marks only
+packets arriving *behind a backlog*, exactly as real RoCE does. The single
+hierarchical allreduce builds no sustained VOQ backlog, so no CNP, so Alpha
+stays 0. This is correct RoCE semantics: DCQCN engages only under genuine
+congestion (incast / oversubscription). Exercising the loop e2e requires a
+multi-flow incast scenario (deferred, R-SoH-3); the 6 unit tests cover every
+link of the chain in isolation.
+
+**PFC deferred (R-SoH-2).** Priority Flow Control (per-VC pause on VOQ
+overflow) is the lossless backpressure complement to DCQCN. It is deferred:
+it requires threading `FlowControlGate` (presently called only from
+`SendMemoryRead`; the ~7 bulk-send paths bypass it) through the
+parity-sensitive send paths, an invasive change separated from this
+parity-safe Phase B. The `FlowControlGate` virtual hook (F9) is the seam;
+PFC's unqueue condition is documented in `doc/RISKS.md`.
+
 ### Fix — scale-out hierarchical surrogate volume overcount + review follow-ups (WU7)
 
 A clean-context, 7-dimension code review of the scale-out RoCEv2 +

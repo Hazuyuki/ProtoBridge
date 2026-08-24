@@ -9,6 +9,7 @@
 
 #include "nccl-protocol-model.h"
 #include "nccl-protocol-payload-builder.h"
+#include "roce-payload-builder.h"      // RocePayloadBuilder::GetTypeId (Seam B builder guard)
 #include "roce-protocol-model.h" // RoceProtocol::SIMPLE
 #include "so-header.h"            // SoHeader::PeekEcn
 
@@ -1198,6 +1199,13 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         rb->MarkPermanentGap(lostSeqNum, header);
         rb->DeliverReadyPackets();
     }
+    else if (header.GetPacketType() == FabricPacketType::CNP)
+    {
+        // CNP: drive the DCQCN rate machine (per-flow Alpha backoff). A CNP
+        // is control traffic but must not be consumed as a credit, so it is
+        // intercepted before the generic control (ProcessCreditPacket) branch.
+        ProcessCnpPacket(header);
+    }
     else if (header.IsControlPacket())
     {
         ProcessCreditPacket(pkt, header);
@@ -1256,6 +1264,13 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
         Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
         rb->MarkPermanentGap(lostSeqNum, header);
         rb->DeliverReadyPackets();
+    }
+    else if (header.GetPacketType() == FabricPacketType::CNP)
+    {
+        // CNP: drive the DCQCN rate machine (per-flow Alpha backoff). A CNP
+        // is control traffic but must not be consumed as a credit, so it is
+        // intercepted before the generic control (ProcessCreditPacket) branch.
+        ProcessCnpPacket(header);
     }
     else if (header.IsControlPacket())
     {
@@ -1770,6 +1785,37 @@ FabricEndpoint::SendCnpPacket(const FabricHeader& markedHeader)
 }
 
 void
+FabricEndpoint::ProcessCnpPacket(const FabricHeader& cnpHeader)
+{
+    NS_LOG_FUNCTION(this << cnpHeader.GetSourceRank());
+
+    // A CNP echoes the original flow back to its source. The CNP's source is
+    // the receiver, so at the source endpoint the flow key (destRank=receiver,
+    // vc, flowId) maps to MakeSeqKey(cnpHeader.GetSourceRank(), vc, flowId).
+    if (!m_dcqcnRate)
+    {
+        // Dormant baseline: no machine mounted (--dcqcn off). CNP is a no-op.
+        return;
+    }
+    uint64_t flowKey = MakeSeqKey(cnpHeader.GetSourceRank(),
+                                 cnpHeader.GetVirtualChannel(),
+                                 cnpHeader.GetFlowId());
+    m_dcqcnRate->OnCnp(flowKey);
+}
+
+void
+FabricEndpoint::SetDcqcnRateMachine(Ptr<DcqcnRateMachine> machine)
+{
+    m_dcqcnRate = machine;
+}
+
+Ptr<DcqcnRateMachine>
+FabricEndpoint::GetDcqcnRateMachine() const
+{
+    return m_dcqcnRate;
+}
+
+void
 FabricEndpoint::TrySendQueuedPackets()
 {
     NS_LOG_FUNCTION(this);
@@ -1823,6 +1869,28 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     {
         NS_LOG_ERROR("Invalid device index " << deviceIndex);
         return;
+    }
+
+    // DCQCN shaping: fold the per-flow rate-backoff delay into the egress
+    // chokepoint. So-only (efficiency < 1.0) data/collective traffic; control,
+    // memory, retry, and scale-up traffic are untouched. At alpha=0 (no CNP)
+    // ShapingDelay is zero, so the baseline is byte-identical (parity-safe).
+    Time shapingDelay = Time(0);
+    if (m_dcqcnRate)
+    {
+        FabricHeader hdr;
+        packet->PeekHeader(hdr);
+        if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket())
+        {
+            double eff = GetProtocolModelForDest(hdr.GetDestRank())->GetEfficiency(hdr.GetProtocol());
+            if (eff < 1.0)
+            {
+                uint64_t flowKey = MakeSeqKey(hdr.GetDestRank(),
+                                             hdr.GetVirtualChannel(),
+                                             hdr.GetFlowId());
+                shapingDelay = m_dcqcnRate->ShapingDelay(packet->GetSize(), flowKey);
+            }
+        }
     }
 
     // WFQ contention: classify packet and increment backlog counter.
@@ -1884,7 +1952,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                                      ? m_fecModel->GetEncodeLatency()
                                      : Time(0);
             Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-            Time totalDelay = serviceTime + encodeLatency;
+            Time totalDelay = serviceTime + encodeLatency + shapingDelay;
             if (totalDelay > Time(0))
             {
                 NS_LOG_DEBUG("WFQ contention: class=" << static_cast<int>(tc)
@@ -1909,9 +1977,10 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     if (LinkUsesFec())
     {
         Time encodeLatency = m_fecModel->GetEncodeLatency();
-        if (encodeLatency > Seconds(0))
+        Time delay = encodeLatency + shapingDelay;
+        if (delay > Seconds(0))
         {
-            Simulator::Schedule(encodeLatency, [this, packet, deviceIndex, dest]() {
+            Simulator::Schedule(delay, [this, packet, deviceIndex, dest]() {
                 Ptr<NetDevice> device = m_devices[deviceIndex];
                 device->Send(packet, dest, 0x0800);
             });
@@ -1919,7 +1988,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
             {
                 Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-                Simulator::Schedule(encodeLatency + serialization, [this, tc]() {
+                Simulator::Schedule(delay + serialization, [this, tc]() {
                     m_contentionModel->DecrementBacklog(tc);
                 });
             }
@@ -1927,13 +1996,25 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         }
     }
 
-    // Immediate send (no FEC latency, no WFQ contention)
-    Ptr<NetDevice> dev = m_devices[deviceIndex];
-    dev->Send(packet, dest, 0x0800);
+    // Immediate send (no FEC latency, no WFQ contention). DCQCN rate backoff
+    // (shapingDelay > 0) defers the egress; otherwise the send is synchronous
+    // (parity-identical to the unmounted baseline).
+    if (shapingDelay > Time(0))
+    {
+        Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest]() {
+            Ptr<NetDevice> dev = m_devices[deviceIndex];
+            dev->Send(packet, dest, 0x0800);
+        });
+    }
+    else
+    {
+        Ptr<NetDevice> dev = m_devices[deviceIndex];
+        dev->Send(packet, dest, 0x0800);
+    }
     if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
     {
         Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-        Simulator::Schedule(serialization, [this, tc]() {
+        Simulator::Schedule(shapingDelay + serialization, [this, tc]() {
             m_contentionModel->DecrementBacklog(tc);
         });
     }
@@ -2058,6 +2139,25 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
     NS_LOG_INFO("Bulk wire transfer: dataSize=" << dataSize << " wireSize=" << wireSize
                << " efficiency=" << efficiency << " protocol=" << static_cast<int>(protocolId));
 
+    // Seam B (WU-SoH5): activate the dormant SoHeader/ECN/CNP loop on the So
+    // (RoCE) fabric. When efficiency < 1.0 (inter-node RoCE) and the mounted
+    // payload builder is RocePayloadBuilder, stamp a within-budget SoHeader +
+    // SetProtocol(SIMPLE) on each coalesced bulk packet. The 10-byte SoHeader
+    // sits WITHIN the wireSize budget (Create(wireChunk-10) + AddHeader(SoHeader)
+    // == wireChunk on-wire body), so chunk count and egress serialization are
+    // unchanged -> bit-identical at zero congestion (ECN never marks). Su
+    // (efficiency == 1.0) and non-RoCE builders stay on SetProtocol(0) with no
+    // SoHeader -> dormant, no breakage. This lights up
+    // EthernetSwitch::MarkEcnIfCongested (guard GetProtocol()==SIMPLE),
+    // SoHeader::PeekEcn, and SendCnpPacket on real So bulk traffic.
+    // NOTE: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1) on the
+    // receive dispatch; the efficiency<1.0 gate in ProcessProtocolDataPacket
+    // keeps Su NVLink LL packets out of this path, so the two byte-1
+    // populations never cross-fire.
+    const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
+    const bool stampSoHeader = (efficiency < 1.0) && m_payloadBuilder &&
+        (m_payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
+
     std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
     const uint64_t MAX_CHUNK_BYTES = m_bulkChunkSize;
     bool needFragment = (devices.size() > 1) ||
@@ -2097,7 +2197,19 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             uint64_t seqKey = MakeSeqKey(destRank, vcId, flowId);
             uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
-            Ptr<Packet> chunkPacket = Create<Packet>(thisWireChunk);
+            const bool stamp = stampSoHeader && (thisWireChunk > soHeaderSize);
+            Ptr<Packet> chunkPacket = stamp
+                ? Create<Packet>(thisWireChunk - soHeaderSize)
+                : Create<Packet>(thisWireChunk);
+            if (stamp)
+            {
+                SoHeader soHeader;
+                soHeader.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+                soHeader.SetEcn(false); // marked in-flight by the So switch on congestion
+                soHeader.SetDataSize(fragmentDataSize);
+                soHeader.SetChunkIndex(static_cast<uint32_t>(i));
+                chunkPacket->AddHeader(soHeader);
+            }
 
             FabricHeader header;
             header.SetPacketType(FabricPacketType::DATA);
@@ -2110,7 +2222,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             header.SetPayloadSize(thisWireChunk);
             header.SetSourceMac(m_address);
             header.SetDestMac(ResolveDestMac(destRank));
-            header.SetProtocol(0);
+            header.SetProtocol(stamp ? protocolId : 0);
             header.SetEffectiveDataSize(fragmentDataSize);
             header.SetTtl(64);
 
@@ -2139,7 +2251,10 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     uint64_t remSeqKey = MakeSeqKey(destRank, vcId, flowId);
                     uint32_t remSeqNum = m_nextSeqNum[remSeqKey]++;
 
-                    Ptr<Packet> remPacket = Create<Packet>(remWireChunk);
+                    const bool remStamp = stampSoHeader && (remWireChunk > soHeaderSize);
+                    Ptr<Packet> remPacket = remStamp
+                        ? Create<Packet>(remWireChunk - soHeaderSize)
+                        : Create<Packet>(remWireChunk);
                     FabricHeader remHeader;
                     remHeader.SetPacketType(FabricPacketType::DATA);
                     remHeader.SetFabricType(GetFabricTypeForDest(destRank));
@@ -2151,9 +2266,19 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     remHeader.SetPayloadSize(remWireChunk);
                     remHeader.SetSourceMac(m_address);
                     remHeader.SetDestMac(ResolveDestMac(destRank));
-                    remHeader.SetProtocol(0);
+                    remHeader.SetProtocol(remStamp ? protocolId : 0);
                     remHeader.SetEffectiveDataSize(remFragmentData);
                     remHeader.SetTtl(64);
+
+                    if (remStamp)
+                    {
+                        SoHeader soHeader;
+                        soHeader.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+                        soHeader.SetEcn(false);
+                        soHeader.SetDataSize(remFragmentData);
+                        soHeader.SetChunkIndex(static_cast<uint32_t>(j));
+                        remPacket->AddHeader(soHeader);
+                    }
 
                     SendQueueEntry remEntry;
                     remEntry.packet = remPacket;
@@ -2191,7 +2316,19 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
         const uint32_t packetSize = static_cast<uint32_t>(wireSize);
-        Ptr<Packet> packet = Create<Packet>(packetSize);
+        const bool stamp = stampSoHeader && (packetSize > soHeaderSize);
+        Ptr<Packet> packet = stamp
+            ? Create<Packet>(packetSize - soHeaderSize)
+            : Create<Packet>(packetSize);
+        if (stamp)
+        {
+            SoHeader soHeader;
+            soHeader.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+            soHeader.SetEcn(false); // marked in-flight by the So switch on congestion
+            soHeader.SetDataSize(static_cast<uint32_t>(dataSize));
+            soHeader.SetChunkIndex(0);
+            packet->AddHeader(soHeader);
+        }
 
         FabricHeader header;
         header.SetPacketType(FabricPacketType::DATA);
@@ -2204,7 +2341,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         header.SetPayloadSize(packetSize);
         header.SetSourceMac(m_address);
         header.SetDestMac(ResolveDestMac(destRank));
-        header.SetProtocol(0);
+        header.SetProtocol(stamp ? protocolId : 0);
         header.SetEffectiveDataSize(static_cast<uint32_t>(dataSize));
         header.SetTtl(64);
 
