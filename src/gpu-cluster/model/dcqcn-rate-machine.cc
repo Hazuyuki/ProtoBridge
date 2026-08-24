@@ -102,21 +102,6 @@ DcqcnRateMachine::GetOrCreate(FlowKey flowKey)
 }
 
 void
-DcqcnRateMachine::CancelTimers(FlowState& s)
-{
-    if (s.fastArmed)
-    {
-        Simulator::Cancel(s.fastTimer);
-        s.fastArmed = false;
-    }
-    if (s.aiArmed)
-    {
-        Simulator::Cancel(s.aiTimer);
-        s.aiArmed = false;
-    }
-}
-
-void
 DcqcnRateMachine::OnCnp(FlowKey flowKey)
 {
     NS_LOG_FUNCTION(this << flowKey);

@@ -84,7 +84,6 @@ class DcqcnRateMachine : public Object
     FlowState& GetOrCreate(FlowKey flowKey);
     void FastRecovery(FlowKey flowKey);
     void AdditiveIncrease(FlowKey flowKey);
-    void CancelTimers(FlowState& s);
 
     // TypeId Attributes
     Time m_tFast;                     ///< Fast-recovery timer interval
