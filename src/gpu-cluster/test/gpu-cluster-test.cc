@@ -20,6 +20,7 @@
 #include "ns3/mccl-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
 #include "ns3/roce-payload-builder.h"
+#include "ns3/so-header.h"
 #include "ns3/nccl-protocol-payload-builder.h"
 #include "ns3/protocol-transaction.h"
 #include "ns3/packet.h"
@@ -1141,8 +1142,8 @@ class RocePayloadBuilderTest : public TestCase
                               static_cast<size_t>(1),
                               "Single segment under chunk size");
         NS_TEST_EXPECT_MSG_EQ(chunks[0]->GetSize(),
-                              1000u + 8u,
-                              "Segment carries 8B RDMA header + data");
+                              1000u + 10u,
+                              "Segment carries 10B SoHeader + data");
 
         // Round-trip: extract must recover the original data (header stripped).
         std::vector<uint8_t> recovered(1000, 0);
@@ -1161,6 +1162,23 @@ class RocePayloadBuilderTest : public TestCase
         }
         NS_TEST_EXPECT_MSG_EQ(match, true, "Extracted data matches original");
 
+        // SoHeader carries the ECN congestion bit (clear on fresh segments)
+        // plus the per-segment RDMA framing; protocolId discriminates RoCE.
+        SoHeader soh;
+        chunks[0]->PeekHeader(soh);
+        NS_TEST_EXPECT_MSG_EQ(soh.GetEcn(), false, "Fresh segment ECN clear");
+        NS_TEST_EXPECT_MSG_EQ(soh.GetDataSize(), 1000u, "SoHeader dataSize");
+        NS_TEST_EXPECT_MSG_EQ(soh.GetProtocolId(),
+                              static_cast<uint8_t>(RoceProtocol::SIMPLE),
+                              "SoHeader protocolId = RoCE");
+
+        // ECN set/get round-trips through the static peek helper.
+        Ptr<Packet> marked = Create<Packet>(0);
+        SoHeader mh;
+        mh.SetEcn(true);
+        marked->AddHeader(mh);
+        NS_TEST_EXPECT_MSG_EQ(SoHeader::PeekEcn(marked), true, "PeekEcn sees set bit");
+
         // Multi-segment: 600 bytes at chunkSize 256 -> 3 segments (256, 256, 88).
         std::vector<uint8_t> data600(600, 0xAB);
         std::vector<Ptr<Packet>> multi =
@@ -1169,11 +1187,11 @@ class RocePayloadBuilderTest : public TestCase
                               static_cast<size_t>(3),
                               "600B at 256B chunk = 3 segments");
         NS_TEST_EXPECT_MSG_EQ(multi[0]->GetSize(),
-                              256u + 8u,
-                              "Seg0 = 256B + 8B header");
+                              256u + 10u,
+                              "Seg0 = 256B + 10B SoHeader");
         NS_TEST_EXPECT_MSG_EQ(multi[2]->GetSize(),
-                              88u + 8u,
-                              "Seg2 = 88B + 8B header");
+                              88u + 10u,
+                              "Seg2 = 88B + 10B SoHeader");
 
         // Wire-size accessors are flat (timing owned by the protocol model).
         NS_TEST_EXPECT_MSG_EQ(builder->GetWireSize(1000, 0),

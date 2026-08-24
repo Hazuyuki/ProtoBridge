@@ -1,12 +1,14 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-only
- * RoCE v2 RDMA payload segmentation for the scale-out fabric. Mirrors the
- * McclPayloadBuilder raw-segmentation template with an 8-byte RDMA transport
- * header prepended per segment (BTH+aETH framing) and stripped on extract.
+ * RoCE v2 RDMA payload segmentation for the scale-out fabric. Each segment
+ * carries a SoHeader (the scale-out protocol header: ECN congestion bit +
+ * data size + chunk index, matching RoCEv2 BTH+aETH framing) prepended per
+ * segment and stripped on extract.
  */
 
 #include "roce-payload-builder.h"
 
+#include "roce-protocol-model.h" // RoceProtocol::SIMPLE
 #include "ns3/log.h"
 #include "ns3/packet.h"
 
@@ -49,15 +51,14 @@ RocePayloadBuilder::BuildChunks(const uint8_t* data,
     for (uint64_t offset = 0; offset < dataSize; offset += chunkSize)
     {
         uint64_t size = std::min(chunkSize, dataSize - offset);
-        uint64_t pktSize = size + ROCE_RDMA_HEADER_SIZE;
-
-        std::vector<uint8_t> buffer(pktSize);
-        RoceRdmaHeader header;
-        header.size = static_cast<uint32_t>(size);
-        header.chunkIndex = chunkIndex++;
-        std::memcpy(buffer.data(), &header, ROCE_RDMA_HEADER_SIZE);
-        std::memcpy(buffer.data() + ROCE_RDMA_HEADER_SIZE, data + offset, size);
-        chunks.push_back(Create<Packet>(buffer.data(), pktSize));
+        Ptr<Packet> pkt = Create<Packet>(data + offset, static_cast<uint32_t>(size));
+        SoHeader header;
+        header.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        header.SetEcn(false); // set in-flight by the So switch on congestion
+        header.SetDataSize(static_cast<uint32_t>(size));
+        header.SetChunkIndex(chunkIndex++);
+        pkt->AddHeader(header);
+        chunks.push_back(pkt);
     }
     return chunks;
 }
@@ -74,21 +75,22 @@ RocePayloadBuilder::ExtractData(Ptr<Packet> packet,
         return 0;
     }
 
+    // SoHeader is outermost here (the FabricHeader was peeled upstream on the
+    // receive path), so PeekHeader deserializes it without mutating the packet.
+    SoHeader header;
+    packet->PeekHeader(header);
+    uint32_t headerSize = header.GetSerializedSize();
     uint32_t packetSize = packet->GetSize();
-    if (packetSize < ROCE_RDMA_HEADER_SIZE)
+    if (packetSize <= headerSize)
     {
         return 0;
     }
 
-    uint8_t headerBuffer[ROCE_RDMA_HEADER_SIZE];
-    packet->CopyData(headerBuffer, ROCE_RDMA_HEADER_SIZE);
-    RoceRdmaHeader header;
-    std::memcpy(&header, headerBuffer, ROCE_RDMA_HEADER_SIZE);
-
-    uint32_t dataSize = header.size;
-    if (dataSize > packetSize - ROCE_RDMA_HEADER_SIZE)
+    uint32_t dataSize = header.GetDataSize();
+    uint32_t avail = packetSize - headerSize;
+    if (dataSize > avail)
     {
-        dataSize = packetSize - ROCE_RDMA_HEADER_SIZE;
+        dataSize = avail;
     }
     if (dataSize > maxDataSize)
     {
@@ -101,7 +103,7 @@ RocePayloadBuilder::ExtractData(Ptr<Packet> packet,
 
     std::vector<uint8_t> packetBuffer(packetSize);
     packet->CopyData(packetBuffer.data(), packetSize);
-    std::memcpy(outData, packetBuffer.data() + ROCE_RDMA_HEADER_SIZE, dataSize);
+    std::memcpy(outData, packetBuffer.data() + headerSize, dataSize);
     return dataSize;
 }
 

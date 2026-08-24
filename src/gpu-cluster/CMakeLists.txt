@@ -32,6 +32,7 @@ build_lib(
     model/ub-payload-builder.cc
     model/roce-protocol-model.cc
     model/roce-payload-builder.cc
+    model/so-header.cc
     model/ethernet-switch.cc
     model/llr-manager.cc
     model/ring-allreduce.cc
@@ -89,6 +90,7 @@ build_lib(
     model/ub-payload-builder.h
     model/roce-protocol-model.h
     model/roce-payload-builder.h
+    model/so-header.h
     model/ethernet-switch.h
     model/llr-manager.h
     model/ring-allreduce.h
