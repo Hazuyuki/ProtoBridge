@@ -40,7 +40,8 @@ enum class FabricPacketType : uint8_t
     MEMORY_RESP = 12,
     RETRY_REQUEST = 13,
     RETRY_ACK = 14,
-    PERMANENT_LOSS = 15
+    PERMANENT_LOSS = 15,
+    CNP = 16 ///< Congestion Notification Packet (RoCEv2 ECN echo, scale-out only)
 };
 
 /**

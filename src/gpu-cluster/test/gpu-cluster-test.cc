@@ -205,6 +205,14 @@ FabricHeaderTest::TestPacketTypeClassification()
     NS_TEST_EXPECT_MSG_EQ(header.IsControlPacket(), true, "NACK is control packet");
     NS_TEST_EXPECT_MSG_EQ(header.IsCollectivePacket(), false, "NACK is not collective");
 
+    // CNP (RoCEv2 Congestion Notification Packet) is a control packet: it must
+    // bypass BER sampling and ECN marking like CREDIT/ACK, else CNP feedback
+    // would deadlock congestion control.
+    header.SetPacketType(FabricPacketType::CNP);
+    NS_TEST_EXPECT_MSG_EQ(header.IsControlPacket(), true, "CNP is control packet");
+    NS_TEST_EXPECT_MSG_EQ(header.IsCollectivePacket(), false, "CNP is not collective");
+    NS_TEST_EXPECT_MSG_EQ(header.IsRetryPacket(), false, "CNP is not retry packet");
+
     // Test collective packet classification
     header.SetPacketType(FabricPacketType::ALLREDUCE);
     NS_TEST_EXPECT_MSG_EQ(header.IsControlPacket(), false, "ALLREDUCE is not control");

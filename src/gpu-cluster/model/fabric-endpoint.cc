@@ -9,6 +9,8 @@
 
 #include "nccl-protocol-model.h"
 #include "nccl-protocol-payload-builder.h"
+#include "roce-protocol-model.h" // RoceProtocol::SIMPLE
+#include "so-header.h"            // SoHeader::PeekEcn
 
 #include "ns3/log.h"
 #include "ns3/simulator.h"
@@ -1738,6 +1740,36 @@ FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumula
 }
 
 void
+FabricEndpoint::SendCnpPacket(const FabricHeader& markedHeader)
+{
+    NS_LOG_FUNCTION(this << markedHeader.GetSourceRank());
+
+    // A CNP is a control echo: it tells the source that a packet it sent was
+    // ECN-marked in flight. It carries no data and rides the same lossless
+    // control path as CREDIT/ACK (control packets bypass BER sampling and
+    // ECN marking, so CNP feedback cannot deadlock).
+    Ptr<Packet> packet = Create<Packet>();
+    FabricHeader header;
+    header.SetPacketType(FabricPacketType::CNP);
+    header.SetFabricType(GetFabricTypeForDest(markedHeader.GetSourceRank()));
+    header.SetVirtualChannel(markedHeader.GetVirtualChannel());
+    header.SetSequenceNumber(markedHeader.GetSequenceNumber());
+    header.SetFlowId(markedHeader.GetFlowId());
+    header.SetSourceRank(m_rank);
+    header.SetDestRank(markedHeader.GetSourceRank());
+    header.SetSourceMac(m_address);
+    header.SetDestMac(ResolveDestMac(markedHeader.GetSourceRank()));
+    packet->AddHeader(header);
+
+    if (!m_devices.empty())
+    {
+        uint32_t deviceIndex = ResolveDeviceIndex(markedHeader.GetSourceRank());
+        SendPacketOnDevice(packet, deviceIndex,
+                           ResolveDestMac(markedHeader.GetSourceRank()));
+    }
+}
+
+void
 FabricEndpoint::TrySendQueuedPackets()
 {
     NS_LOG_FUNCTION(this);
@@ -2237,6 +2269,17 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
     {
         ProcessDataPacket(packet, header);
         return;
+    }
+
+    // RoCEv2 ECN echo: if an So switch marked this segment's SoHeader ECN bit
+    // in flight, emit a Congestion Notification Packet back to the source. The
+    // FabricHeader was peeled on the receive path, so the SoHeader is now
+    // outermost and PeekEcn reads it directly. Peek (non-mutating) so the
+    // SoHeader is still present for ExtractData below.
+    if (protocolId == static_cast<uint8_t>(RoceProtocol::SIMPLE) &&
+        SoHeader::PeekEcn(packet))
+    {
+        SendCnpPacket(header);
     }
 
     // Extract pure data from protocol-aware payload

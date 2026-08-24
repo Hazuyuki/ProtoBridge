@@ -483,6 +483,11 @@ class FabricEndpoint : public Application
     void SendCreditPacket(uint16_t destRank, uint8_t vcId, uint16_t count,
                           uint32_t seqNum, uint16_t flowId);
     void SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumulative);
+    /// @brief Emit a RoCEv2 Congestion Notification Packet back to the source
+    /// of an ECN-marked data packet (scale-out ECN echo). Mirrors the
+    /// SendCreditPacket control-packet shape so it rides the same lossless
+    /// control path and bypasses BER/ECN marking.
+    void SendCnpPacket(const FabricHeader& markedHeader);
     void TrySendQueuedPackets();
 
     /**

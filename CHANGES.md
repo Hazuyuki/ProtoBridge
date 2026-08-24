@@ -45,6 +45,44 @@ the parity-sensitive send paths, an invasive change separated from the
 clean, parity-safe Phase A header+mark foundation. Phase A's hook is inert
 without a CNP/rate consumer, so it ships timing-neutral.
 
+### New — CNP control packet + ECN-echo trigger on the receive path (WU-SoH3)
+
+Phase A step 3. The ECN *reaction* receiver half is added, mirroring the
+WU-SoH2 *mark* half:
+
+* `FabricPacketType::CNP` (= 16) is a new control packet type, classified by
+  `FabricHeader::IsControlPacket()` alongside CREDIT/ACK/NACK/PERMANENT_LOSS.
+  This is the critical invariant: CNP rides the same lossless control path
+  and bypasses BER sampling + ECN marking (else CNP feedback would deadlock
+  congestion control). `EthernetSwitch::MarkEcnIfCongested` already skips
+  control packets, so a CNP is never re-marked.
+* `FabricEndpoint::SendCnpPacket(markedHeader)` emits a CNP control packet
+  back to the source of an ECN-marked segment, mirroring `SendCreditPacket`.
+* In `ProcessProtocolDataPacket`, when the (already-FabricHeader-peeled)
+  packet carries a RoCE SoHeader with the ECN bit set, `SoHeader::PeekEcn`
+  triggers `SendCnpPacket` back to the source.
+
+**Dormancy (important, by design — activation deferred to Phase B).** The
+ECN trigger gates on `protocol == RoceProtocol::SIMPLE` (set by
+`RocePayloadBuilder::BuildChunks`, which stamps a SoHeader). The production
+So send path, however, routes inter-node traffic through
+`SendBulkWireTransferSize`, which stamps `SetProtocol(0)` and emits **no
+SoHeader** (the RoCE model only governs wire-size/efficiency, not the
+on-wire header layout, and `RocePayloadBuilder` is never wired in the sim).
+Consequently the WU-SoH2 mark guard *and* the WU-SoH3 CNP trigger never fire
+on production So packets: the ECN mechanism is correct but **dormant**.
+Parity stays bit-identical because the mechanism does not trigger, not
+because it is wired into the live path. The C++ `EthernetSwitchEcnTest`
+(unit-level) verifies the mark+peek logic is correct when a RoCE packet
+*does* carry a SoHeader. **Activating** the mechanism requires a live So
+send path that emits `protocol=RoCE::SIMPLE` packets carrying a SoHeader
+(two candidate seams: mount `RocePayloadBuilder` on So endpoints, or stamp a
+lightweight SoHeader in `SendBulkWireTransferSize`). Both touch
+parity-sensitive send/wire-layout and are deferred to Phase B (WU-SoH5)
+alongside the DCQCN rate consumer, so the whole ECN↔rate loop lands together.
+Activation preconditions (R-SoH-1) are the two seams named above; revisit at
+Phase B kickoff.
+
 ### Fix — scale-out hierarchical surrogate volume overcount + review follow-ups (WU7)
 
 A clean-context, 7-dimension code review of the scale-out RoCEv2 +

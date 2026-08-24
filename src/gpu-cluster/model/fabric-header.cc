@@ -319,7 +319,8 @@ FabricHeader::IsControlPacket() const
     return type == FabricPacketType::CREDIT ||
            type == FabricPacketType::ACK ||
            type == FabricPacketType::NACK ||
-           type == FabricPacketType::PERMANENT_LOSS;
+           type == FabricPacketType::PERMANENT_LOSS ||
+           type == FabricPacketType::CNP;
 }
 
 bool
