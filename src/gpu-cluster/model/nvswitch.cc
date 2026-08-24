@@ -710,6 +710,13 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
                   << ", size=" << m_voqs[outPort].size()
                   << " depth=" << m_voqDepth);
 
+    // Congestion hook: let a subclass (EthernetSwitch) mark the SoHeader ECN
+    // bit on enqueue, before the fast-path / push. The depth here is the queue
+    // the packet is arriving into (excluding itself); the empty-VOQ fast-path
+    // below sees depth 0 and so produces no mark -- matching RoCE marking
+    // semantics where only packets arriving behind a backlog get marked.
+    OnPacketEnqueue(entry.packet, outPort, m_voqs[outPort].size());
+
     // For non-blocking switch with egress serialization:
     // If VOQ is empty and output port is free, forward immediately with
     // serialization delay. Otherwise enqueue and wait for arbitration.
@@ -720,6 +727,16 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
     }
 
     m_voqs[outPort].push(entry);
+}
+
+void
+NvSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort, size_t voqDepth)
+{
+    // Default no-op: NVSwitch (scale-up fabric) does no ECN marking, so Su
+    // parity is unaffected. EthernetSwitch overrides to mark the SoHeader.
+    (void)packet;
+    (void)outPort;
+    (void)voqDepth;
 }
 
 void

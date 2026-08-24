@@ -336,6 +336,21 @@ class NvSwitch : public FabricSwitch
   protected:
     void DoDispose() override;
 
+    /**
+     * @brief Congestion hook called when a packet is enqueued to a VOQ.
+     *
+     * Default is a no-op (NvSwitch marks nothing, so Su parity is preserved
+     * on NVSwitch instances). A scale-out switch (EthernetSwitch) overrides
+     * this to mark the SoHeader ECN bit when the VOQ depth indicates
+     * congestion. At call time the packet still carries its FabricHeader
+     * (outermost) over the inner SoHeader, matching the in-flight state.
+     * @param packet The packet being enqueued (mutable)
+     * @param outPort Output port the packet is queued for
+     * @param voqDepth Current VOQ depth (packets, excluding this one)
+     */
+    virtual void OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
+                                 size_t voqDepth);
+
   private:
     /**
      * @brief Receive handler for packets from ports (promiscuous mode)

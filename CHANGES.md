@@ -6,6 +6,45 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — polymorphic SoHeader + ECN carrier for the scale-out fabric (WU-SoH)
+
+The scale-out (So) RoCEv2 fabric needed an ECN bit, but the shared
+`FabricHeader` (39 B, on every Su+So packet) has no spare flag bit and its
+enums are full bytes — adding ECN to it would perturb the
+`packet->GetSize()`-based egress serialization for ALL traffic and break Su
+parity (the WU3 deferral rationale). Solved by stamping a **second, per-So
+header** (`SoHeader`, 10 B: protocolId + flags[bit0=ECN] + dataSize +
+chunkIndex) onto So packets only, inner to FabricHeader. Su packets never
+carry it, so Su parity is untouched.
+
+`SoHeader` is a real polymorphic `ns3::Header`: a `protocolId` discriminator
+makes it protocol-pluggable (today `RoceProtocol::SIMPLE = 1`, the seam open
+to other So protocols via the `ProtocolPayloadBuilder` factory). The old
+8-byte raw `RoceRdmaHeader` memcpy prefix in `RocePayloadBuilder` is promoted
+to this typed header (`AddHeader`/`RemoveHeader`/`PeekHeader`); the 0.95 wire
+efficiency absorbs the 8→10 B change, so So `simTime`s are bit-identical
+(verified: 2-node 15307388 ns, 4-node 13421212 ns, unchanged from WU2/WU4).
+WU-SoH1 adds `so-header.{h,cc}` + the builder refactor + a round-trip/ECN
+unit test; WU-SoH2 adds the **ECN-mark egress hook**:
+`NvSwitch::OnPacketEnqueue(packet, outPort, voqDepth)` is a new `protected
+virtual` (default no-op → NvSwitch/Su parity preserved) called in
+`EnqueueToVoq` before the fast-path; `EthernetSwitch` overrides it and its
+public `MarkEcnIfCongested` stamps the SoHeader ECN bit when
+`voqDepth >= EcnThreshold` (Attribute, default 8), but only on RoCE DATA
+packets — control packets (CREDIT/ACK/NACK) and non-RoCE packets bypass
+(matching the BER bypass), since marking control feedback would deadlock
+congestion control. Unit test `EthernetSwitchEcnTest` covers shallow
+(no mark), at-threshold (mark), control (untouched), non-RoCE (untouched).
+
+Deferred to Phase B (WU-SoH5, queued, own RISKS entry): the coupled
+congestion *reaction* — receiver ECN peek → CNP control packet back to the
+source (WU-SoH3), sender DCQCN Alpha rate-backoff + PFC priority pause
+(WU-SoH5). Phase B is blocked on threading `FlowControlGate` (presently
+called only from `SendMemoryRead`; the ~7 bulk-send paths bypass it) through
+the parity-sensitive send paths, an invasive change separated from the
+clean, parity-safe Phase A header+mark foundation. Phase A's hook is inert
+without a CNP/rate consumer, so it ships timing-neutral.
+
 ### Fix — scale-out hierarchical surrogate volume overcount + review follow-ups (WU7)
 
 A clean-context, 7-dimension code review of the scale-out RoCEv2 +

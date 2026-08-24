@@ -38,6 +38,7 @@
 #include "ns3/arbiter.h"
 #include "ns3/nvswitch.h"
 #include "ns3/fabric-switch.h"
+#include "ns3/ethernet-switch.h"
 #include "ns3/object-factory.h"
 #include "ns3/config.h"
 #include "ns3/protocol-model.h"
@@ -3859,6 +3860,98 @@ class EthernetSwitchSeamTest : public TestCase
     }
 };
 
+// EthernetSwitch ECN marking: on enqueue, when a VOQ crosses the ECN
+// threshold, the switch stamps the inner SoHeader ECN bit on RoCE DATA
+// packets only. Control packets and shallow-queue packets are untouched.
+class EthernetSwitchEcnTest : public TestCase
+{
+  public:
+    EthernetSwitchEcnTest() : TestCase("EthernetSwitch ECN mark on congestion") {}
+    void DoRun() override
+    {
+        Ptr<EthernetSwitch> sw = CreateObject<EthernetSwitch>();
+        // A small, deterministic threshold so the test does not depend on the
+        // production default.
+        sw->SetAttribute("EcnThreshold", UintegerValue(4));
+
+        // Helper: a RoCE DATA packet = [FabricHeader(DATA, RoCE)][SoHeader][payload].
+        auto makeDataPacket = []() {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            SoHeader soh;
+            soh.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+            soh.SetEcn(false);
+            soh.SetDataSize(64);
+            soh.SetChunkIndex(0);
+            pkt->AddHeader(soh);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+            pkt->AddHeader(fh);
+            return pkt;
+        };
+
+        // (1) Shallow queue (depth 2 < threshold 4): no mark.
+        Ptr<Packet> shallow = makeDataPacket();
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(shallow, 2), false,
+                              "below-threshold packet must not be marked");
+        SoHeader s1;
+        shallow->PeekHeader(s1); // FabricHeader is outermost; PeekHeader reads it
+        NS_TEST_ASSERT_MSG_EQ(s1.GetEcn(), false,
+                              "shallow SoHeader ECN must stay clear (read past FabricHeader)");
+        // Read the actual SoHeader by peeling the FabricHeader first.
+        FabricHeader fh1;
+        shallow->PeekHeader(fh1);
+        Ptr<Packet> shallowCopy = shallow->Copy();
+        shallowCopy->RemoveHeader(fh1);
+        SoHeader so1;
+        shallowCopy->PeekHeader(so1);
+        NS_TEST_ASSERT_MSG_EQ(so1.GetEcn(), false, "shallow SoHeader ECN must stay clear");
+
+        // (2) Deep queue (depth 4 >= threshold 4): RoCE DATA packet is marked.
+        Ptr<Packet> deep = makeDataPacket();
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(deep, 4), true,
+                              "at-threshold RoCE DATA packet must be marked");
+        FabricHeader fh2;
+        deep->PeekHeader(fh2);
+        NS_TEST_ASSERT_MSG_EQ(fh2.IsControlPacket(), false,
+                              "data packet's FabricHeader must not be control after mark");
+        NS_TEST_ASSERT_MSG_EQ(fh2.GetProtocol(),
+                              static_cast<uint8_t>(RoceProtocol::SIMPLE),
+                              "FabricHeader protocol preserved after mark");
+        Ptr<Packet> deepCopy = deep->Copy();
+        deepCopy->RemoveHeader(fh2);
+        SoHeader so2;
+        deepCopy->PeekHeader(so2);
+        NS_TEST_ASSERT_MSG_EQ(so2.GetEcn(), true, "deep RoCE DATA SoHeader ECN must be set");
+        NS_TEST_ASSERT_MSG_EQ(so2.GetProtocolId(),
+                              static_cast<uint8_t>(RoceProtocol::SIMPLE),
+                              "SoHeader protocol preserved after mark");
+
+        // (3) Control packet (CREDIT) at deep queue: untouched (no SoHeader to
+        // mark, and marking control feedback would deadlock congestion control).
+        Ptr<Packet> ctrl = Create<Packet>(16);
+        FabricHeader cfh;
+        cfh.SetPacketType(FabricPacketType::CREDIT);
+        cfh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        ctrl->AddHeader(cfh);
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(ctrl, 10), false,
+                              "control packet must not be marked even when congested");
+
+        // (4) Non-RoCE DATA packet at deep queue: untouched (carries no SoHeader).
+        Ptr<Packet> nonRoce = Create<Packet>(32);
+        SoHeader ns;
+        ns.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        ns.SetEcn(false);
+        nonRoce->AddHeader(ns);
+        FabricHeader nfh;
+        nfh.SetPacketType(FabricPacketType::DATA);
+        nfh.SetProtocol(0); // not RoCE
+        nonRoce->AddHeader(nfh);
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(nonRoce, 10), false,
+                              "non-RoCE DATA packet must not be marked");
+    }
+};
+
 // Per-fabric protocol-model selection: an endpoint with an inter-node (So)
 // model uses it for remote ranks and the scale-up (Su) model for local ranks.
 class InterNodeProtocolModelSeamTest : public TestCase
@@ -4886,6 +4979,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ArbiterSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchTypeSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchSeamTest, TestCase::Duration::QUICK);
+    AddTestCase(new EthernetSwitchEcnTest, TestCase::Duration::QUICK);
     AddTestCase(new InterNodeProtocolModelSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new FlowControlVirtualHookTest, TestCase::Duration::QUICK);
 
