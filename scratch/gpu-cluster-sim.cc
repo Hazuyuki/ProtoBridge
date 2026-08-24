@@ -261,6 +261,11 @@ main(int argc, char* argv[])
     uint64_t interNodeLatencyNs = 10000;
     std::string interNodeFabricTypeStr = "RoCE";
     uint64_t interNodeStartupNs = 40000;
+    // Ethernet (RoCEv2) switch ECN threshold: VOQ depth (packets) at which the
+    // switch marks the inner SoHeader ECN bit on enqueue. 0 disables marking.
+    // The ECN reaction (CNP + DCQCN rate-backoff) is a Phase-B capability, so
+    // this knob is inert until the So send path emits SoHeader-bearing packets.
+    uint32_t ecnThreshold = 8;
     std::string intraNodeTopology = "switched";
     std::string intraNodeAlgorithm = "fullmesh";
 
@@ -432,6 +437,7 @@ main(int argc, char* argv[])
     cmd.AddValue("interNodeLatency", "Inter-node link latency in nanoseconds", interNodeLatencyNs);
     cmd.AddValue("interNodeFabricType", "Inter-node fabric type: RoCE/ETH/NVLink", interNodeFabricTypeStr);
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
+    cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
     cmd.AddValue("intraNodeAlgorithm", "Intra-node algorithm for hierarchical: ring/fullmesh", intraNodeAlgorithm);
     std::string stepTraceFile = "";
@@ -821,6 +827,11 @@ main(int argc, char* argv[])
             // (e.g. "host") use the Ethernet switch subtype (a thin NvSwitch
             // derivative) instead of the NVLink NvSwitch.
             multiTopo.SetInterNodeSwitchType("ns3::EthernetSwitch");
+            // ECN threshold is an EthernetSwitch Attribute; set the default
+            // before the helper instantiates the So switches. Inert until the
+            // So send path emits SoHeader-bearing packets (Phase B).
+            Config::SetDefault("ns3::EthernetSwitch::EcnThreshold",
+                               UintegerValue(ecnThreshold));
         }
         multiTopo.SetInterNodeTopology(interNodeTopology);
         multiTopo.SetIntraNodeTopology(intraNodeTopology);

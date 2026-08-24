@@ -83,6 +83,25 @@ alongside the DCQCN rate consumer, so the whole ECN↔rate loop lands together.
 Activation preconditions (R-SoH-1) are the two seams named above; revisit at
 Phase B kickoff.
 
+### New — --ecnThreshold CLI knob + Phase A closeout (WU-SoH4)
+
+`scratch/gpu-cluster-sim` gains `--ecnThreshold` (uint32, default 8, 0=off),
+wired to the `EthernetSwitch::EcnThreshold` Attribute via
+`Config::SetDefault` before the So fabric is built (so every EthernetSwitch
+in the multi-node path picks it up). This closes Phase A of the SoHeader/ECN
+effort (WU-SoH1 header + WU-SoH2 mark + WU-SoH3 CNP + this knob): the full
+ECN *carrier + mark + echo* seam exists, is unit-tested, and is gated
+behind a CLI flag, with Phase B (DCQCN rate reaction + PFC + activation of
+the live SoHeader-bearing send path) queued as WU-SoH5.
+
+Dormancy re-confirmed end-to-end: the So hierarchical allreduce is
+bit-identical across `--ecnThreshold` values (default 8, 0, and 1 all yield
+2-node simTimeNs=15307388, 4-node 13421212, su 4769616) because the So send
+path emits `protocol=0` packets with no SoHeader, so the ECN guard never
+fires regardless of threshold. The knob is therefore a no-op on today's So
+traffic and ships parity-safe; it becomes live once Phase B activates the
+SoHeader-bearing send path.
+
 ### Fix — scale-out hierarchical surrogate volume overcount + review follow-ups (WU7)
 
 A clean-context, 7-dimension code review of the scale-out RoCEv2 +
