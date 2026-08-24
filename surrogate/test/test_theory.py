@@ -440,6 +440,14 @@ def test_hierarchical_collective_required():
         h.predict(1 << 22, "ring", 32)          # no collective=
 
 
+def test_hierarchical_collective_is_keyword_only():
+    """collective must be passed by keyword; a positional 4th arg is rejected
+    (matches the base-class `*, collective` contract)."""
+    h = wb.make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2)
+    with pytest.raises(TypeError):
+        h.predict(1 << 22, "ring", 32, "allreduce")  # positional collective
+
+
 def test_hierarchical_collective_validated():
     """An invalid collective raises ValueError, not a silent fallback."""
     h = wb.make_h200_hierarchical_theory()
@@ -487,12 +495,15 @@ def test_hierarchical_decomposition_additive():
     su, so = h.su, h.so
     topo = h.so_topology
     n_su, n_so = h.n_su, h.n_so
+    # Su phases move the full D; inter-node So phases move the per-node
+    # reduced chunk D/n_su (matching the 4-phase allreduce decomposition).
+    so_chunk = D // n_su
     phases = (
         su.predict(D, n_su, "ring", 128, collective="allreduce", phase="rs")
-        + so.predict(D, n_so, "ring", 128, collective="allreduce", phase="rs",
-                     topology=topo)
-        + so.predict(D, n_so, "ring", 128, collective="allreduce", phase="ag",
-                     topology=topo)
+        + so.predict(so_chunk, n_so, "ring", 128, collective="allreduce",
+                     phase="rs", topology=topo)
+        + so.predict(so_chunk, n_so, "ring", 128, collective="allreduce",
+                     phase="ag", topology=topo)
         + su.predict(D, n_su, "ring", 128, collective="allreduce", phase="ag"))
     assert abs(h.predict(D, "ring", 128, collective="allreduce") - phases) < 1e-6
 

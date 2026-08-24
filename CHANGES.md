@@ -6,6 +6,58 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fix — scale-out hierarchical surrogate volume overcount + review follow-ups (WU7)
+
+A clean-context, 7-dimension code review of the scale-out RoCEv2 +
+hierarchical-collectives work (WU1-6, commit cc50698) returned verdict
+`ship-with-fixes`: 0 blockers, 1 MAJOR, the documented deferrals (PFC/DCQCN,
+MTU, 2-tier spine-leaf, config-primary So parity) confirmed honest. The MAJOR
+and follow-up fixes:
+
+* **MAJOR — So-phase volume overcount.** `HierarchicalSurrogate.predict` fed
+  the FULL tensor `data_bytes` to every phase. The allreduce inter-node
+  So reduce-scatter / all-gather stages move only the per-node reduced chunk
+  `D / n_su` (after the intra-node RS, each node holds `D/n_su`), matching
+  `hierarchical-allreduce.cc`; feeding full `D` was an `n_su`-x overcount
+  (8x at 8 GPUs/node). Fixed: `so_chunk = data_bytes // self.n_su` drives the
+  two So phases; the Su RS/AG phases (full `D`) are unchanged. The fix
+  STRENGTHENS the declared lower bound (the surrogate shrinks further below
+  ns-3): the `test/parity/test_surrogate_vs_ns3_hierarchical.py` anchor ratios
+  drop 0.30->0.20 (2-node) and 0.40->0.23 (4-node), both still >= the 0.05
+  floor. Discovered as a consequence (the `allgather < allreduce` invariant is
+  the oracle): allgather phase-1 (intra-node gather) must move the per-node
+  share `D / n_so`, else allgather would exceed allreduce once the allreduce
+  So-phase volume is corrected. Fixed with `node_share = data_bytes //
+  self.n_so` on phase 1; phases 2 (So AG) + 3 (Su AG) + alltoall (both) keep
+  the full `D`. The false docstring claim ("the per-phase bus-factor volume
+  D*(N-1)/N then comes out correctly") is rewritten to state the true per-phase
+  data sizes. 52 surrogate tests green (was 51; +1 new keyword-only test).
+* **`collective=` is keyword-only on the hierarchical path too.** The
+  `HierarchicalSurrogate.predict` signature gains a bare `*` before
+  `collective`, matching the `oss-surrogate-collective-kwarg` rule (collective
+  is a required keyword-only arg, never inferred from `algo`). A new test
+  asserts positional `collective` raises `TypeError`; all existing callers use
+  `collective=` so nothing breaks.
+* **Doc nits.** `roce-protocol-model.h` and `.cc` described the So segment as
+  "MTU-sized" / "segmentation granularity, <= MTU", but the builder coalesces
+  into 512 KB `ChunkSize` segments (real 9 KB jumbo-MTU frame splitting is a
+  documented WU3 deferral). Comments/help strings corrected to name `ChunkSize`
+  and point at CHANGES.md WU3.
+* **CI wires in `test/parity/`.** `.github/workflows/ci.yml` pytest line now
+  runs `surrogate/test/ test/parity/ -q` so a RoCE-path regression (the So
+  hierarchical regression + the surrogate-vs-ns3 anchor) cannot pass CI green
+  silently. The `gpu-cluster-sim` binary the parity tests invoke is built in
+  the preceding "Build" step.
+* **Honest task ledger.** The WU3/WU4/WU5 task descriptions now split DELIVERED
+  vs DEFERRED, cross-referencing the CHANGES.md deferral notes, so the ledger
+  no longer reads as "PFC/DCQCN/MTU + 2-tier spine-leaf + config-primary So
+  parity shipped" when those are scoped-out lower-bound choices. No code
+  behavior changed.
+
+Surrogate math correctness verified against ns-3 hierarchical-allreduce (the
+anchor) and against the `allgather < allreduce` volume invariant. Not a
+calibration change — the So term remains a declared uncalibrated lower bound.
+
 ### New — RoCE v2 protocol model + payload builder (scale-out WU1)
 
 `model/roce-protocol-model.{h,cc}` (`: ProtocolModel`) and

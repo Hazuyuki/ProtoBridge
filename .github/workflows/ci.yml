@@ -71,5 +71,8 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "simTimeUs=" || { echo "no RESULT line"; exit 1; }
 
-      - name: Python surrogate tests
-        run: python3 -m pytest surrogate/test/ -q
+      - name: Python surrogate + parity tests
+        # test/parity/ runs the RoCE-path regression (test_so_hierarchical_*)
+        # and the surrogate-vs-ns3 lower-bound anchor; both invoke the
+        # gpu-cluster-sim binary built in the "Build" step above.
+        run: python3 -m pytest surrogate/test/ test/parity/ -q

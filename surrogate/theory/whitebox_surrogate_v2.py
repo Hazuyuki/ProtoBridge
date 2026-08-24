@@ -1373,11 +1373,16 @@ class HierarchicalSurrogate:
       alltoall  (2-phase): L = L_su(alltoall) + L_so(alltoall)
       sendrecv          : L = L_so(sendrecv)  (single inter-node hop, no Su stage)
 
-    Each phase is fed the FULL tensor ``data_bytes`` and its participant count
-    (``n_su`` GPUs for Su stages, ``n_so`` nodes for So stages); the per-phase
-    bus-factor volume D*(N-1)/N then comes out correctly from the ring
-    per-step model. ``collective`` stays a REQUIRED keyword-only argument to
-    ``predict`` (never inferred from ``algo``), consistent with
+    Per-phase data sizes follow the true hierarchical algorithm, not all full
+    ``data_bytes``: the allreduce inter-node RS/AG stages move only the
+    per-node reduced chunk ``D/n_su`` (after intra-node reduce-scatter each
+    node holds ``D/n_su``, matching ``ns-3 hierarchical-allreduce.cc``); the
+    allgather first intra-node stage gathers the per-node share ``D/n_so``
+    (each GPU starts with ``D/N``) while its inter-node stage and final
+    broadcast move the full ``D``; alltoall ships the full ``D`` on both
+    stages. Each stage's bus-factor volume ``D_phase*(N-1)/N`` then comes from
+    the ring per-step model. ``collective`` is a REQUIRED keyword-only argument
+    to ``predict`` (never inferred from ``algo``), consistent with
     :class:`TheoryDerivedSurrogate`.
     """
 
@@ -1398,7 +1403,7 @@ class HierarchicalSurrogate:
             data_bytes, n, algo, credits, collective=collective,
             phase=phase, topology=topology, **kw)
 
-    def predict(self, data_bytes, algo, credits, collective, **kw):
+    def predict(self, data_bytes, algo, credits, *, collective, **kw):
         """Predict hierarchical collective latency (µs).
 
         ``collective`` (required) selects the phase decomposition. Other
@@ -1423,16 +1428,24 @@ class HierarchicalSurrogate:
                                       topology=self.so_topology, **kw))
         if collective == 'allreduce':
             # 4-phase: local RS -> inter-node RS -> inter-node AG -> local AG.
+            # Su phases (rs/ag) move the full D; the inter-node So phases move
+            # only the per-node reduced chunk D/n_su (after su_rs each node
+            # holds D/n_su), matching ns-3 hierarchical-allreduce.cc.
+            so_chunk = data_bytes // self.n_su
             return (self._phase(data_bytes, self.n_su, self.su, algo, 'rs',
                                 credits, None, 'allreduce', **kw)
-                    + self._phase(data_bytes, self.n_so, self.so, algo, 'rs',
+                    + self._phase(so_chunk, self.n_so, self.so, algo, 'rs',
                                   credits, self.so_topology, 'allreduce', **kw)
-                    + self._phase(data_bytes, self.n_so, self.so, algo, 'ag',
+                    + self._phase(so_chunk, self.n_so, self.so, algo, 'ag',
                                   credits, self.so_topology, 'allreduce', **kw)
                     + self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
                                   credits, None, 'allreduce', **kw))
         # allgather (3-phase): local AG -> inter-node AG -> local AG.
-        return (self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
+        # Phase 1 gathers the per-node share D/n_so intra-node (each GPU
+        # starts with D/N); phase 2 gathers the full D across nodes; phase 3
+        # broadcasts the full D within the node.
+        node_share = data_bytes // self.n_so
+        return (self._phase(node_share, self.n_su, self.su, algo, 'ag',
                             credits, None, 'allgather', **kw)
                 + self._phase(data_bytes, self.n_so, self.so, algo, 'ag',
                               credits, self.so_topology, 'allgather', **kw)

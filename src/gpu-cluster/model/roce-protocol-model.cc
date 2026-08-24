@@ -43,7 +43,8 @@ RoceProtocolModel::GetTypeId()
                           MakeUintegerAccessor(&RoceProtocolModel::m_perStepLatencyNs),
                           MakeUintegerChecker<uint64_t>())
             .AddAttribute("ChunkSize",
-                          "RoCE segment size in bytes (segmentation granularity, <= MTU)",
+                          "RoCE coalesce granularity in bytes (per-builder segment size; "
+                          "real 9 KB MTU frame splitting is deferred -- see CHANGES.md WU3)",
                           UintegerValue(512 * 1024),
                           MakeUintegerAccessor(&RoceProtocolModel::m_chunkSize),
                           MakeUintegerChecker<uint64_t>(1))

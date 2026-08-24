@@ -4,9 +4,11 @@
  *
  * RoCE v2 (RDMA over Converged Ethernet) protocol model for the scale-out
  * (inter-node) Ethernet fabric. SIMPLE-only: unlike NCCL LL/LL128 line
- * protocols (which are scale-up oriented), a RoCEv2 message is segmented
- * into MTU-sized RDMA packets, each carrying an 8-byte RDMA transport
- * header (BTH + aETH) over UDP/IP/Ethernet. The aggregate wire overhead
+ * protocols (which are scale-up oriented), a RoCEv2 message is coalesced
+ * into ChunkSize segments (default 512 KB; real 9 KB jumbo-MTU frame
+ * splitting is deferred -- see CHANGES.md WU3), each carrying an 8-byte
+ * RDMA transport header (BTH + aETH) over UDP/IP/Ethernet. The aggregate
+ * wire overhead
  * (Eth+IP+UDP+BTH+aETH encapsulation + RDMA NIC pipeline) is captured by
  * WireEfficiency; the per-message RDMA NIC startup (doorbell + WQE) by
  * StartupDelayNs; the per-switch-hop serialization + cut-through latency by
