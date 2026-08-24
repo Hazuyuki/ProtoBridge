@@ -193,6 +193,31 @@ parity-sensitive send paths, an invasive change separated from this
 parity-safe Phase B. The `FlowControlGate` virtual hook (F9) is the seam;
 PFC's unqueue condition is documented in `doc/RISKS.md`.
 
+### Fix — gate ECN mark/peek on the RoCE fabric, not the SIMPLE protocol byte (WU-SoH5 review)
+
+`RoceProtocol::SIMPLE = 1` collides with `NcclProtocol::LL = 1` on the shared
+protocol byte of `FabricHeader`. The two Phase-B ECN sites gated on
+`GetProtocol() == RoceProtocol::SIMPLE` alone, so a Su LL packet (protocol=1,
+**no** SoHeader) matched the guard:
+
+* `EthernetSwitch::MarkEcnIfCongested` (switch-side): a Su LL packet
+  traversing the host-topology EthernetSwitch (which routes both Su and So
+  traffic) at a backlogged VOQ would pass the guard and `RemoveHeader(SoHeader)`
+  would read 10 B of NCCL LL payload as a SoHeader — corrupting the packet
+  (data-correctness, not just a spurious CNP).
+* `FabricEndpoint::ProcessProtocolDataPacket` (receive-side): the same packet
+  would reach `SoHeader::PeekEcn` and read 10 B of payload as a SoHeader,
+  emitting a spurious CNP (and charging a never-shaped Su flow key).
+
+Both sites now ALSO require `GetFabricType() == FabricType::ROCE`, since only
+RoCE-fabric (So) packets carry a SoHeader (stamped by `SendBulkWireTransferSize`
+which sets `SetFabricType(GetFabricTypeForDest(destRank)) = ROCE`). The Su ring
+parity baseline uses `NcclProtocol::SIMPLE = 3` (no collision), so parity is
+unchanged: su 4769616, 2-node 15307388, 4-node 13421212 ns, `--dcqcn` on/off
+identical. `EthernetSwitchEcnTest` gains case (5): a Su LL packet
+(NVLINK fabric, protocol=1, no SoHeader) at a deep queue is neither marked nor
+mutated. Found by an independent subagent code review of `840f48b`.
+
 ### Fix — scale-out hierarchical surrogate volume overcount + review follow-ups (WU7)
 
 A clean-context, 7-dimension code review of the scale-out RoCEv2 +

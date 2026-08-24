@@ -71,7 +71,13 @@ EthernetSwitch::MarkEcnIfCongested(Ptr<Packet> packet, size_t voqDepth) const
     {
         return false;
     }
-    if (fh.GetProtocol() != static_cast<uint8_t>(RoceProtocol::SIMPLE))
+    // Only RoCE-fabric (So) DATA packets carry an inner SoHeader to mark.
+    // RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1); without the
+    // fabric-type gate, a Su LL packet (protocol=1, no SoHeader) traversing
+    // this switch would pass the protocol guard and RemoveHeader(soh) below
+    // would read 10 B of NCCL LL payload as a SoHeader -- corrupting it.
+    if (fh.GetProtocol() != static_cast<uint8_t>(RoceProtocol::SIMPLE) ||
+        fh.GetFabricType() != FabricType::ROCE)
     {
         return false;
     }

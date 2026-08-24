@@ -2412,8 +2412,13 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
     // in flight, emit a Congestion Notification Packet back to the source. The
     // FabricHeader was peeled on the receive path, so the SoHeader is now
     // outermost and PeekEcn reads it directly. Peek (non-mutating) so the
-    // SoHeader is still present for ExtractData below.
-    if (protocolId == static_cast<uint8_t>(RoceProtocol::SIMPLE) &&
+    // SoHeader is still present for ExtractData below. The fabric-type gate is
+    // load-bearing: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1),
+    // and Su LL/LL128 packets (efficiency<1.0, no SoHeader) would otherwise
+    // reach here and PeekEcn would read 10 B of NCCL payload as a SoHeader
+    // (spurious CNP). Only RoCE-fabric (So) packets carry a SoHeader.
+    if (header.GetFabricType() == FabricType::ROCE &&
+        protocolId == static_cast<uint8_t>(RoceProtocol::SIMPLE) &&
         SoHeader::PeekEcn(packet))
     {
         SendCnpPacket(header);

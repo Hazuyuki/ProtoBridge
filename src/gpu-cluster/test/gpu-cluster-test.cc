@@ -3897,6 +3897,7 @@ class EthernetSwitchEcnTest : public TestCase
             pkt->AddHeader(soh);
             FabricHeader fh;
             fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ROCE);
             fh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
             pkt->AddHeader(fh);
             return pkt;
@@ -3961,6 +3962,23 @@ class EthernetSwitchEcnTest : public TestCase
         nonRoce->AddHeader(nfh);
         NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(nonRoce, 10), false,
                               "non-RoCE DATA packet must not be marked");
+
+        // (5) Su LL enum-collision regression: RoceProtocol::SIMPLE(1) collides
+        // with NcclProtocol::LL(1). A Su LL packet (NVLINK fabric, protocol=1,
+        // NO SoHeader) at a deep queue must NOT be marked, and must NOT be
+        // corrupted by a spurious RemoveHeader(SoHeader) reading 10 B of NCCL
+        // LL payload. The fabric-type gate is what prevents this.
+        Ptr<Packet> suLl = Create<Packet>(64); // NCCL LL payload, no SoHeader
+        FabricHeader lfh;
+        lfh.SetPacketType(FabricPacketType::DATA);
+        lfh.SetFabricType(FabricType::NVLINK);
+        lfh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE)); // == NcclProtocol::LL(1)
+        suLl->AddHeader(lfh);
+        uint32_t suLlSize = suLl->GetSize();
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(suLl, 10), false,
+                              "Su LL packet (NVLINK, no SoHeader) must not be marked");
+        NS_TEST_ASSERT_MSG_EQ(suLl->GetSize(), suLlSize,
+                              "Su LL packet must not be mutated (no spurious SoHeader strip)");
     }
 };
 
