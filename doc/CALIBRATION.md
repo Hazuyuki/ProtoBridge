@@ -124,17 +124,33 @@ single-packet send, no NCCL startup) + the `.cfg` `[op]` stencil `kind = P2P`
 (`startup = 0` → raw transfer; verified: packets sent/received, `simTimeUs`
 scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
 
-**Gaps (deferred):**
-- The `.cfg` SEND_P2P completion measures **dispatch time** (`latencyNs` is
-  fixed at 400 ns regardless of size), not delivery latency — a perftest-style
-  ns-3 latency needs delivery-complete instrumentation.
-- A RoCE P2P run needs a RoCE PEX profile (`configs/protocol_profiles/`) +
-  the inter-node `RoceProtocolModel` wired as the So protocol model (the
-  WU1–WU3 scale-out plan). The analytical calibrated model
-  (`make_connectx7_p2p_perftest_theory`) covers the RoCE P2P case in the
-  meantime.
-- `--collective=p2p` inline CLI is a no-op (validated but no injector
-  handler); P2P is reachable via the `.cfg` stencil path.
+**Gaps (deferred) — updated after the ns-3 sweep:**
+- ~~The `.cfg` SEND_P2P completion measures dispatch time (`latencyNs` is fixed
+  at 400 ns regardless of size), not delivery latency.~~ **Retracted:** completion
+  is **delivery-gated**. `ProtocolConfigRunner::Start()` stamps `m_startNs`
+  (protocol-config-runner.cc:109); `OnAction` routes `SEND_P2P` through
+  `SendBulkWireTransferSize` (runner.cc:136); `OnPacketReceived` builds a
+  `PACKET_DELIVERED` event (runner.cc:165) that satisfies the transaction-graph
+  WAIT node; `OnComplete` computes `durationNs = Now - m_startNs` (runner.cc:185).
+  The `latencyNs = 400` is only a config echo, not the measured duration. Proven
+  empirically by the ib_write_lat sweep
+  ([`configs/calibration/roce_p2p_ns3_sweep.py`](../configs/calibration/roce_p2p_ns3_sweep.py)):
+  `simTimeUs` scales with size (2 B → 1.50 µs, 64 KB → 4.40 µs), impossible for
+  fixed-dispatch. So `simTimeUs` **is** the single-transfer delivery latency,
+  directly comparable to `ib_write_lat`.
+- The inter-node `RoceProtocolModel` **is** wired (scratch/gpu-cluster-sim.cc
+  attaches it on every endpoint when `--interNodeFabricType=RoCE`;
+  `FabricEndpoint::GetProtocolModelForDest`, fabric-endpoint.cc:716-726, selects
+  it for non-local dests under the `m_localRankCount > 1` guard). A RoCE P2P run
+  works **today** via `p2p-roce.cfg` + `--interNodeTopology=tor`
+  + `--interNodeBandwidth=400 --interNodeLatency=100`, reproducing `ib_write_lat`
+  at **MAPE 5.26 %** (sweep best fit; see the sweep JSON). A dedicated
+  `h200-roce.profile` PEX bundle is **not** required — `[stack] = h200-ll128`
+  governs only the Su model; the RoCE model is wired out-of-band.
+- `--collective=p2p` inline CLI remains a no-op (P2P is reachable via the `.cfg`
+  stencil path). The remaining follow-up is the opt-in per-QP ceiling
+  (`PerQpCeilingGbps` ≈ 49 G) for **ib_write_bw** sustained-throughput parity
+  (not needed for the ib_write_lat single-transfer sweep above).
 
 ### Applicability / limits of this data
 

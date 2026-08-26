@@ -518,6 +518,74 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
             }
         }
     }
+    else if (m_interNodeTopology == "tor")
+    {
+        // Single shared leaf switch (ib_write_lat's 2-NIC-into-1-leaf topology):
+        // every node's inter-node NIC hangs off ONE switch, so a P2P transfer
+        // crosses 1 switch hop (vs 'host's N switches + peer links = multi-hop).
+        // For numNodes=2 this is the minimal same-switch RoCE fabric matching the
+        // perftest; routing is identical to 'host' (one inter-node NIC per GPU,
+        // the switch forwards by static route) so PopulateInterNodeRouting reuses
+        // the 'host' block.
+        NvSwitchHelper switchHelper;
+        switchHelper.SetSwitchType(m_interNodeSwitchType);
+        m_interNodeSwitchNodes.resize(1);
+        m_interNodeSwitches.resize(1);
+        std::vector<std::vector<uint32_t>> gpuPorts(
+            m_numNodes,
+            std::vector<uint32_t>(m_gpusPerNode));
+
+        Ptr<Node> switchNode = CreateObject<Node>();
+        Ptr<NetDevice> switchDevice = switchHelper.Install(switchNode);
+        Ptr<NvSwitch> leafSwitch = DynamicCast<NvSwitch>(switchDevice);
+        NS_ASSERT(leafSwitch);
+        leafSwitch->SetVoqDepth(m_switchVoqDepth);
+        leafSwitch->SetArbitrationInterval(m_switchArbIntervalNs);
+        if (m_switchCutThroughDelayNs > 0)
+        {
+            leafSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
+        }
+        if (m_arbiter)
+        {
+            leafSwitch->SetArbiter(m_arbiter);
+        }
+        m_interNodeSwitchNodes[0] = switchNode;
+        m_interNodeSwitches[0] = leafSwitch;
+        m_allSwitchNodes.Add(switchNode);
+        m_allNodes.Add(switchNode);
+
+        for (uint32_t nodeId = 0; nodeId < m_numNodes; ++nodeId)
+        {
+            NodeInfo& info = m_nodeInfos[nodeId];
+            for (uint32_t localIdx = 0; localIdx < m_gpusPerNode; ++localIdx)
+            {
+                Ptr<Node> gpuNode = info.gpuNodes.Get(localIdx);
+                Ptr<FabricEndpoint> ep =
+                    DynamicCast<FabricEndpoint>(info.endpoints.Get(localIdx));
+                NetDeviceContainer devices = p2pInter.Install(gpuNode, switchNode);
+                Ptr<NetDevice> gpuDevice = devices.Get(0);
+                Ptr<NetDevice> switchPort = devices.Get(1);
+                uint32_t deviceIndex = ep->AddNetDevice(gpuDevice);
+                uint32_t portIndex =
+                    leafSwitch->AddPort(DynamicCast<PointToPointNetDevice>(switchPort));
+
+                info.interNodeDevices.push_back(gpuDevice);
+                info.interNodeDeviceIndices.push_back(deviceIndex);
+                gpuPorts[nodeId][localIdx] = portIndex;
+            }
+        }
+
+        // Static routes: the shared switch forwards each GPU MAC to its direct port.
+        for (uint32_t destNode = 0; destNode < m_numNodes; ++destNode)
+        {
+            for (uint32_t localIdx = 0; localIdx < m_gpusPerNode; ++localIdx)
+            {
+                Mac48Address destination = Mac48Address::ConvertFrom(
+                    m_nodeInfos[destNode].interNodeDevices[localIdx]->GetAddress());
+                leafSwitch->AddStaticRoute(destination, gpuPorts[destNode][localIdx]);
+            }
+        }
+    }
     else
     {
         NS_ABORT_MSG("Unsupported inter-node topology: " << m_interNodeTopology);
@@ -531,7 +599,7 @@ MultiNodeTopologyHelper::PopulateInterNodeRouting()
 
     if (m_numNodes <= 1) return;
 
-    if (m_interNodeTopology == "host")
+    if (m_interNodeTopology == "host" || m_interNodeTopology == "tor")
     {
         for (uint32_t nodeId = 0; nodeId < m_numNodes; ++nodeId)
         {

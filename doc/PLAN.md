@@ -42,6 +42,15 @@ in two phases:
   stencil, demo `configs/protocol_configs/p2p-single.cfg`). The perftest
   **validates** the ns-3 RoCE wire constants (wire_eff 0.95 slightly conservative
   vs 0.988; line rate 400 Gbps match) — **no ns-3 model change warranted**.
+  **ns-3 `ib_write_lat` direct comparison — DONE:** the inter-node `RoceProtocolModel`
+  was already wired out-of-band, so a `h200-roce.profile` was not needed;
+  `configs/calibration/roce_p2p_ns3_sweep.py` + `--interNodeTopology=tor`
+  (single shared leaf, 1 hop) reproduce `ib_write_lat` at **MAPE 5.26 %** (best fit
+  `startup=950/interNodeLatency=100/switchCutThroughDelay=200/bw=400`; the 1–4 KB
+  transition undershoots — ns-3 linear vs `ib_write_lat` sublinear S^0.669,
+  structural). Completion is delivery-gated (the prior "dispatch time" claim is
+  retracted). The per-QP ceiling for `ib_write_bw` sustained throughput remains
+  open.
   Layer caveat: perftest is raw RDMA, *below* the NCCL collective layer; it does
   not exercise the 40 µs NCCL startup. Detail in `doc/CALIBRATION.md` §"RoCE v2
   P2P (scale-out)".
@@ -51,7 +60,8 @@ in two phases:
 - [x] Phase A: SoHeader carrier + ECN mark + CNP echo + `--ecnThreshold` (parity-safe, dormant).
 - [x] Phase B: activate live SoHeader send path + DCQCN rate machine + egress chokepoint + `--dcqcn` + tests.
 - [x] RoCE P2P perftest calibration: surrogate `make_connectx7_p2p_perftest_theory` (MAPE 2.6 % vs `ib_write_lat`) + `roce_p2p_calib.py`/`.json` + `p2p-single.cfg` demo + `doc/CALIBRATION.md` §RoCE P2P.
-- [ ] ns-3 RoCE P2P direct perftest comparison: RoCE PEX profile (`h200-roce.profile`) + inter-node `RoceProtocolModel` wired as So model + delivery-complete instrumentation (the `.cfg` SEND_P2P `latencyNs` is dispatch time, not delivery) + opt-in per-QP ceiling (`PerQpCeilingGbps`) — folded into the WU1–WU3 scale-out plan.
+- [x] ns-3 RoCE P2P `ib_write_lat` direct comparison: DONE. The inter-node `RoceProtocolModel` was already wired out-of-band (no `h200-roce.profile` needed); `configs/calibration/roce_p2p_ns3_sweep.py` + new `--interNodeTopology=tor` (single shared leaf, 1 hop) reproduce `ib_write_lat` at **MAPE 5.26 %** (best fit `startup=950/interNodeLatency=100/switchCutThroughDelay=200/interNodeBandwidth=400`; 2-link 2×ser = single-write rate). The prior "`.cfg` SEND_P2P `latencyNs` is dispatch time" claim is **retracted** — completion is delivery-gated (`ProtocolConfigRunner` `m_startNs` → `PACKET_DELIVERED` → `durationNs`).
+- [ ] ns-3 RoCE P2P `ib_write_bw` per-QP ceiling: opt-in `PerQpCeilingGbps` (~49 G) on `DcqcnRateMachine::ShapingDelay` for sustained-throughput parity (large-dataSize pipelined single-QP transfer); NOT needed for the `ib_write_lat` single-transfer sweep above.
 - [ ] PFC: per-VC priority pause via `FlowControlGate` (F9 seam) — R-SoH-2 (deferred, invasive).
 - [ ] DCQCN e2e contention proof: multi-flow incast scenario saturating one switch output port — R-SoH-3 (deferred; unit tests cover every link).
 - [ ] True per-flow rate pacer (vs per-chunk shaping delay) — R-SoH-4 (deferred; acceptable for lower-bound-band surrogate anchor).

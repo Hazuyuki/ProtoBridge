@@ -6,6 +6,31 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — ns-3 RoCE P2P `ib_write_lat` sweep harness + `tor` inter-node topology
+
+Direct ns-3-vs-perftest comparison for the single-transfer `ib_write_lat` curve
+(closes the "deferred ns-3 comparison" from the entry below; the inter-node
+`RoceProtocolModel` was already wired, so no new C++ model was needed).
+
+* `configs/calibration/roce_p2p_ns3_sweep.py` grid-searches
+  `{startup, interNodeLatency, switchCutThroughDelay}` (interNodeBandwidth fixed
+  at 400 Gbps — the GPU→switch→GPU path serializes on 2 P2P links, so 2×
+  serialization at 400 Gbps yields the ~199 Gbps single-write rate) and reports
+  MAPE vs `ib_write_lat`. Best fit: `startup=950 ns`, `interNodeLatency=100 ns`,
+  `switchCutThroughDelay=200 ns` → **MAPE 5.26 %** (2 B +3.4 %, 64 B +1.4 %,
+  1 KB −7.4 %, 4 KB −9.6 %, 64 KB +4.5 %). The floor + slope match within
+  3–5 %; the 1–4 KB transition undershoots because `ib_write_lat` is sublinear
+  (NIC pipeline, S^0.669) while ns-3 serialization is linear — the same
+  structural divergence the analytical surrogate (2.6 % MAPE) fits via its
+  sublinear term. This is the honest structural floor of the ns-3 wire model.
+* New `--interNodeTopology=tor` in `MultiNodeTopologyHelper`: a single shared
+  leaf switch every node's inter-node NIC hangs off (1 hop), matching
+  `ib_write_lat`'s 2-NIC-into-1-leaf topology. The legacy `host` value builds
+  N switches + full-mesh peer links (multi-hop, overshoots `ib_write_lat`).
+* `configs/protocol_configs/p2p-roce.cfg` defaults updated to the sweep best fit
+  (`startup=950`); the header documents the calibrated run CLI and the
+  delivery-gated completion path.
+
 ### New — RoCE v2 P2P perftest calibration (soft, surrogate-anchored)
 
 The scale-out (So) RoCEv2 fabric has no real-HW anchor in this release (the A800
@@ -39,13 +64,17 @@ timing.
   0.95 is slightly conservative vs the 0.988 best-case 8-QP saturation, and the
   400 Gbps line rate matches — so **no ns-3 model change is warranted** here.
 
-Deferred to the WU1–WU3 scale-out plan: a direct ns-3-vs-perftest comparison
-needs a RoCE PEX profile (`h200-roce.profile`) + the inter-node
-`RoceProtocolModel` wired as the So model + delivery-complete instrumentation
-(the `.cfg` `SEND_P2P` `latencyNs` measures dispatch time, not delivery) + an
-opt-in per-QP ceiling (`PerQpCeilingGbps`, ~49 G). The analytical calibrated
-model covers the RoCE P2P case in the meantime. Detail in `doc/CALIBRATION.md`
-§"RoCE v2 P2P (scale-out)".
+Update — the deferred ns-3-vs-perftest comparison is now **done** for
+`ib_write_lat` (the inter-node `RoceProtocolModel` was already wired out-of-band;
+a `h200-roce.profile` PEX bundle is **not** required). The `.cfg` `SEND_P2P`
+completion is **delivery-gated** — the prior "measures dispatch time, not
+delivery" claim is **retracted** (`ProtocolConfigRunner` stamps `m_startNs` at
+`Start()` and computes `durationNs = Now - m_startNs` at `OnComplete` after the
+`PACKET_DELIVERED` event; `simTimeUs` scales with size, impossible for
+fixed-dispatch — see `doc/CALIBRATION.md`). Remaining follow-up: the opt-in
+per-QP ceiling (`PerQpCeilingGbps` ≈ 49 G) for `ib_write_bw` sustained-throughput
+parity (not needed for the `ib_write_lat` single-transfer sweep). Detail in
+`doc/CALIBRATION.md` §"RoCE v2 P2P (scale-out)".
 
 ### New — polymorphic SoHeader + ECN carrier for the scale-out fabric (WU-SoH)
 

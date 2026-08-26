@@ -441,7 +441,7 @@ main(int argc, char* argv[])
     cmd.AddValue("contentionP2pWeight", "WFQ weight for P2P traffic", contentionP2pWeight);
     cmd.AddValue("numNodes", "Number of GPU nodes (1=single-node, 2+=multi-node)", numNodes);
     cmd.AddValue("gpusPerNode", "GPUs per node (multi-node mode)", gpusPerNode);
-    cmd.AddValue("interNodeTopology", "Inter-node topology: fullmesh/ring/host", interNodeTopology);
+    cmd.AddValue("interNodeTopology", "Inter-node topology: fullmesh/ring/host/tor (tor = single shared leaf, 1 hop, ib_write_lat style)", interNodeTopology);
     cmd.AddValue("interNodeBandwidth", "Inter-node link bandwidth in Gbps", interNodeBandwidthGbps);
     cmd.AddValue("interNodeLatency", "Inter-node link latency in nanoseconds", interNodeLatencyNs);
     cmd.AddValue("interNodeFabricType", "Inter-node fabric type: RoCE/ETH/NVLink", interNodeFabricTypeStr);
