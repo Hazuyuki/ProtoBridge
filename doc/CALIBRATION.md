@@ -148,9 +148,15 @@ scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
   `h200-roce.profile` PEX bundle is **not** required — `[stack] = h200-ll128`
   governs only the Su model; the RoCE model is wired out-of-band.
 - `--collective=p2p` inline CLI remains a no-op (P2P is reachable via the `.cfg`
-  stencil path). The remaining follow-up is the opt-in per-QP ceiling
-  (`PerQpCeilingGbps` ≈ 49 G) for **ib_write_bw** sustained-throughput parity
-  (not needed for the ib_write_lat single-transfer sweep above).
+  stencil path). The opt-in per-QP ceiling (`PerQpCeilingGbps` ≈ 49 G) for
+  **ib_write_bw** sustained-throughput parity is **DONE**:
+  `--perQpCeilingGbps=49` mounts `DcqcnRateMachine`'s true per-flow pacer;
+  [`configs/calibration/roce_p2p_bw_sweep.py`](../configs/calibration/roce_p2p_bw_sweep.py)
+  → converged **MAPE 3.20 %** for sizes ≥64 MB (64 MB 50.74 G +3.5 %, 256 MB
+  47.60 G −2.9 % ≈ 49 G per-QP), correcting the 7.1× no-ceiling overestimate
+  (256 MB 348.3 G → 47.6 G). Transition zone <64 MB over-estimates (1–7
+  8 MB-coalesced chunks un-paced; the blog's sub-ceiling small-size regime is
+  msg-issue-limited, not modeled — the same structural gap as `ib_write_lat`).
 
 ### Applicability / limits of this data
 

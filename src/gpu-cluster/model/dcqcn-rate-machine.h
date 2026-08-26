@@ -38,6 +38,17 @@ namespace ns3
  * The flow key is FabricEndpoint::MakeSeqKey(destRank, vcId, flowId): the key
  * the sender uses on the send path matches the key the CNP carries back, so
  * OnCnp and ShapingDelay address the same per-flow state.
+ *
+ * PerQpCeilingGbps (> 0 = on) caps the *sustained* throughput of a single
+ * flow (one flowKey == one QP) at the given rate. This is a HARDWARE per-QP
+ * NIC cap (e.g. the ~49 Gbps single-QP `ib_write_bw` ceiling), independent of
+ * congestion. It is enforced as a TRUE per-flow rate pacer -- not a per-chunk
+ * constant offset: a per-flow `nextSendNs` bookkeeper spaces consecutive
+ * chunks so the aggregate rate of a single flow settles to the ceiling
+ * (chunkSize / ceilingBps per chunk). A constant offset (the DCQCN alpha
+ * model above) would only delay the burst start, leaving the NetDevice to
+ * serialize all chunks at the link rate -- which does NOT cap sustained
+ * throughput; the pacer does. Default 0.0 = off (parity-identical).
  */
 class DcqcnRateMachine : public Object
 {
@@ -58,10 +69,12 @@ class DcqcnRateMachine : public Object
 
     /**
      * \brief Extra egress delay (ns) to shape a chunk of chunkBytes for this
-     *        flow. Returns 0 when Alpha is at/below the floor (no congestion
-     *        => no shaping), so the baseline is parity-identical.
+     *        flow. Returns 0 when Alpha is at/below the floor AND no per-QP
+     *        ceiling is set (no congestion, no ceiling => no shaping), so the
+     *        baseline is parity-identical. When PerQpCeilingGbps > 0 this is
+     *        NON-const: it mutates the per-flow next-send time (the pacer).
      */
-    Time ShapingDelay(uint32_t chunkBytes, FlowKey flowKey) const;
+    Time ShapingDelay(uint32_t chunkBytes, FlowKey flowKey);
 
     /**
      * \brief Current Alpha for a flow (0 = no backoff, 1 = max backoff).
@@ -77,6 +90,7 @@ class DcqcnRateMachine : public Object
         uint32_t fastCycles{0};    ///< Fast-recovery cycles consumed
         bool fastArmed{false};    ///< A fast-recovery timer is pending
         bool aiArmed{false};      ///< An additive-increase timer is pending
+        int64_t nextSendNs{0};    ///< Earliest next-chunk egress (pacer), ns
         EventId fastTimer;       ///< Pending fast-recovery event
         EventId aiTimer;         ///< Pending additive-increase event
     };
@@ -94,6 +108,7 @@ class DcqcnRateMachine : public Object
     double m_gDecay;                  ///< g *= gDecay per fast cycle
     double m_alphaFloor;              ///< Alpha floor (ShapingDelay==0 at/below)
     double m_maxRateBps;              ///< Max link rate (B/s) for shaping math
+    double m_perQpCeilingGbps;        ///< Per-QP sustained ceiling (Gbps, 0=off)
 
     std::unordered_map<FlowKey, FlowState> m_flows;
 };

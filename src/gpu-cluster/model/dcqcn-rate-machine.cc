@@ -78,6 +78,14 @@ DcqcnRateMachine::GetTypeId()
                           "Max link rate (B/s) for shaping-delay math.",
                           DoubleValue(50.0e9),
                           MakeDoubleAccessor(&DcqcnRateMachine::m_maxRateBps),
+                          MakeDoubleChecker<double>(0.0))
+            // Opt-in per-QP sustained-throughput ceiling (Gbps; 0 = off). A
+            // HARDWARE per-QP NIC cap (e.g. ~49 Gbps single-QP ib_write_bw),
+            // independent of congestion. Enforced as a true per-flow pacer.
+            .AddAttribute("PerQpCeilingGbps",
+                          "Per-QP sustained throughput ceiling (Gbps, 0=off).",
+                          DoubleValue(0.0),
+                          MakeDoubleAccessor(&DcqcnRateMachine::m_perQpCeilingGbps),
                           MakeDoubleChecker<double>(0.0));
     return tid;
 }
@@ -90,7 +98,8 @@ DcqcnRateMachine::DcqcnRateMachine()
       m_gInit(0.5),
       m_gDecay(0.5),
       m_alphaFloor(0.0),
-      m_maxRateBps(50.0e9)
+      m_maxRateBps(50.0e9),
+      m_perQpCeilingGbps(0.0)
 {
     NS_LOG_FUNCTION(this);
 }
@@ -199,30 +208,71 @@ DcqcnRateMachine::AdditiveIncrease(FlowKey flowKey)
 }
 
 Time
-DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey) const
+DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
 {
-    auto it = m_flows.find(flowKey);
-    if (it == m_flows.end() || it->second.alpha <= m_alphaFloor || m_maxRateBps <= 0.0)
+    // DCQCN congestion backoff: read-only, never creates flow state (so the
+    // ceiling=0 baseline is byte-identical to the pre-pacer machine). At
+    // alpha=0 (no CNP) this is zero.
+    double dcqcnSec = 0.0;
+    if (m_maxRateBps > 0.0)
+    {
+        auto it = m_flows.find(flowKey);
+        if (it != m_flows.end() && it->second.alpha > m_alphaFloor)
+        {
+            double alpha = it->second.alpha;
+            // rateFactor = clamp(1 - alpha/2, 0.5, 1.0): alpha=0 -> 1.0 (no
+            // delay); alpha=1 -> 0.5 (double the serialization time).
+            double rateFactor = std::max(0.5, std::min(1.0, 1.0 - alpha / 2.0));
+            if (rateFactor < 1.0)
+            {
+                // base serialization time at max rate; extra delay so the
+                // chunk experiences the reduced rate.
+                double baseSeconds = static_cast<double>(chunkBytes) / m_maxRateBps;
+                double d = baseSeconds * (1.0 / rateFactor - 1.0);
+                if (d > 0.0)
+                {
+                    dcqcnSec = d;
+                }
+            }
+        }
+    }
+
+    // Per-QP ceiling: a TRUE per-flow rate pacer. Spaces consecutive chunks of
+    // the same flow (one QP) so the aggregate rate settles to the ceiling. A
+    // constant per-chunk offset would not cap sustained throughput -- the
+    // NetDevice serializes a back-to-back burst at the link rate; only pacing
+    // the next chunk's earliest egress time does. Only mutates state when the
+    // ceiling is on (> 0), so the off baseline is parity-identical.
+    double paceSec = 0.0;
+    if (m_perQpCeilingGbps > 0.0)
+    {
+        // 1 Gbps = 1e9 bit/s = 1.25e8 B/s (matches MaxRateBps 50e9 == 400 G).
+        double ceilingBps = m_perQpCeilingGbps * 1.25e8;
+        if (ceilingBps > 0.0)
+        {
+            FlowState& s = GetOrCreate(flowKey);
+            int64_t nowNs = Simulator::Now().GetNanoSeconds();
+            // Earliest this chunk may egress (ns); 0 before the flow's first chunk.
+            int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
+            // The ceiling-rate slot this chunk occupies (ns).
+            double slotSec = static_cast<double>(chunkBytes) / ceilingBps;
+            int64_t slotNs = static_cast<int64_t>(slotSec * 1e9);
+            if (slotNs < 1)
+            {
+                slotNs = 1; // avoid a zero-slot spin
+            }
+            // The next chunk on this flow may egress one ceiling slot after
+            // this chunk's egress start (nowNs + delayNs).
+            s.nextSendNs = (nowNs + delayNs) + slotNs;
+            paceSec = static_cast<double>(delayNs) / 1e9;
+        }
+    }
+
+    if (dcqcnSec <= 0.0 && paceSec <= 0.0)
     {
         return Time(0);
     }
-    double alpha = it->second.alpha;
-    // rateFactor = clamp(1 - alpha/2, 0.5, 1.0): at alpha=0 the factor is 1.0
-    // (no delay); at alpha=1 the factor is 0.5 (double the serialization time).
-    double rateFactor = std::max(0.5, std::min(1.0, 1.0 - alpha / 2.0));
-    if (rateFactor >= 1.0)
-    {
-        return Time(0);
-    }
-    // base serialization time at max rate (s); extra delay so the chunk
-    // experiences the reduced rate: base * (1/rateFactor - 1).
-    double baseSeconds = static_cast<double>(chunkBytes) / m_maxRateBps;
-    double delaySeconds = baseSeconds * (1.0 / rateFactor - 1.0);
-    if (delaySeconds <= 0.0)
-    {
-        return Time(0);
-    }
-    return Time::FromDouble(delaySeconds, Time::S);
+    return Time::FromDouble(std::max(dcqcnSec, paceSec), Time::S);
 }
 
 double

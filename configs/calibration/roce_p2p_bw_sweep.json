@@ -1,0 +1,56 @@
+{
+  "source": "share_data/zhuyu/RoCEv2_benchmark_data.md (ib_write_bw per-QP ceiling)",
+  "model": "ns-3 RoCE P2P, tor, 1 flowKey==1 QP, large pipelined transfer",
+  "ceiling_gbps_anchor": 49.02,
+  "ramp_note": "ib_write_bw Hill-form ramp (MAPE 19.8%) is TX-depth-128 pipeline dynamics, NOT a calibration target (per calib JSON); only the ceiling is.",
+  "converged_mape_pct_sizes_ge_64MB": 3.1956397422744516,
+  "transition_zone_note": "sizes < 64MB over-estimate: the per-QP ceiling paces INTER-chunk gaps, so 1-7-chunk (8MB-coalesced) transfers are not yet paced; the blog's sub-ceiling small-size regime is msg-issue-limited (not modeled, like ib_write_lat).",
+  "rows": [
+    {
+      "size": 65536,
+      "sim_us": 4.4,
+      "gbps": 119.15636363636364,
+      "err_pct": 143.0770372018842
+    },
+    {
+      "size": 262144,
+      "sim_us": 13.2,
+      "gbps": 158.87515151515152,
+      "err_pct": 224.10271626917887
+    },
+    {
+      "size": 1048576,
+      "sim_us": 48.2,
+      "gbps": 174.037510373444,
+      "err_pct": 255.03368089237858
+    },
+    {
+      "size": 4194304,
+      "sim_us": 188.4,
+      "gbps": 178.10208067940553,
+      "err_pct": 263.3253379832834
+    },
+    {
+      "size": 16777216,
+      "sim_us": 2172.1,
+      "gbps": 61.791689148750066,
+      "err_pct": 26.05403743115068
+    },
+    {
+      "size": 67108864,
+      "sim_us": 10581.4,
+      "gbps": 50.737228722097264,
+      "err_pct": 3.5031185681298664
+    },
+    {
+      "size": 268435456,
+      "sim_us": 45111.2,
+      "gbps": 47.60422351877139,
+      "err_pct": -2.8881609164190367
+    }
+  ],
+  "no_ceiling": {
+    "size": 268435456,
+    "gbps": 348.3234360604685
+  }
+}

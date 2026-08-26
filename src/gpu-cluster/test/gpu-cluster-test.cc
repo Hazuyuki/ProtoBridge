@@ -4245,6 +4245,81 @@ class DcqcnRateMachineTest : public TestCase
     }
 };
 
+// (1b) Per-QP throughput ceiling pacer. PerQpCeilingGbps > 0 must pace
+// consecutive chunks of ONE flow (one QP) at chunkBytes/ceilingBps apart so the
+// aggregate rate settles to the ceiling (a sustained-throughput cap, NOT a
+// one-time offset). Two flows (two QPs) pace independently. Ceiling = 0 (default)
+// leaves ShapingDelay == 0 -- the parity foundation.
+class PerQpCeilingPacerTest : public TestCase
+{
+  public:
+    PerQpCeilingPacerTest()
+        : TestCase("Per-QP ceiling pacer spaces one flow, leaves 0 off") {}
+    void DoRun() override
+    {
+        const DcqcnRateMachine::FlowKey kA = 12345;
+        const DcqcnRateMachine::FlowKey kB = 67890;
+        const uint32_t chunk = 9000;      // a wire MTU chunk
+        const double ceilingGbps = 49.0;  // single-QP ib_write_bw ceiling
+
+        // (a) Parity: ceiling=0 -> ShapingDelay==0 for every consecutive chunk
+        // of a flow (no pacing, no state mutation). Matches the unmounted baseline.
+        Ptr<DcqcnRateMachine> off = CreateObject<DcqcnRateMachine>();
+        for (int i = 0; i < 4; ++i)
+        {
+            NS_TEST_ASSERT_MSG_EQ(off->ShapingDelay(chunk, kA).GetNanoSeconds(), 0,
+                "ceiling=0 must not pace (parity-safe)");
+        }
+
+        // (b) Ceiling on: pace one flow. Simulator::Now()==0 across this sync
+        // loop, so chunk i's delay == i*slot (the pacer's next-send bookkeeping).
+        Ptr<DcqcnRateMachine> on = CreateObject<DcqcnRateMachine>();
+        on->SetAttribute("PerQpCeilingGbps", DoubleValue(ceilingGbps));
+        const double ceilingBps = ceilingGbps * 1.25e8; // 1 Gbps = 1.25e8 B/s
+        const int64_t slotNs =
+            static_cast<int64_t>(static_cast<double>(chunk) / ceilingBps * 1e9);
+        for (int i = 0; i < 4; ++i)
+        {
+            const int64_t got = on->ShapingDelay(chunk, kA).GetNanoSeconds();
+            const int64_t expect = static_cast<int64_t>(i) * slotNs;
+            NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(got),
+                static_cast<double>(expect), 2.0,
+                "chunk i of one flow must be paced i*slot apart");
+        }
+
+        // (c) Independence: flow B's first chunk is paced at 0 regardless of
+        // flow A's accumulated next-send (a different QP has its own pacer).
+        NS_TEST_ASSERT_MSG_EQ(on->ShapingDelay(chunk, kB).GetNanoSeconds(), 0,
+            "a second flow's first chunk must not inherit flow A's pacing");
+
+        // (d) Ceiling + DCQCN compose: both apply, the binding (larger) delay
+        // wins (max). With Alpha=0.5 the DCQCN extra-serialization delay for a
+        // 9000 B chunk at 50e9 B/s is base*(1/0.75-1) = 60 ns; the ceiling slot
+        // is 9000/6.125e9 = 1469 ns. The first chunk's pacer delay is 0, so the
+        // DCQCN delay (60) binds at chunk 0; from chunk 1 the pacer delay
+        // (1469) exceeds the DCQCN delay, so the ceiling binds -- proving the
+        // sustained-throughput cap overrides DCQCN once a flow has history.
+        on->OnCnp(kA); // Alpha=0.5
+        const DcqcnRateMachine::FlowKey kC = 111;
+        on->OnCnp(kC); // Alpha=0.5 on a fresh flow (pacer state empty)
+        // chunk 0: max(DCQCN 60, pacer 0) = 60 (DCQCN binds; ceiling pacer is 0
+        // for a flow's first chunk).
+        const int64_t d0 = on->ShapingDelay(chunk, kC).GetNanoSeconds();
+        const int64_t dcqcnNs =
+            static_cast<int64_t>(static_cast<double>(chunk) / 50.0e9 * 1e9 *
+                                 (1.0 / 0.75 - 1.0));
+        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d0),
+            static_cast<double>(dcqcnNs), 2.0,
+            "chunk 0: DCQCN delay binds (pacer is 0 for the first chunk)");
+        // chunk 1: max(DCQCN 60, pacer slot 1469) = 1469 (ceiling binds).
+        const int64_t d1 = on->ShapingDelay(chunk, kC).GetNanoSeconds();
+        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d1),
+            static_cast<double>(slotNs), 2.0,
+            "chunk 1: ceiling pacer binds over the DCQCN delay");
+        Simulator::Destroy();
+    }
+};
+
 // (2) CNP received -> ProcessCnpPacket -> OnCnp (NOT ProcessCreditPacket). The
 // CNP is injected over the real P2P wire (ReceiveFromDevice is private); Alpha
 // growing proves the CNP reached the DCQCN rate machine. Had it been misrouted
@@ -5452,6 +5527,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new EthernetSwitchEcnTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpReactionTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
+    AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SoOnlyPredicateTest, TestCase::Duration::QUICK);
     AddTestCase(new DormantTest, TestCase::Duration::QUICK);

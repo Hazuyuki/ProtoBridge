@@ -49,8 +49,14 @@ in two phases:
   `startup=950/interNodeLatency=100/switchCutThroughDelay=200/bw=400`; the 1–4 KB
   transition undershoots — ns-3 linear vs `ib_write_lat` sublinear S^0.669,
   structural). Completion is delivery-gated (the prior "dispatch time" claim is
-  retracted). The per-QP ceiling for `ib_write_bw` sustained throughput remains
-  open.
+  retracted). **ns-3 `ib_write_bw` per-QP ceiling — DONE:** opt-in
+  `--perQpCeilingGbps=49` mounts `DcqcnRateMachine`'s true per-flow pacer
+  (per-flow `nextSendNs`, spaces consecutive chunks to the ceiling);
+  `configs/calibration/roce_p2p_bw_sweep.py` → converged **MAPE 3.20 %** for
+  sizes ≥64 MB (256 MB 47.60 G ≈ 49 G per-QP), correcting the 7.1× no-ceiling
+  overestimate (256 MB 348.3 G → 47.6 G). Transition zone <64 MB over-estimates
+  (1–7 8 MB-coalesced chunks un-paced; the blog's sub-ceiling small-size regime
+  is msg-issue-limited, not modeled — same structural gap as `ib_write_lat`).
   Layer caveat: perftest is raw RDMA, *below* the NCCL collective layer; it does
   not exercise the 40 µs NCCL startup. Detail in `doc/CALIBRATION.md` §"RoCE v2
   P2P (scale-out)".
@@ -61,10 +67,10 @@ in two phases:
 - [x] Phase B: activate live SoHeader send path + DCQCN rate machine + egress chokepoint + `--dcqcn` + tests.
 - [x] RoCE P2P perftest calibration: surrogate `make_connectx7_p2p_perftest_theory` (MAPE 2.6 % vs `ib_write_lat`) + `roce_p2p_calib.py`/`.json` + `p2p-single.cfg` demo + `doc/CALIBRATION.md` §RoCE P2P.
 - [x] ns-3 RoCE P2P `ib_write_lat` direct comparison: DONE. The inter-node `RoceProtocolModel` was already wired out-of-band (no `h200-roce.profile` needed); `configs/calibration/roce_p2p_ns3_sweep.py` + new `--interNodeTopology=tor` (single shared leaf, 1 hop) reproduce `ib_write_lat` at **MAPE 5.26 %** (best fit `startup=950/interNodeLatency=100/switchCutThroughDelay=200/interNodeBandwidth=400`; 2-link 2×ser = single-write rate). The prior "`.cfg` SEND_P2P `latencyNs` is dispatch time" claim is **retracted** — completion is delivery-gated (`ProtocolConfigRunner` `m_startNs` → `PACKET_DELIVERED` → `durationNs`).
-- [ ] ns-3 RoCE P2P `ib_write_bw` per-QP ceiling: opt-in `PerQpCeilingGbps` (~49 G) on `DcqcnRateMachine::ShapingDelay` for sustained-throughput parity (large-dataSize pipelined single-QP transfer); NOT needed for the `ib_write_lat` single-transfer sweep above.
+- [x] ns-3 RoCE P2P `ib_write_bw` per-QP ceiling: DONE. Opt-in `PerQpCeilingGbps` (~49 G) on `DcqcnRateMachine::ShapingDelay` as a true per-flow pacer (per-flow `nextSendNs`, not a per-chunk offset); `roce_p2p_bw_sweep.py` → converged MAPE 3.20 % (≥64 MB); corrects the 7.1× no-ceiling overestimate. Resolves R-SoH-4 (per-flow pacer mechanism now exists; DCQCN congestion still per-chunk, acceptable).
 - [ ] PFC: per-VC priority pause via `FlowControlGate` (F9 seam) — R-SoH-2 (deferred, invasive).
 - [ ] DCQCN e2e contention proof: multi-flow incast scenario saturating one switch output port — R-SoH-3 (deferred; unit tests cover every link).
-- [ ] True per-flow rate pacer (vs per-chunk shaping delay) — R-SoH-4 (deferred; acceptable for lower-bound-band surrogate anchor).
+- [x] True per-flow rate pacer — R-SoH-4 RESOLVED for the per-QP ceiling (`PerQpCeilingGbps` uses per-flow `nextSendNs`); the DCQCN congestion path still uses per-chunk extra-serialization shaping (acceptable for the lower-bound-band surrogate anchor).
 
 ## Build / test gate (DoD)
 

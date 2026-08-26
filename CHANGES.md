@@ -6,6 +6,35 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — ns-3 RoCE P2P `ib_write_bw` per-QP ceiling pacer + validation
+
+Opt-in per-QP sustained-throughput ceiling for the single-QP `ib_write_bw` curve
+(closes #23/#24; the `ib_write_lat` single-transfer sweep + delivery-gated
+completion landed in the entry below).
+
+* `DcqcnRateMachine::PerQpCeilingGbps` (Gbps, 0 = off) is a TRUE per-flow rate
+  pacer: a per-flow `nextSendNs` bookkeeper spaces consecutive chunks of one
+  flowKey (one QP) so the aggregate rate settles to the ceiling
+  (`chunkBytes/ceilingBps` per chunk). A constant per-chunk offset (the DCQCN
+  alpha model) would only delay the burst start, leaving the NetDevice to
+  serialize all chunks at the link rate — which does NOT cap sustained
+  throughput; the pacer does. Resolves R-SoH-4 for the ceiling (the DCQCN
+  congestion path stays per-chunk, acceptable for the lower-bound band).
+* Parity-safe: default 0 = off → `ShapingDelay` byte-identical to pre-WU3
+  (DCQCN path read-only, ceiling block skipped); 256 MB no-ceiling = 348.3 G
+  line rate unchanged.
+* `scratch/gpu-cluster-sim.cc` `--perQpCeilingGbps` CLI (mounts
+  `DcqcnRateMachine` when RoCE + (`--dcqcn` or ceiling > 0)).
+* `src/gpu-cluster/test/gpu-cluster-test.cc` `PerQpCeilingPacerTest`: off =
+  parity (4 chunks delay 0); on = per-flow spacing (chunk i ≈ i·slot);
+  independent flows; DCQCN composition (alpha binds chunk 0, ceiling binds 1).
+* `configs/calibration/roce_p2p_bw_sweep.py` → converged **MAPE 3.20 %** for
+  sizes ≥64 MB (64 MB 50.74 G +3.5 %, 256 MB 47.60 G −2.9 % ≈ 49 G per-QP);
+  the pacer corrects the 7.1× no-ceiling overestimate (256 MB 348.3 G → 47.6 G).
+  Transition zone <64 MB over-estimates (1–7 8 MB-coalesced chunks un-paced; the
+  blog's sub-ceiling small-size regime is msg-issue-limited, not modeled — the
+  same structural gap as `ib_write_lat`).
+
 ### New — ns-3 RoCE P2P `ib_write_lat` sweep harness + `tor` inter-node topology
 
 Direct ns-3-vs-perftest comparison for the single-transfer `ib_write_lat` curve

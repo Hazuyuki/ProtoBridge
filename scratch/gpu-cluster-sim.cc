@@ -275,6 +275,10 @@ main(int argc, char* argv[])
     // ProcessCnpPacket drives the per-flow Alpha rate-backoff folded into the
     // single SendPacketOnDevice egress chokepoint.
     bool enableDcqcn = false;
+    // Opt-in per-QP sustained-throughput ceiling (Gbps; 0 = off). Mounts the
+    // DCQCN rate machine (its true per-flow pacer enforces the cap) even when
+    // --dcqcn is off. Calibrated to the ~49 Gbps single-QP ib_write_bw ceiling.
+    double perQpCeilingGbps = 0.0;
     std::string intraNodeTopology = "switched";
     std::string intraNodeAlgorithm = "fullmesh";
 
@@ -448,6 +452,7 @@ main(int argc, char* argv[])
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
     cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
+    cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
     cmd.AddValue("intraNodeAlgorithm", "Intra-node algorithm for hierarchical: ring/fullmesh", intraNodeAlgorithm);
     std::string stepTraceFile = "";
@@ -860,14 +865,22 @@ main(int argc, char* argv[])
             roceModel = CreateObject<RoceProtocolModel>();
         }
 
-        // DCQCN rate machine (Phase B). One shared machine across all So
-        // endpoints: state is keyed per flow (destRank,vcId,flowId), so a single
-        // instance is correct and matches a real NIC's per-flow tables. Null
-        // when --dcqcn is off → CNP no-ops + zero shaping delay (parity-safe).
+        // DCQCN rate machine (Phase B) + opt-in per-QP ceiling pacer. One shared
+        // machine across all So endpoints: state is keyed per flow
+        // (destRank,vcId,flowId), so a single instance is correct and matches a
+        // real NIC's per-flow tables. Null when both --dcqcn and
+        // --perQpCeilingGbps are off -> CNP no-ops + zero shaping/pacing
+        // (parity-safe). The per-QP ceiling uses the machine's true per-flow
+        // pacer (not the DCQCN alpha path), so it mounts the machine even with
+        // --dcqcn off; PerQpCeilingGbps=0 there keeps ShapingDelay==0.
         Ptr<DcqcnRateMachine> dcqcnMachine;
-        if (interNodeFabricType == FabricType::ROCE && enableDcqcn)
+        if (interNodeFabricType == FabricType::ROCE && (enableDcqcn || perQpCeilingGbps > 0.0))
         {
             dcqcnMachine = CreateObject<DcqcnRateMachine>();
+            if (perQpCeilingGbps > 0.0)
+            {
+                dcqcnMachine->SetAttribute("PerQpCeilingGbps", DoubleValue(perQpCeilingGbps));
+            }
         }
 
         ApplicationContainer apps = multiTopo.GetAllEndpoints();
