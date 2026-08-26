@@ -331,12 +331,6 @@ FabricEndpoint::SetInterNodeFabricType(FabricType type)
     m_interNodeFabricType = static_cast<uint8_t>(type);
 }
 
-FabricType
-FabricEndpoint::GetInterNodeFabricType() const
-{
-    return static_cast<FabricType>(m_interNodeFabricType);
-}
-
 void
 FabricEndpoint::SetNodeId(uint32_t nodeId)
 {
@@ -704,12 +698,6 @@ void
 FabricEndpoint::SetInterNodeProtocolModel(Ptr<ProtocolModel> model)
 {
     m_interNodeProtocolModel = model;
-}
-
-Ptr<ProtocolModel>
-FabricEndpoint::GetInterNodeProtocolModel() const
-{
-    return m_interNodeProtocolModel;
 }
 
 Ptr<ProtocolModel>

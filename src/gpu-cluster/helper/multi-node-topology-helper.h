@@ -104,13 +104,7 @@ class MultiNodeTopologyHelper
 
     // Accessors
     ApplicationContainer GetAllEndpoints() const;
-    NodeContainer GetAllNodes() const;
-    NodeContainer GetGpuNodes() const;
-    NodeContainer GetSwitchNodes() const;
-    uint32_t GetNodeIdForRank(uint16_t rank) const;
-    uint16_t GetLocalRankForGlobalRank(uint16_t globalRank) const;
     uint16_t GetGlobalRank(uint32_t nodeId, uint32_t localIdx) const;
-    uint32_t GetTotalNumGpus() const;
     Ptr<NvSwitch> GetNvSwitch(uint32_t nodeId) const;
 
   private:
@@ -140,8 +134,6 @@ class MultiNodeTopologyHelper
     FabricType m_interNodeFabricType;
     std::string m_interNodeTopology;
     std::string m_interNodeSwitchType{"ns3::NvSwitch"}; ///< So switch TypeId (NvSwitch default; EthernetSwitch for RoCE)
-    std::vector<Ptr<Node>> m_interNodeSwitchNodes;
-    std::vector<Ptr<NvSwitch>> m_interNodeSwitches;
 
     std::vector<NodeInfo> m_nodeInfos;
     NodeContainer m_allGpuNodes;

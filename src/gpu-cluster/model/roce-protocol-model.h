@@ -55,7 +55,6 @@ public:
 
 private:
     uint64_t m_startupDelayNs;
-    uint64_t m_perGpuStartupDelayNs;
     uint64_t m_perStepLatencyNs;
     uint64_t m_chunkSize;
     double m_wireEfficiency;

@@ -9,8 +9,10 @@
  * equivalent; they default off on NvSwitch). RoCEv2 ECN congestion marking is
  * layered on here: on enqueue, when a VOQ crosses the ECN threshold, the
  * switch marks the inner SoHeader ECN bit of RoCE data packets (control
- * packets bypass, matching the BER bypass). PFC priority flow control +
- * DCQCN rate backoff remain separable future work (see CHANGES.md WU-SoH).
+ * packets bypass, matching the BER bypass). PFC priority flow control
+ * remains deferred (R-SoH-2); DCQCN rate backoff is implemented in
+ * DcqcnRateMachine and wired into FabricEndpoint (only the multi-flow incast
+ * e2e proof, R-SoH-3, is deferred).
  */
 #ifndef ETHERNET_SWITCH_H
 #define ETHERNET_SWITCH_H

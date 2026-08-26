@@ -32,11 +32,6 @@ RoceProtocolModel::GetTypeId()
                           UintegerValue(40000),
                           MakeUintegerAccessor(&RoceProtocolModel::m_startupDelayNs),
                           MakeUintegerChecker<uint64_t>())
-            .AddAttribute("PerGpuStartupDelayNs",
-                          "Incremental startup per participating endpoint in ns",
-                          UintegerValue(0),
-                          MakeUintegerAccessor(&RoceProtocolModel::m_perGpuStartupDelayNs),
-                          MakeUintegerChecker<uint64_t>())
             .AddAttribute("PerStepLatencyNs",
                           "Per-switch-hop serialization + cut-through latency in ns",
                           UintegerValue(800),
@@ -59,7 +54,6 @@ RoceProtocolModel::GetTypeId()
 
 RoceProtocolModel::RoceProtocolModel()
     : m_startupDelayNs(40000),
-      m_perGpuStartupDelayNs(0),
       m_perStepLatencyNs(800),
       m_chunkSize(512 * 1024),
       m_wireEfficiency(0.95)
@@ -120,7 +114,8 @@ uint64_t
 RoceProtocolModel::GetStartupDelayNs(uint8_t protocolId, uint16_t numGpus) const
 {
     (void)protocolId;
-    return m_startupDelayNs + m_perGpuStartupDelayNs * numGpus;
+    (void)numGpus;
+    return m_startupDelayNs;
 }
 
 uint64_t

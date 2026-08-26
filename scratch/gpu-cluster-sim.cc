@@ -264,8 +264,9 @@ main(int argc, char* argv[])
     uint64_t interNodeStartupNs = 40000;
     // Ethernet (RoCEv2) switch ECN threshold: VOQ depth (packets) at which the
     // switch marks the inner SoHeader ECN bit on enqueue. 0 disables marking.
-    // The ECN reaction (CNP + DCQCN rate-backoff) is a Phase-B capability, so
-    // this knob is inert until the So send path emits SoHeader-bearing packets.
+    // The ECN reaction (CNP + DCQCN rate-backoff) is gated by --dcqcn (default
+    // off = parity-safe); ECN marking itself is live (Phase B): the switch
+    // marks SoHeader ECN at this VOQ depth on enqueue.
     uint32_t ecnThreshold = 8;
     // DCQCN rate machine (Phase B). Off by default: with no DcqcnRateMachine
     // mounted, CNPs are no-ops and SendPacketOnDevice adds zero shaping delay,
@@ -843,8 +844,9 @@ main(int argc, char* argv[])
             // derivative) instead of the NVLink NvSwitch.
             multiTopo.SetInterNodeSwitchType("ns3::EthernetSwitch");
             // ECN threshold is an EthernetSwitch Attribute; set the default
-            // before the helper instantiates the So switches. Inert until the
-            // So send path emits SoHeader-bearing packets (Phase B).
+            // before the helper instantiates the So switches. ECN marking is
+            // live (Phase B): the switch marks SoHeader ECN at this VOQ depth
+            // on enqueue; the CNP+DCQCN reaction is gated by --dcqcn.
             Config::SetDefault("ns3::EthernetSwitch::EcnThreshold",
                                UintegerValue(ecnThreshold));
         }

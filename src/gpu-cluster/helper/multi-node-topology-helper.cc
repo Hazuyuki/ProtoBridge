@@ -64,18 +64,9 @@ void MultiNodeTopologyHelper::SetInterNodeFabricType(FabricType type) { m_interN
 void MultiNodeTopologyHelper::SetInterNodeTopology(const std::string& topo) { m_interNodeTopology = topo; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchType(const std::string& typeId) { m_interNodeSwitchType = typeId; }
 
-uint32_t MultiNodeTopologyHelper::GetTotalNumGpus() const { return m_numNodes * m_gpusPerNode; }
 uint16_t MultiNodeTopologyHelper::GetGlobalRank(uint32_t nodeId, uint32_t localIdx) const
 {
     return static_cast<uint16_t>(nodeId * m_gpusPerNode + localIdx);
-}
-uint32_t MultiNodeTopologyHelper::GetNodeIdForRank(uint16_t rank) const
-{
-    return rank / m_gpusPerNode;
-}
-uint16_t MultiNodeTopologyHelper::GetLocalRankForGlobalRank(uint16_t globalRank) const
-{
-    return globalRank % m_gpusPerNode;
 }
 Ptr<NvSwitch> MultiNodeTopologyHelper::GetNvSwitch(uint32_t nodeId) const
 {
@@ -83,9 +74,6 @@ Ptr<NvSwitch> MultiNodeTopologyHelper::GetNvSwitch(uint32_t nodeId) const
     return m_nodeInfos[nodeId].nvSwitch;
 }
 
-NodeContainer MultiNodeTopologyHelper::GetAllNodes() const { return m_allNodes; }
-NodeContainer MultiNodeTopologyHelper::GetGpuNodes() const { return m_allGpuNodes; }
-NodeContainer MultiNodeTopologyHelper::GetSwitchNodes() const { return m_allSwitchNodes; }
 ApplicationContainer MultiNodeTopologyHelper::GetAllEndpoints() const { return m_allEndpoints; }
 
 NodeContainer
@@ -435,8 +423,10 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
     {
         NvSwitchHelper switchHelper;
         switchHelper.SetSwitchType(m_interNodeSwitchType);
-        m_interNodeSwitchNodes.resize(m_numNodes);
-        m_interNodeSwitches.resize(m_numNodes);
+        std::vector<Ptr<Node>> interNodeSwitchNodes;
+        std::vector<Ptr<NvSwitch>> interNodeSwitches;
+        interNodeSwitchNodes.resize(m_numNodes);
+        interNodeSwitches.resize(m_numNodes);
         std::vector<std::vector<uint32_t>> gpuPorts(
             m_numNodes,
             std::vector<uint32_t>(m_gpusPerNode));
@@ -458,8 +448,8 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
             {
                 hostSwitch->SetArbiter(m_arbiter);
             }
-            m_interNodeSwitchNodes[nodeId] = switchNode;
-            m_interNodeSwitches[nodeId] = hostSwitch;
+            interNodeSwitchNodes[nodeId] = switchNode;
+            interNodeSwitches[nodeId] = hostSwitch;
             m_allSwitchNodes.Add(switchNode);
             m_allNodes.Add(switchNode);
         }
@@ -473,12 +463,12 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
                 Ptr<FabricEndpoint> ep =
                     DynamicCast<FabricEndpoint>(info.endpoints.Get(localIdx));
                 NetDeviceContainer devices =
-                    p2pInter.Install(gpuNode, m_interNodeSwitchNodes[nodeId]);
+                    p2pInter.Install(gpuNode, interNodeSwitchNodes[nodeId]);
                 Ptr<NetDevice> gpuDevice = devices.Get(0);
                 Ptr<NetDevice> switchPort = devices.Get(1);
                 uint32_t deviceIndex = ep->AddNetDevice(gpuDevice);
                 uint32_t portIndex =
-                    m_interNodeSwitches[nodeId]->AddPort(
+                    interNodeSwitches[nodeId]->AddPort(
                         DynamicCast<PointToPointNetDevice>(switchPort));
 
                 info.interNodeDevices.push_back(gpuDevice);
@@ -492,18 +482,18 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
             for (uint32_t nodeB = nodeA + 1; nodeB < m_numNodes; ++nodeB)
             {
                 NetDeviceContainer devices =
-                    p2pInter.Install(m_interNodeSwitchNodes[nodeA],
-                                     m_interNodeSwitchNodes[nodeB]);
-                peerPorts[{nodeA, nodeB}] = m_interNodeSwitches[nodeA]->AddPort(
+                    p2pInter.Install(interNodeSwitchNodes[nodeA],
+                                     interNodeSwitchNodes[nodeB]);
+                peerPorts[{nodeA, nodeB}] = interNodeSwitches[nodeA]->AddPort(
                     DynamicCast<PointToPointNetDevice>(devices.Get(0)));
-                peerPorts[{nodeB, nodeA}] = m_interNodeSwitches[nodeB]->AddPort(
+                peerPorts[{nodeB, nodeA}] = interNodeSwitches[nodeB]->AddPort(
                     DynamicCast<PointToPointNetDevice>(devices.Get(1)));
             }
         }
 
         for (uint32_t switchId = 0; switchId < m_numNodes; ++switchId)
         {
-            Ptr<NvSwitch> hostSwitch = m_interNodeSwitches[switchId];
+            Ptr<NvSwitch> hostSwitch = interNodeSwitches[switchId];
             for (uint32_t destNode = 0; destNode < m_numNodes; ++destNode)
             {
                 for (uint32_t localIdx = 0; localIdx < m_gpusPerNode; ++localIdx)
@@ -529,8 +519,10 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
         // the 'host' block.
         NvSwitchHelper switchHelper;
         switchHelper.SetSwitchType(m_interNodeSwitchType);
-        m_interNodeSwitchNodes.resize(1);
-        m_interNodeSwitches.resize(1);
+        std::vector<Ptr<Node>> interNodeSwitchNodes;
+        std::vector<Ptr<NvSwitch>> interNodeSwitches;
+        interNodeSwitchNodes.resize(1);
+        interNodeSwitches.resize(1);
         std::vector<std::vector<uint32_t>> gpuPorts(
             m_numNodes,
             std::vector<uint32_t>(m_gpusPerNode));
@@ -549,8 +541,8 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
         {
             leafSwitch->SetArbiter(m_arbiter);
         }
-        m_interNodeSwitchNodes[0] = switchNode;
-        m_interNodeSwitches[0] = leafSwitch;
+        interNodeSwitchNodes[0] = switchNode;
+        interNodeSwitches[0] = leafSwitch;
         m_allSwitchNodes.Add(switchNode);
         m_allNodes.Add(switchNode);
 

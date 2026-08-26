@@ -6,6 +6,44 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — So RoCEv2 fabric simplification pass (dead-code removal)
+
+An independent multi-agent code review (27 review/verify agents, adversarially
+verified) of the scale-out (So) RoCEv2 fabric concluded the implementation is
+already lean — there is no bloat to cut, only ~49 LOC of zero-caller dead code,
+provably-dead guards, and stale comments. This pass removes those; no datapath
+logic changes, no behavioral change.
+
+* Removed zero-caller accessors/getters: 6 dead `MultiNodeTopologyHelper`
+  accessors (`GetInterNodeSwitchNodes`/`GetInterNodeSwitches`/etc. — never called;
+  `multiTopo.` only uses `Set*`/`Build`/`GetAllEndpoints`/`GetNvSwitch`),
+  `FabricEndpoint::GetInterNodeFabricType`/`GetInterNodeProtocolModel`
+  (callers read the members directly via `GetFabricTypeForDest`/`GetProtocolModelForDest`),
+  `SoHeader::GetChunkIndex` (only `SetChunkIndex` + serialize are used).
+* Dropped the speculative `RoceProtocolModel::PerGpuStartupDelayNs` knob — the
+  So startup delay is a flat `StartupDelayNs` (40 µs NCCL launch), not scaled
+  per GPU; the 2-arg `GetStartupDelayNs(numGpus)` now returns it unchanged
+  (the `numGpus` arg is retained only to satisfy the pure-virtual signature).
+* Removed 2 provably-dead `DcqcnRateMachine` `if` wrappers (`rateFactor < 1.0`
+  and `ceilingBps > 0.0`) whose predicates are always true when their outer
+  guards hold (the inner `if (d > 0.0)` backstop still covers the rateFactor==1.0
+  sub-epsilon corner). Behavior-identical; the ceiling pacer stays opt-in.
+* `MultiNodeTopologyHelper`: `m_interNodeSwitchNodes`/`m_interNodeSwitches`
+  instance members → function-locals in the `host`/`tor` branches (the members
+  were write-only — the switch nodes survive via `m_allSwitchNodes`/`m_allNodes`).
+* Comment-only fixes: `ethernet-switch.h`/`so-header.h` docs dropped speculative
+  "subclass/extension" promises; 2 stale scratch ECN comments now say "live
+  (Phase B)"; this file's earlier `GetInterNodeProtocolModel` mention trimmed to
+  `SetInterNodeProtocolModel` (the getter was removed).
+
+Parity re-verified byte-identical after the pass: `--dcqcn` off ==
+pre-Phase-B (su 4769616, 2-node 15307388, 4-node 13421212 ns); `gpu-cluster`
+C++ suite green at EXTENSIVE; 54 surrogate pytests green. Deferred
+(do-not-touch, verified): `GetDataSize` (pure-virtual), the RocePayloadBuilder
+identity overrides (pure-virtual safety rail), `GetDcqcnRateMachine` (sole public
+read of a private member — conservatively kept despite zero callers), and 5
+dedup refactors (left for a separate, behavior-risking pass).
+
 ### New — ns-3 RoCE P2P `ib_write_bw` per-QP ceiling pacer + validation
 
 Opt-in per-QP sustained-throughput ceiling for the single-QP `ib_write_bw` curve
@@ -424,8 +462,8 @@ the packet's source rank for symmetry) now route through
 `GetProtocolModelForDest`. Because the hierarchical inter-node phase uses
 `SendBulkWireTransfer(->Size)`, an So model's `GetWireSize` (ceil(data/0.95))
 now governs the inter-node wire bytes, so the Ethernet+IP+UDP+IB overhead is
-honored. `SetInterNodeProtocolModel`/`GetInterNodeProtocolModel` accessors are
-added; the model is set programmatically (not a TypeId PointerValue attribute,
+honored. `SetInterNodeProtocolModel` accessor is added; the model is set
+programmatically (not a TypeId PointerValue attribute,
 per the Construct-nulls-it seam constraint). One unit test
 (`InterNodeProtocolModelSeamTest`) verifies local->NCCL / remote->RoCE
 selection.

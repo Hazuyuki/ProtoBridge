@@ -9,11 +9,9 @@
  * (data size + chunk index) that previously lived in RocePayloadBuilder's
  * raw 8-byte prefix.
  *
- * Protocol-pluggable: m_protocolId discriminates the So protocol (RoCE today;
- * a future non-RoCE So protocol that needs vendor-specific wire fields
- * subclasses SoHeader and adds its fields). The switch marks only the common
- * ECN bit and is blind to the vendor layout, so adding a new So protocol
- * needs no switch change. Su (intra-node NVLink) packets never carry a
+ * m_protocolId is a fixed on-wire RoCE protocol discriminator (value =
+ * RoceProtocol::SIMPLE = 1). The switch marks only the common ECN bit and is
+ * blind to the vendor layout. Su (intra-node NVLink) packets never carry a
  * SoHeader, so the Su parity path is untouched.
  */
 #ifndef SO_HEADER_H
@@ -73,11 +71,6 @@ class SoHeader : public Header
     void SetDataSize(uint32_t s)
     {
         m_dataSize = s;
-    }
-
-    uint32_t GetChunkIndex() const
-    {
-        return m_chunkIndex;
     }
 
     void SetChunkIndex(uint32_t c)

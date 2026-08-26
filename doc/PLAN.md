@@ -71,6 +71,7 @@ in two phases:
 - [ ] PFC: per-VC priority pause via `FlowControlGate` (F9 seam) — R-SoH-2 (deferred, invasive).
 - [ ] DCQCN e2e contention proof: multi-flow incast scenario saturating one switch output port — R-SoH-3 (deferred; unit tests cover every link).
 - [x] True per-flow rate pacer — R-SoH-4 RESOLVED for the per-QP ceiling (`PerQpCeilingGbps` uses per-flow `nextSendNs`); the DCQCN congestion path still uses per-chunk extra-serialization shaping (acceptable for the lower-bound-band surrogate anchor).
+- [x] So RoCEv2 fabric simplification pass: independent multi-agent code review (27 agents, adversarially verified) found the fabric already lean — removed ~49 LOC of zero-caller dead code + provably-dead guards + stale comments (6 dead topo accessors, 3 unused getters, `PerGpuStartupDelayNs` knob, 2 dcqcn `if` wrappers, `m_interNodeSwitch*`→locals, 5 comment fixes). Behavior-preserving; parity re-verified byte-identical (su 4769616, 2-node 15307388, 4-node 13421212 ns).
 
 ## Build / test gate (DoD)
 

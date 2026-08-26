@@ -83,7 +83,6 @@ class FabricEndpoint : public Application
 
     // Inter-node fabric type (for RDMA NICs)
     void SetInterNodeFabricType(FabricType type);
-    FabricType GetInterNodeFabricType() const;
 
     // Node ID (which node this GPU belongs to)
     void SetNodeId(uint32_t nodeId);
@@ -314,7 +313,6 @@ class FabricEndpoint : public Application
     // -> GetProtocolModelForDest falls back to m_protocolModel everywhere, so
     // single-node and no-So-model behavior is byte-identical (parity-safe).
     void SetInterNodeProtocolModel(Ptr<ProtocolModel> model);
-    Ptr<ProtocolModel> GetInterNodeProtocolModel() const;
     Ptr<ProtocolModel> GetProtocolModelForDest(uint16_t destRank) const;
 
     // Protocol payload builder

@@ -223,16 +223,13 @@ DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
             // rateFactor = clamp(1 - alpha/2, 0.5, 1.0): alpha=0 -> 1.0 (no
             // delay); alpha=1 -> 0.5 (double the serialization time).
             double rateFactor = std::max(0.5, std::min(1.0, 1.0 - alpha / 2.0));
-            if (rateFactor < 1.0)
+            // base serialization time at max rate; extra delay so the
+            // chunk experiences the reduced rate.
+            double baseSeconds = static_cast<double>(chunkBytes) / m_maxRateBps;
+            double d = baseSeconds * (1.0 / rateFactor - 1.0);
+            if (d > 0.0)
             {
-                // base serialization time at max rate; extra delay so the
-                // chunk experiences the reduced rate.
-                double baseSeconds = static_cast<double>(chunkBytes) / m_maxRateBps;
-                double d = baseSeconds * (1.0 / rateFactor - 1.0);
-                if (d > 0.0)
-                {
-                    dcqcnSec = d;
-                }
+                dcqcnSec = d;
             }
         }
     }
@@ -248,24 +245,21 @@ DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     {
         // 1 Gbps = 1e9 bit/s = 1.25e8 B/s (matches MaxRateBps 50e9 == 400 G).
         double ceilingBps = m_perQpCeilingGbps * 1.25e8;
-        if (ceilingBps > 0.0)
+        FlowState& s = GetOrCreate(flowKey);
+        int64_t nowNs = Simulator::Now().GetNanoSeconds();
+        // Earliest this chunk may egress (ns); 0 before the flow's first chunk.
+        int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
+        // The ceiling-rate slot this chunk occupies (ns).
+        double slotSec = static_cast<double>(chunkBytes) / ceilingBps;
+        int64_t slotNs = static_cast<int64_t>(slotSec * 1e9);
+        if (slotNs < 1)
         {
-            FlowState& s = GetOrCreate(flowKey);
-            int64_t nowNs = Simulator::Now().GetNanoSeconds();
-            // Earliest this chunk may egress (ns); 0 before the flow's first chunk.
-            int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
-            // The ceiling-rate slot this chunk occupies (ns).
-            double slotSec = static_cast<double>(chunkBytes) / ceilingBps;
-            int64_t slotNs = static_cast<int64_t>(slotSec * 1e9);
-            if (slotNs < 1)
-            {
-                slotNs = 1; // avoid a zero-slot spin
-            }
-            // The next chunk on this flow may egress one ceiling slot after
-            // this chunk's egress start (nowNs + delayNs).
-            s.nextSendNs = (nowNs + delayNs) + slotNs;
-            paceSec = static_cast<double>(delayNs) / 1e9;
+            slotNs = 1; // avoid a zero-slot spin
         }
+        // The next chunk on this flow may egress one ceiling slot after
+        // this chunk's egress start (nowNs + delayNs).
+        s.nextSendNs = (nowNs + delayNs) + slotNs;
+        paceSec = static_cast<double>(delayNs) / 1e9;
     }
 
     if (dcqcnSec <= 0.0 && paceSec <= 0.0)

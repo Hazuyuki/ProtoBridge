@@ -24,6 +24,7 @@ parent repo (read-only to this repo's commits). Risk detail in `doc/RISKS.md`.
 | 22 | Retract false "dispatch time" claim (delivery-gated, sweep-proven) in committed docs/memory | — | — | ✅ done |
 | 23 | `PerQpCeilingGbps` opt-in per-flow pacer on `DcqcnRateMachine::ShapingDelay` (true per-flow `nextSendNs`, parity-safe) + `PerQpCeilingPacerTest` | #19 wiring | ✅ done |
 | 24 | `ib_write_bw` per-QP ceiling validation harness (`roce_p2p_bw_sweep.py`) — converged MAPE 3.20 % ≥64 MB | #23 pacer | ✅ done |
+| 25 | So RoCEv2 fabric simplification pass (independent multi-agent review): dead-code removal + provably-dead-guard removal + comment fixes — ~49 LOC, behavior-preserving | — | ✅ done (byte-identical parity re-verified) |
 
 ## Deferred (open)
 
@@ -35,9 +36,11 @@ parent repo (read-only to this repo's commits). Risk detail in `doc/RISKS.md`.
 
 ## Verification status (current HEAD)
 
-- Build: clean (`./ns3 build` → ninja no work to do; configure re-runs pick up new `dcqcn-rate-machine.{h,cc}`).
+- Simplification pass (#25): So RoCEv2 fabric reviewed by an independent multi-agent workflow (27 agents, adversarially verified). Verdict: fabric is already lean — only ~49 LOC of zero-caller dead code + provably-dead guards + stale comments. Removed: 6 dead `MultiNodeTopologyHelper` accessors, `GetInterNodeFabricType`/`GetInterNodeProtocolModel`/`GetChunkIndex` getters, `PerGpuStartupDelayNs` speculative knob, 2 dcqcn provably-dead `if` wrappers (`rateFactor<1.0`, `ceilingBps>0.0`), `m_interNodeSwitch*` instance members → function-locals; 5 comment-only fixes (`ethernet-switch.h`/`so-header.h` docs, 2 scratch ECN comments, `CHANGES.md`). Deferred (do_not_touch): `GetDataSize` (pure-virtual), RocePayloadBuilder identity overrides, `GetDcqcnRateMachine` (conservatively kept — verifier conflict), 5 dedup refactors. **All behavior-preserving; no datapath logic touched.**
+- Build: clean (`./ns3 build` → 45/45 targets, debug `WARNINGS_AS_ERRORS=ON`, zero warnings).
 - C++ tests: `gpu-cluster` suite PASS at EXTENSIVE (1 passed, 0 failed); SoH tests all green — `EthernetSwitchEcnTest`, `CnpReactionTest`, `DcqcnRateMachineTest`, `CnpDispatchTest`, `SoOnlyPredicateTest`, `DormantTest`, **`PerQpCeilingPacerTest`** (off=parity, on=per-flow spacing, DCQCN composition).
-- Parity: `--dcqcn` off == pre-Phase-B bit-identical (su 4769616, 2-node 15307388, 4-node 13421212 ns); `--perQpCeilingGbps=0` default == pre-WU3 byte-identical (256 MB no-ceiling = 348.3 G line rate, unchanged).
+- Surrogate: 54 pytests green (`python3 -m pytest surrogate/test/ -q`).
+- Parity: `--dcqcn` off == pre-Phase-B bit-identical (su 4769616, 2-node 15307388, 4-node 13421212 ns) — **re-verified byte-identical after the simplification pass**; `--perQpCeilingGbps=0` default == pre-WU3 byte-identical (256 MB no-ceiling = 348.3 G line rate, unchanged).
 - RoCE P2P calibration: surrogate `make_connectx7_p2p_perftest_theory` MAPE 2.60 % vs `ib_write_lat`; 54 surrogate pytests green; `configs/calibration/roce_p2p_calib.py` runs clean → `roce_p2p_calib.json`; `configs/protocol_configs/p2p-single.cfg` runs — NVLink(Su) P2P verified `simTimeUs` 2 B → 1.2 µs, 8 MiB → 836.8 µs (1 pkt tx/rx, 0 dropped).
 - ns-3 `ib_write_lat` sweep DONE: `configs/calibration/roce_p2p_ns3_sweep.py` (tor single-shared-leaf topology, bw=400/2-link 2×ser=single-write rate) best fit `startup=950/interNodeLatency=100/switchCutThroughDelay=200` → **MAPE 5.26 %** vs `ib_write_lat` (2 B +3.4 %, 64 B +1.4 %, 1 KB −7.4 %, 4 KB −9.6 %, 64 KB +4.5 %; 1–4 KB undershoots = ns-3 linear vs `ib_write_lat` sublinear S^0.669, structural). `p2p-roce.cfg` startup updated 1050→950; delivery-gated completion confirmed (prior "dispatch time" claim retracted).
 - ns-3 `ib_write_bw` per-QP ceiling DONE (#23/#24): opt-in `--perQpCeilingGbps=49` mounts `DcqcnRateMachine`'s true per-flow pacer (per-flow `nextSendNs`, spaces consecutive chunks to the ceiling). `configs/calibration/roce_p2p_bw_sweep.py` → converged **MAPE 3.20 %** for sizes ≥64 MB (64 MB 50.74 G +3.5 %, 256 MB 47.60 G −2.9 % ≈ 49 G per-QP); the pacer corrects the 7.1× no-ceiling overestimate (256 MB 348.3 G → 47.6 G). Transition zone <64 MB over-estimates (1–7 8 MB-coalesced chunks are un-paced; the blog's sub-ceiling small-size regime is msg-issue-limited, not modeled — same structural gap as `ib_write_lat`).

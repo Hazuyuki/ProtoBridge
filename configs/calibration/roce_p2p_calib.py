@@ -164,7 +164,6 @@ def derive_wire_efficiency():
 # --------------------------------------------------------------------------
 NS3_DEFAULTS = dict(
     startup_delay_ns=40000,        # RoceProtocolModel::StartupDelayNs  (NCCL-launch layer)
-    per_gpu_startup_delay_ns=0,
     per_step_latency_ns=800,       # RoceProtocolModel::PerStepLatencyNs
     chunk_size_bytes=512 * 1024,   # RoceProtocolModel::ChunkSize
     wire_efficiency=0.95,          # RoceProtocolModel::WireEfficiency
