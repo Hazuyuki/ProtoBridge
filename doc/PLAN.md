@@ -72,6 +72,7 @@ in two phases:
 - [ ] DCQCN e2e contention proof: multi-flow incast scenario saturating one switch output port — R-SoH-3 (deferred; unit tests cover every link).
 - [x] True per-flow rate pacer — R-SoH-4 RESOLVED for the per-QP ceiling (`PerQpCeilingGbps` uses per-flow `nextSendNs`); the DCQCN congestion path still uses per-chunk extra-serialization shaping (acceptable for the lower-bound-band surrogate anchor).
 - [x] So RoCEv2 fabric simplification pass: independent multi-agent code review (27 agents, adversarially verified) found the fabric already lean — removed ~49 LOC of zero-caller dead code + provably-dead guards + stale comments (6 dead topo accessors, 3 unused getters, `PerGpuStartupDelayNs` knob, 2 dcqcn `if` wrappers, `m_interNodeSwitch*`→locals, 5 comment fixes). Behavior-preserving; parity re-verified byte-identical (su 4769616, 2-node 15307388, 4-node 13421212 ns).
+- [x] Hierarchical (Su→So) surrogate documented: `surrogate/theory/USER_GUIDE.md` §6 + recipes J/K/L cover the model-agnostic `HierarchicalSurrogate` entry point, the 3 build levels (full-custom `TheoryDerivedSurrogate` / wire-derived `make_surrogate_from_wire` / preset), So topology families (`so_fullmesh`/`so_spineleaf`/`so_fattree`), and the collective phase decomposition — non-H200 examples verified byte-exact (809.92 / 450.39 / 540.76 / 701.85 µs); stale test-count 37→54 fixed in §9.
 
 ## Build / test gate (DoD)
 

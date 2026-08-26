@@ -6,6 +6,24 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — document the hierarchical (Su→So) surrogate config in USER_GUIDE
+
+`surrogate/theory/USER_GUIDE.md` gains §6 ("Scale-out (So) fabric + hierarchical
+(Su→So) collectives") + recipes J/K/L. The hierarchical model is entered via the
+model-agnostic `HierarchicalSurrogate` class (not the H200-only
+`make_h200_hierarchical_theory` factory): it composes **any** Su sub-surrogate
+(NVLink) with **any** So sub-surrogate (Ethernet RoCEv2) under a So topology, so
+A800 / B200 / MI300 / any NVLink + any Ethernet fabric work the same way. §6
+covers the three build levels for `su`/`so` (full-custom
+`TheoryDerivedSurrogate` / wire-derived `make_surrogate_from_wire` / preset), the
+Su-vs-So knob table, the So topology families (`so_fullmesh` non-blocking lower
+bound / `so_spineleaf` / `so_fattree`), and the required-keyword-only
+`collective=` phase decomposition (allreduce 4-phase / allgather 3-phase /
+alltoall 2-phase / sendrecv So-only). Non-H200 worked examples J/K/L, all cited
+numbers verified byte-exact (809.92 / 450.39 / 540.76 / 701.85 µs). Stale
+`# 37 passed` → `# 54 passed` + a hierarchical-test clause fixed in §9. Doc-only;
+no code or behavior change.
+
 ### New — So RoCEv2 fabric simplification pass (dead-code removal)
 
 An independent multi-agent code review (27 review/verify agents, adversarially

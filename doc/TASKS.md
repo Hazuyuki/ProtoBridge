@@ -25,6 +25,7 @@ parent repo (read-only to this repo's commits). Risk detail in `doc/RISKS.md`.
 | 23 | `PerQpCeilingGbps` opt-in per-flow pacer on `DcqcnRateMachine::ShapingDelay` (true per-flow `nextSendNs`, parity-safe) + `PerQpCeilingPacerTest` | #19 wiring | ✅ done |
 | 24 | `ib_write_bw` per-QP ceiling validation harness (`roce_p2p_bw_sweep.py`) — converged MAPE 3.20 % ≥64 MB | #23 pacer | ✅ done |
 | 25 | So RoCEv2 fabric simplification pass (independent multi-agent review): dead-code removal + provably-dead-guard removal + comment fixes — ~49 LOC, behavior-preserving | — | ✅ done (byte-identical parity re-verified) |
+| 26 | `USER_GUIDE.md` §6 + recipes J/K/L: document the hierarchical (Su→So) surrogate config — model-agnostic `HierarchicalSurrogate` entry + 3 build levels + So topology families + collective phase table (non-H200, numbers verified) | — | ✅ done |
 
 ## Deferred (open)
 
@@ -40,6 +41,7 @@ parent repo (read-only to this repo's commits). Risk detail in `doc/RISKS.md`.
 - Build: clean (`./ns3 build` → 45/45 targets, debug `WARNINGS_AS_ERRORS=ON`, zero warnings).
 - C++ tests: `gpu-cluster` suite PASS at EXTENSIVE (1 passed, 0 failed); SoH tests all green — `EthernetSwitchEcnTest`, `CnpReactionTest`, `DcqcnRateMachineTest`, `CnpDispatchTest`, `SoOnlyPredicateTest`, `DormantTest`, **`PerQpCeilingPacerTest`** (off=parity, on=per-flow spacing, DCQCN composition).
 - Surrogate: 54 pytests green (`python3 -m pytest surrogate/test/ -q`).
+- Docs (#26): `surrogate/theory/USER_GUIDE.md` §6 + recipes J/K/L document the hierarchical (Su→So) surrogate config — model-agnostic `HierarchicalSurrogate` entry, 3 build levels (full-custom / wire-derived / preset), So topology families, collective phase table; non-H200 examples verified byte-exact (809.92 / 450.39 / 540.76 / 701.85 µs); stale `# 37 passed`→`# 54 passed` + hierarchical-test clause fixed in §9.
 - Parity: `--dcqcn` off == pre-Phase-B bit-identical (su 4769616, 2-node 15307388, 4-node 13421212 ns) — **re-verified byte-identical after the simplification pass**; `--perQpCeilingGbps=0` default == pre-WU3 byte-identical (256 MB no-ceiling = 348.3 G line rate, unchanged).
 - RoCE P2P calibration: surrogate `make_connectx7_p2p_perftest_theory` MAPE 2.60 % vs `ib_write_lat`; 54 surrogate pytests green; `configs/calibration/roce_p2p_calib.py` runs clean → `roce_p2p_calib.json`; `configs/protocol_configs/p2p-single.cfg` runs — NVLink(Su) P2P verified `simTimeUs` 2 B → 1.2 µs, 8 MiB → 836.8 µs (1 pkt tx/rx, 0 dropped).
 - ns-3 `ib_write_lat` sweep DONE: `configs/calibration/roce_p2p_ns3_sweep.py` (tor single-shared-leaf topology, bw=400/2-link 2×ser=single-write rate) best fit `startup=950/interNodeLatency=100/switchCutThroughDelay=200` → **MAPE 5.26 %** vs `ib_write_lat` (2 B +3.4 %, 64 B +1.4 %, 1 KB −7.4 %, 4 KB −9.6 %, 64 KB +4.5 %; 1–4 KB undershoots = ns-3 linear vs `ib_write_lat` sublinear S^0.669, structural). `p2p-roce.cfg` startup updated 1050→950; delivery-gated completion confirmed (prior "dispatch time" claim retracted).

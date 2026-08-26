@@ -268,7 +268,95 @@ Full per-family formulas: §13 of `WHITEBOX_SURROGATE.md`.
 
 ---
 
-## 6. Recipes
+## 6. Scale-out (So) fabric + hierarchical (Su→So) collectives
+
+When a job spans more than one node, NCCL runs the collective **hierarchically**:
+each node does it locally over NVLink (Su, scale-up), one representative per node
+does it across nodes over Ethernet RoCEv2 (So, scale-out), then the result is
+redistributed locally (Su). The `HierarchicalSurrogate` class composes **any** Su
+sub-surrogate with **any** So sub-surrogate under a So topology. It is
+**model-agnostic** — H200 is just one preset; A800 / B200 / MI300 / any NVLink
+plus any Ethernet fabric work the same way by building `su` and `so` from your
+own hardware numbers.
+
+The So term is an **uncalibrated lower bound** anchored to ns-3 (spec-derived
+RoCEv2 params — 400GbE wire rate, 40 µs RDMA startup, 0.95 wire efficiency — not
+real-HW calibration). The analytical model omits per-packet credit flow, VOQ
+arbitration, PFC/MTU overhead, and per-phase barrier syncs that ns-3 models, so
+the hierarchical latency sits below the ns-3 packet-level simulation.
+
+### Entry point — the class, not a factory
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import HierarchicalSurrogate
+
+h = HierarchicalSurrogate(su, so, gpus_per_node=8, num_nodes=4, so_topology=so_topo)
+lat_us = h.predict(data_bytes, "ring", credits=128, collective="allreduce")
+```
+
+`su` and `so` are **any** `TheoryDerivedSurrogate` instances (§3). The convenience
+factory `make_h200_hierarchical_theory(gpus_per_node, num_nodes,
+so_topology_family, ...)` is one H200 preset for this; for any other platform,
+build `su`/`so` yourself and compose — the class is the general entry point.
+
+### Build `su` (NVLink) and `so` (Ethernet RoCEv2) — three levels, most general first
+
+| Level | How | When |
+|---|---|---|
+| **1 full custom** | `TheoryDerivedSurrogate(ring_bw_bytes_per_us=..., startup_us=..., ...)` | every knob explicit, any vendor |
+| **2 wire-derived** | `make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo, **overrides)` | only the per-link wire rate known (preferred for new platforms) |
+| **3 preset** | `make_h200_ring_theory()` / `make_1024_optical_fattree_theory()` / `make_connectx7_p2p_perftest_theory()` | reuse a shipped anchor |
+
+The So sub-surrogate is a `TheoryDerivedSurrogate` with **Ethernet-flavored**
+values — no H200 lock-in. The knobs that distinguish a So (RoCEv2) stage from a
+Su (NVLink) stage:
+
+| Knob | Su (NVLink) | So (Ethernet RoCEv2) | Why |
+|---|---|---|---|
+| `ring_bw_bytes_per_us` | NVLink schedule bw | Ethernet schedule bw (e.g. 160000 = 400GbE × 8 NIC) | per-fabric wire rate |
+| `num_lanes` | NVLink links/GPU (18) | NICs/node (8) | So counts NICs, not NVLink lanes |
+| `link_latency_us` | 0.4 | ~1.0 | per-hop propagation |
+| `t_min_switch_us` | 1.1 (NVSwitch) | ~1.5 (Ethernet pipeline) | switch fill |
+| `startup_us` | 15 (NCCL) | ~40 (RDMA) | software launch |
+| `wire_efficiency` | 1.0 (no L3/L4 header) | 0.95 (Eth+IP+UDP+IB) | header overhead on T_serial |
+| `tree_bw` / `nvls_bw` | used on Su | inherited, unused on So | So stage runs the ring path |
+
+### So topology — `so_topology`
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import make_topology_from_family
+so_topo = make_topology_from_family("so_spineleaf", N=num_nodes,
+                                     links_per_gpu=8, per_link_gbps=50.0)
+```
+
+Three So families (`N` = node count, `links_per_gpu` = NICs/node,
+`per_link_gbps` = unidirectional Ethernet GB/s, 50 = 400GbE):
+
+| Family | Hop | Bisection | Use |
+|---|---|---|---|
+| `so_fullmesh` | 1 | non-blocking | **lower bound** (default); per-node NIC is the bottleneck |
+| `so_spineleaf` | 2 | leaf uplink / spine downlink | oversubscribed, 1 inter-switch hop |
+| `so_fattree` | 3 | tier-capped | most oversubscribed, 2 inter-switch hops |
+
+For a fully custom So fabric use `make_topology(bisection_gbps=..., hop_count=...)` (§5 ②).
+
+### `predict()` — `collective=` is required, selects the phase decomposition
+
+`collective` is a **required keyword-only** argument (same rule as §4); it selects
+how the Su and So stages compose:
+
+| `collective` | Decomposition | So-stage volume |
+|---|---|---|
+| `allreduce` | Su(rs) + So(rs) + So(ag) + Su(ag) — 4 phases | `D/n_su` (per-node reduced chunk) |
+| `allgather` | Su(ag) + So(ag) + Su(ag) — 3 phases | `D` (full) on inter-node + final |
+| `alltoall` | Su + So — 2 phases | full `D` |
+| `sendrecv` | So only — 1 phase | no Su stage (single inter-node hop) |
+
+Worked examples (non-H200) are recipes J/K/L below.
+
+---
+
+## 7. Recipes
 
 ### A. H200 ring AllReduce, default (ideal) fabric
 
@@ -348,9 +436,61 @@ s = make_h200_sendrecv_theory()
 s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="sendrecv")
 ```
 
+### J. Scale-out + hierarchical — wire-derived stages (non-H200)
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import (
+    make_surrogate_from_wire, make_topology_from_family, HierarchicalSurrogate)
+D = 1 << 24  # 16 MiB
+
+# Su: a non-H200 NVLink platform — 20 GB/s/link, 6 lanes, 10us startup
+su = make_surrogate_from_wire(b_link_bytes_per_us=20000, num_lanes=6, algo="ring",
+        startup_us=10.0, link_latency_us=0.5)
+# So: 200GbE RoCE — 25 GB/s/link, 4 NICs, 40us RDMA startup, 0.95 wire-eff
+so = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=4, algo="ring",
+        startup_us=40.0, link_latency_us=1.0, wire_efficiency=0.95, t_min_switch_us=1.5)
+so_topo = make_topology_from_family("so_spineleaf", N=4, links_per_gpu=4, per_link_gbps=25.0)
+h = HierarchicalSurrogate(su, so, gpus_per_node=6, num_nodes=4, so_topology=so_topo)
+h.predict(D, "ring", 128, collective="allreduce")     # ~809.92 us
+```
+
+### K. Hierarchical — full-custom stages (every knob explicit)
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import (
+    TheoryDerivedSurrogate, make_topology_from_family, HierarchicalSurrogate)
+D = 1 << 24
+
+su = TheoryDerivedSurrogate(packet_bw_bytes_per_us=120000, ring_bw_bytes_per_us=120000,
+        startup_us=8.0, num_lanes=6, link_latency_us=0.5)
+so = TheoryDerivedSurrogate(packet_bw_bytes_per_us=40000, ring_bw_bytes_per_us=40000,
+        startup_us=40.0, num_lanes=4, link_latency_us=1.0,
+        wire_efficiency=0.95, t_min_switch_us=1.5)
+so_topo = make_topology_from_family("so_fullmesh", N=4, links_per_gpu=4, per_link_gbps=25.0)
+h = HierarchicalSurrogate(su, so, gpus_per_node=6, num_nodes=4, so_topology=so_topo)
+h.predict(D, "ring", 128, collective="allreduce")     # ~450.39 us
+h.predict(D, "ring", 128, collective="allgather")     # ~540.76 us
+```
+
+### L. Hierarchical — reuse a non-H200 preset as the Su stage
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import (
+    make_1024_optical_fattree_theory, make_surrogate_from_wire,
+    make_topology_from_family, HierarchicalSurrogate)
+D = 1 << 24
+
+su = make_1024_optical_fattree_theory()              # 1024-GPU 600G optical study profile
+so = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=4, algo="ring",
+        startup_us=40.0, link_latency_us=1.0, wire_efficiency=0.95, t_min_switch_us=1.5)
+so_topo = make_topology_from_family("so_spineleaf", N=4, links_per_gpu=4, per_link_gbps=25.0)
+h = HierarchicalSurrogate(su, so, gpus_per_node=8, num_nodes=4, so_topology=so_topo)
+h.predict(D, "ring", 128, collective="allreduce")     # ~701.85 us
+```
+
 ---
 
-## 7. What it does and does not model
+## 8. What it does and does not model
 
 **Does:**
 - Ideal-NVSwitch default fabric (byte-identical to the pre-topology model).
@@ -374,10 +514,10 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="sendrecv
 
 ---
 
-## 8. Tests
+## 9. Tests
 
 ```bash
-python3 -m pytest surrogate/test/ -q          # 37 passed
+python3 -m pytest surrogate/test/ -q          # 54 passed
 ```
 
 `test_theory.py` checks the model is finite, monotone in size, within a 2×
@@ -386,12 +526,14 @@ collective kwargs: `collective` is required (omitting it raises `TypeError`)
 and validated (a bad name raises `ValueError`), an explicit `collective`
 reproduces the calibrated ring/tree/nvls configs, the ber>0 GBN-retransmission
 path runs under an explicit collective, plus AlltoAll step/volume for ring+tree,
-Send-Recv single-hop decomposition, the AlltoAll bisection-cap contention, and
-the topology name→Topology factory + error paths.
+Send-Recv single-hop decomposition, the AlltoAll bisection-cap contention, the
+hierarchical (Su→So) decomposition with its required `collective=` and So-family
+ordering (`so_fullmesh` ≤ `so_spineleaf` ≤ `so_fattree`) + node-count
+monotonicity, and the topology name→Topology factory + error paths.
 
 ---
 
-## 9. Going deeper
+## 10. Going deeper
 
 - [`WHITEBOX_SURROGATE.md`](WHITEBOX_SURROGATE.md) — full derivation, the design
   rule, and the per-family topology formulas (§12, §13).
