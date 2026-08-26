@@ -1,0 +1,66 @@
+{
+  "source": "share_data/zhuyu/RoCEv2_benchmark_data.md",
+  "source_type": "third-party engineering blog (not peer-reviewed, not A800 HW)",
+  "env": {
+    "nic": "ConnectX-7 400G",
+    "proto": "RoCEv2 GID3 IPv4",
+    "mtu": 4096,
+    "transport": "RC",
+    "tx_depth": 128
+  },
+  "line_rate_gbps": 400.0,
+  "calibrated": {
+    "per_qp_ceiling_gbps": 49.0,
+    "per_qp_ceiling_frac_of_line": 0.1225,
+    "qps_to_saturate_line": 8,
+    "wire_efficiency_8qp": 0.9875,
+    "wire_efficiency_recommended": 0.9688,
+    "per_message_fixed_latency_us": 1.45,
+    "single_write_serialization_rate_gbps": 199.26486486486488,
+    "nic_msg_issue_rate_Mps": 8.2421875,
+    "saturation_knee_bytes": 4096,
+    "latency_fit": {
+      "a_us": 1.449945667465858,
+      "b": 0.0016542315139026554,
+      "c": 0.6690194058719513,
+      "mape_pct": 0.1125625046994534,
+      "L0_us": 1.45,
+      "R_lat_gbps": 199.26486486486488
+    },
+    "bandwidth_fit": {
+      "R_gbps": 49.25766732634272,
+      "S0": 316.51584457181946,
+      "d": 1.4981029343856975,
+      "mape_pct": 19.81267322130969,
+      "ceiling_gbps": 49.022499999999994,
+      "knee_bytes": 4096,
+      "msg_rate_Mps_mean": 8.2421875,
+      "tiny_regime_mape_pct": 1.5713534353885241
+    }
+  },
+  "ns3_defaults": {
+    "startup_delay_ns": 40000,
+    "per_gpu_startup_delay_ns": 0,
+    "per_step_latency_ns": 800,
+    "chunk_size_bytes": 524288,
+    "wire_efficiency": 0.95,
+    "inter_node_link_latency_ns": 10000,
+    "inter_node_bandwidth_gbps": 400,
+    "per_qp_ceiling_gbps": null,
+    "per_message_doorbell_ns": null,
+    "source": "src/gpu-cluster/model/roce-protocol-model.cc + scratch/gpu-cluster-sim.cc defaults"
+  },
+  "applicability": {
+    "usable_for": [
+      "per-QP single-flow ceiling",
+      "wire_efficiency",
+      "per-message doorbell latency",
+      "saturation knee"
+    ],
+    "NOT_usable_for": [
+      "collective simTime fidelity (raw P2P, not AR/AG/A2A)",
+      "multi-node/multi-hop scaling (2-node same-switch)",
+      "DCQCN/PFC/ECN (no congestion data)"
+    ]
+  }
+}

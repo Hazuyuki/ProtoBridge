@@ -6,6 +6,47 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — RoCE v2 P2P perftest calibration (soft, surrogate-anchored)
+
+The scale-out (So) RoCEv2 fabric has no real-HW anchor in this release (the A800
+calibration target is single-node NVLink). A third-party perftest blog
+(`/share_data/zhuyu/RoCEv2_benchmark_data.md`, ConnectX-7 400G, RoCEv2 GID3 IPv4,
+MTU 4096, RC, TX depth 128 — `ib_write_bw` / `ib_write_lat`) is used as a
+**soft, externally-anchored sanity calibration** of the *raw-RDMA scalar
+constants*, **not** a fidelity verdict on collective simTime. Perftest is raw RDMA
+(one-sided write), the layer *below* NCCL — it does not exercise the 40 µs
+NCCL-launch startup, so it calibrates the wire + NIC constants, not collective
+timing.
+
+* `configs/calibration/roce_p2p_calib.py` encodes the blog data and fits two
+  models; extracted constants land in `configs/calibration/roce_p2p_calib.json`:
+  per-QP single-flow ceiling 49.0 Gbps, wire efficiency 0.988 (8-QP saturation
+  395/400), per-message fixed latency 1.45 µs (doorbell + prop + completion),
+  single-write serialization ~199 Gbps (2B→64 KB slope; surrogate uses the round
+  192 Gbps = 24 k B/µs), NIC message-issue ~8.2 Mmsg/s, 4 KB
+  saturation knee, line rate 400 Gbps match.
+* `surrogate/theory/whitebox_surrogate_v2.py::make_connectx7_p2p_perftest_theory()`
+  returns a `TheoryDerivedSurrogate` whose `predict(D, 2, "ring",
+  collective="sendrecv")` reproduces `ib_write_lat` at MAPE 2.6 % (2 B / 64 B /
+  64 KB within 2 %). 2 pytests in `surrogate/test/test_theory.py` (defaults +
+  fit-vs-blog) green.
+* ns-3 **does** support P2P: `P2pTraffic` + `FabricEndpoint::SendP2p` (the raw
+  single-packet send, no NCCL startup) + the `.cfg` `[op]` stencil `kind = P2P`
+  (`P2P_TRANSFER`). Runnable demo `configs/protocol_configs/p2p-single.cfg`
+  (`startup = 0` → raw transfer; verified: `simTimeUs` scales with size, 2 B →
+  1.2 µs, 8 MiB → 836.8 µs).
+* The perftest **validates** the ns-3 RoCE wire constants — `wire_efficiency`
+  0.95 is slightly conservative vs the 0.988 best-case 8-QP saturation, and the
+  400 Gbps line rate matches — so **no ns-3 model change is warranted** here.
+
+Deferred to the WU1–WU3 scale-out plan: a direct ns-3-vs-perftest comparison
+needs a RoCE PEX profile (`h200-roce.profile`) + the inter-node
+`RoceProtocolModel` wired as the So model + delivery-complete instrumentation
+(the `.cfg` `SEND_P2P` `latencyNs` measures dispatch time, not delivery) + an
+opt-in per-QP ceiling (`PerQpCeilingGbps`, ~49 G). The analytical calibrated
+model covers the RoCE P2P case in the meantime. Detail in `doc/CALIBRATION.md`
+§"RoCE v2 P2P (scale-out)".
+
 ### New — polymorphic SoHeader + ECN carrier for the scale-out fabric (WU-SoH)
 
 The scale-out (So) RoCEv2 fabric needed an ECN bit, but the shared

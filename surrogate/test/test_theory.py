@@ -416,6 +416,40 @@ def test_roce_theory_defaults():
     assert s.T_min_switch == 1.5
 
 
+def test_connectx7_p2p_perftest_theory_defaults():
+    """ConnectX-7 P2P perftest profile: 192 Gbps single-write rate, 1.45 us
+    fixed latency (1.05 doorbell+completion + 0.4 prop), single QP, wire_eff
+    1.0 (the 192 Gbps is already an effective rate)."""
+    s = wb.make_connectx7_p2p_perftest_theory()
+    assert s.ring_bw == 24000               # 192 Gbps single-write effective rate
+    assert s.S_startup == 1.05             # doorbell + write completion
+    assert s.lat == 0.4                    # same-switch propagation
+    assert abs(s.S_startup + s.lat - 1.45) < 1e-9  # fixed overhead 1.45 us
+    assert s.wire_efficiency == 1.0
+    assert s.num_lanes == 1               # single QP / single flow
+
+
+def test_connectx7_p2p_perftest_fits_ib_write_lat():
+    """predict(sendrecv) reproduces the ib_write_lat single-write latency curve
+    (ConnectX-7 400G, same switch) within 5% MAPE. The single-write curve is
+    sublinear in NIC processing, so the linear surrogate fits the 2B/64B/64KB
+    endpoints closely and the 1KB transition within ~8% (overall ~2.6% MAPE).
+    """
+    s = wb.make_connectx7_p2p_perftest_theory()
+    # ib_write_lat t_avg (us) from configs/calibration/roce_p2p_calib.py
+    lat = {2: 1.45, 64: 1.48, 1024: 1.62, 65536: 4.21}
+    errs = []
+    for D, meas in lat.items():
+        pred = s.predict(D, 2, "ring", credits=128, ber=0, collective="sendrecv")
+        errs.append(abs(pred - meas) / meas)
+    mape = sum(errs) / len(errs) * 100.0
+    assert mape < 5.0, f"ib_write_lat MAPE {mape:.2f}% exceeds 5%"
+    # large-write endpoint (64 KB) fits within 2% (the sublinear regime starts
+    # dominating only at the 1 KB transition)
+    big = s.predict(65536, 2, "ring", credits=128, ber=0, collective="sendrecv")
+    assert abs(big - 4.21) / 4.21 < 0.02
+
+
 def test_so_topology_families_exist():
     """so_fullmesh / so_spineleaf / so_fattree build Topology objects; the
     non-blocking fullmesh caps no more than the oversubscribed spine-leaf."""

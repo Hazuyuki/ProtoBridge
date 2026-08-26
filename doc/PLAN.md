@@ -6,7 +6,7 @@ history is the parent `doc/PLAN.md`+`doc/TASKS.md` checkpoint bridge, which is
 protobridge-side resume source; refresh the parent bridge when parent write
 access is available. Risk detail lives in `doc/RISKS.md`.
 
-## Where we are (HEAD after WU-SoH5)
+## Where we are (HEAD after WU-SoH5 + RoCE P2P perftest calibration)
 
 Three-layer OTP/PEX/surrogate architecture. Scale-up (Su) NVLink/NVSwitch
 fabric is calibrated (H200 ring/tree/NVLS). Scale-out (So) RoCEv2 Ethernet
@@ -30,10 +30,28 @@ in two phases:
   dormant under light load (faithful RoCE: no congestion → no DCQCN action) —
   see R-SoH-3/R-SoH-4 in `doc/RISKS.md`.
 
+- **RoCE v2 P2P perftest calibration (surrogate) — DONE.** A third-party
+  perftest blog (ConnectX-7 400G, `ib_write_bw`/`ib_write_lat`) was used as a
+  *soft, externally-anchored* sanity calibration of the **raw-RDMA scalar
+  constants** (per-QP ceiling 49 Gbps, wire efficiency 0.988, per-message
+  doorbell 1.45 µs, single-write serialization 192 Gbps, msg-issue 8.16 Mmsg/s,
+  4 KB saturation knee). The calibrated analytical model
+  `make_connectx7_p2p_perftest_theory()` (surrogate, `collective="sendrecv"`)
+  reproduces `ib_write_lat` at MAPE 2.6 %. ns-3 **does** support P2P
+  (`P2pTraffic` + `FabricEndpoint::SendP2p` raw path + `.cfg` `kind=P2P`
+  stencil, demo `configs/protocol_configs/p2p-single.cfg`). The perftest
+  **validates** the ns-3 RoCE wire constants (wire_eff 0.95 slightly conservative
+  vs 0.988; line rate 400 Gbps match) — **no ns-3 model change warranted**.
+  Layer caveat: perftest is raw RDMA, *below* the NCCL collective layer; it does
+  not exercise the 40 µs NCCL startup. Detail in `doc/CALIBRATION.md` §"RoCE v2
+  P2P (scale-out)".
+
 ## Milestones
 
 - [x] Phase A: SoHeader carrier + ECN mark + CNP echo + `--ecnThreshold` (parity-safe, dormant).
 - [x] Phase B: activate live SoHeader send path + DCQCN rate machine + egress chokepoint + `--dcqcn` + tests.
+- [x] RoCE P2P perftest calibration: surrogate `make_connectx7_p2p_perftest_theory` (MAPE 2.6 % vs `ib_write_lat`) + `roce_p2p_calib.py`/`.json` + `p2p-single.cfg` demo + `doc/CALIBRATION.md` §RoCE P2P.
+- [ ] ns-3 RoCE P2P direct perftest comparison: RoCE PEX profile (`h200-roce.profile`) + inter-node `RoceProtocolModel` wired as So model + delivery-complete instrumentation (the `.cfg` SEND_P2P `latencyNs` is dispatch time, not delivery) + opt-in per-QP ceiling (`PerQpCeilingGbps`) — folded into the WU1–WU3 scale-out plan.
 - [ ] PFC: per-VC priority pause via `FlowControlGate` (F9 seam) — R-SoH-2 (deferred, invasive).
 - [ ] DCQCN e2e contention proof: multi-flow incast scenario saturating one switch output port — R-SoH-3 (deferred; unit tests cover every link).
 - [ ] True per-flow rate pacer (vs per-chunk shaping delay) — R-SoH-4 (deferred; acceptable for lower-bound-band surrogate anchor).

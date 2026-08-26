@@ -1012,6 +1012,52 @@ def make_1024_optical_fattree_theory(**overrides):
     return TheoryDerivedSurrogate(**defaults)
 
 
+def make_connectx7_p2p_perftest_theory(**overrides):
+    """ConnectX-7 400G RoCEv2 P2P perftest-calibrated profile (raw RDMA layer).
+
+    Calibrated to the ib_write_lat single-write latency curve from a
+    third-party perftest blog (NVIDIA ConnectX-7 400G, RoCEv2 GID index 3,
+    MTU 4096, RC, TX depth 128). Provenance + the fit live in
+    ``configs/calibration/roce_p2p_calib.py`` / ``.json``; the data source is
+    a third-party engineering blog, NOT the project's A800 hardware, so this
+    is a soft externally-anchored calibration of the raw-RDMA scalar
+    constants, not a collective-fidelity verdict.
+
+    This models the RAW RDMA layer (NIC doorbell + same-switch propagation +
+    write completion) which sits BELOW the NCCL collective layer: there is no
+    NCCL kernel-launch startup, no collective algorithm. ``predict(D, 2,
+    'ring', credits=128, collective='sendrecv')`` reproduces ib_write_lat
+    within ~3% MAPE (the single-write curve is sublinear in NIC processing;
+    the linear surrogate fits the 2B/64B/64KB endpoints closely and the 1KB
+    transition within ~8%).
+
+    Calibrated constants (ib_write_lat fit): per-message fixed latency 1.45 us
+    (doorbell + completion 1.05 us + same-switch propagation 0.4 us), single-
+    write effective serialization 192 Gbps (24000 B/us -- NIC-processing-
+    limited, below the 400G line rate; already an effective rate, so
+    wire_efficiency=1.0 here), single QP (num_lanes=1). Separately extracted
+    (NOT expressed by this latency model): the per-QP sustained throughput
+    ceiling ~49 Gbps and the 0.988 wire efficiency (8-QP saturation 0.9875)
+    are throughput/aggregate concepts -- the 49G ceiling is applied in ns-3
+    via the opt-in PerQpCeilingGbps attribute, not here.
+    """
+    defaults = dict(
+        packet_bw_bytes_per_us=24000,    # 192 Gbps single-write effective rate
+        ring_bw_bytes_per_us=24000,
+        tree_bw_per_level_bytes_per_us=24000,
+        nvls_bw_bytes_per_us=24000,
+        link_latency_us=0.4,            # same-switch propagation
+        startup_us=1.05,                # NIC doorbell + write completion
+        wire_efficiency=1.0,            # 192 Gbps is already an effective rate
+        num_lanes=1,                    # single QP / single flow
+        t_min_switch_us=0.0,
+        bulk_chunk_bytes=8 * 1024 * 1024,
+        spray_chunk_bytes=131072,
+    )
+    defaults.update(overrides)
+    return TheoryDerivedSurrogate(**defaults)
+
+
 def make_surrogate(algo, **overrides):
     """Factory by algorithm name; passes ``overrides`` to the chosen profile."""
     if algo in ('ring', 'rin'):
