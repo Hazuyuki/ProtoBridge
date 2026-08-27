@@ -27,8 +27,8 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduc
 |---|---|---|
 | `b_link_bytes_per_us` | single NVLink unidirectional wire rate | 25000 |
 | `num_lanes` | NVLink links per GPU | 18 |
-| `algo` | ring / tree / nvls | — |
-| `eta_ring`, `eta_tree`, `eta_nvls` (optional, defaulted) | efficiency factors | 0.40 / 1.05 / 1.20 |
+| `algo` | ring / tree / nvls / fullmesh | — |
+| `eta_ring`, `eta_tree`, `eta_nvls`, `eta_fullmesh` (optional, defaulted) | efficiency factors | 0.40 / 1.05 / 1.20 / 1.0 |
 
 Derived bandwidths: `ring_bw = packet_bw = eta_ring * B_agg`,
 `tree_bw = (B_agg / num_lanes) * eta_tree`, `nvls_bw = eta_nvls * B_agg`
@@ -69,7 +69,7 @@ mechanism-specific or message-size-specific fitted coefficient.
 | `D` | Operation data size in bytes |
 | `N` | Participating GPU or NPU count |
 | `collective` | AllReduce, AllGather, AlltoAll, or Send-Recv (required; not inferred from `algorithm`) |
-| `algorithm` | Ring, tree, NVLS, or collnetdirect schedule |
+| `algorithm` | Ring, tree, NVLS, full-mesh, or collnetdirect schedule |
 | `S_protocol` | Protocol startup latency |
 | `steps` | Number of communication steps |
 | `B_step` | Data transmitted in one step |

@@ -253,6 +253,83 @@ def test_collective_explicit_reproduces_calibrated():
                      collective="allgather") == pytest.approx(1018.01, rel=1e-3)
 
 
+def test_fullmesh_steps_not_ring_fallthrough():
+    """Full-mesh is 2 phases (AR: reduce-scatter + all-gather) / 1 phase (AG),
+    NOT the ring's 2*(N-1) sequential steps -- the N-1 per-peer sends are
+    concurrent on dedicated bundles. Without these branches, algo='fullmesh'
+    silently fell through to the ring step count (14 at N=8)."""
+    s = wb.make_h200_fullmesh_theory()
+    assert s._steps(8, "fullmesh", "allreduce") == 2
+    assert s._steps(8, "fullmesh", "allgather") == 1
+    assert s._steps(8, "fullmesh", "allreduce") != 2 * (8 - 1)
+
+
+def test_fullmesh_per_step_is_chunk_over_n():
+    """Each phase ships the D/N chunk on each peer's dedicated bundle (the N-1
+    sends are concurrent, so the per-step serialized volume is D/N, not the
+    ring's D*(N-1)/N)."""
+    s = wb.make_h200_fullmesh_theory()
+    D = 256 * 1024 * 1024
+    assert s._per_step(D, 8, "fullmesh", 2, "allreduce") == pytest.approx(D / 8)
+
+
+def test_fullmesh_credit_pressure_is_one():
+    """Full-mesh is single-hop per-peer on a dedicated bundle -- no pipelined
+    credit pressure (like nvls), so Phi_credit = 1."""
+    s = wb.make_h200_fullmesh_theory()
+    D = 256 * 1024 * 1024
+    assert s._credit_pressure(D, 8, "fullmesh", 128, "allreduce") == 1.0
+
+
+def test_fullmesh_reproduces_ns3_ground_truth():
+    """Surrogate fullmesh reproduces the ns-3 FullMeshAllReduce/AllGather
+    simTimeUs (the calibration ground truth) within 2% on the SIMPLE regime
+    (256 MiB / 8 GPUs: ns-3 AR=165.0 us, AG=90.0 us). fullmesh_bw is back-fit
+    to this ns-3 sweep (configs/calibration/fullmesh_ns3_sweep.py)."""
+    s = wb.make_h200_fullmesh_theory()
+    D = 256 * 1024 * 1024
+    ar = s.predict(D, 8, "fullmesh", credits=128, ber=0, collective="allreduce")
+    ag = s.predict(D, 8, "fullmesh", credits=128, ber=0, collective="allgather")
+    assert ar == pytest.approx(165.0, rel=2e-2)   # ns-3 GT 165.0
+    assert ag == pytest.approx(90.0, rel=2e-2)    # ns-3 GT 90.0
+
+
+def test_fullmesh_ar_is_two_ag_serial_parts():
+    """AR = 2 phases, AG = 1 phase, so AR = 2*AG - startup (the serial+fixed
+    work doubles, the startup is paid once). Exact structural invariant of the
+    2-phase-vs-1-phase full-mesh model (Phi_credit=Phi_fec=Phi_share=1)."""
+    s = wb.make_h200_fullmesh_theory()
+    D = 256 * 1024 * 1024
+    ar = s.predict(D, 8, "fullmesh", credits=128, ber=0, collective="allreduce")
+    ag = s.predict(D, 8, "fullmesh", credits=128, ber=0, collective="allgather")
+    assert ar == pytest.approx(2 * ag - s.S_startup, rel=1e-9)
+
+
+def test_fullmesh_faster_than_ring_at_large_size():
+    """Full-mesh uses all N-1 dedicated bundles concurrently, so at large
+    messages it is far faster than the ring (which pipelines 2*(N-1) steps).
+    ns-3: fullmesh AR 256 MiB / 8 = 165 us vs ring 1348 us (~8x)."""
+    s = wb.make_h200_fullmesh_theory()
+    D = 256 * 1024 * 1024
+    fm = s.predict(D, 8, "fullmesh", credits=128, ber=0, collective="allreduce")
+    ring = wb.make_h200_ring_theory().predict(
+        D, 8, "ring", credits=128, ber=0, collective="allreduce")
+    assert fm < ring
+    assert ring / fm > 5.0   # ~8x at this point
+
+
+def test_fullmesh_wire_factory_derives_full_bundle():
+    """The wire-derived entry (make_surrogate_from_wire, eta_fullmesh=1.0)
+    gives fullmesh_bw = eta * B_agg = 1.0 * (25000 * 18) = 450000 -- the full
+    dedicated bundle, the single-parameter entry for non-H200 platforms."""
+    s = wb.make_surrogate_from_wire(25000, 18, "fullmesh")
+    assert s.fullmesh_bw == pytest.approx(450000)
+    # and it reproduces the ns-3 GT just like the H200 preset
+    D = 256 * 1024 * 1024
+    assert s.predict(D, 8, "fullmesh", credits=128, ber=0,
+                     collective="allreduce") == pytest.approx(165.0, rel=2e-2)
+
+
 def test_collective_explicit_retx_path():
     """The ber>0 link-retry path (GBN cascade) runs under an explicit
     collective without crashing and adds retransmission overhead over ber=0."""

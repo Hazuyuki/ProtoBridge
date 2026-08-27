@@ -6,7 +6,7 @@ history is the parent `doc/PLAN.md`+`doc/TASKS.md` checkpoint bridge, which is
 protobridge-side resume source; refresh the parent bridge when parent write
 access is available. Risk detail lives in `doc/RISKS.md`.
 
-## Where we are (HEAD after WU-SoH5 + RoCE P2P perftest calibration)
+## Where we are (HEAD after WU-SoH5 + RoCE P2P perftest calibration + fullmesh surrogate)
 
 Three-layer OTP/PEX/surrogate architecture. Scale-up (Su) NVLink/NVSwitch
 fabric is calibrated (H200 ring/tree/NVLS). Scale-out (So) RoCEv2 Ethernet
@@ -61,6 +61,22 @@ in two phases:
   not exercise the 40 µs NCCL startup. Detail in `doc/CALIBRATION.md` §"RoCE v2
   P2P (scale-out)".
 
+- **Full-mesh surrogate algorithm (ns-3-calibrated) — DONE (this branch).** The
+  surrogate gained a 4th algorithm shape, `fullmesh`, calibrated directly to
+  ns-3 as ground truth (not a wire-rate derivation like ring/tree/nvls).
+  `make_h200_fullmesh_theory()` + a `fullmesh` branch at every algo-dispatch
+  site (`_steps`/`_per_step`/`_step_time`/`_credit_pressure`/`predict`/
+  `_shared_contention`/`make_surrogate`/`make_surrogate_from_wire`). Model:
+  `T = startup + steps·(lat + (D/N)/fullmesh_bw)` (AR steps=2 barrier-gated,
+  AG steps=1) — structurally NVLS **without** the N-fold serialization factor
+  (every GPU-pair has a dedicated `--numLanes=18` bundle, concurrent not
+  serialized). `configs/calibration/fullmesh_ns3_sweep.py` sweeps N∈{4,8,16} ×
+  {AR,AG} × 1–256 MiB (54 pts) and back-fits `fullmesh_bw = Σ(V²)/Σ(R·V)` on
+  the SIMPLE-regime points → `fullmesh_bw=449890 B/µs` (η=0.9998 vs the
+  18×25000=450000 physics, MAPE 0.10%); 7 pytests + a parity test
+  (`test/parity/test_surrogate_vs_ns3_fullmesh.py`, within 0.3% at N=8 AR+AG
+  {16,64,256} MiB) green. Detail in `doc/CALIBRATION.md` §"Full-mesh".
+
 ## Milestones
 
 - [x] Phase A: SoHeader carrier + ECN mark + CNP echo + `--ecnThreshold` (parity-safe, dormant).
@@ -73,6 +89,8 @@ in two phases:
 - [x] True per-flow rate pacer — R-SoH-4 RESOLVED for the per-QP ceiling (`PerQpCeilingGbps` uses per-flow `nextSendNs`); the DCQCN congestion path still uses per-chunk extra-serialization shaping (acceptable for the lower-bound-band surrogate anchor).
 - [x] So RoCEv2 fabric simplification pass: independent multi-agent code review (27 agents, adversarially verified) found the fabric already lean — removed ~49 LOC of zero-caller dead code + provably-dead guards + stale comments (6 dead topo accessors, 3 unused getters, `PerGpuStartupDelayNs` knob, 2 dcqcn `if` wrappers, `m_interNodeSwitch*`→locals, 5 comment fixes). Behavior-preserving; parity re-verified byte-identical (su 4769616, 2-node 15307388, 4-node 13421212 ns).
 - [x] Hierarchical (Su→So) surrogate documented: `surrogate/theory/USER_GUIDE.md` §6 + recipes J/K/L cover the model-agnostic `HierarchicalSurrogate` entry point, the 3 build levels (full-custom `TheoryDerivedSurrogate` / wire-derived `make_surrogate_from_wire` / preset), So topology families (`so_fullmesh`/`so_spineleaf`/`so_fattree`), and the collective phase decomposition — non-H200 examples verified byte-exact (809.92 / 450.39 / 540.76 / 701.85 µs); stale test-count 37→54 fixed in §9.
+- [x] Full-mesh surrogate algorithm (ns-3-calibrated): `make_h200_fullmesh_theory` + `fullmesh` branches at 11 dispatch sites; `fullmesh_bw=449890 B/µs` back-fit to the ns-3 `FullMeshAllReduce`/`FullMeshAllGather` sweep (η=0.9998, MAPE 0.10% on the SIMPLE regime); 7 pytests + parity test (within 0.3% at N=8 AR+AG {16,64,256} MiB). The 4th algorithm shape — ring/tree/nvls → ring/tree/nvls/fullmesh. Detail in `doc/CALIBRATION.md` §"Full-mesh".
+- [x] Full-mesh surrogate reviewed (independent 6-dimension multi-agent code review, 3-skeptic adversarial verify per finding): verdict SHIP-WITH-FIXES, **no blockers**. 3 refinements applied — "lower bound by construction"→"calibrated back-fit, not a bound" (the symmetric parity band + 8/30 above-ns-3 fit points contradict a one-sided lower bound); parity band [0.90,1.10]→[0.95,1.05] + ns-3-GT unit-test `rel 5e-2`→`2e-2` (the prior band was ~100× the 0.10% fit error); `WHITEBOX_SURROGATE.md` algo enumeration + fullmesh. 61 pytests + parity still green.
 
 ## Build / test gate (DoD)
 

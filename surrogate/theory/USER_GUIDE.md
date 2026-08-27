@@ -9,13 +9,15 @@ were measured, see [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md).
 
 The model predicts the latency of one collective operation — AllReduce,
 AllGather, AlltoAll, or point-to-point Send-Recv — scheduled as ring / tree /
-NVLS. The **collective name and the algorithm together** select the step model:
+NVLS / full-mesh. The **collective name and the algorithm together** select the
+step model:
 pass `collective=` to `predict()` (`'allreduce'` / `'allgather'` /
 `'alltoall'` / `'sendrecv'`). It is a **required** argument — not inferred from
 the algorithm, so the caller must name the operation explicitly. It is a
-first-principles physical derivation, so it
-is a **lower bound** on ns-3 — use it for **ordering and trend analysis across a
-design space**, not for absolute single-point prediction.
+first-principles physical derivation, so for ring/tree/NVLS it is a **lower
+bound** on ns-3 — the full-mesh algorithm is the ns-3-calibrated exception
+(within ~0.1%; see §7 recipe M). Use it for **ordering and trend analysis
+across a design space**, not for absolute single-point prediction.
 
 ---
 
@@ -58,7 +60,8 @@ fabric whose bisection bandwidth or path length differs from ideal NVSwitch.
 
 ```python
 make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
-                         eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20, **overrides)
+                         eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20,
+                         eta_fullmesh=1.0, **overrides)
 ```
 
 Derives every schedule bandwidth from **one** physical input — the per-GPU
@@ -69,8 +72,8 @@ efficiency factors. No per-bandwidth calibration needed.
 |---|---|---|
 | `b_link_bytes_per_us` | single NVLink unidirectional wire rate | `25000` (25 GB/s) |
 | `num_lanes` | NVLink links per GPU | `18` |
-| `algo` | `ring` / `tree` / `nvls` | — |
-| `eta_ring` / `eta_tree` / `eta_nvls` | efficiency factors (defaulted) | 0.40 / 1.05 / 1.20 |
+| `algo` | `ring` / `tree` / `nvls` / `fullmesh` (`fm`) | — |
+| `eta_ring` / `eta_tree` / `eta_nvls` / `eta_fullmesh` | efficiency factors (defaulted) | 0.40 / 1.05 / 1.20 / 1.0 |
 
 Derived bandwidths land within ~2% of the calibrated H200 values (see §11 of
 `WHITEBOX_SURROGATE.md`). This is the entry point for any new platform where
@@ -79,7 +82,7 @@ only the per-link wire rate is known.
 ### H200 measured presets
 
 ```python
-from surrogate.theory.whitebox_surrogate_v2 import make_h200_ring_theory, make_h200_tree_theory, make_h200_nvls_theory
+from surrogate.theory.whitebox_surrogate_v2 import make_h200_ring_theory, make_h200_tree_theory, make_h200_nvls_theory, make_h200_fullmesh_theory
 s = make_h200_ring_theory()      # ships the exact calibrated H200 ring numbers
 ```
 
@@ -87,7 +90,9 @@ Use these when you want the measured H200 values rather than the wire-rate
 derivation. They accept `**overrides` too (any `__init__` keyword). For
 AlltoAll and Send-Recv use `make_h200_alltoall_theory()` (SIMPLE 46 µs
 startup) and `make_h200_sendrecv_theory()` (15 µs startup); both reuse the
-H200 ring anchor with a protocol-appropriate startup.
+H200 ring anchor with a protocol-appropriate startup. For the full-mesh
+algorithm use `make_h200_fullmesh_theory()` — it is **ns-3-calibrated** (not a
+wire-rate derivation); see recipe M.
 
 ### Custom hardware
 
@@ -110,7 +115,8 @@ The full `__init__` parameter list (21 knobs, all defaulted) is in the
 | `ring_bw_bytes_per_us` | bytes/µs | ring serialization | 177000 |
 | `tree_bw_per_level_bytes_per_us` | bytes/µs | tree serialization | 26250 |
 | `nvls_bw_bytes_per_us` | bytes/µs | NVLS serialization | 535500 |
-| `link_latency_us` | µs (400 ns = 0.4) | ring/nvls propagation | 0.4 |
+| `fullmesh_bw_bytes_per_us` | bytes/µs | full-mesh serialization (ns-3-calibrated) | 449890 |
+| `link_latency_us` | µs (400 ns = 0.4) | ring/nvls/fullmesh propagation | 0.4 |
 | `t_min_switch_us` | µs | tree fixed (NVSwitch fill) | 1.1 |
 | `credit_bdp_ring_packets` | packets | ring credit pressure Φ_credit | 91.5 |
 | `credit_bdp_tree_packets` | packets | tree credit pressure Φ_credit | 35.5 |
@@ -138,7 +144,7 @@ s.predict(data_bytes, num_gpus, algo, credits, ber=0, ..., topology=None, *, col
 |---|---|
 | `data_bytes` | operation data size in bytes |
 | `num_gpus` | participating GPU count N |
-| `algo` | `ring` / `tree` / `nvls` |
+| `algo` | `ring` / `tree` / `nvls` / `fullmesh` |
 | `credits` | flow-control credit count |
 | `collective` | `'allreduce'` / `'allgather'` / `'alltoall'` / `'sendrecv'` (keyword-only; not inferred from `algo`) |
 
@@ -169,9 +175,18 @@ mapping (full formulas in §6 of `WHITEBOX_SURROGATE.md`):
 | `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
 | `allreduce` | `tree` | `2⌊log₂N⌋` | `D(N-1)/N / steps` | `D(N-1)/N` |
 | `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
+| `allreduce` | `fullmesh` | `2` | `D/N` | `D/N` per peer (N−1 concurrent) |
+| `allgather` | `fullmesh` | `1` | `D/N` | `D/N` per peer (N−1 concurrent) |
 | `alltoall` | `ring` / `collnetdirect` | `N-1` | `D/N` | `D(N-1)/N` |
 | `alltoall` | `tree` | `⌈log₂N⌉` | `D(N-1)/N / steps` | `D(N-1)/N` |
 | `sendrecv` | any | `1` | `D` | `D` (single hop) |
+
+Full-mesh is the one algorithm where `N` does **not** scale the step volume:
+the `N-1` peer sends are **concurrent** on dedicated per-pair bundles (one
+phase ships `D/N` per bundle), not `2(N-1)` sequential hops like ring. AR = 2
+phases (barrier-gated reduce-scatter + all-gather), AG = 1; `fullmesh_bw` is
+ns-3-calibrated (recipe M) — structurally it is NVLS **without** the N-fold
+serialization factor.
 
 AlltoAll moves `D(N-1)/N` per GPU across `N-1` partner phases (ring) or
 `⌈log₂N⌉` recursive-doubling rounds (tree) — the volume correction the DSE's
@@ -488,6 +503,41 @@ h = HierarchicalSurrogate(su, so, gpus_per_node=8, num_nodes=4, so_topology=so_t
 h.predict(D, "ring", 128, collective="allreduce")     # ~701.85 us
 ```
 
+### M. Full-mesh — ns-3-calibrated (the 4th algorithm shape)
+
+The full-mesh algorithm ships its own preset, `make_h200_fullmesh_theory()`,
+whose `fullmesh_bw=449890` is back-fit to the ns-3 `FullMeshAllReduce` /
+`FullMeshAllGather` sweep (η=0.9998 vs the `18×25000` dedicated-bundle
+physics, MAPE 0.10%). Unlike ring/tree/NVLS (wire-rate derivations, which are
+one-sided lower bounds on ns-3), this one is **ground-truth-calibrated to
+ns-3** — a least-squares back-fit that straddles ns-3 within ~0.1% (above at
+some points, below at others), not a one-sided bound. It still omits
+per-packet credit flow, VOQ arbitration and the inter-phase barrier ns-3
+models; the residual is the ~0.1% gap in either direction.
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import make_h200_fullmesh_theory
+s = make_h200_fullmesh_theory()                       # ns-3-calibrated preset
+# 256 MiB full-mesh AllReduce on 8 GPUs: 2 phases, D/N per phase.
+s.predict(256 * 1024 * 1024, 8, "fullmesh", credits=128, ber=0, collective="allreduce")   # ~165 us
+# AllGather: 1 phase -> ~90 us (T_AR ~ 2*T_AG - startup).
+s.predict(256 * 1024 * 1024, 8, "fullmesh", credits=128, ber=0, collective="allgather")   # ~90 us
+```
+
+The wire-derived entry (a non-H200 full-mesh platform) uses the same η=1.0
+default — `make_surrogate_from_wire(25000, 18, "fullmesh")` derives
+`fullmesh_bw = 1.0 × 25000 × 18 = 450000`, matching the ns-3 fit to 0.02%:
+
+```python
+s = make_surrogate_from_wire(25000, 18, "fullmesh")  # fullmesh_bw=450000
+s.predict(256 * 1024 * 1024, 8, "fullmesh", credits=128, ber=0, collective="allreduce")   # ~165 us
+```
+
+Full-mesh needs no topology: the per-phase bundle rate is far below the
+full-mesh bisection, so the bisection cap never binds and `topology=None` is
+byte-identical. Calibration details + the ns-3 sweep are in
+[`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Full-mesh”.
+
 ---
 
 ## 8. What it does and does not model
@@ -517,19 +567,24 @@ h.predict(D, "ring", 128, collective="allreduce")     # ~701.85 us
 ## 9. Tests
 
 ```bash
-python3 -m pytest surrogate/test/ -q          # 54 passed
+python3 -m pytest surrogate/test/ -q          # 61 passed
+python3 test/parity/test_surrogate_vs_ns3_fullmesh.py   # fullmesh vs ns-3 (6 pts)
 ```
 
 `test_theory.py` checks the model is finite, monotone in size, within a 2×
 physical band of the ns-3 H200 baseline, and exercises the topology and
 collective kwargs: `collective` is required (omitting it raises `TypeError`)
 and validated (a bad name raises `ValueError`), an explicit `collective`
-reproduces the calibrated ring/tree/nvls configs, the ber>0 GBN-retransmission
+reproduces the calibrated ring/tree/nvls configs, the full-mesh algorithm
+(steps/per-step/credit, ns-3 reproduction at 256 MiB, `T_AR ≈ 2·T_AG`,
+faster-than-ring), the ber>0 GBN-retransmission
 path runs under an explicit collective, plus AlltoAll step/volume for ring+tree,
 Send-Recv single-hop decomposition, the AlltoAll bisection-cap contention, the
 hierarchical (Su→So) decomposition with its required `collective=` and So-family
 ordering (`so_fullmesh` ≤ `so_spineleaf` ≤ `so_fattree`) + node-count
-monotonicity, and the topology name→Topology factory + error paths.
+monotonicity, and the topology name→Topology factory + error paths. The
+full-mesh parity test asserts the ns-3-calibrated surrogate tracks ns-3
+within a tight [0.95, 1.05] band across N=8 AR+AG at {16,64,256} MiB.
 
 ---
 

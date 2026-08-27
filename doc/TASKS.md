@@ -26,6 +26,8 @@ parent repo (read-only to this repo's commits). Risk detail in `doc/RISKS.md`.
 | 24 | `ib_write_bw` per-QP ceiling validation harness (`roce_p2p_bw_sweep.py`) — converged MAPE 3.20 % ≥64 MB | #23 pacer | ✅ done |
 | 25 | So RoCEv2 fabric simplification pass (independent multi-agent review): dead-code removal + provably-dead-guard removal + comment fixes — ~49 LOC, behavior-preserving | — | ✅ done (byte-identical parity re-verified) |
 | 26 | `USER_GUIDE.md` §6 + recipes J/K/L: document the hierarchical (Su→So) surrogate config — model-agnostic `HierarchicalSurrogate` entry + 3 build levels + So topology families + collective phase table (non-H200, numbers verified) | — | ✅ done |
+| 27 | Full-mesh surrogate algorithm (ns-3-calibrated): `make_h200_fullmesh_theory` + `fullmesh` branches at 11 dispatch sites + `fullmesh_ns3_sweep.py` + `fullmesh_bw=449890 B/µs` (η=0.9998, MAPE 0.10%) + 7 pytests + parity test | — | ✅ done |
+| 28 | Independent multi-agent code review of #27 (6 dims: model-vs-ns3/calibration/dispatch-completeness/tests/doc-accuracy/regression; 3-skeptic adversarial verify per finding) → SHIP-WITH-FIXES, no blockers; 3 refinements applied: honest "calibrated back-fit, not a bound" framing (was "lower bound by construction", contradicted by the symmetric parity band + 8/30 above-ns-3 fit points), parity band [0.90,1.10]→[0.95,1.05] + ns-3-GT unit-test rel 5e-2→2e-2 (was ~100× the 0.10% error), `WHITEBOX_SURROGATE.md` algo enumeration + fullmesh | — | ✅ done |
 
 ## Deferred (open)
 

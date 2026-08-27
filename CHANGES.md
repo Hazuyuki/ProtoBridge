@@ -6,6 +6,31 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — full-mesh surrogate algorithm (ns-3-calibrated, the 4th shape)
+
+The latency surrogate gains a 4th algorithm shape — `fullmesh` — calibrated
+directly to ns-3 as ground truth (unlike ring/tree/nvls, which are wire-rate
+derivations). `make_h200_fullmesh_theory()` ships the back-fit
+`fullmesh_bw=449890 B/µs`, and a `fullmesh` branch was added at every
+algo-dispatch site in `surrogate/theory/whitebox_surrogate_v2.py` (11 sites:
+`__init__`/`_steps`/`_per_step`/`_bdp`/`_step_time`/`_credit_pressure`/
+`predict`/`_shared_contention`/`make_surrogate`/`make_surrogate_from_wire` +
+the new factory). Model: `T = startup + steps·(lat + (D/N)/fullmesh_bw)` (AR
+steps=2 barrier-gated, AG steps=1) — structurally NVLS **without** the N-fold
+serialization factor, because in `--topology=fullmesh` every GPU-pair gets a
+dedicated `--numLanes=18` NVLink bundle (concurrent, not serialized). New
+`configs/calibration/fullmesh_ns3_sweep.py` sweeps N∈{4,8,16} × {AR,AG} ×
+1–256 MiB (54 pts) and back-fits the scalar on the SIMPLE regime → η=0.9998
+vs the 18×25000=450000 physics, **MAPE 0.10%**. Verification: 7 new pytests
+(`surrogate/test/test_theory.py`, 54→61 green) + a parity test
+(`test/parity/test_surrogate_vs_ns3_fullmesh.py`, within 0.3% at N=8 AR+AG
+{16,64,256} MiB) + `./ns3 build` green (no C++ change — the fullmesh injectors
+already exist and are the ground truth). Doc: `doc/CALIBRATION.md` §"Full-mesh"
++ `surrogate/theory/USER_GUIDE.md` recipe M. Simple-regime scoped (sub-SIMPLE
+LL/LL128 tiers out of scope, same as the ring preset); calibrated back-fit
+(straddles ns-3 within ~0.1%, symmetric parity band — not a one-sided bound),
+omitting per-packet credit/VOQ/barrier. No ns-3 `src/` change.
+
 ### New — document the hierarchical (Su→So) surrogate config in USER_GUIDE
 
 `surrogate/theory/USER_GUIDE.md` gains §6 ("Scale-out (So) fabric + hierarchical

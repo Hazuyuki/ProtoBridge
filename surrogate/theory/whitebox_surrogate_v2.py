@@ -106,6 +106,7 @@ class TheoryDerivedSurrogate:
                  ring_bw_bytes_per_us=177000,
                  tree_bw_per_level_bytes_per_us=26250,
                  nvls_bw_bytes_per_us=535500,
+                 fullmesh_bw_bytes_per_us=449890,
                  link_latency_us=0.4,
                  credit_bdp_ring_packets=91.5,
                  credit_bdp_tree_packets=35.5,
@@ -127,6 +128,7 @@ class TheoryDerivedSurrogate:
         self.ring_bw = ring_bw_bytes_per_us
         self.tree_bw_per_level = tree_bw_per_level_bytes_per_us
         self.nvls_bw = nvls_bw_bytes_per_us
+        self.fullmesh_bw = fullmesh_bw_bytes_per_us
         self.lat = link_latency_us
         self.credit_bdp_ring = credit_bdp_ring_packets
         self.credit_bdp_tree = credit_bdp_tree_packets
@@ -184,6 +186,12 @@ class TheoryDerivedSurrogate:
             if algo == 'tree':
                 return max(1, math.ceil(math.log2(max(N, 2))))
             return max(1, N - 1)
+        if algo == 'fullmesh':
+            # Full-mesh: 2 phases (reduce-scatter + all-gather) for allreduce,
+            # 1 phase for allgather. The N-1 per-peer sends in each phase are
+            # concurrent on dedicated bundles, not sequential steps (unlike the
+            # ring's 2*(N-1) pipelined steps), so the step count is O(1).
+            return 2 if collective == 'allreduce' else 1
         if algo == 'tree':
             return 2 * max(1, int(math.log2(N)))
         if algo == 'nvls':
@@ -201,7 +209,11 @@ class TheoryDerivedSurrogate:
         collective = self._validate_collective(collective)
         if collective == 'sendrecv':
             return D
-        if algo == 'nvls':
+        if algo in ('nvls', 'fullmesh'):
+            # nvls: D/N multicast share. fullmesh: each peer's dedicated
+            # bundle carries one D/N chunk per phase (the N-1 sends are
+            # concurrent, so the per-step serialized volume is D/N, not the
+            # ring's D*(N-1)/N).
             return D / N
         return D * (N - 1) / N / steps
 
@@ -242,6 +254,11 @@ class TheoryDerivedSurrogate:
             return self.T_min_switch + extra_lat + per_step / bw_tree
         elif algo == 'nvls':
             return extra_lat + self.lat + (per_step * N) / min(self.nvls_bw, bsec)
+        elif algo == 'fullmesh':
+            # 1 chunk (D/N) over 1 dedicated per-peer bundle -- no N-fold
+            # serialization (unlike nvls, which funnels N chunks through one
+            # shared switch port). One hop for fullmesh topology (extra_lat=0).
+            return extra_lat + self.lat + per_step / min(self.fullmesh_bw, bsec)
         else:
             return extra_lat + self.lat + per_step / min(self.ring_bw, bsec)
 
@@ -255,7 +272,8 @@ class TheoryDerivedSurrogate:
         Send-Recv: Phi = 1 (single hop, no pipeline to keep busy)
         """
         collective = self._validate_collective(collective)
-        if collective == 'sendrecv' or algo == 'nvls' or cr <= 0:
+        if (collective == 'sendrecv' or algo in ('nvls', 'fullmesh')
+                or cr <= 0):
             return 1.0
 
         bdp = self._bdp(N, algo, collective)
@@ -438,6 +456,8 @@ class TheoryDerivedSurrogate:
             schedule_bw = self.tree_bw_per_level * max(1, int(math.log2(N)))
         elif algo == 'nvls':
             schedule_bw = self.nvls_bw
+        elif algo == 'fullmesh':
+            schedule_bw = self.fullmesh_bw
         else:
             schedule_bw = self.ring_bw
         schedule_bw_GB = schedule_bw / 1000.0
@@ -790,6 +810,9 @@ class TheoryDerivedSurrogate:
         elif algo == 'nvls':
             T_fixed_step = self.lat + (hop - 1.0) * self.lat
             T_serial_step = (per_step * num_gpus) / min(self.nvls_bw, bsec)
+        elif algo == 'fullmesh':
+            T_fixed_step = self.lat + (hop - 1.0) * self.lat
+            T_serial_step = per_step / min(self.fullmesh_bw, bsec)
         else:
             T_fixed_step = self.lat + (hop - 1.0) * self.lat
             T_serial_step = per_step / min(self.ring_bw, bsec)
@@ -915,6 +938,41 @@ def make_h200_nvls_theory(**overrides):
         t_min_switch_us=1.1,
         startup_us=23.0,
         nvls_startup_us=23.0,
+    )
+    defaults.update(overrides)
+    return TheoryDerivedSurrogate(**defaults)
+
+
+def make_h200_fullmesh_theory(**overrides):
+    """H200 full-mesh profile: every GPU-pair has a dedicated NVLink bundle.
+
+    ns-3 ``FullMeshAllReduce`` (2 phases: reduce-scatter + all-gather, each
+    phase shipping the ``D/N`` chunk to all N-1 peers concurrently on
+    dedicated per-pair bundles) is the ground truth this is calibrated to.
+    Structurally it is NVLS WITHOUT the N-fold serialization -- each peer's
+    bundle carries one chunk per phase, so ``T_step = (D/N)/fullmesh_bw``
+    (no ``*N`` factor). ``fullmesh_bw`` is back-fit to the ns-3 sweep
+    (``configs/calibration/fullmesh_ns3_sweep.py``); the model omits
+    per-packet credit flow, VOQ arbitration and the inter-phase barrier that
+    ns-3 models, so it sits at or just below ns-3 (a lower-bound back-fit,
+    like the ring preset). Scoped to the SIMPLE wire regime (chunk D/N >= 2
+    MB); the LL/LL128 small-message regime is out of scope (same scope as the
+    ring preset). Accepts the same ``overrides`` as the ring profile.
+    """
+    defaults = dict(
+        packet_bw_bytes_per_us=177000,
+        ring_bw_bytes_per_us=177000,
+        tree_bw_per_level_bytes_per_us=26250,
+        nvls_bw_bytes_per_us=535500,
+        fullmesh_bw_bytes_per_us=449890,
+        link_latency_us=0.4,
+        credit_bdp_ring_packets=91.5,
+        credit_bdp_tree_packets=35.5,
+        spray_chunk_bytes=131072,
+        bulk_chunk_bytes=8 * 1024 * 1024,
+        num_lanes=18,
+        t_min_switch_us=1.1,
+        startup_us=15.0,
     )
     defaults.update(overrides)
     return TheoryDerivedSurrogate(**defaults)
@@ -1066,13 +1124,15 @@ def make_surrogate(algo, **overrides):
         return make_h200_tree_theory(**overrides)
     elif algo in ('nvls', 'nvl'):
         return make_h200_nvls_theory(**overrides)
+    elif algo in ('fullmesh', 'fm'):
+        return make_h200_fullmesh_theory(**overrides)
     else:
         return make_h200_ring_theory(**overrides)
 
 
 def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
                              eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20,
-                             **overrides):
+                             eta_fullmesh=1.0, **overrides):
     """Derive every schedule bandwidth from ONE NVLink wire-rate input.
 
     A single physical base -- the per-GPU NVLink aggregate
@@ -1088,10 +1148,16 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
                            ~1.05 (one NVLink + NCCL/FEC overhead; ~= n_fec/k_fec)
       nvls_bw = eta_nvls * B_agg
                            ~1.20 (NVSwitch hardware multicast amplification)
+      fullmesh_bw = eta_fullmesh * B_agg
+                           ~1.0 (dedicated per-peer bundle uses the full
+                                  aggregate; full-mesh has no N-fold switch
+                                  serialization, unlike nvls)
 
     For H200 (b_link=25000 B/us, num_lanes=18, B_agg=450000) this yields
     ring/packet=180000 (calibrated 177000, +1.7%), tree=26250 (exact),
-    nvls=540000 (calibrated 535500, +0.8%). Pass ``ring_bw_bytes_per_us=`` etc.
+    nvls=540000 (calibrated 535500, +0.8%), fullmesh=450000 (ns-3-calibrated,
+    the dedicated 18-lane-per-pair bundle within the fit band). Pass
+    ``ring_bw_bytes_per_us=`` etc.
     in ``overrides`` to override any derived value. The calibrated
     ``make_h200_*`` factories still ship the exact measured values; this is
     the single-parameter entry point for new platforms where only the
@@ -1103,6 +1169,7 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
         ring_bw_bytes_per_us=eta_ring * b_agg,
         tree_bw_per_level_bytes_per_us=(b_agg / num_lanes) * eta_tree,
         nvls_bw_bytes_per_us=eta_nvls * b_agg,
+        fullmesh_bw_bytes_per_us=eta_fullmesh * b_agg,
         num_lanes=num_lanes,
     )
     derived.update(overrides)

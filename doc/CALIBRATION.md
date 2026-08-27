@@ -22,6 +22,7 @@ recipe below carries the exact runtime values it uses.
 | Surrogate | Calibration set | Metric | Value |
 |-----------|-----------------|--------|-------|
 | Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive (≈0.566× vs 8-GPU ns-3) |
+| Theory-derived full-mesh (`surrogate/theory/`) | ns-3-calibrated — `fullmesh_bw=449890 B/µs` back-fit to the ns-3 `FullMeshAllReduce`/`FullMeshAllGather` sweep (η=0.9998 vs the 18×25000 dedicated-bundle physics) | vs ns-3 | MAPE 0.10% on the SIMPLE-regime sweep points (N∈{4,8,16}, 1–256 MiB); parity within 0.3% at N=8 AR+AG {16,64,256} MiB (see the Full-mesh section below) |
 
 ## Generate fresh ns-3 baselines
 
@@ -166,4 +167,77 @@ scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
   multi-node/multi-hop scaling (2-node same-switch only); DCQCN/PFC/ECN
   (no congestion data — the blog itself flags this, pointing to the
   SIGCOMM 2015 DCQCN paper).
+
+## Full-mesh AllReduce/AllGather — ns-3-calibrated
+
+Unlike ring (back-fit to one H200 HW point) and NVLS (an uncalibrated lower
+bound), the full-mesh algorithm is **calibrated directly to ns-3 as ground
+truth**. ns-3's `FullMeshAllReduce` / `FullMeshAllGather` injectors run on
+`--topology=fullmesh` — every GPU-pair gets a dedicated `--numLanes=18` NVLink
+bundle, no switch — and the surrogate's single scalar `fullmesh_bw` is the
+least-squares back-fit to that sweep.
+
+### Model
+
+Each phase ships the chunk `D/N` to all `N-1` peers **concurrently** on
+dedicated per-pair bundles, so a phase's time is `(D/N)/bundle_bw` — **no
+N-fold serialization** (the structural difference from NVLS, which funnels `N`
+chunks through one shared switch port). AllReduce = 2 phases (reduce-scatter +
+all-gather, barrier-gated); AllGather = 1 phase.
+
+```
+T_AR = startup + 2·(lat + (D/N)/fullmesh_bw)
+T_AG = startup + 1·(lat + (D/N)/fullmesh_bw)
+```
+
+### Sweep + fit
+
+[`configs/calibration/fullmesh_ns3_sweep.py`](../configs/calibration/fullmesh_ns3_sweep.py)
+sweeps `N ∈ {4,8,16}` × `{allreduce, allgather}` × 1 MiB–256 MiB (54 points,
+[`fullmesh_sweep.csv`](../configs/calibration/fullmesh_sweep.csv)), parses
+`simTimeUs`, then back-fits the single scalar on the SIMPLE-regime points
+(chunk `D/N ≥ 2 MiB` ⇒ wire-eff 1.0, `startupSIMPLE=15000` ns == surrogate
+`startup_us=15.0`):
+
+```
+fullmesh_bw = Σ(Vᵢ²)/Σ(Rᵢ·Vᵢ),   V = steps·(D/N),  R = T_ns3 − S − steps·lat
+```
+
+| Constant | Value | Anchor |
+|----------|-------|--------|
+| `fullmesh_bw` | 449890 B/µs | ns-3 sweep least-squares fit |
+| `eta_fullmesh` | 0.9998 | `fullmesh_bw / (18 × 25000)` = 99.98% of the dedicated-bundle physics |
+| MAPE | 0.10% | 30 SIMPLE-regime fit points |
+
+The fit lands within 0.02% of the physics bundle `18 × 25000 = 450000` B/µs,
+confirming the dedicated-bundle model: every GPU-pair runs at the full NVLink
+aggregate with no contention. Result in
+[`fullmesh_calib.json`](../configs/calibration/fullmesh_calib.json).
+
+### Scope + limits
+
+- **SIMPLE regime only** (chunk `D/N ≥ 2 MiB`). Sub-SIMPLE sizes use the
+  LL/LL128 startup tiers and 50/93.75% wire efficiencies the scalar fit does
+  not capture (the same scope restriction as the ring preset); the parity test
+  covers only SIMPLE-regime sizes.
+- **Calibrated back-fit, not a bound**: `fullmesh_bw` is a least-squares fit, so
+  the surrogate straddles ns-3 rather than bounding it from below (above at 8 of
+  30 fit points, below at 22; worst deviation 0.31%) — hence the parity test's
+  symmetric band, not a one-sided floor. The model omits per-packet credit
+  flow, VOQ arbitration and the inter-phase barrier that ns-3 models; the
+  residual is ~0.1% in either direction (e.g. 64 MiB AllGather: surrogate
+  34.05 µs vs ns-3 34.00 µs — slightly above), not a systematic offset.
+- **AllReduce vs AllGather**: `T_AR ≈ 2·T_AG − startup` (two serial phases).
+  Full-mesh AllReduce is ~8× faster than ring at 256 MiB/8 (165 µs vs 1326 µs)
+  because the `N-1` peer sends are concurrent, not `2(N-1)` sequential hops.
+
+### Verification
+
+- 7 unit tests (`surrogate/test/test_theory.py`): step count, per-step volume,
+  credit pressure, ns-3 reproduction at 256 MiB, the `T_AR ≈ 2·T_AG` relation,
+  faster-than-ring.
+- Parity test
+  ([`test/parity/test_surrogate_vs_ns3_fullmesh.py`](../test/parity/test_surrogate_vs_ns3_fullmesh.py)):
+  surrogate within 0.3% of ns-3 across N=8 AR+AG at {16,64,256} MiB (the
+  calibrated [0.95, 1.05] band).
 

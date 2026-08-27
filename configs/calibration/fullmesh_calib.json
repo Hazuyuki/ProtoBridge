@@ -1,0 +1,21 @@
+{
+  "source": "ns-3 FullMeshAllReduce/FullMeshAllGather on --topology=fullmesh",
+  "model": "T = startup + steps*(lat + (D/N)/fullmesh_bw); AR steps=2, AG steps=1",
+  "fit_set": "SIMPLE regime (chunk D/N >= 2 MB, startupSIMPLE=15000 ns == surrogate startup_us=15.0)",
+  "fullmesh_bw_bytes_per_us": 449890.3101081605,
+  "eta_fullmesh": 0.9997562446848011,
+  "mape_pct": 0.09740212043089107,
+  "n_fit_points": 30,
+  "ns3_config": {
+    "bandwidth_gbps": 200,
+    "latency_ns": 400,
+    "num_lanes": 18,
+    "startup_simple_ns": 15000
+  },
+  "surrogate_anchor": {
+    "startup_us": 15.0,
+    "link_latency_us": 0.4
+  },
+  "physics_bundle_bytes_per_us": 450000,
+  "sweep_csv": "fullmesh_sweep.csv"
+}
