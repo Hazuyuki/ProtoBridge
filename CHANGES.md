@@ -6,6 +6,53 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — plain (non-RoCE) lossy Ethernet scale-out fabric (ns-3 + surrogate)
+
+The scale-out (So) fabric was RoCEv2-only (lossless RDMA + DCQCN/PFC/ECN). It
+now gains a PLAIN (non-RoCE) lossy Ethernet counterpart — the lossy contrast to
+RoCE's losslessness, for a RoCE-vs-Ethernet loss-resilience comparison. Both
+layers, on branch `feature/plain-ethernet-fabric`.
+
+**ns-3 (C++):** a new `EthernetProtocolModel`
+(`src/gpu-cluster/model/ethernet-protocol-model.{h,cc}`, mirroring
+`roce-protocol-model`) — `WireEfficiency=1.0` (locked; plain L2 data carries no
+RoCE IP/UDP/IB headers), `GetProtocolId()=0` (NONE — the non-bulk send path
+stamps `SetProtocol` unconditionally), store-and-forward NIC driver
+(startup 1500 ns / per-step 800 ns / 9 KiB jumbo chunk). The `EthernetSwitch`
+(lossy) tail-drops at `VoqDropThreshold` and emits a NACK back to the source
+(`NvSwitch::EmitNackBack`, mirroring the BER-NACK path); the sender retransmits
+via the LLR/SACK path (`ProcessNackPacket` → `HandleRetryRequest`/
+`HandleSackRequest`), with `LlrManager::OnRetryTimeout` as the backstop and
+`--llrRetryLimit` bounding the loop (permanent-loss fallback under exhausted
+retries = faithful severe-congestion lossy-Ethernet degradation). To wire the
+NACK origin, `NvSwitch::OnPacketEnqueue` changed `void→bool` (+`inPort`) — base
+returns `true` (no-op) so the RoCE/ECN path is byte-identical — and
+`MultiNodeTopologyHelper` gained `SetInterNodeSwitchLlrEnabled` (default `false`
+= RoCE parity) so the So switch carries `m_llrEnabled=true` on the ETH path (else
+`EmitNackBack` early-returns and the drop is silent → stall). `scratch` lights
+the previously-dead `FabricType::ETHERNET` enum + forces LLR on **both** endpoint
+and switch for ETH; new `configs/protocol_configs/p2p-eth.cfg` (single P2P) +
+`p2p-eth-incast.cfg` (2-flow incast: `--voqDropThreshold=2 --llrRetryLimit=64`
+→ 87 drops → 285 retransmits → 0 permanent losses, completes 68.7 µs). 2 new C++
+tests (`EthernetProtocolModelTest`, `EthernetSwitchDropTest`); `--ber=0` keeps
+the lossy drop the only loss source. RoCE parity byte-identical
+(su 4769616 / 2-node 15307388 / 4-node 13421212 ns).
+
+**Surrogate:** `make_h200_ethernet_theory()` — the lossy counterpart to
+`make_h200_roce_theory()`: same 400GbE wire (`ring_bw=160000`), store-and-forward
+latency (`link_latency_us=3.0` / `t_min_switch_us=3.0` vs RoCE 1.0/1.5),
+`wire_efficiency=1.0` (mirrors the ns-3 model's locked 1.0). It is a spec-derived
+**lower bound anchored to ns-3** (no perftest ground truth, like RoCE); the lossy
+drop/NACK/retransmit behavior is ns-3-only (same split as RoCE/DCQCN).
+`make_h200_hierarchical_theory` gains a backward-compatible `so_factory` seam
+(default `make_h200_roce_theory`) to swap in the Ethernet So stage. 3 new pytests
+(61→64 green); parity test `test/parity/test_surrogate_vs_ns3_ethernet.py`
+(lower-bound anchor, ratio ~0.2 = identical to the RoCE hierarchical anchor).
+Doc: `doc/CALIBRATION.md` §"Plain Ethernet" + `USER_GUIDE.md` recipe N +
+`WHITEBOX_SURROGATE.md` So-profile mention. (`eta_ethernet` skipped — Ethernet
+differs from RoCE in switch *latency*, not wire *bandwidth*, so an eta would be a
+redundant alias; the preset captures the store-and-forward latency.)
+
 ### New — full-mesh surrogate algorithm (ns-3-calibrated, the 4th shape)
 
 The latency surrogate gains a 4th algorithm shape — `fullmesh` — calibrated

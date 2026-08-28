@@ -97,6 +97,13 @@ class MultiNodeTopologyHelper
     // Ethernet RoCEv2 So fabric (EthernetSwitch derives from NvSwitch, so the
     // existing datapath wiring is reused unchanged).
     void SetInterNodeSwitchType(const std::string& typeId);
+    /// Enable LLR (link-level retry) on every inter-node (So) switch so the
+    /// lossy EthernetSwitch can emit NACKs back to senders on VOQ tail-drop
+    /// (EmitNackBack gates on the switch's m_llrEnabled). Default false keeps
+    /// the lossless RoCE path byte-identical (RoCE avoids drops via ECN, so it
+    /// never relies on switch-emitted NACKs); set true only for the plain
+    /// (lossy) Ethernet path.
+    void SetInterNodeSwitchLlrEnabled(bool enabled);
 
     // Build
     NodeContainer Build();
@@ -134,6 +141,7 @@ class MultiNodeTopologyHelper
     FabricType m_interNodeFabricType;
     std::string m_interNodeTopology;
     std::string m_interNodeSwitchType{"ns3::NvSwitch"}; ///< So switch TypeId (NvSwitch default; EthernetSwitch for RoCE)
+    bool m_interNodeSwitchLlrEnabled = false;            ///< LLR on So switches (default false = RoCE parity)
 
     std::vector<NodeInfo> m_nodeInfos;
     NodeContainer m_allGpuNodes;

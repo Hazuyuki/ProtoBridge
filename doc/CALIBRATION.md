@@ -168,6 +168,72 @@ scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
   (no congestion data — the blog itself flags this, pointing to the
   SIGCOMM 2015 DCQCN paper).
 
+## Plain Ethernet (scale-out) — lossy, ns-3-anchored lower bound
+
+The plain (non-RoCE) Ethernet So fabric is the **lossy counterpart** to RoCEv2.
+Both ride the same 400GbE L2 wire; the difference is the congestion contract:
+
+- **RoCEv2** is *lossless*: ECN marks the SoHeader on VOQ pressure, DCQCN
+  backs the sender off, PFC would pause — drops are *avoided*, never
+  recovered by retransmission.
+- **Plain Ethernet** is *lossy*: the `EthernetSwitch` **tail-drops** at
+  `VoqDropThreshold` and **emits a NACK back to the source**
+  (`NvSwitch::EmitNackBack`, mirroring the BER-NACK path); the sender
+  retransmits via the LLR/SACK path (`FabricEndpoint::ProcessNackPacket` →
+  `HandleRetryRequest`/`HandleSackRequest`), with `LlrManager::OnRetryTimeout`
+  as the backstop if the NACK itself is lost. `--llrRetryLimit` bounds the
+  retransmit loop; exhausting it fires the permanent-loss fallback (faithful
+  severe-congestion lossy-Ethernet degradation — the thing RoCE's PFC exists
+  to prevent).
+
+### ns-3 model (`EthernetProtocolModel`)
+
+- `WireEfficiency = 1.0` (locked): plain L2 data carries **no RoCE
+  IP/UDP/IB headers**, and ns-3 does not model Ethernet preamble/IFG framing,
+  so the wire rate is the data rate (vs RoCE's 0.95). This is why the
+  surrogate uses `wire_efficiency=1.0`, not 0.95.
+- `GetProtocolId() = 0` (NONE): the non-bulk `SendDataAutoProtocol` path
+  stamps `SetProtocol(protocolId)` unconditionally, so a non-zero id would
+  misroute Ethernet DATA into the NCCL-LL receiver.
+- Store-and-forward NIC driver: `StartupDelayNs=1500`, `PerStepLatencyNs=800`,
+  `ChunkSize=9KiB` (jumbo MTU, smaller than RoCE's bulk path).
+- **`VoqDropThreshold < VoqDepth` invariant**: the lossy-NACK path must fire
+  before the base `NvSwitch` hard-cap drop (else the loss is silent). The sim
+  wires `VoqDepth=1024` with `VoqDropThreshold=8` (default) for the ETH path.
+- **LLR is required** (a fabric precondition, like RoCE's ECN/PFC infra):
+  `--interNodeFabricType=ETH` forces `llrEnabled=1` on **both** the endpoint
+  sender (so `StorePacket` populates the retry buffer and `ProcessNackPacket`
+  can retransmit) **and** the So switch (so `EmitNackBack` does not early-return
+  on `!m_llrEnabled`). Without switch-side LLR the drop is silent and the
+  transfer stalls to the 3600s `Simulator::Stop` ceiling.
+- `--ber=0 --packetLossRate=0` in the Ethernet `.cfg` so the **only** loss
+  source is VOQ tail-drop (deterministic), isolating the lossy-retransmit path
+  from the BER model.
+
+### Surrogate (`make_h200_ethernet_theory`)
+
+The surrogate is the **uncongested mean** — the lossy drop/NACK/retransmit
+behavior is **ns-3-only** (the same split as RoCE: the surrogate gives the
+uncongested mean while DCQCN/PFC/per-QP-ceiling live in ns-3). The profile is
+spec-derived (store-and-forward `link_latency_us=3.0` / `t_min_switch_us=3.0`
+vs RoCE's cut-through 1.0/1.5; `ring_bw=160000` shared with RoCE; `wire_eff=1.0`).
+It is a **lower bound anchored to ns-3**, not a tight back-fit (no perftest/blog
+ground truth for plain Ethernet, unlike RoCE's `ib_write_lat`). Plugged as the
+So profile of `make_h200_hierarchical_theory` via the `so_factory` seam, the
+measured surrogate/ns-3 ratio is ~0.2 — **identical to the RoCE hierarchical
+anchor's ~0.2**, because the So stage is a small fraction of the uncongested
+hierarchical and the store-and-forward latency is the only So difference (small
+at large sizes). The parity test `test/parity/test_surrogate_vs_ns3_ethernet.py`
+asserts the lower bound (surrogate ≤ ns-3) with a sanity floor, mirroring the
+RoCE hierarchical anchor.
+
+### Config + run
+
+See `configs/protocol_configs/p2p-eth.cfg` (single P2P) and
+`p2p-eth-incast.cfg` (2-flow incast that exercises the full NACK→LLR-retransmit
+→delivery loop; `--voqDropThreshold=2 --llrRetryLimit=64` gives 87 drops → 285
+retransmits → 0 permanent losses, completing in 68.7 µs).
+
 ## Full-mesh AllReduce/AllGather — ns-3-calibrated
 
 Unlike ring (back-fit to one H200 HW point) and NVLS (an uncalibrated lower

@@ -31,6 +31,7 @@ build_lib(
     model/ub-protocol-model.cc
     model/ub-payload-builder.cc
     model/roce-protocol-model.cc
+    model/ethernet-protocol-model.cc
     model/roce-payload-builder.cc
     model/so-header.cc
     model/ethernet-switch.cc
@@ -90,6 +91,7 @@ build_lib(
     model/ub-protocol-model.h
     model/ub-payload-builder.h
     model/roce-protocol-model.h
+    model/ethernet-protocol-model.h
     model/roce-payload-builder.h
     model/so-header.h
     model/ethernet-switch.h

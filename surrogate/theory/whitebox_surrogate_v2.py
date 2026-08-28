@@ -1048,6 +1048,55 @@ def make_h200_roce_theory(**overrides):
     return TheoryDerivedSurrogate(**defaults)
 
 
+def make_h200_ethernet_theory(**overrides):
+    """H200-class plain (non-RoCE) Ethernet scale-out (So) fabric profile.
+
+    The lossy counterpart to :func:`make_h200_roce_theory`: same 400GbE L2
+    wire (``ring_bw`` is identical -- the physical link is the same), but a
+    STORE-AND-FORWARD switch pipeline instead of RoCE's cut-through RDMA path.
+    The store-and-forward latency dominates at small messages (the key
+    physical difference vs RoCE); at large messages the serial term dominates
+    and plain Ethernet is marginally faster (no RoCE IP/UDP/IB header
+    overhead).
+
+    Spec-derived, anchored to ns-3 (NOT real HW -- there is no perftest/blog
+    ground truth for plain Ethernet, unlike RoCE's ib_write_lat):
+
+    * ``wire_efficiency=1.0`` mirrors the ns-3 ``EthernetProtocolModel``,
+      which locks ``WireEfficiency=1.0`` (ns-3 does not model Ethernet
+      preamble/IFG framing, and plain L2 data carries no RoCE
+      IP/UDP/IB headers). For ns-3 parity the surrogate must reproduce the
+      ns-3 mean it is derived from, so 1.0 -- not RoCE's 0.95.
+    * ``link_latency_us=3.0`` / ``t_min_switch_us=3.0`` model a commodity
+      store-and-forward switch pipeline (cut-through RoCE uses 1.0 / 1.5).
+    * ``startup_us=40``, ``ring_bw=160000``, ``num_lanes=8`` are shared with
+      the RoCE profile (same wire, same NCCL inter-node startup).
+
+    The surrogate is the UNCONGESTED MEAN. Lossy congestion behavior -- VOQ
+    tail-drop, the switch-emitted NACK, and LLR/SACK retransmission -- is
+    ns-3-only (the same split as RoCE: the surrogate gives the uncongested
+    mean while DCQCN/PFC/per-QP-ceiling live in ns-3). Accepts ``**overrides``
+    to tune any ``__init__`` param.
+    """
+    defaults = dict(
+        packet_bw_bytes_per_us=160000,
+        ring_bw_bytes_per_us=160000,
+        tree_bw_per_level_bytes_per_us=26250,
+        nvls_bw_bytes_per_us=535500,
+        link_latency_us=3.0,
+        credit_bdp_ring_packets=91.5,
+        credit_bdp_tree_packets=35.5,
+        spray_chunk_bytes=131072,
+        bulk_chunk_bytes=8 * 1024 * 1024,
+        num_lanes=8,
+        t_min_switch_us=3.0,
+        startup_us=40.0,
+        wire_efficiency=1.0,
+    )
+    defaults.update(overrides)
+    return TheoryDerivedSurrogate(**defaults)
+
+
 def make_1024_optical_fattree_theory(**overrides):
     """Profile for the 1024-GPU, 600-Gbps fat-tree optical study.
 
@@ -1569,6 +1618,7 @@ class HierarchicalSurrogate:
 def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
                                  so_topology_family='so_fullmesh',
                                  so_per_link_gbps=50.0, so_links_per_gpu=8,
+                                 so_factory=make_h200_roce_theory,
                                  **so_overrides):
     """H200-class hierarchical (Su NVLink + So Ethernet RoCEv2) profile.
 
@@ -1592,16 +1642,20 @@ def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
         So per-link unidirectional wire rate (50 = 400GbE).
     so_links_per_gpu : int
         NICs per node (the So ``links_per_gpu``; N is node count).
+    so_factory : callable, optional
+        Factory building the So (scale-out) profile (default
+        :func:`make_h200_roce_theory`). Pass :func:`make_h200_ethernet_theory`
+        to model a plain (non-RoCE) lossy Ethernet So fabric instead of RoCE.
     **so_overrides
-        Forwarded to :func:`make_h200_roce_theory` to tune So startup /
-        latency / wire-efficiency / bandwidth.
+        Forwarded to ``so_factory`` to tune So startup / latency /
+        wire-efficiency / bandwidth.
 
     ``collective`` stays required at ``predict`` time (pass it explicitly --
     it is not inferred from ``algo``); the decomposition is selected by the
     collective, not the algorithm.
     """
     su = make_h200_ring_theory()
-    so = make_h200_roce_theory(**so_overrides)
+    so = so_factory(**so_overrides)
     so_topo = make_topology_from_family(
         so_topology_family, num_nodes,
         links_per_gpu=so_links_per_gpu, per_link_gbps=so_per_link_gbps)

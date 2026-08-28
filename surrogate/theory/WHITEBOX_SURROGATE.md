@@ -41,6 +41,12 @@ The `make_h200_ring_theory` / `make_h200_tree_theory` /
 calibrated H200 numbers — use them when you want the measured values rather
 than the wire-rate derivation. `predict()` then takes the operation inputs
 (`data_bytes`, `num_gpus`, `algo`, `credits`, ...) described in Section 2.
+The scale-out (So) presets `make_h200_roce_theory` (lossless RoCEv2) and
+`make_h200_ethernet_theory` (its lossy plain-Ethernet counterpart — same
+400GbE wire, store-and-forward switch latency) are So stages composed under a
+`HierarchicalSurrogate` via the `so_factory` seam; their lossy-congestion
+behavior (ECN/DCQCN for RoCE; VOQ tail-drop → NACK → LLR/SACK retransmit for
+Ethernet) is ns-3-only, the surrogate being the uncongested mean.
 
 ## 1. Design Rule
 

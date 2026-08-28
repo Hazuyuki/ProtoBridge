@@ -56,7 +56,7 @@ inline const char* FabricTypeToString(FabricType type)
 inline FabricType FabricTypeFromString(const std::string& str)
 {
     if (str == "NVLink" || str == "nvlink")   return FabricType::NVLINK;
-    if (str == "Ethernet" || str == "eth")    return FabricType::ETHERNET;
+    if (str == "Ethernet" || str == "eth" || str == "ETH")    return FabricType::ETHERNET;
     if (str == "Hybrid" || str == "hybrid")   return FabricType::HYBRID;
     if (str == "ICI" || str == "ici")         return FabricType::ICI;
     if (str == "HCCS" || str == "hccs")       return FabricType::HCCS;

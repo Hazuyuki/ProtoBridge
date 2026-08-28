@@ -706,11 +706,20 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
                   << " depth=" << m_voqDepth);
 
     // Congestion hook: let a subclass (EthernetSwitch) mark the SoHeader ECN
-    // bit on enqueue, before the fast-path / push. The depth here is the queue
-    // the packet is arriving into (excluding itself); the empty-VOQ fast-path
-    // below sees depth 0 and so produces no mark -- matching RoCE marking
+    // bit on enqueue (RoCE lossless) or tail-drop with a NACK (plain Ethernet
+    // lossy), before the fast-path / push. The depth here is the queue the
+    // packet is arriving into (excluding itself); the empty-VOQ fast-path below
+    // sees depth 0 and so produces no mark/drop -- matching RoCE marking
     // semantics where only packets arriving behind a backlog get marked.
-    OnPacketEnqueue(entry.packet, outPort, m_voqs[outPort].size());
+    // A false return drops the packet (caller counts a VOQ drop); true admits.
+    if (!OnPacketEnqueue(entry.packet, outPort, entry.inPort,
+                         m_voqs[outPort].size()))
+    {
+        m_dropTrace(entry.packet);
+        m_droppedPackets++;
+        m_voqDrops++;
+        return;
+    }
 
     // For non-blocking switch with egress serialization:
     // If VOQ is empty and output port is free, forward immediately with
@@ -724,14 +733,49 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
     m_voqs[outPort].push(entry);
 }
 
-void
-NvSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort, size_t voqDepth)
+bool
+NvSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
+                          uint32_t inPort, size_t voqDepth)
 {
-    // Default no-op: NVSwitch (scale-up fabric) does no ECN marking, so Su
-    // parity is unaffected. EthernetSwitch overrides to mark the SoHeader.
+    // Default no-op: NVSwitch (scale-up fabric) does no ECN marking or lossy
+    // drop, so Su parity is unaffected. EthernetSwitch overrides to mark the
+    // SoHeader (RoCE) or tail-drop with a NACK (plain Ethernet). Returning
+    // true admits the packet (the caller pushes it to the VOQ).
     (void)packet;
     (void)outPort;
+    (void)inPort;
     (void)voqDepth;
+    return true;
+}
+
+void
+NvSwitch::EmitNackBack(const FabricHeader& orig, uint32_t returnPort,
+                       Mac48Address destMac)
+{
+    // No retransmission machinery active -> a NACK would be unprocessable.
+    // Mirrors the BER-NACK gate in ReceiveFromPort (m_llrEnabled).
+    if (!m_llrEnabled)
+    {
+        return;
+    }
+    if (returnPort >= m_ports.size())
+    {
+        return;
+    }
+    FabricHeader nackHeader;
+    nackHeader.SetPacketType(FabricPacketType::NACK);
+    nackHeader.SetFabricType(orig.GetFabricType());
+    nackHeader.SetSourceRank(orig.GetDestRank());
+    nackHeader.SetDestRank(orig.GetSourceRank());
+    nackHeader.SetSequenceNumber(orig.GetSequenceNumber());
+    nackHeader.SetFlowId(orig.GetFlowId());
+    nackHeader.SetVirtualChannel(orig.GetVirtualChannel());
+    nackHeader.SetSourceMac(orig.GetDestMac());
+    nackHeader.SetDestMac(orig.GetSourceMac());
+
+    Ptr<Packet> nackPkt = Create<Packet>(0);
+    nackPkt->AddHeader(nackHeader);
+    m_ports[returnPort]->Send(nackPkt, destMac, 0x0800);
 }
 
 void

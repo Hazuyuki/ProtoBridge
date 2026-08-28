@@ -39,6 +39,7 @@
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/ub-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
+#include "ns3/ethernet-protocol-model.h"
 #include "ns3/dcqcn-rate-machine.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/nccl-protocol-payload-builder.h"
@@ -268,6 +269,11 @@ main(int argc, char* argv[])
     // off = parity-safe); ECN marking itself is live (Phase B): the switch
     // marks SoHeader ECN at this VOQ depth on enqueue.
     uint32_t ecnThreshold = 8;
+    // Plain-Ethernet lossy VOQ tail-drop threshold (pkts); 0=off. Must be <
+    // NvSwitch::VoqDepth (the ETHERNET branch raises that to 1024) so the
+    // NACK path fires before the base hard-cap drop. Default 8 = the
+    // EthernetSwitch Attribute default (parity-neutral).
+    uint32_t voqDropThreshold = 8;
     // DCQCN rate machine (Phase B). Off by default: with no DcqcnRateMachine
     // mounted, CNPs are no-ops and SendPacketOnDevice adds zero shaping delay,
     // so all So runs stay bit-identical to the Phase-A baseline. On, a shared
@@ -452,6 +458,7 @@ main(int argc, char* argv[])
     cmd.AddValue("interNodeFabricType", "Inter-node fabric type: RoCE/ETH/NVLink", interNodeFabricTypeStr);
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
     cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
+    cmd.AddValue("voqDropThreshold", "Plain-Ethernet lossy VOQ tail-drop threshold (pkts); 0=off. Must be < VoqDepth (ETHERNET raises it to 1024)", voqDropThreshold);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
@@ -800,6 +807,30 @@ main(int argc, char* argv[])
 
         FabricType interNodeFabricType = FabricTypeFromString(interNodeFabricTypeStr);
 
+        // Plain (non-RoCE) lossy Ethernet REQUIRES link-level retry: the
+        // EthernetSwitch tail-drops at VoqDropThreshold and emits a NACK back
+        // to the source (EmitNackBack), which the sender retransmits via the
+        // LLR/SACK path (StorePacket -> HandleRetryRequest/HandleSackRequest).
+        // Without LLR the drop is silent and the transfer stalls forever.
+        // Force LLR on for the Ethernet path (a fabric precondition, like
+        // RoCE's ECN/PFC infra). BOTH the local llrEnabled var AND
+        // pbundle.llrEnabled must be set: ProtocolConfigRunner::ApplyBundle
+        // (below) re-applies pbundle.llrEnabled to every endpoint
+        // (protocol-config-runner.cc:53), so the bundle must carry true or it
+        // clobbers this force after the endpoint loop sets m_llrEnabled.
+        if (interNodeFabricType == FabricType::ETHERNET)
+        {
+            const bool wasLlr = llrEnabled;
+            llrEnabled = true;
+            pbundle.llrEnabled = true;
+            if (!wasLlr)
+            {
+                std::cerr << "Note: --interNodeFabricType=ETH is lossy (VOQ "
+                             "tail-drop) and requires LLR retransmission; "
+                             "forcing llrEnabled=1.\n";
+            }
+        }
+
         MultiNodeTopologyHelper multiTopo;
         multiTopo.SetNumNodes(numNodes);
         multiTopo.SetGpusPerNode(gpusPerNode);
@@ -850,6 +881,29 @@ main(int argc, char* argv[])
             Config::SetDefault("ns3::EthernetSwitch::EcnThreshold",
                                UintegerValue(ecnThreshold));
         }
+        else if (interNodeFabricType == FabricType::ETHERNET)
+        {
+            // Plain (non-RoCE) lossy Ethernet So fabric: same EthernetSwitch
+            // subtype (L2 MAC-learning + VOQ + crossbar datapath), but lossy.
+            // VoqDropThreshold < VoqDepth is the lossy-NACK invariant: the
+            // tail-drop + EmitNackBack path (EthernetSwitch::OnPacketEnqueue)
+            // must fire before the base hard-cap drop (NvSwitch at m_voqDepth),
+            // else the loss is silent. VoqDepth=1024 gives ample headroom above
+            // the default VoqDropThreshold=8 so the NACK path is operative.
+            multiTopo.SetInterNodeSwitchType("ns3::EthernetSwitch");
+            Config::SetDefault("ns3::NvSwitch::VoqDepth",
+                               UintegerValue(1024));
+            Config::SetDefault("ns3::EthernetSwitch::VoqDropThreshold",
+                               UintegerValue(voqDropThreshold));
+            // The So switch's m_llrEnabled must be true or EmitNackBack
+            // (nvswitch.cc) returns early -- the lossy drop stays silent and
+            // the transfer stalls. The endpoint-side LLR force above arms the
+            // sender (StorePacket + ProcessNackPacket); this arms the switch
+            // that ORIGINATES the NACK on tail-drop. Default false on the
+            // helper keeps the lossless RoCE path byte-identical (RoCE avoids
+            // drops via ECN, so it never relies on switch-emitted NACKs).
+            multiTopo.SetInterNodeSwitchLlrEnabled(true);
+        }
         multiTopo.SetInterNodeTopology(interNodeTopology);
         multiTopo.SetIntraNodeTopology(intraNodeTopology);
 
@@ -862,9 +916,18 @@ main(int argc, char* argv[])
         // traffic keeps the scale-up (NCCL) model. With no So model wired,
         // GetProtocolModelForDest falls back to the Su model (parity-safe).
         Ptr<RoceProtocolModel> roceModel;
+        Ptr<EthernetProtocolModel> ethModel;
         if (interNodeFabricType == FabricType::ROCE)
         {
             roceModel = CreateObject<RoceProtocolModel>();
+        }
+        else if (interNodeFabricType == FabricType::ETHERNET)
+        {
+            // Plain (non-RoCE) lossy Ethernet So model: WireEfficiency=1.0
+            // (no SoHeader encapsulation, no DCQCN/per-QP ceiling -- those are
+            // RDMA concepts), store-and-forward per-step latency. No DcqcnRate
+            // Machine is wired for the Ethernet path below.
+            ethModel = CreateObject<EthernetProtocolModel>();
         }
 
         // DCQCN rate machine (Phase B) + opt-in per-QP ceiling pacer. One shared
@@ -897,6 +960,10 @@ main(int argc, char* argv[])
             if (roceModel)
             {
                 ep->SetInterNodeProtocolModel(roceModel);
+            }
+            if (ethModel)
+            {
+                ep->SetInterNodeProtocolModel(ethModel);
             }
             if (dcqcnMachine)
             {

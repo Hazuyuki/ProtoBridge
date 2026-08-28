@@ -493,6 +493,72 @@ def test_roce_theory_defaults():
     assert s.T_min_switch == 1.5
 
 
+def test_ethernet_theory_defaults():
+    """So plain-Ethernet profile: same 400GbE ring bw as RoCE (160000), 40 us
+    startup, wire_eff 1.0 (ns-3 EthernetProtocolModel locks WireEfficiency=1.0
+    -- plain L2 data carries no RoCE IP/UDP/IB headers), 8 NICs/node, and a
+    store-and-forward switch pipeline (~3 us/hop, 3 us switch) vs RoCE's
+    cut-through 1.0/1.5."""
+    s = wb.make_h200_ethernet_theory()
+    assert s.ring_bw == 160000               # same 400GbE wire as RoCE
+    assert s.S_startup == 40.0               # same NCCL inter-node startup
+    assert s.wire_efficiency == 1.0          # ns-3 Ethernet locks eff=1.0
+    assert s.num_lanes == 8
+    assert s.lat == 3.0                       # store-and-forward (vs RoCE 1.0)
+    assert s.T_min_switch == 3.0             # store-and-forward (vs RoCE 1.5)
+
+
+def test_ethernet_slower_than_roce_small_faster_large():
+    """At small messages the store-and-forward switch pipeline dominates, so
+    plain Ethernet is slower than RoCE (cut-through). At large messages the
+    serial term dominates and Ethernet is at least as fast (wire_eff 1.0 vs
+    RoCE 0.95 -- no RoCE header overhead). Both share ring_bw/credits, so the
+    relative ordering is set by latency (small) vs serial (large)."""
+    eth = wb.make_h200_ethernet_theory()
+    roce = wb.make_h200_roce_theory()
+    small = 1 << 14   # 16 KiB -- latency-dominated
+    big = 1 << 28     # 256 MiB -- serial-dominated
+    e_small = eth.predict(small, 2, "ring", credits=128, ber=0,
+                          collective="sendrecv")
+    r_small = roce.predict(small, 2, "ring", credits=128, ber=0,
+                           collective="sendrecv")
+    assert e_small > r_small, \
+        f"small-msg Ethernet {e_small} not > RoCE {r_small}"
+    e_big = eth.predict(big, 2, "ring", credits=128, ber=0,
+                         collective="sendrecv")
+    r_big = roce.predict(big, 2, "ring", credits=128, ber=0,
+                         collective="sendrecv")
+    assert e_big <= r_big, \
+        f"large-msg Ethernet {e_big} not <= RoCE {r_big}"
+
+
+def test_hierarchical_with_ethernet_so():
+    """HierarchicalSurrogate composes with a plain-Ethernet So profile via the
+    so_factory seam: the Su (NVLink ring) stage is unchanged, the So stage uses
+    make_h200_ethernet_theory (store-and-forward, wire_eff 1.0). The 2-node
+    hierarchical allreduce exceeds the Su-only (1-node) allreduce (the So
+    phase adds time), and the wired So profile is verifiably the Ethernet
+    one (lat 3.0, wire_eff 1.0), not the RoCE default."""
+    eth_h = wb.make_h200_hierarchical_theory(
+        gpus_per_node=8, num_nodes=2, so_factory=wb.make_h200_ethernet_theory)
+    roce_h = wb.make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2)
+    su_only = wb.make_h200_ring_theory()
+    D = 1 << 24   # 16 MiB
+    t_eth = eth_h.predict(D, "ring", credits=128, collective="allreduce")
+    t_su = su_only.predict(D, 8, "ring", credits=128, ber=0,
+                           collective="allreduce")
+    # the So stage adds time -> hierarchical > Su-only
+    assert t_eth > t_su, f"Ethernet hierarchical {t_eth} not > Su-only {t_su}"
+    # the So profile really IS the Ethernet one (store-and-forward lat 3.0)
+    assert eth_h.so.lat == 3.0
+    assert eth_h.so.wire_efficiency == 1.0
+    assert roce_h.so.lat == 1.0           # RoCE default unchanged by the seam
+    # the two So profiles give different hierarchical latencies (the seam
+    # actually swaps the So stage, not a no-op)
+    t_roce = roce_h.predict(D, "ring", credits=128, collective="allreduce")
+    assert t_eth != t_roce
+
+
 def test_connectx7_p2p_perftest_theory_defaults():
     """ConnectX-7 P2P perftest profile: 192 Gbps single-write rate, 1.45 us
     fixed latency (1.05 doorbell+completion + 0.4 prop), single QP, wire_eff

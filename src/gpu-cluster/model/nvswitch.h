@@ -339,17 +339,38 @@ class NvSwitch : public FabricSwitch
     /**
      * @brief Congestion hook called when a packet is enqueued to a VOQ.
      *
-     * Default is a no-op (NvSwitch marks nothing, so Su parity is preserved
-     * on NVSwitch instances). A scale-out switch (EthernetSwitch) overrides
-     * this to mark the SoHeader ECN bit when the VOQ depth indicates
-     * congestion. At call time the packet still carries its FabricHeader
-     * (outermost) over the inner SoHeader, matching the in-flight state.
+     * Returns false to DROP the packet (the caller skips the push and counts
+     * a VOQ drop); returns true to admit it. Default returns true (no-op, so
+     * Su parity is preserved on NVSwitch instances). A scale-out switch
+     * overrides this: EthernetSwitch marks the SoHeader ECN bit on RoCE data
+     * packets (lossless), and tail-drops plain-Ethernet data packets past the
+     * VoqDropThreshold with a NACK to the source (lossy). At call time the
+     * packet still carries its FabricHeader (outermost) over any inner
+     * SoHeader, matching the in-flight state.
      * @param packet The packet being enqueued (mutable)
      * @param outPort Output port the packet is queued for
+     * @param inPort Input port the packet arrived on (return path for a NACK)
      * @param voqDepth Current VOQ depth (packets, excluding this one)
+     * @return true to admit (enqueue); false to drop (caller counts m_voqDrops)
      */
-    virtual void OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
-                                 size_t voqDepth);
+    virtual bool OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
+                                 uint32_t inPort, size_t voqDepth);
+
+    /**
+     * @brief Emit a NACK control packet back to the source of @p orig on @p returnPort.
+     *
+     * Used by the lossy Ethernet drop path: when a plain-Ethernet data packet
+     * is tail-dropped at the VoqDropThreshold, the switch tells the sender to
+     * retransmit via the existing LLR/SACK path. Mirrors the BER-NACK emission
+     * in ReceiveFromPort. No-op when LLR is disabled (the sender could not
+     * process the NACK anyway). Protected so EthernetSwitch (which cannot reach
+     * the private m_ports table) can call it.
+     * @param orig The dropped packet's FabricHeader (source becomes NACK dest)
+     * @param returnPort Port back toward the source (the packet's input port)
+     * @param destMac L2 destination for the NACK (the source's NIC MAC)
+     */
+    void EmitNackBack(const FabricHeader& orig, uint32_t returnPort,
+                      Mac48Address destMac);
 
   private:
     /**

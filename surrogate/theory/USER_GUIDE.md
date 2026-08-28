@@ -336,6 +336,18 @@ Su (NVLink) stage:
 | `wire_efficiency` | 1.0 (no L3/L4 header) | 0.95 (Eth+IP+UDP+IB) | header overhead on T_serial |
 | `tree_bw` / `nvls_bw` | used on Su | inherited, unused on So | So stage runs the ring path |
 
+**Plain (non-RoCE) lossy Ethernet So fabric.** `make_h200_ethernet_theory()`
+is the lossy counterpart to `make_h200_roce_theory()`: the same 400GbE L2 wire
+(`ring_bw=160000`), but a **store-and-forward** switch pipeline
+(`link_latency_us=3.0`, `t_min_switch_us=3.0` vs RoCE's cut-through 1.0/1.5)
+and `wire_efficiency=1.0` (plain L2 data carries no RoCE IP/UDP/IB headers —
+mirroring the ns-3 `EthernetProtocolModel`, which locks `WireEfficiency=1.0`).
+The lossy drop/NACK/LLR-retransmit behavior is **ns-3-only** — the surrogate
+is the uncongested mean (the same split as RoCE/DCQCN). To use it as the So
+stage of a hierarchical collective, pass it via the `so_factory` seam:
+`make_h200_hierarchical_theory(so_factory=make_h200_ethernet_theory)` (the
+default is `make_h200_roce_theory`). See recipe N.
+
 ### So topology — `so_topology`
 
 ```python
@@ -537,6 +549,34 @@ Full-mesh needs no topology: the per-phase bundle rate is far below the
 full-mesh bisection, so the bisection cap never binds and `topology=None` is
 byte-identical. Calibration details + the ns-3 sweep are in
 [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Full-mesh”.
+
+### N. Plain (non-RoCE) Ethernet So fabric — the lossy RoCE counterpart
+
+`make_h200_ethernet_theory()` is the lossy counterpart to
+`make_h200_roce_theory()`: the same 400GbE L2 wire (`ring_bw=160000`) but a
+**store-and-forward** switch pipeline instead of RoCE's cut-through RDMA path,
+and `wire_efficiency=1.0` (plain L2 data carries no RoCE IP/UDP/IB headers —
+mirroring the ns-3 `EthernetProtocolModel`, which locks `WireEfficiency=1.0`).
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import make_h200_ethernet_theory, make_h200_hierarchical_theory
+# Plain-Ethernet So stage in a hierarchical 2-node allreduce (the lossy
+# counterpart to the RoCE So stage). The lossy drop/NACK/LLR-retransmit
+# behavior is ns-3-only; the surrogate is the uncongested mean (same split
+# as RoCE/DCQCN).
+h = make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
+                                  so_factory=make_h200_ethernet_theory)
+h.predict(256 * 1024 * 1024, "ring", credits=128, collective="allreduce")
+```
+
+The store-and-forward latency (`link_latency_us=3.0`, `t_min_switch_us=3.0`
+vs RoCE's 1.0/1.5) dominates at small messages; at large messages the serial
+term dominates and plain Ethernet is marginally faster (no RoCE header
+overhead). The profile is a spec-derived **lower bound anchored to ns-3** (no
+perftest/blog ground truth for plain Ethernet, unlike RoCE's `ib_write_lat`);
+the parity test asserts surrogate ≤ ns-3 with a sanity floor. Calibration +
+the ns-3 lossy model (VOQ tail-drop → switch NACK → LLR/SACK retransmit) are
+in [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Plain Ethernet”.
 
 ---
 

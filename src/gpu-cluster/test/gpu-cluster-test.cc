@@ -19,6 +19,7 @@
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/mccl-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
+#include "ns3/ethernet-protocol-model.h"
 #include "ns3/roce-payload-builder.h"
 #include "ns3/so-header.h"
 #include "ns3/dcqcn-rate-machine.h"
@@ -1125,6 +1126,67 @@ class RoceProtocolModelTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::DMA_BULK),
                               0,
                               "RoCEv2 bulk DMA latency modeled on the wire");
+    }
+};
+
+/**
+ * @brief Test case for the plain (non-RoCE) Ethernet protocol model constants.
+ *
+ * Mirrors RoceProtocolModelTest. The defining contrast is WireEfficiency=1.0
+ * (no SoHeader, no wire expansion -- vs RoCE's 0.95/1053) and protocol id 0
+ * (NONE -- no EthernetProtocol enum, so the non-bulk SendDataAutoProtocol path
+ * stamps protocol=0 and cannot collide with NcclProtocol::LL=1).
+ */
+class EthernetProtocolModelTest : public TestCase
+{
+  public:
+    EthernetProtocolModelTest()
+        : TestCase("Plain Ethernet protocol parameters")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<EthernetProtocolModel> model = CreateObject<EthernetProtocolModel>();
+        const uint8_t none = 0; // no EthernetProtocol enum; id is always NONE
+
+        // Spec/NIC-derived defaults (uncalibrated: no perftest ground truth for
+        // plain Ethernet, unlike RoCE's ib_write_lat).
+        NS_TEST_EXPECT_MSG_EQ(model->GetProtocolId(1024),
+                              none,
+                              "Plain Ethernet has no line protocol (NONE)");
+        NS_TEST_EXPECT_MSG_EQ(model->GetStartupDelayNs(none),
+                              1500,
+                              "Default plain-Ethernet NIC-driver startup (1.5us)");
+        NS_TEST_EXPECT_MSG_EQ(model->GetPerStepLatencyNs(none),
+                              800,
+                              "Default plain-Ethernet store-and-forward per-hop latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetChunkSize(none),
+                              9 * 1024,
+                              "Default plain-Ethernet segment size (jumbo MTU)");
+        // WireEfficiency=1.0: no expansion (contrast RoCE's ceil(1000/0.95)=1053).
+        NS_TEST_EXPECT_MSG_EQ(model->GetWireSize(1000, none),
+                              1000,
+                              "Plain Ethernet carries no SoHeader overhead");
+        NS_TEST_EXPECT_MSG_EQ_TOL(model->GetEfficiency(none),
+                                  1.0,
+                                  1e-12,
+                                  "Plain Ethernet wire efficiency is 1.0 (no SoHeader)");
+        NS_TEST_EXPECT_MSG_EQ(model->GetVendorName(),
+                              std::string("Ethernet-PLAIN"),
+                              "Plain Ethernet vendor name");
+
+        // Memory-semantic latencies (same shape as RoCE; unconsumed on the bulk
+        // P2P path but kept for GetMemoryLatencyNs parity).
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::SYNC_LOAD_STORE),
+                              1000,
+                              "Plain Ethernet synchronous NIC load/store latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::ASYNC_URMA),
+                              5000,
+                              "Plain Ethernet asynchronous remote memory access latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::DMA_BULK),
+                              0,
+                              "Plain Ethernet bulk DMA latency modeled on the wire");
     }
 };
 
@@ -3982,6 +4044,84 @@ class EthernetSwitchEcnTest : public TestCase
     }
 };
 
+/**
+ * @brief Test case for the EthernetSwitch lossy VOQ tail-drop + NACK decision.
+ *
+ * Mirrors EthernetSwitchEcnTest's no-port + public-seam pattern: the lossy drop
+ * is the OPPOSITE of RoCE's lossless ECN mark. OnPacketEnqueue is public on
+ * EthernetSwitch (overriding the protected NvSwitch base) so the drop decision
+ * is unit-testable without driving the full datapath. EmitNackBack gates on
+ * m_llrEnabled (off here) then returnPort<m_ports.size(); with no ports wired
+ * it is a safe no-op -- the test asserts the DROP DECISION (return false/true),
+ * not the NACK egress (covered by the e2e incast run).
+ */
+class EthernetSwitchDropTest : public TestCase
+{
+  public:
+    EthernetSwitchDropTest()
+        : TestCase("EthernetSwitch lossy VOQ tail-drop on plain Ethernet") {}
+    void DoRun() override
+    {
+        Ptr<EthernetSwitch> sw = CreateObject<EthernetSwitch>();
+        // Small deterministic threshold; EcnThreshold stays at default 8 so the
+        // RoCE lossless path is exercised below at depth 10 without interference.
+        sw->SetAttribute("VoqDropThreshold", UintegerValue(4));
+
+        // Plain-Ethernet DATA = [FabricHeader(DATA, ETHERNET, proto=0)][payload].
+        // NO inner SoHeader -- the defining contrast to RoCE (efficiency=1.0 so
+        // SendBulkWireTransferSize stamps no SoHeader).
+        auto makeEthData = []() {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0); // NONE (no EthernetProtocol enum)
+            pkt->AddHeader(fh);
+            return pkt;
+        };
+
+        // (1) Shallow queue (depth 2 < threshold 4): admit (return true).
+        Ptr<Packet> shallow = makeEthData();
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(shallow, 0, 1, 2), true,
+                              "below-threshold Ethernet DATA must be admitted");
+
+        // (2) At-threshold (depth 4 >= 4): tail-drop + NACK (return false). The
+        // lossy path -- the opposite of RoCE's lossless ECN mark.
+        Ptr<Packet> deep = makeEthData();
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(deep, 0, 1, 4), false,
+                              "at-threshold Ethernet DATA must be tail-dropped (lossy)");
+
+        // (3) RoCE DATA at deep queue (depth 10): NOT dropped -- RoCE is
+        // lossless, falls through to the ECN path (returns true). Guards the
+        // regression where the lossy drop would clobber RoCE traffic sharing
+        // the EthernetSwitch subtype.
+        Ptr<Packet> roce = Create<Packet>(64);
+        SoHeader soh;
+        soh.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        soh.SetEcn(false);
+        soh.SetDataSize(64);
+        roce->AddHeader(soh);
+        FabricHeader rfh;
+        rfh.SetPacketType(FabricPacketType::DATA);
+        rfh.SetFabricType(FabricType::ROCE);
+        rfh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        roce->AddHeader(rfh);
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(roce, 0, 1, 10), true,
+                              "RoCE DATA must NOT be tail-dropped (lossless ECN path)");
+
+        // (4) CREDIT control packet at deep queue: bypass (return true) --
+        // dropping control feedback would deadlock the credit loop, matching
+        // the BER bypass.
+        Ptr<Packet> ctrl = Create<Packet>(16);
+        FabricHeader cfh;
+        cfh.SetPacketType(FabricPacketType::CREDIT);
+        cfh.SetFabricType(FabricType::ETHERNET);
+        ctrl->AddHeader(cfh);
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(ctrl, 0, 1, 10), true,
+                              "CREDIT control packet must bypass the lossy drop");
+    }
+};
+
 // A FabricEndpoint subclass that exposes the protected receive dispatch for
 // test injection. Mirrors EndpointFlowControlOverride's pattern.
 class CnpTestEndpoint : public FabricEndpoint
@@ -5496,6 +5636,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new FabricTypeTest, TestCase::Duration::QUICK);
     AddTestCase(new McclProtocolModelTest, TestCase::Duration::QUICK);
     AddTestCase(new RoceProtocolModelTest, TestCase::Duration::QUICK);
+    AddTestCase(new EthernetProtocolModelTest, TestCase::Duration::QUICK);
     AddTestCase(new RocePayloadBuilderTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);
@@ -5525,6 +5666,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SwitchTypeSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchEcnTest, TestCase::Duration::QUICK);
+    AddTestCase(new EthernetSwitchDropTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpReactionTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);

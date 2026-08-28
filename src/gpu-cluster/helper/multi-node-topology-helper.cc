@@ -38,7 +38,8 @@ MultiNodeTopologyHelper::MultiNodeTopologyHelper()
       m_interNodeDataRate("400Gbps"),
       m_interNodeDelay("10us"),
       m_interNodeFabricType(FabricType::ROCE),
-      m_interNodeTopology("fullmesh")
+      m_interNodeTopology("fullmesh"),
+      m_interNodeSwitchLlrEnabled(false)
 {}
 
 MultiNodeTopologyHelper::~MultiNodeTopologyHelper()
@@ -63,6 +64,7 @@ void MultiNodeTopologyHelper::SetInterNodeDelay(const std::string& delay) { m_in
 void MultiNodeTopologyHelper::SetInterNodeFabricType(FabricType type) { m_interNodeFabricType = type; }
 void MultiNodeTopologyHelper::SetInterNodeTopology(const std::string& topo) { m_interNodeTopology = topo; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchType(const std::string& typeId) { m_interNodeSwitchType = typeId; }
+void MultiNodeTopologyHelper::SetInterNodeSwitchLlrEnabled(bool enabled) { m_interNodeSwitchLlrEnabled = enabled; }
 
 uint16_t MultiNodeTopologyHelper::GetGlobalRank(uint32_t nodeId, uint32_t localIdx) const
 {
@@ -448,6 +450,7 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
             {
                 hostSwitch->SetArbiter(m_arbiter);
             }
+            hostSwitch->SetLlrEnabled(m_interNodeSwitchLlrEnabled);
             interNodeSwitchNodes[nodeId] = switchNode;
             interNodeSwitches[nodeId] = hostSwitch;
             m_allSwitchNodes.Add(switchNode);
@@ -541,6 +544,7 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
         {
             leafSwitch->SetArbiter(m_arbiter);
         }
+        leafSwitch->SetLlrEnabled(m_interNodeSwitchLlrEnabled);
         interNodeSwitchNodes[0] = switchNode;
         interNodeSwitches[0] = leafSwitch;
         m_allSwitchNodes.Add(switchNode);

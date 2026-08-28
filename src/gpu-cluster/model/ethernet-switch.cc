@@ -30,12 +30,22 @@ EthernetSwitch::GetTypeId()
                                           "marks the SoHeader ECN bit on enqueue",
                                           UintegerValue(8),
                                           MakeUintegerAccessor(&EthernetSwitch::m_ecnThreshold),
-                                          MakeUintegerChecker<uint32_t>(0));
+                                          MakeUintegerChecker<uint32_t>(0))
+            .AddAttribute("VoqDropThreshold",
+                          "VOQ depth (packets) at which a plain-Ethernet data "
+                          "packet is tail-dropped with a NACK to the source "
+                          "(lossy fabric). Must be < NvSwitch::VoqDepth, else "
+                          "the base hard-cap drop preempts the NACK path. "
+                          "Ignored for RoCE packets (lossless ECN path).",
+                          UintegerValue(8),
+                          MakeUintegerAccessor(&EthernetSwitch::m_voqDropThreshold),
+                          MakeUintegerChecker<uint32_t>(0));
     return tid;
 }
 
 EthernetSwitch::EthernetSwitch()
-    : m_ecnThreshold(8)
+    : m_ecnThreshold(8),
+      m_voqDropThreshold(8)
 {
 }
 
@@ -45,12 +55,38 @@ EthernetSwitch::GetVendorName() const
     return "Ethernet-RoCEv2";
 }
 
-void
+bool
 EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
-                                size_t voqDepth)
+                                uint32_t inPort, size_t voqDepth)
 {
     (void)outPort;
-    MarkEcnIfCongested(packet, voqDepth);
+    if (!packet)
+    {
+        return true;
+    }
+    FabricHeader fh;
+    packet->PeekHeader(fh);
+
+    // Lossy drop: a plain-Ethernet (non-RoCE) DATA packet that meets the VOQ
+    // drop threshold is tail-dropped with a NACK back to the source, so the
+    // sender retransmits via the existing LLR/SACK path. Control and retry
+    // packets bypass (matching the BER bypass) -- dropping them would
+    // deadlock the credit/feedback loop. RoCE packets fall through to the
+    // lossless ECN path below.
+    if (!fh.IsControlPacket() && !fh.IsRetryPacket()
+        && fh.GetFabricType() == FabricType::ETHERNET)
+    {
+        if (voqDepth >= m_voqDropThreshold)
+        {
+            EmitNackBack(fh, inPort, fh.GetSourceMac());
+            return false; // drop: caller skips the push + counts m_voqDrops
+        }
+        return true; // admit; plain Ethernet carries no SoHeader to ECN-mark
+    }
+
+    // RoCE lossless path: mark the inner SoHeader ECN bit when congested.
+    (void)MarkEcnIfCongested(packet, voqDepth);
+    return true;
 }
 
 bool
