@@ -131,17 +131,35 @@ def assert_lossless(fields, label):
     assert fields.get("simTimeNs") is not None, "{}: missing simTimeNs".format(label)
 
 
+# Byte-identical RoCE parity reference (RngRun=1, deterministic). These are
+# the canonical "byte-identical" numbers cited in PLAN.md / TASKS.md /
+# CHANGES.md; pinning them turns that doc claim into a machine-checked gate --
+# a 1-ns drift means the void->bool OnPacketEnqueue change or the ETHERNET-only
+# LLR force has disturbed the RoCE path.
+PARITY_NS = {
+    "su-baseline": 4769616,
+    2: 15307388,
+    4: 13421212,
+}
+
+
 def test_so_hierarchical_regression():
     # Single-node Su baseline: the hierarchical So run must cost MORE than this
     # (the So inter-node phase adds reduce-scatter + allgather across nodes).
     su, _ = run_su_baseline(1 << 20 << 8)
     assert_lossless(su, "su-baseline")
     su_ns = su["simTimeNs"]
+    assert su_ns == PARITY_NS["su-baseline"], (
+        "su-baseline simTimeNs={} (parity drift; expected {})".format(
+            su_ns, PARITY_NS["su-baseline"]))
 
     for num_nodes, data_size in SO_MATRIX:
         label = "so-hier {}node {}B".format(num_nodes, data_size)
         so, _ = run_so_hierarchical(num_nodes, data_size)
         assert_lossless(so, label)
+        assert so["simTimeNs"] == PARITY_NS[num_nodes], (
+            "{}: simTimeNs={} (parity drift; expected {})".format(
+                label, so["simTimeNs"], PARITY_NS[num_nodes]))
         assert so["simTimeNs"] > su_ns, (
             "{}: simTimeNs={} not > Su baseline {} (So phase must add time)".format(
                 label, so["simTimeNs"], su_ns
@@ -155,7 +173,9 @@ if __name__ == "__main__":
     try:
         assert_lossless(su, "su-baseline")
         su_ns = su["simTimeNs"]
-        print("PASS  su-baseline  256MiB 8gpu  simTimeNs={}  (lossless)".format(su_ns))
+        assert su_ns == PARITY_NS["su-baseline"], (
+            "su-baseline parity drift: {} != {}".format(su_ns, PARITY_NS["su-baseline"]))
+        print("PASS  su-baseline  256MiB 8gpu  simTimeNs={}  (lossless, parity)".format(su_ns))
     except AssertionError as e:
         ok = False
         su_ns = None
@@ -165,6 +185,9 @@ if __name__ == "__main__":
         try:
             so, _ = run_so_hierarchical(num_nodes, data_size)
             assert_lossless(so, label)
+            assert so["simTimeNs"] == PARITY_NS[num_nodes], (
+                "{} parity drift: {} != {}".format(
+                    label, so["simTimeNs"], PARITY_NS[num_nodes]))
             if su_ns is not None:
                 assert so["simTimeNs"] > su_ns, (
                     "{}: simTimeNs={} not > Su baseline {}".format(

@@ -4119,6 +4119,15 @@ class EthernetSwitchDropTest : public TestCase
         ctrl->AddHeader(cfh);
         NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(ctrl, 0, 1, 10), true,
                               "CREDIT control packet must bypass the lossy drop");
+
+        // (5) VoqDropThreshold=0 = lossless (disabled): an Ethernet DATA packet
+        // at a deep queue is admitted (return true). Guards the documented
+        // "0=off" semantics -- without the early-return guard, voqDepth >= 0
+        // would tail-drop every packet (a total-stall foot-gun).
+        sw->SetAttribute("VoqDropThreshold", UintegerValue(0));
+        Ptr<Packet> disabled = makeEthData();
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(disabled, 0, 1, 10), true,
+                              "VoqDropThreshold=0 (lossless) must admit Ethernet DATA");
     }
 };
 

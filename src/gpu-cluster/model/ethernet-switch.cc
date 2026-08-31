@@ -76,6 +76,14 @@ EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
     if (!fh.IsControlPacket() && !fh.IsRetryPacket()
         && fh.GetFabricType() == FabricType::ETHERNET)
     {
+        // 0 = lossless (disable the lossy drop): the documented "0=off".
+        // Without this guard `voqDepth >= 0` is always true and every
+        // Ethernet DATA packet would be tail-dropped -- a total-stall
+        // foot-gun (the opposite of the documented "off").
+        if (m_voqDropThreshold == 0)
+        {
+            return true;
+        }
         if (voqDepth >= m_voqDropThreshold)
         {
             EmitNackBack(fh, inPort, fh.GetSourceMac());

@@ -206,9 +206,9 @@ Both ride the same 400GbE L2 wire; the difference is the congestion contract:
   can retransmit) **and** the So switch (so `EmitNackBack` does not early-return
   on `!m_llrEnabled`). Without switch-side LLR the drop is silent and the
   transfer stalls to the 3600s `Simulator::Stop` ceiling.
-- `--ber=0 --packetLossRate=0` in the Ethernet `.cfg` so the **only** loss
-  source is VOQ tail-drop (deterministic), isolating the lossy-retransmit path
-  from the BER model.
+- `--ber=0 --packetLossRate=0` on the ns-3 command line (see the run examples
+  in the `.cfg` headers) so the **only** loss source is VOQ tail-drop
+  (deterministic), isolating the lossy-retransmit path from the BER model.
 
 ### Surrogate (`make_h200_ethernet_theory`)
 

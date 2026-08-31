@@ -1628,7 +1628,9 @@ def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
     (``so_fullmesh`` non-blocking lower bound by default; ``so_spineleaf`` /
     ``so_fattree`` for oversubscribed fabrics whose bisection caps the So
     schedule rate). The So term is an uncalibrated lower bound anchored to
-    ns-3.
+    ns-3. Pass ``so_factory=make_h200_ethernet_theory`` to swap the So stage
+    to a plain (non-RoCE) lossy Ethernet fabric (same wire, store-and-forward
+    switch latency); the default remains RoCEv2.
 
     Parameters
     ----------

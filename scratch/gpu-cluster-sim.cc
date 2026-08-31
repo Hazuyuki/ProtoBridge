@@ -458,7 +458,7 @@ main(int argc, char* argv[])
     cmd.AddValue("interNodeFabricType", "Inter-node fabric type: RoCE/ETH/NVLink", interNodeFabricTypeStr);
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
     cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
-    cmd.AddValue("voqDropThreshold", "Plain-Ethernet lossy VOQ tail-drop threshold (pkts); 0=off. Must be < VoqDepth (ETHERNET raises it to 1024)", voqDropThreshold);
+    cmd.AddValue("voqDropThreshold", "Plain-Ethernet lossy VOQ tail-drop threshold (pkts); 0=off. Must be < switchVoqDepth (default 10000)", voqDropThreshold);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
@@ -888,13 +888,40 @@ main(int argc, char* argv[])
             // VoqDropThreshold < VoqDepth is the lossy-NACK invariant: the
             // tail-drop + EmitNackBack path (EthernetSwitch::OnPacketEnqueue)
             // must fire before the base hard-cap drop (NvSwitch at m_voqDepth),
-            // else the loss is silent. VoqDepth=1024 gives ample headroom above
-            // the default VoqDropThreshold=8 so the NACK path is operative.
+            // else the loss is silent. The operative So VoqDepth is
+            // `switchVoqDepth` (default 10000): the helper calls
+            // SetVoqDepth(switchVoqDepth) on every So switch after construction,
+            // which supersedes the Config::SetDefault below (a construction-
+            // time fallback only). Enforce the invariant so a user passing
+            // --switchVoqDepth=4 --voqDropThreshold=8 cannot silently stall.
+            NS_ABORT_MSG_IF(
+                voqDropThreshold != 0 && voqDropThreshold >= switchVoqDepth,
+                "voqDropThreshold (" << voqDropThreshold
+                << ") must be < switchVoqDepth (" << switchVoqDepth
+                << ") or 0=off, else the base hard-cap drop fires before the "
+                << "NACK path and the lossy transfer silently stalls.");
             multiTopo.SetInterNodeSwitchType("ns3::EthernetSwitch");
             Config::SetDefault("ns3::NvSwitch::VoqDepth",
                                UintegerValue(1024));
             Config::SetDefault("ns3::EthernetSwitch::VoqDropThreshold",
                                UintegerValue(voqDropThreshold));
+            // The lossy-NACK path lives in EthernetSwitch::OnPacketEnqueue, so
+            // it only engages when the inter-node topology instantiates a
+            // switch (host / tor). fullmesh / ring build direct P2P links with
+            // a DropTailQueue and NO switch -- a drop there is silent (no NACK,
+            // no retransmit), so the lossy feature is inert under incast. Warn
+            // (not abort): a non-incast P2P run on fullmesh/ring is still valid,
+            // only the lossy-retransmit behaviour is unavailable.
+            if (interNodeTopology == "fullmesh" || interNodeTopology == "ring")
+            {
+                std::cerr << "Warning: --interNodeFabricType=ETH with "
+                             "--interNodeTopology=" << interNodeTopology
+                          << " has no switch in the inter-node path, so the "
+                             "lossy VOQ tail-drop + NACK retransmit path is "
+                             "INERT (a P2P DropTailQueue overflow would drop "
+                             "silently). Use --interNodeTopology=host or tor "
+                             "to exercise the lossy fabric.\n";
+            }
             // The So switch's m_llrEnabled must be true or EmitNackBack
             // (nvswitch.cc) returns early -- the lossy drop stays silent and
             // the transfer stalls. The endpoint-side LLR force above arms the

@@ -53,6 +53,22 @@ Doc: `doc/CALIBRATION.md` §"Plain Ethernet" + `USER_GUIDE.md` recipe N +
 differs from RoCE in switch *latency*, not wire *bandwidth*, so an eta would be a
 redundant alias; the preset captures the store-and-forward latency.)
 
+**Independent code review (3 read-only subagents, adversarial) — verdict
+SHIP-WITH-FIXES, no blockers; RoCE parity gate re-confirmed byte-identical.**
+Fixes applied: (1) `--voqDropThreshold=0` now genuinely means lossless/off
+(early-return-true guard; the prior `voqDepth >= 0` would tail-drop every
+packet — a total-stall foot-gun the doc called "off"); (2) the lossy-NACK
+invariant `voqDropThreshold < switchVoqDepth` is now enforced
+(`NS_ABORT_MSG_IF`) — the comment no longer claims the dead
+`Config::SetDefault(VoqDepth,1024)` governs (the helper's
+`SetVoqDepth(switchVoqDepth=10000)` supersedes it); (3) a stderr warning when
+`ETH` is combined with `fullmesh`/`ring` (no switch in the inter-node path →
+the lossy path is inert); (4) the RoCE parity numbers
+(4769616/15307388/13421212) are now **pinned by `test_so_hierarchical_regression.py`**
+(were a doc claim only); (5) new `test/parity/test_ethernet_lossy_recovery.py`
+automates the incast NACK→retransmit→complete loop AND the
+`--llrRetryLimit` permanent-loss fallback (were manual smoke only).
+
 ### New — full-mesh surrogate algorithm (ns-3-calibrated, the 4th shape)
 
 The latency surrogate gains a 4th algorithm shape — `fullmesh` — calibrated
