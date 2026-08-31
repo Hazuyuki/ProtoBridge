@@ -6,6 +6,24 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — config-primary selection of the scale-out (So) fabric
+
+The config-primary path (`.cfg`/`.profile`) previously sourced only the
+scale-**up** (Su, intra-node) fabric axes; the scale-**out** fabric type (RoCE
+vs ETH) was CLI-only (`--interNodeFabricType`). The profile→CLI sourcing block
+now also sources the four inter-node axes — `interNodeFabricType`,
+`interNodeTopology`, `interNodeBandwidthGbps`, `interNodeLatencyNs` — from the
+`.cfg`'s `[stack]` section (or the `.profile`), so **one config adapts across
+protocols**: `interNodeFabricType = ETH` selects the lossy Ethernet So fabric,
+`RoCE` the lossless variant, with no `--interNode*` CLI flag. Keys absent fall
+back to the CLI default (backward-compatible — existing profiles unaffected).
+`numNodes`/`gpusPerNode`/`dataSize` stay on the CLI (scale axes, like `numGpus`).
+Demo `configs/protocol_configs/eth-hierarchical.cfg` (a hierarchical allreduce
+over ETH, fully config-driven); bit-identical to the inline CLI path — gated by
+the new `test/parity/test_config_vs_inline_eth.py` (2-/4-node, 256 MiB,
+`simTimeNs` exactly equal). Closes the config-primary So gap noted in
+`test_so_hierarchical_regression.py`.
+
 ### New — plain (non-RoCE) lossy Ethernet scale-out fabric (ns-3 + surrogate)
 
 The scale-out (So) fabric was RoCEv2-only (lossless RDMA + DCQCN/PFC/ECN). It

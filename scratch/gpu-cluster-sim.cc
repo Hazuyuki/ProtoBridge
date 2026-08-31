@@ -539,6 +539,17 @@ main(int argc, char* argv[])
         applyU32(sprayChunkSize, "sprayChunkSize");
         applyU32(switchVoqDepth, "switchVoqDepth");
         applyU64(switchArbIntervalNs, "switchArbIntervalNs");
+        // Inter-node (So) fabric. Lets a `.cfg`/`.profile` select the So
+        // fabric -- RoCE vs ETH -- plus its topology/hardware, so ONE config
+        // adapts across protocols without --interNode* CLI flags (the same
+        // config-primary philosophy as the intra-node axes above). Keys absent
+        // fall back to the CLI default (backward-compatible: existing profiles
+        // without these keys behave exactly as before). numNodes/gpusPerNode
+        // stay on the CLI (scale axes, like numGpus/dataSize).
+        applyS(interNodeFabricTypeStr, "interNodeFabricType");
+        applyS(interNodeTopology, "interNodeTopology");
+        applyU64(interNodeBandwidthGbps, "interNodeBandwidthGbps");
+        applyU64(interNodeLatencyNs, "interNodeLatencyNs");
         // Protocol model + startup + thresholds.
         applyS(protocolModelType, "protocolModel");
         applyU32(forceProtocol, "forceProtocol");

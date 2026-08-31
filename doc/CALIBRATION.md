@@ -209,6 +209,17 @@ Both ride the same 400GbE L2 wire; the difference is the congestion contract:
 - `--ber=0 --packetLossRate=0` on the ns-3 command line (see the run examples
   in the `.cfg` headers) so the **only** loss source is VOQ tail-drop
   (deterministic), isolating the lossy-retransmit path from the BER model.
+- **Config-primary So fabric selection.** The inter-node fabric axes —
+  `interNodeFabricType`, `interNodeTopology`, `interNodeBandwidthGbps`,
+  `interNodeLatencyNs` — are sourced from the `.cfg`'s `[stack]` section (or the
+  `.profile`) into the same CLI variables the inline path consumes, so ONE config
+  adapts across protocols: `interNodeFabricType = ETH` selects the lossy Ethernet
+  So fabric, `RoCE` the lossless variant, with no `--interNode*` CLI flag. Keys
+  absent fall back to the CLI default (backward-compatible). `numNodes`/
+  `gpusPerNode`/`dataSize` stay on the CLI (scale axes). Demo:
+  `configs/protocol_configs/eth-hierarchical.cfg` (a hierarchical allreduce over
+  ETH, fully config-driven); bit-identical to the inline CLI path — gated by
+  `test/parity/test_config_vs_inline_eth.py`.
 
 ### Surrogate (`make_h200_ethernet_theory`)
 
