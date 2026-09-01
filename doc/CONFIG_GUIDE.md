@@ -88,6 +88,16 @@ vcCredits          = 64
 flowControl        = credit
 ```
 
+**Credit is a scale-up (Su) mechanism only.** `vcCredits`/`flowControl` gate
+the intra-node (NVLink) fabric; scale-out (So) traffic bypasses credit on both
+send (`SendBulkWireTransferSize`'s `IsLocalRank(destRank)` guard) and the
+credit-return path (`OnPacketDelivered`). So flow control is the lossless/lossy
+fabric mechanism instead: ECN + DCQCN + per-QP ceiling
+(`--ecnThreshold`/`--dcqcn`/`--perQpCeilingGbps`) for RoCE, VOQ tail-drop +
+LLR retransmit (`--voqDropThreshold`/`--llrMode`/`--llrRetryLimit`) for plain
+Ethernet — matching real hardware (RDMA uses ECN/PFC, not per-packet credits;
+NVLink is credit-based). Tuning `vcCredits` therefore only affects Su latency.
+
 **Fabric hardware + protocol startup + FEC + BER** (sourced into the local CLI
 variables — these are what make a `.cfg` reproduce a calibrated run without
 per-run flags):

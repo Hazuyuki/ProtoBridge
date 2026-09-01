@@ -2042,10 +2042,17 @@ FabricEndpoint::OnPacketDelivered(Ptr<Packet> packet, uint32_t seqNum, FabricHea
 
     FabricPacketType packetType = header.GetPacketType();
     SendLlrAckPacket(header, false);
+    // Return credits only for intra-node (Su) traffic. Scale-out (So) packets
+    // bypassed credit on send (SendBulkWireTransferSize's IsLocalRank guard),
+    // so there is no credit owed back. Returning one for an So packet would
+    // corrupt the Su credit bookkeeping it never consumed from. The
+    // IsLocalRank(sourceRank) predicate is the mirror of the send-side guard;
+    // single-node (m_localRankCount==1) keeps all sources local -> unchanged.
     if ((packetType == FabricPacketType::DATA
          || packetType == FabricPacketType::P2P
          || header.IsCollectivePacket())
-        && header.GetSourceRank() != 0xFFFF)
+        && header.GetSourceRank() != 0xFFFF
+        && IsLocalRank(header.GetSourceRank()))
     {
         SendCreditPacket(header.GetSourceRank(),
                          header.GetVirtualChannel(),
@@ -2214,8 +2221,15 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             header.SetEffectiveDataSize(fragmentDataSize);
             header.SetTtl(64);
 
-            // Credit-based flow control: check and consume credits before sending
-            if (m_creditManager && !m_creditManager->HasCredits(vcId))
+            // Credit-based flow control: check and consume credits before sending.
+            // Scale-out (So) traffic bypasses credit: inter-node fabric uses
+            // ECN/DCQCN (RoCE) or VOQ tail-drop + LLR retransmit (Ethernet) for
+            // flow control, not per-packet credits. The Su/So split mirrors
+            // GetProtocolModelForDest's IsLocalRank() predicate. So packets
+            // never queue on credit (they'd deadlock since no credit is ever
+            // returned for So -- see OnPacketDelivered). Su (local rank)
+            // keeps full credit gating, unchanged.
+            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
             {
                 NS_LOG_DEBUG("No credits for BULK chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -2279,7 +2293,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                 TrySendQueuedPackets();
                 break;
             }
-            if (m_creditManager)
+            if (m_creditManager && IsLocalRank(destRank))
             {
                 m_creditManager->ConsumeCredit(vcId, seqNum);
             }
@@ -2333,8 +2347,10 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         header.SetEffectiveDataSize(static_cast<uint32_t>(dataSize));
         header.SetTtl(64);
 
-        // Credit-based flow control: check and consume credits before sending
-        if (m_creditManager && !m_creditManager->HasCredits(vcId))
+        // Credit-based flow control: check and consume credits before sending.
+        // So (inter-node) traffic bypasses credit (see multi-chunk branch
+        // above for the rationale); Su (local rank) keeps full gating.
+        if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
         {
             NS_LOG_DEBUG("No credits for BULK single packet on VC " << static_cast<int>(vcId));
             SendQueueEntry entry;
@@ -2346,7 +2362,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             TrySendQueuedPackets();
             return;
         }
-        if (m_creditManager)
+        if (m_creditManager && IsLocalRank(destRank))
         {
             m_creditManager->ConsumeCredit(vcId, seqNum);
         }

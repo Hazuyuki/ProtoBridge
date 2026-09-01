@@ -6,6 +6,21 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Changed — scale-out (So) traffic bypasses credit flow control
+
+`SendBulkWireTransferSize` and `OnPacketDelivered` now gate credit on
+`IsLocalRank(destRank)`: scale-out (inter-node, So) packets neither consume nor
+return per-packet credits. Previously So endpoints carried a credit structure
+that never fired (the default `--vcCredits` depth ≫ any bulk chunk, so
+`HasCredits` was always true) — a vestigial shell. So flow control is, and now
+honestly is, the lossless/lossy fabric mechanism instead: ECN/DCQCN/per-QP
+ceiling (RoCE) and VOQ tail-drop + LLR retransmit (Ethernet). Scale-up (Su,
+NVLink) keeps full credit gating — unchanged. Single-node (`m_localRankCount
+==1`) keeps all ranks local → unchanged. Su baseline (4769616 ns) and So RoCE
+hierarchical parity (15307388 / 13421212 ns) re-verified byte-identical; the
+bypass is behavior-equivalent at the old credit depth. `--vcCredits` now
+documented as Su-only.
+
 ### New — config-primary selection of the scale-out (So) fabric
 
 The config-primary path (`.cfg`/`.profile`) previously sourced only the
