@@ -17,8 +17,12 @@ time-offset background P2P flow sharing the same fabric**, for both scale-up
    single-node (Su) path (`topoHelper.SetContentionModel`); multi-node (So)
    endpoints never received one. The multi-node endpoint loop in
    `scratch/gpu-cluster-sim.cc` now creates an **independent** `ContentionModel`
-   per endpoint (mirroring the single-node helper's clone — independent backlog,
-   not a shared instance that would aggregate backlog across endpoints). WFQ
+   per endpoint — an **independent** instance per endpoint, which differs from
+   (and is more correct than) the single-node `GpuClusterTopologyHelper`: that
+   helper's `AttachContentionModelToEndpoints` creates one clone and shares it
+   across all endpoints, so its backlog aggregates cross-endpoint. The
+   per-endpoint split here keeps each WFQ backlog local (a shared instance
+   would let one endpoint's backlog inflate another's `numActive`). WFQ
    penalty fires only at `numActive>1`, so pure-collective So traffic stays
    single-class and **byte-identical** (su 4769616 / 2n 15307388 / 4n 13421212 ns
    re-verified); the model engages only when a second class is concurrently

@@ -1033,13 +1033,17 @@ main(int argc, char* argv[])
             if (asyncMemLatencyNs > 0) { ep->SetAsyncMemLatencyNs(asyncMemLatencyNs); }
             ep->SetLlrEnabled(llrEnabled);
 
-            // Per-endpoint ContentionModel (independent backlog, mirrors the
-            // single-node helper's AttachContentionModelToEndpoints clone at
-            // gpu-cluster-helper.cc:2624). The WFQ penalty only fires at
-            // numActive>1 (fabric-endpoint.cc:1936), so pure-collective So
-            // traffic stays byte-identical (single COLLECTIVE class); the
-            // model only engages when a second class (e.g. a background P2P
-            // flow) is concurrently active on the same endpoint.
+            // Per-endpoint ContentionModel: each endpoint gets an INDEPENDENT
+            // instance. This DIFFERS from the single-node GpuClusterTopologyHelper,
+            // whose AttachContentionModelToEndpoints creates one clone and shares
+            // it across all endpoints (so backlog aggregates cross-endpoint). The
+            // per-endpoint split here keeps each WFQ backlog local — the correct
+            // model: a shared instance would let one endpoint's backlog inflate
+            // another's numActive and corrupt the WFQ decision. The WFQ penalty
+            // only fires at numActive>1 (SendPacketOnDevice), so pure-collective
+            // So traffic stays byte-identical (single COLLECTIVE class); the model
+            // only engages when a second class (e.g. a background P2P flow) is
+            // concurrently active on the same endpoint.
             Ptr<ContentionModel> cm = CreateObject<ContentionModel>();
             cm->SetCollectiveWeight(contentionCollectiveWeight);
             cm->SetMemoryWeight(contentionMemoryWeight);
@@ -2037,14 +2041,16 @@ main(int argc, char* argv[])
         bgP2p->SetEndpoint(endpoints[bgP2pSrc]);
         bgP2p->SetDestRank(static_cast<uint16_t>(bgP2pDst));
         bgP2p->SetPacketSize(bgP2pSizeBytes);
-        // back-to-back (interval=0) means one packet serialization time at the
-        // intra-node bandwidth, NOT a literal 0 ns: P2pTraffic::ScheduleNext
-        // schedules the next burst at Simulator::Now()+interval, so a 0 interval
-        // would loop forever at a fixed sim-time and starve every later event
-        // (including the collective completion). ns = bytes*8 / Gbps.
         uint64_t intervalNs = bgP2pIntervalNs;
-        if (intervalNs == 0 && bandwidthGbps > 0)
+        if (intervalNs == 0)
         {
+            // back-to-back = one packet serialization time at the intra-node
+            // bandwidth, NOT a literal 0 ns: P2pTraffic::ScheduleNext schedules
+            // the next burst at Now()+interval, so a 0 interval would loop
+            // forever at a fixed sim-time and starve every later event (incl.
+            // the collective completion). ns = bytes*8 / Gbps.
+            NS_ABORT_MSG_IF(bandwidthGbps == 0,
+                            "bgP2pIntervalNs=0 needs bandwidthGbps>0 to derive a serialization interval");
             intervalNs = bgP2pSizeBytes * 8ULL / bandwidthGbps;
         }
         bgP2p->SetInterval(NanoSeconds(intervalNs));
