@@ -106,6 +106,16 @@ The WFQ penalty fires **only when more than one class is concurrently active**
 on the same endpoint's injection side; single-class traffic (a pure collective)
 is byte-identical to the unmounted baseline. As of this release multi-node
 (scale-out) endpoints are wired too — previously only single-node (Su) was.
+
+**Modeling-layer difference (design, not a bug).** The two regimes model
+contention at *different* layers, so their magnitudes are not expected to
+match: single-node (Su) shares ONE `ContentionModel` clone across all the
+node's endpoints — backlog aggregates cross-endpoint, modeling the **shared
+NVSwitch egress**; multi-node (So) mounts an **independent** per-endpoint
+instance, modeling **each NIC's injection side** (cross-node port contention
+is additionally covered by the So switch VOQ arbiter). The single-node
+interference impact is therefore larger (shared-NVSwitch injection-side
+contention is more direct than cross-node NIC).
 To exercise contention, inject a time-offset background P2P flow with
 `--bgP2pEnabled=1 --bgP2pSrc=R --bgP2pDst=R' --bgP2pSizeBytes=B
 --bgP2pStartTimeNs=T`; it is an unlimited self-driven `P2pTraffic` that shares

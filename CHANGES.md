@@ -17,11 +17,12 @@ time-offset background P2P flow sharing the same fabric**, for both scale-up
    single-node (Su) path (`topoHelper.SetContentionModel`); multi-node (So)
    endpoints never received one. The multi-node endpoint loop in
    `scratch/gpu-cluster-sim.cc` now creates an **independent** `ContentionModel`
-   per endpoint — an **independent** instance per endpoint, which differs from
-   (and is more correct than) the single-node `GpuClusterTopologyHelper`: that
-   helper's `AttachContentionModelToEndpoints` creates one clone and shares it
-   across all endpoints, so its backlog aggregates cross-endpoint. The
-   per-endpoint split here keeps each WFQ backlog local (a shared instance
+   per endpoint, modeling each NIC's injection side — this DIFFERS from (not
+   corrects) the single-node `GpuClusterTopologyHelper`: that helper's
+   `AttachContentionModelToEndpoints` creates one clone and shares it across all
+   endpoints to model the shared NVSwitch egress, so its backlog aggregates
+   cross-endpoint (different layers, not a correctness difference). The
+   per-endpoint split here keeps each endpoint's WFQ backlog local (a shared instance
    would let one endpoint's backlog inflate another's `numActive`). WFQ
    penalty fires only at `numActive>1`, so pure-collective So traffic stays
    single-class and **byte-identical** (su 4769616 / 2n 15307388 / 4n 13421212 ns
@@ -41,7 +42,13 @@ Smoke (2-node RoCE host, 16 MiB hierarchical allreduce): baseline 1248928 ns vs
 over 129 packets, `status=complete`. Single-node Su smoke: 319658 → 450982 ns
 (+41%). `--bgP2p*`: `bgP2pEnabled`/`bgP2pSrc`/`bgP2pDst`/`bgP2pSizeBytes`/
 `bgP2pIntervalNs`/`bgP2pStartTimeNs`; result block reports
-`bgP2pBytesSent`/`bgP2pPacketsSent`.
+`bgP2pBytesSent`/`bgP2pPacketsSent`. Gated by
+`test/parity/test_contention_interference.py` (baseline vs +bgP2p, asserts
+interference `simTimeNs > baseline` + `bgP2pBytesSent > 0` + `complete`, for
+both single-node Su and multi-node So). Design note: single-node shares one
+`ContentionModel` clone across endpoints (models the shared NVSwitch egress);
+multi-node mounts an independent per-endpoint instance (models each NIC
+injection side) — different layers, magnitudes not expected to match.
 
 ### Changed — scale-out (So) traffic bypasses credit flow control
 
