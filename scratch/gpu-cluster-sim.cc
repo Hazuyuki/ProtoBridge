@@ -49,6 +49,7 @@
 #include "ns3/fec-model.h"
 #include "ns3/llr-manager.h"
 #include "ns3/contention-model.h"
+#include "ns3/p2p-traffic.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/point-to-point-net-device.h"
 #include "ns3/point-to-point-channel.h"
@@ -450,6 +451,24 @@ main(int argc, char* argv[])
     cmd.AddValue("contentionCollectiveWeight", "WFQ weight for collective traffic", contentionCollectiveWeight);
     cmd.AddValue("contentionMemoryWeight", "WFQ weight for memory traffic", contentionMemoryWeight);
     cmd.AddValue("contentionP2pWeight", "WFQ weight for P2P traffic", contentionP2pWeight);
+
+    // Background P2P interferer: a self-driven P2pTraffic flow scheduled at
+    // bgP2pStartTimeNs that shares the fabric with the primary collective,
+    // exercising the WFQ contention model (multi-class numActive>1) and the
+    // So switch VOQ arbitration. Default off (parity-identical). The flow is
+    // unlimited (maxPackets=0); the sim stops when the collective completes.
+    bool bgP2pEnabled = false;
+    uint32_t bgP2pSrc = 0;
+    uint32_t bgP2pDst = 1;
+    uint64_t bgP2pSizeBytes = 1048576;   // 1 MiB
+    uint64_t bgP2pIntervalNs = 0;        // 0 = back-to-back
+    uint64_t bgP2pStartTimeNs = 0;       // absolute sim time (ns)
+    cmd.AddValue("bgP2pEnabled", "Inject a background P2P flow as a contention interferer", bgP2pEnabled);
+    cmd.AddValue("bgP2pSrc", "Background P2P source rank", bgP2pSrc);
+    cmd.AddValue("bgP2pDst", "Background P2P destination rank", bgP2pDst);
+    cmd.AddValue("bgP2pSizeBytes", "Background P2P packet size (bytes)", bgP2pSizeBytes);
+    cmd.AddValue("bgP2pIntervalNs", "Background P2P send interval (0=back-to-back)", bgP2pIntervalNs);
+    cmd.AddValue("bgP2pStartTimeNs", "Background P2P start time (ns from sim start)", bgP2pStartTimeNs);
     cmd.AddValue("numNodes", "Number of GPU nodes (1=single-node, 2+=multi-node)", numNodes);
     cmd.AddValue("gpusPerNode", "GPUs per node (multi-node mode)", gpusPerNode);
     cmd.AddValue("interNodeTopology", "Inter-node topology: fullmesh/ring/host/tor (tor = single shared leaf, 1 hop, ib_write_lat style)", interNodeTopology);
@@ -1013,6 +1032,20 @@ main(int argc, char* argv[])
             if (syncMemLatencyNs > 0) { ep->SetSyncMemLatencyNs(syncMemLatencyNs); }
             if (asyncMemLatencyNs > 0) { ep->SetAsyncMemLatencyNs(asyncMemLatencyNs); }
             ep->SetLlrEnabled(llrEnabled);
+
+            // Per-endpoint ContentionModel (independent backlog, mirrors the
+            // single-node helper's AttachContentionModelToEndpoints clone at
+            // gpu-cluster-helper.cc:2624). The WFQ penalty only fires at
+            // numActive>1 (fabric-endpoint.cc:1936), so pure-collective So
+            // traffic stays byte-identical (single COLLECTIVE class); the
+            // model only engages when a second class (e.g. a background P2P
+            // flow) is concurrently active on the same endpoint.
+            Ptr<ContentionModel> cm = CreateObject<ContentionModel>();
+            cm->SetCollectiveWeight(contentionCollectiveWeight);
+            cm->SetMemoryWeight(contentionMemoryWeight);
+            cm->SetP2pWeight(contentionP2pWeight);
+            cm->SetBandwidth(bandwidthGbps * 1000000000ULL / 8);  // Gbps -> bytes/sec
+            ep->SetContentionModel(cm);
 
             endpoints.push_back(ep);
         }
@@ -1987,6 +2020,38 @@ main(int argc, char* argv[])
         injector = rd;
     }
 
+    // Background P2P interferer: a self-driven P2pTraffic flow that shares the
+    // fabric with the primary collective. Scheduled at bgP2pStartTimeNs so it
+    // can overlap (or precede) the collective, exercising multi-class WFQ
+    // contention at the endpoint injection side and So switch VOQ arbitration.
+    // Unlimited (maxPackets=0): the sim stops via OnCollectiveComplete when the
+    // collective finishes, terminating the background flow alongside it.
+    // Declared in main scope so it outlives Simulator::Run() for the report below.
+    Ptr<P2pTraffic> bgP2p;
+    if (bgP2pEnabled
+        && bgP2pSrc < endpoints.size() && bgP2pDst < endpoints.size()
+        && bgP2pSrc != bgP2pDst
+        && endpoints[bgP2pSrc] && endpoints[bgP2pDst])
+    {
+        bgP2p = CreateObject<P2pTraffic>();
+        bgP2p->SetEndpoint(endpoints[bgP2pSrc]);
+        bgP2p->SetDestRank(static_cast<uint16_t>(bgP2pDst));
+        bgP2p->SetPacketSize(bgP2pSizeBytes);
+        // back-to-back (interval=0) means one packet serialization time at the
+        // intra-node bandwidth, NOT a literal 0 ns: P2pTraffic::ScheduleNext
+        // schedules the next burst at Simulator::Now()+interval, so a 0 interval
+        // would loop forever at a fixed sim-time and starve every later event
+        // (including the collective completion). ns = bytes*8 / Gbps.
+        uint64_t intervalNs = bgP2pIntervalNs;
+        if (intervalNs == 0 && bandwidthGbps > 0)
+        {
+            intervalNs = bgP2pSizeBytes * 8ULL / bandwidthGbps;
+        }
+        bgP2p->SetInterval(NanoSeconds(intervalNs));
+        bgP2p->SetMaxPackets(0);  // 0 = unlimited background flow
+        Simulator::Schedule(NanoSeconds(bgP2pStartTimeNs), &P2pTraffic::Start, bgP2p);
+    }
+
 
     Simulator::Stop(Seconds(3600));
     Simulator::Run();
@@ -2196,6 +2261,12 @@ main(int argc, char* argv[])
     std::cout << "fecNoError=" << (fecModel ? fecModel->GetNoErrorCount() : 0) << std::endl;
     std::cout << "fecCorrectable=" << (fecModel ? fecModel->GetCorrectableCount() : 0) << std::endl;
     std::cout << "fecUncorrectable=" << (fecModel ? fecModel->GetUncorrectableCount() : 0) << std::endl;
+    std::cout << "bgP2pEnabled=" << (bgP2pEnabled ? "true" : "false") << std::endl;
+    if (bgP2p)
+    {
+        std::cout << "bgP2pBytesSent=" << bgP2p->GetBytesSent() << std::endl;
+        std::cout << "bgP2pPacketsSent=" << bgP2p->GetPacketsSent() << std::endl;
+    }
     std::cout << "RESULT_END" << std::endl;
 
     Simulator::Destroy();

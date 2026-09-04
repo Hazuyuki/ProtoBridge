@@ -98,6 +98,25 @@ LLR retransmit (`--voqDropThreshold`/`--llrMode`/`--llrRetryLimit`) for plain
 Ethernet — matching real hardware (RDMA uses ECN/PFC, not per-packet credits;
 NVLink is credit-based). Tuning `vcCredits` therefore only affects Su latency.
 
+**WFQ contention model (`--contention*Weight`, `--bgP2p*`).** Each endpoint
+carries a `ContentionModel` that does weighted-fair-queuing over three traffic
+classes — COLLECTIVE / MEMORY / P2P (`--contentionCollectiveWeight` /
+`--contentionMemoryWeight` / `--contentionP2pWeight`, defaults 0.7/0.2/0.1).
+The WFQ penalty fires **only when more than one class is concurrently active**
+on the same endpoint's injection side; single-class traffic (a pure collective)
+is byte-identical to the unmounted baseline. As of this release multi-node
+(scale-out) endpoints are wired too — previously only single-node (Su) was.
+To exercise contention, inject a time-offset background P2P flow with
+`--bgP2pEnabled=1 --bgP2pSrc=R --bgP2pDst=R' --bgP2pSizeBytes=B
+--bgP2pStartTimeNs=T`; it is an unlimited self-driven `P2pTraffic` that shares
+the fabric with the primary collective until the collective completes (which
+stops the sim). `--bgP2pIntervalNs=0` means back-to-back = one packet
+serialization time at the intra-node bandwidth (a literal 0 ns would loop at a
+fixed sim-time and stall the sim). The result block reports
+`bgP2pBytesSent`/`bgP2pPacketsSent`. Example (2-node RoCE, 16 MiB hierarchical
+allreduce): 1248928 ns baseline → 1353663 ns (+8.4%) with a rank 0→4
+cross-node background flow.
+
 **Fabric hardware + protocol startup + FEC + BER** (sourced into the local CLI
 variables — these are what make a `.cfg` reproduce a calibrated run without
 per-run flags):
