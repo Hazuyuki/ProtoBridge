@@ -17,38 +17,53 @@ time-offset background P2P flow sharing the same fabric**, for both scale-up
    single-node (Su) path (`topoHelper.SetContentionModel`); multi-node (So)
    endpoints never received one. The multi-node endpoint loop in
    `scratch/gpu-cluster-sim.cc` now creates an **independent** `ContentionModel`
-   per endpoint, modeling each NIC's injection side — this DIFFERS from (not
-   corrects) the single-node `GpuClusterTopologyHelper`: that helper's
-   `AttachContentionModelToEndpoints` creates one clone and shares it across all
-   endpoints to model the shared NVSwitch egress, so its backlog aggregates
-   cross-endpoint (different layers, not a correctness difference). The
-   per-endpoint split here keeps each endpoint's WFQ backlog local (a shared instance
-   would let one endpoint's backlog inflate another's `numActive`). WFQ
-   penalty fires only at `numActive>1`, so pure-collective So traffic stays
-   single-class and **byte-identical** (su 4769616 / 2n 15307388 / 4n 13421212 ns
-   re-verified); the model engages only when a second class is concurrently
-   active on the same endpoint.
+   per endpoint (backlog local to that endpoint's injection side; bandwidth is
+   the intra-node NVLink rate `bandwidthGbps`, also for So-bound packets) —
+   this DIFFERS from the single-node `GpuClusterTopologyHelper`, whose
+   `AttachContentionModelToEndpoints` creates ONE clone and shares it across all
+   endpoints so the backlog aggregates node-wide (two layers, not a correctness
+   difference; the helper's header comment previously said "cloned for each
+   endpoint" and now states the sharing). WFQ penalty fires only at
+   `numActive>1`, so pure-collective So traffic stays single-class and
+   **byte-identical** (su 4769616 / 2n 15307388 / 4n 13421212 ns re-verified);
+   the model engages only when a second class is concurrently active on the
+   same endpoint.
 2. **Background P2P injection entry.** New `--bgP2p*` CLI injects a self-driven
    `P2pTraffic` flow scheduled at `--bgP2pStartTimeNs` that shares the fabric
    with the primary collective — exercising endpoint WFQ (multi-class) and So
    switch VOQ arbitration. Unlimited (`maxPackets=0`); the sim stops via
    `OnCollectiveComplete` when the collective finishes. `--bgP2pIntervalNs=0`
    (back-to-back) means one packet serialization time at the intra-node
-   bandwidth, NOT a literal 0 ns (a 0 interval would loop at a fixed sim-time
-   and starve later events). Default off (parity-identical).
+   bandwidth (clamped to ≥1 ns — integer division floors <100 B at 800G to 0,
+   which would loop at a fixed sim-time and starve later events); a cross-node
+   flow is thereby over-driven by the intra/inter rate ratio (2× at 800G/400G)
+   and queues at the NIC — pass `--bgP2pIntervalNs` explicitly to pace at the
+   inter-node rate. `bgP2pBytesSent`/`bgP2pPacketsSent` count injection
+   (`SendP2p` calls), not delivery. Default off (parity-identical).
 
-Smoke (2-node RoCE host, 16 MiB hierarchical allreduce): baseline 1248928 ns vs
-+background P2P (rank 0→4 cross-node) 1353663 ns (+8.4%), `bgP2pBytesSent` 135 MB
-over 129 packets, `status=complete`. Single-node Su smoke: 319658 → 450982 ns
-(+41%). `--bgP2p*`: `bgP2pEnabled`/`bgP2pSrc`/`bgP2pDst`/`bgP2pSizeBytes`/
-`bgP2pIntervalNs`/`bgP2pStartTimeNs`; result block reports
-`bgP2pBytesSent`/`bgP2pPacketsSent`. Gated by
-`test/parity/test_contention_interference.py` (baseline vs +bgP2p, asserts
-interference `simTimeNs > baseline` + `bgP2pBytesSent > 0` + `complete`, for
-both single-node Su and multi-node So). Design note: single-node shares one
-`ContentionModel` clone across endpoints (models the shared NVSwitch egress);
-multi-node mounts an independent per-endpoint instance (models each NIC
-injection side) — different layers, magnitudes not expected to match.
+**What slows the collective, honestly.** Two mechanisms, which the gate checks
+separately because each can regress on its own: (a) **link sharing** — the bg
+packets FIFO-serialize on the same NetDevice / So switch VOQ as the collective;
+(b) the **WFQ penalty** — an extra send-side delay when >1 class is active.
+Smoke (2-node RoCE host, 16 MiB hierarchical allreduce): baseline 1248928 ns →
+cross-node bg (rank 0→4) 1353663 ns (+8.4%, 129 × 1 MiB injected). That +8.4%
+is **entirely link sharing**: with all three weights set to 1.0 (which makes
+`ComputeServiceTime` return exactly 0 while the model stays mounted) the run
+is byte-identical at 1353663 — the WFQ term fires (26 packets penalized) but
+is off the critical path behind the over-driven 400G NIC queue. An intra-node
+bg (rank 0→1) on the same 2-node run does discriminate: 1311031 (default) vs
+1295971 (weights=1.0). Single-node Su: 319658 → 450982 ns (+41%), of which the
+WFQ penalty on the P2P class is a −3.7% correction (468378 with weights=1.0).
+WFQ reshuffles who waits; it is not monotone in latency. `--bgP2p*`:
+`bgP2pEnabled`/`bgP2pSrc`/`bgP2pDst`/`bgP2pSizeBytes`/`bgP2pIntervalNs`/
+`bgP2pStartTimeNs`. Gated by `test/parity/test_contention_interference.py`
+(4 cases): interference `simTimeNs > baseline` + `complete` + injected bytes
+for both regimes, a **WFQ discriminator** (default weights `!=` weights=1.0,
+intra-node bg in both regimes), and all seven `simTimeNs` values pinned like
+the RoCE parity triple. Design note: single-node shares one `ContentionModel`
+clone across endpoints (backlog node-wide); multi-node mounts an independent
+per-endpoint instance (backlog per endpoint) — different layers, magnitudes
+not expected to match.
 
 ### Changed — scale-out (So) traffic bypasses credit flow control
 

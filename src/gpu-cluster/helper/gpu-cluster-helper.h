@@ -435,7 +435,12 @@ class GpuClusterTopologyHelper
 
     /**
      * @brief Set contention model to attach to all endpoints during build
-     * @param model Contention model (cloned for each endpoint)
+     * @param model Contention model template. Build creates ONE clone (weights
+     *        copied, bandwidth from the helper data rate) and shares that single
+     *        instance across all endpoints, so the WFQ backlog aggregates
+     *        node-wide (a shared-egress view). The multi-node path in
+     *        scratch/gpu-cluster-sim.cc instead mounts an independent instance
+     *        per endpoint.
      */
     void SetContentionModel(Ptr<ContentionModel> model);
 

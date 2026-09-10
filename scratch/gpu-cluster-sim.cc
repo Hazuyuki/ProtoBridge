@@ -1034,16 +1034,20 @@ main(int argc, char* argv[])
             ep->SetLlrEnabled(llrEnabled);
 
             // Per-endpoint ContentionModel: each endpoint gets an INDEPENDENT
-            // instance. This DIFFERS from the single-node GpuClusterTopologyHelper,
-            // whose AttachContentionModelToEndpoints creates one clone and shares
-            // it across all endpoints (so backlog aggregates cross-endpoint). The
-            // per-endpoint split here keeps each WFQ backlog local — the correct
-            // model: a shared instance would let one endpoint's backlog inflate
-            // another's numActive and corrupt the WFQ decision. The WFQ penalty
-            // only fires at numActive>1 (SendPacketOnDevice), so pure-collective
-            // So traffic stays byte-identical (single COLLECTIVE class); the model
-            // only engages when a second class (e.g. a background P2P flow) is
-            // concurrently active on the same endpoint.
+            // instance (its WFQ backlog is local to this endpoint's injection
+            // side). This DIFFERS from the single-node GpuClusterTopologyHelper,
+            // whose AttachContentionModelToEndpoints creates ONE clone and shares
+            // it across all endpoints (backlog aggregates node-wide) — two
+            // different layers, not a correctness difference. The bandwidth is
+            // the intra-node NVLink injection rate (bandwidthGbps), also for
+            // So-bound packets. The WFQ penalty only fires at numActive>1
+            // (SendPacketOnDevice), so pure-collective So traffic stays
+            // byte-identical (single COLLECTIVE class); the model only engages
+            // when a second class (e.g. a background P2P flow) is concurrently
+            // active on the same endpoint. Note the penalty is an extra delay on
+            // the send path, off the wire's own FIFO queueing: for a cross-node
+            // background flow the So NIC/switch link sharing dominates and the
+            // WFQ term may be entirely off the critical path.
             Ptr<ContentionModel> cm = CreateObject<ContentionModel>();
             cm->SetCollectiveWeight(contentionCollectiveWeight);
             cm->SetMemoryWeight(contentionMemoryWeight);
@@ -1195,8 +1199,9 @@ main(int argc, char* argv[])
         // on ingress and sends NACK back, matching real NVLink behavior
         topoHelper.SetSwitchLlrEnabled(llrEnabled);
 
-        // Contention model: configured once, shared via helper for GPU endpoints
-        // and manually attached to memory endpoints (created outside the helper)
+        // Contention model: configured once as a template; the helper's Build*
+        // clones it ONCE and shares that single instance across all endpoints
+        // (backlog aggregates node-wide). Multi-node mounts one per endpoint.
         contentionModel = CreateObject<ContentionModel>();
         contentionModel->SetCollectiveWeight(contentionCollectiveWeight);
         contentionModel->SetMemoryWeight(contentionMemoryWeight);
@@ -2048,10 +2053,15 @@ main(int argc, char* argv[])
             // bandwidth, NOT a literal 0 ns: P2pTraffic::ScheduleNext schedules
             // the next burst at Now()+interval, so a 0 interval would loop
             // forever at a fixed sim-time and starve every later event (incl.
-            // the collective completion). ns = bytes*8 / Gbps.
+            // the collective completion). ns = bytes*8 / Gbps, using the
+            // intra-node rate even for a cross-node flow (a So flow is then
+            // over-driven by the intra/inter ratio and queues at the NIC; pass
+            // --bgP2pIntervalNs explicitly to pace at the inter-node rate).
+            // Integer division floors sub-ns serialization (<100 B at 800G) to
+            // 0, which would hit the same stall — clamp to >= 1 ns.
             NS_ABORT_MSG_IF(bandwidthGbps == 0,
                             "bgP2pIntervalNs=0 needs bandwidthGbps>0 to derive a serialization interval");
-            intervalNs = bgP2pSizeBytes * 8ULL / bandwidthGbps;
+            intervalNs = std::max<uint64_t>(1, bgP2pSizeBytes * 8ULL / bandwidthGbps);
         }
         bgP2p->SetInterval(NanoSeconds(intervalNs));
         bgP2p->SetMaxPackets(0);  // 0 = unlimited background flow

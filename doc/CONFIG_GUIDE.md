@@ -107,25 +107,53 @@ on the same endpoint's injection side; single-class traffic (a pure collective)
 is byte-identical to the unmounted baseline. As of this release multi-node
 (scale-out) endpoints are wired too — previously only single-node (Su) was.
 
-**Modeling-layer difference (design, not a bug).** The two regimes model
-contention at *different* layers, so their magnitudes are not expected to
-match: single-node (Su) shares ONE `ContentionModel` clone across all the
-node's endpoints — backlog aggregates cross-endpoint, modeling the **shared
-NVSwitch egress**; multi-node (So) mounts an **independent** per-endpoint
-instance, modeling **each NIC's injection side** (cross-node port contention
-is additionally covered by the So switch VOQ arbiter). The single-node
-interference impact is therefore larger (shared-NVSwitch injection-side
-contention is more direct than cross-node NIC).
+**Modeling-layer difference.** The two regimes mount the model at *different*
+layers, so their magnitudes are not expected to match: single-node (Su) shares
+ONE `ContentionModel` clone across all the node's endpoints (the helper's
+`AttachContentionModelToEndpoints` — backlog aggregates node-wide, a
+shared-egress view); multi-node (So) mounts an **independent** per-endpoint
+instance (backlog local to that endpoint's injection side). Both use the
+intra-node NVLink rate as the WFQ bandwidth, also for So-bound packets;
+cross-node port contention is additionally covered by the So switch VOQ
+arbiter. Neither layer has a hardware calibration behind it.
+
+**Two mechanisms slow a collective under a background flow**, and they are
+not the same thing: (a) **link sharing** — the background packets FIFO-serialize
+on the same NetDevice / So switch VOQ as the collective's; (b) the **WFQ
+penalty** above, an extra send-side delay when more than one class is active.
+Link sharing dominates every smoke below; the WFQ penalty can be entirely off
+the critical path. To isolate it, set all three weights to 1.0: that makes the
+penalty exactly 0 while leaving the model mounted, so any difference from the
+default-weight run is the WFQ contribution.
+
 To exercise contention, inject a time-offset background P2P flow with
 `--bgP2pEnabled=1 --bgP2pSrc=R --bgP2pDst=R' --bgP2pSizeBytes=B
 --bgP2pStartTimeNs=T`; it is an unlimited self-driven `P2pTraffic` that shares
 the fabric with the primary collective until the collective completes (which
 stops the sim). `--bgP2pIntervalNs=0` means back-to-back = one packet
-serialization time at the intra-node bandwidth (a literal 0 ns would loop at a
-fixed sim-time and stall the sim). The result block reports
-`bgP2pBytesSent`/`bgP2pPacketsSent`. Example (2-node RoCE, 16 MiB hierarchical
-allreduce): 1248928 ns baseline → 1353663 ns (+8.4%) with a rank 0→4
-cross-node background flow.
+serialization time at the **intra-node** bandwidth, clamped to ≥1 ns (a
+literal 0 ns would loop at a fixed sim-time and stall the sim). For a
+cross-node flow that over-drives the inter-node link by the intra/inter rate
+ratio (2× at 800G/400G) and the excess queues at the NIC; pass
+`--bgP2pIntervalNs` explicitly to pace at the inter-node rate. The result block
+reports `bgP2pBytesSent`/`bgP2pPacketsSent` — these count *injection*
+(`SendP2p` calls), not delivery.
+
+Reference numbers (`--RngRun=1`, 16 MiB allreduce, 1 MiB bg packets from
+t=5 µs; all pinned by `test/parity/test_contention_interference.py`):
+
+| regime | bg flow | default weights | weights=1.0 | baseline |
+|--------|---------|-----------------|-------------|----------|
+| 2-node RoCE hierarchical | rank 0→4 (cross-node) | 1353663 | 1353663 | 1248928 |
+| 2-node RoCE hierarchical | rank 0→1 (intra-node) | 1311031 | 1295971 | 1248928 |
+| single-node Su ring | rank 0→2 | 450982 | 468378 | 319658 |
+
+The cross-node +8.4% is all link sharing (WFQ byte-identical); the intra-node
+bg is what discriminates WFQ on the multi-node path. The single-node +41% is
+link sharing with a −3.7% WFQ correction on the P2P class — WFQ reshuffles
+who waits rather than adding latency monotonically. The regimes differ in
+baseline length and link type (credit-gated NVLink vs an over-driven 400G
+NIC), which is what separates their magnitudes, not the WFQ term.
 
 **Fabric hardware + protocol startup + FEC + BER** (sourced into the local CLI
 variables — these are what make a `.cfg` reproduce a calibrated run without

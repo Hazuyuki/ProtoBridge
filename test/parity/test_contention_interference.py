@@ -3,42 +3,52 @@
 """Automated gate for multi-operation temporal contention modeling.
 
 The ``--bgP2p*`` CLI (commit 93d86a2) injects a self-driven ``P2pTraffic`` flow
-at ``--bgP2pStartTimeNs`` that shares the fabric with the primary collective,
-exercising the WFQ contention model (multi-class ``numActive>1``) at the
-endpoint injection side and the So switch VOQ arbitration. This test converts
-the manual smoke (CHANGES.md / PLAN.md) into a machine-checked gate: the
-interference run must (a) still complete, (b) actually emit background P2P
-bytes, and (c) be strictly slower than the no-interference baseline -- a
-regression that silently disables the contention gate (e.g. ``numActive``
-mis-counted, the WFQ penalty branch skipped, or ``P2pTraffic`` not reaching
-``SendPacketOnDevice``) collapses to ``bg simTimeNs == base simTimeNs`` and
-``bgP2pBytesSent == 0``.
+at ``--bgP2pStartTimeNs`` that shares the fabric with the primary collective.
+Two DIFFERENT mechanisms slow the collective, and this test checks both, since
+each can regress independently:
 
-Two cases, mirroring the two topology regimes:
+1. **Link sharing (FIFO queueing on the wire).** The background packets and
+   the collective's packets serialize on the same NetDevice / So switch VOQ.
+   This is what dominates the smoke numbers below and it is what the
+   ``interference`` assertions check: the bg run must still complete, must
+   inject bytes, and must be strictly slower than the baseline.
+2. **WFQ contention penalty (``ContentionModel``).** An extra send-side delay
+   applied only when more than one traffic class is active on the endpoint
+   (``numActive>1`` in ``SendPacketOnDevice``). Setting all three class
+   weights to 1.0 makes ``ComputeServiceTime`` return exactly 0 while the
+   model stays mounted -- i.e. it neuters the penalty without touching the
+   link sharing. The ``wfq`` assertions run the bg case a second time with
+   weights=1.0 and require the result to DIFFER (either direction: WFQ
+   reshuffles who waits, it does not add latency monotonically). A regression
+   that skips the penalty branch, mis-counts ``numActive``, or fails to
+   classify P2P collapses ``weights=default == weights=1.0``.
 
-* ``test_contention_interference_multi_node`` -- 2-node RoCE hierarchical
-  allreduce (16 MiB) + a cross-node background P2P (rank 0 -> rank 4). So
-  contention is modeled at BOTH the endpoint WFQ and the So switch VOQ.
-  Baseline 1248928 ns -> interference 1353663 ns (+8.4%).
+Pinned values (deterministic, ``--RngRun=1``; re-pin on an intentional model
+change, the way ``test_so_hierarchical_regression.py`` pins its parity triple):
 
-* ``test_contention_interference_single_node`` -- single-node Su ring
-  allreduce (16 MiB) + an intra-node background P2P (rank 0 -> rank 2).
-  Contention is the shared-NVSwitch injection-side WFQ. Baseline 319658 ns
-  -> interference 450982 ns (+41%); the Su impact is larger because the
-  background flow contends directly at the shared NVSwitch injection side.
+* multi-node, 2-node RoCE hierarchical allreduce 16 MiB:
+  baseline 1248928; cross-node bg (rank 0->4) 1353663 (+8.4%) -- the WFQ term
+  is OFF the critical path here (weights=1.0 gives the identical 1353663: the
+  bg flow, paced at the 800G intra-node rate onto a 400G link, is limited by
+  NIC link sharing), so the WFQ discriminator uses an intra-node bg (rank
+  0->1): default 1311031 vs weights=1.0 1295971.
+* single-node, Su ring allreduce 16 MiB: baseline 319658; intra-node bg
+  (rank 0->2) default 450982 vs weights=1.0 468378 (+41% is link sharing; the
+  WFQ penalty on the P2P class is a -3.7% correction).
 
-Note on the single- vs multi-node modeling difference (a DESIGN choice, not
-a bug): the single-node ``GpuClusterTopologyHelper`` shares ONE
+Note on the single- vs multi-node modeling difference (a design choice, not a
+bug): the single-node ``GpuClusterTopologyHelper`` shares ONE
 ``ContentionModel`` clone across all its endpoints (backlog aggregates
-cross-endpoint -- it models the shared NVSwitch egress), whereas the
-multi-node path mounts an INDEPENDENT per-endpoint instance (it models each
-NIC injection side). This test only checks that interference takes effect in
-BOTH regimes, not that the two magnitudes match.
+node-wide), whereas the multi-node path mounts an independent per-endpoint
+instance (backlog local to that endpoint's injection side; bandwidth is the
+intra-node rate in both). This test checks that both mechanisms take effect
+in BOTH regimes, not that the two magnitudes match.
 
 Run:
     python3 -m pytest test/parity/test_contention_interference.py -v
     python3 test/parity/test_contention_interference.py
 """
+
 
 import glob
 import os
@@ -87,7 +97,7 @@ def run_sim(extra_args, timeout=300):
     return fields, out
 
 
-# Multi-node: 2-node RoCE hierarchical allreduce, 16 MiB, cross-node bg P2P.
+# Multi-node: 2-node RoCE hierarchical allreduce, 16 MiB.
 MULTI_BASE = [
     "--numNodes=2", "--gpusPerNode=4",
     "--collective=allreduce", "--algorithm=hierarchical",
@@ -96,10 +106,12 @@ MULTI_BASE = [
     "--interNodeBandwidth=400", "--interNodeLatency=100",
     "--RngRun=1",
 ]
-MULTI_BG = MULTI_BASE + [
-    "--bgP2pEnabled=1", "--bgP2pSrc=0", "--bgP2pDst=4",
-    "--bgP2pSizeBytes=1048576", "--bgP2pStartTimeNs=5000",
-]
+BG_COMMON = ["--bgP2pEnabled=1", "--bgP2pSrc=0",
+             "--bgP2pSizeBytes=1048576", "--bgP2pStartTimeNs=5000"]
+WEIGHTS_ONE = ["--contentionCollectiveWeight=1", "--contentionMemoryWeight=1",
+               "--contentionP2pWeight=1"]
+MULTI_BG_CROSS = MULTI_BASE + BG_COMMON + ["--bgP2pDst=4"]   # link-sharing smoke
+MULTI_BG_INTRA = MULTI_BASE + BG_COMMON + ["--bgP2pDst=1"]   # WFQ discriminator
 
 # Single-node: Su ring allreduce, 16 MiB, intra-node bg P2P.
 SINGLE_BASE = [
@@ -108,23 +120,27 @@ SINGLE_BASE = [
     "--dataSize=16777216",
     "--RngRun=1",
 ]
-SINGLE_BG = SINGLE_BASE + [
-    "--bgP2pEnabled=1", "--bgP2pSrc=0", "--bgP2pDst=2",
-    "--bgP2pSizeBytes=1048576", "--bgP2pStartTimeNs=5000",
-]
+SINGLE_BG = SINGLE_BASE + BG_COMMON + ["--bgP2pDst=2"]
+
+PINNED = {
+    "multi-base": 1248928, "multi-bg-cross": 1353663,
+    "multi-bg-intra": 1311031, "multi-bg-intra-w1": 1295971,
+    "single-base": 319658, "single-bg": 450982, "single-bg-w1": 468378,
+}
 
 
-def _assert_interference(base, bg, out, regime):
+def _assert_interference(base, base_out, bg, bg_out, regime):
     assert base.get("status") == "complete", (
-        "{} baseline did not complete:\n{}".format(regime, out[-500:]))
+        "{} baseline did not complete:\n{}".format(regime, base_out[-500:]))
     assert bg.get("status") == "complete", (
         "{} interference run did not complete (bg P2P may have deadlocked the "
-        "collective):\n{}".format(regime, out[-500:]))
+        "collective):\n{}".format(regime, bg_out[-500:]))
     assert bg.get("bgP2pEnabled") == "true", (
         "{}: bgP2pEnabled not reflected in result block".format(regime))
+    # bgP2pBytesSent counts injection (SendP2p calls), not delivery; >0 only
+    # proves the P2pTraffic was constructed and Start() fired.
     assert bg.get("bgP2pBytesSent", 0) > 0, (
-        "{}: bgP2pBytesSent={} (the background P2pTraffic never reached the "
-        "wire -- SendP2p/SendPacketOnDevice regressed?)"
+        "{}: bgP2pBytesSent={} (the background P2pTraffic never started)"
         .format(regime, bg.get("bgP2pBytesSent")))
     assert bg.get("bgP2pPacketsSent", 0) > 0, (
         "{}: bgP2pPacketsSent={}".format(regime, bg.get("bgP2pPacketsSent")))
@@ -134,27 +150,67 @@ def _assert_interference(base, bg, out, regime):
         "{}: simTimeNs missing (base={} bg={})".format(regime, base_ns, bg_ns))
     assert bg_ns > base_ns, (
         "{}: interference simTimeNs ({}) not strictly greater than baseline "
-        "({}) -- the WFQ contention gate did not slow the collective under the "
-        "background flow (numActive>1 penalty branch regressed, or P2P class "
-        "not classified).".format(regime, bg_ns, base_ns))
+        "({}) -- the background flow did not share the wire with the "
+        "collective (P2pTraffic not reaching SendPacketOnDevice / the "
+        "NetDevice?).".format(regime, bg_ns, base_ns))
+
+
+def _assert_pinned(fields, key, regime):
+    got = fields.get("simTimeNs")
+    assert got == PINNED[key], (
+        "{}: {} simTimeNs={} != pinned {} (re-pin only on an intentional "
+        "model change)".format(regime, key, got, PINNED[key]))
+
+
+def _assert_wfq_discriminates(bg, bg_w1, regime):
+    a = bg.get("simTimeNs")
+    b = bg_w1.get("simTimeNs")
+    assert a is not None and b is not None and a != b, (
+        "{}: bg simTimeNs with default WFQ weights ({}) == with all weights=1.0 "
+        "({}) -- the ContentionModel penalty has no effect on the critical "
+        "path (numActive>1 branch skipped, P2P class not classified, or "
+        "ContentionModel not mounted on this endpoint).".format(regime, a, b))
 
 
 def test_contention_interference_multi_node():
-    base, _ = run_sim(MULTI_BASE)
-    bg, out = run_sim(MULTI_BG)
-    _assert_interference(base, bg, out, "multi-node")
+    base, base_out = run_sim(MULTI_BASE)
+    bg, bg_out = run_sim(MULTI_BG_CROSS)
+    _assert_interference(base, base_out, bg, bg_out, "multi-node")
+    _assert_pinned(base, "multi-base", "multi-node")
+    _assert_pinned(bg, "multi-bg-cross", "multi-node")
+
+
+def test_contention_wfq_multi_node():
+    bg, _ = run_sim(MULTI_BG_INTRA)
+    bg_w1, _ = run_sim(MULTI_BG_INTRA + WEIGHTS_ONE)
+    assert bg.get("status") == "complete" and bg_w1.get("status") == "complete"
+    _assert_wfq_discriminates(bg, bg_w1, "multi-node")
+    _assert_pinned(bg, "multi-bg-intra", "multi-node")
+    _assert_pinned(bg_w1, "multi-bg-intra-w1", "multi-node")
 
 
 def test_contention_interference_single_node():
-    base, _ = run_sim(SINGLE_BASE)
-    bg, out = run_sim(SINGLE_BG)
-    _assert_interference(base, bg, out, "single-node")
+    base, base_out = run_sim(SINGLE_BASE)
+    bg, bg_out = run_sim(SINGLE_BG)
+    _assert_interference(base, base_out, bg, bg_out, "single-node")
+    _assert_pinned(base, "single-base", "single-node")
+    _assert_pinned(bg, "single-bg", "single-node")
+
+
+def test_contention_wfq_single_node():
+    bg, _ = run_sim(SINGLE_BG)
+    bg_w1, _ = run_sim(SINGLE_BG + WEIGHTS_ONE)
+    assert bg.get("status") == "complete" and bg_w1.get("status") == "complete"
+    _assert_wfq_discriminates(bg, bg_w1, "single-node")
+    _assert_pinned(bg_w1, "single-bg-w1", "single-node")
 
 
 if __name__ == "__main__":
     ok = True
     for name, fn in (("multi_node", test_contention_interference_multi_node),
-                     ("single_node", test_contention_interference_single_node)):
+                     ("wfq_multi_node", test_contention_wfq_multi_node),
+                     ("single_node", test_contention_interference_single_node),
+                     ("wfq_single_node", test_contention_wfq_single_node)):
         try:
             fn()
             print("PASS  contention_interference  {}".format(name))
