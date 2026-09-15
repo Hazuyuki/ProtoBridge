@@ -244,6 +244,14 @@ class FabricEndpoint : public Application
     void SetLlrRetryLimit(uint32_t limit);
     uint32_t GetLlrRetryLimit() const;
     Ptr<LlrManager> GetLlrManager() const;
+    // Opt-in sender-side retry-timeout backstop: registers the LlrManager
+    // timeout callback so an un-ACKed entry is RETRANSMITTED when its retry
+    // timer fires (SACK: that seq; GBN: from that seq onward). Without this
+    // the timeout is a no-op, and under random loss a lost NACK deadlocks
+    // SACK mode (the NACK is the only recovery trigger). Default-off for
+    // parity: under heavy congestion RETRY_ACKs arrive later than the retry
+    // timeout and the backstop would inject spurious duplicates.
+    void EnableLlrTimeoutRetransmit();
 
     // FEC model
     void SetFecModel(Ptr<FecModel> model);
@@ -458,6 +466,8 @@ class FabricEndpoint : public Application
      * @param header The fabric header
      */
     void ProcessNackPacket(Ptr<Packet> packet, const FabricHeader& header);
+    void OnLlrRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    void DispatchRetransmissions(const std::vector<LlrManager::Retransmission>& retransmissions);
     void ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header);
     void SendRetransmission(LlrManager::Retransmission retransmission);
 

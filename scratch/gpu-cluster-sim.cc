@@ -247,6 +247,7 @@ main(int argc, char* argv[])
     uint64_t llrBufferSizeBytes = 0;  // Phase A.2: packets = llrBufferSizeBytes / sprayChunkSize
     std::string llrOverflowPolicyStr = "dropoldest";  // dropoldest/dropnewest
     uint64_t llrRetryTimeoutNs = 0;
+    bool llrTimeoutRetransmit = false;  // opt-in sender-side timeout retransmit backstop
     uint64_t llrReloadBandwidthGBps = 4800;
     uint64_t llrReloadLatencyNs = 300;
 
@@ -424,6 +425,12 @@ main(int argc, char* argv[])
                  llrBufferSizeBytes);
     cmd.AddValue("llrOverflowPolicy", "LLR overflow policy: dropoldest/dropnewest", llrOverflowPolicyStr);
     cmd.AddValue("llrRetryTimeout", "LLR retry timeout in ns (0=auto)", llrRetryTimeoutNs);
+    cmd.AddValue("llrTimeoutRetransmit",
+                 "Retransmit un-ACKed LLR entries when their retry timer fires (sender-side "
+                 "backstop; required for llrMode=sack under random loss where a lost NACK "
+                 "otherwise deadlocks the flow). Default 0 = timer fires but does nothing "
+                 "(legacy behavior, parity-safe).",
+                 llrTimeoutRetransmit);
     cmd.AddValue("llrReloadBandwidth",
                  "Backing-source bandwidth in GB/s for retry-buffer misses",
                  llrReloadBandwidthGBps);
@@ -1482,6 +1489,10 @@ main(int argc, char* argv[])
                 if (llrRetryTimeoutNs > 0)
                 {
                     llrMgr->SetRetryTimeout(NanoSeconds(llrRetryTimeoutNs));
+                }
+                if (llrTimeoutRetransmit)
+                {
+                    ep->EnableLlrTimeoutRetransmit();
                 }
             }
         }

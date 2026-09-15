@@ -6,6 +6,30 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — SRNIC Fig. 11 loss-recovery comparison + `--llrTimeoutRetransmit` backstop
+
+External measured anchor for the LLR recovery modes: SRNIC (NSDI'23) Figure 11
+measures a ConnectX-6 (go-back-N) collapsing under FPGA-injected random loss
+while SRNIC's selective repeat degrades gently. The ns-3 counterpart sweeps
+`llrMode=gobackn` vs `llrMode=sack` (only that axis changes between arms) on
+the RoCE tor 100G fabric with `--packetLossRate` — the recovery-mode spread
+reproduces, and at 1% loss the GBN arm (0.510 normalized) sits within 5 points
+of the measured CX-6 collapse (0.467). Digitized reference with provenance in
+`configs/calibration/srnic_fig11_cx6_reference.csv`, sweep driver
+`configs/calibration/eth_gbn_loss_sweep.py`, arms
+`configs/protocol_configs/p2p-roce-lossy{,-sack}.cfg`, full write-up (incl. the
+whole-message-GBN-window structural caveats) in `doc/CALIBRATION.md`.
+
+The experiment exposed a production model gap: `LlrManager::OnRetryTimeout`
+only invoked a callback that unit tests registered — the retry timeout was a
+no-op in real runs, so a lost NACK deadlocked SACK mode forever (NACK emission
+at receiver drop time was the only recovery trigger, and `--packetLossRate`
+applies to control packets). New opt-in `--llrTimeoutRetransmit` (default 0 =
+legacy no-op, parity-pinned byte-identical) wires `FabricEndpoint` to the
+timeout: on fire it re-issues the retransmission through the mode's own path
+(SACK single-seq / GBN blanket), re-arming timers and honoring
+`--llrRetryLimit`.
+
 ### New — RTTCC (RTT-probe-based congestion control) for the plain-Ethernet So fabric
 
 `--rttcc` (default off) adds a second congestion-control option beside DCQCN,

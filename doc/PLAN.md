@@ -61,6 +61,22 @@ in two phases:
   not exercise the 40 µs NCCL startup. Detail in `doc/CALIBRATION.md` §"RoCE v2
   P2P (scale-out)".
 
+- **SRNIC Fig. 11 measured loss-recovery comparison — DONE (task #33).** Second
+  external measured anchor for the So fabric: SRNIC (NSDI'23) Figure 11 (CX-6
+  go-back-N vs SRNIC selective repeat, 100G, perftest 4 KB, CC disabled,
+  FPGA-injected random loss) mapped onto the fabric's own `llrMode=gobackn` vs
+  `llrMode=sack` axis — only that axis changes between arms. Normalized
+  `G(p)/G(0)` sweep (9 loss points × 3 seeds): the recovery-mode spread
+  reproduces; GBN 0.510 vs measured CX-6 0.467 at 1% loss; structural
+  deviations documented, not tuned away (whole-message GBN window → early
+  collapse + saturating ~0.50 floor; SACK optimistic vs the real RNIC).
+  Exposed + fixed a production gap: the LLR retry timeout was a no-op outside
+  unit tests, so a lost NACK deadlocked SACK — new opt-in
+  `--llrTimeoutRetransmit` backstop (default 0, parity-pinned). Artifacts:
+  `configs/calibration/srnic_fig11_cx6_reference.csv` + `eth_gbn_loss_sweep.py`
+  + `p2p-roce-lossy{,-sack}.cfg`; write-up in `doc/CALIBRATION.md` §"Loss
+  recovery under injected packet loss".
+
 - **Full-mesh surrogate algorithm (ns-3-calibrated) — DONE (this branch).** The
   surrogate gained a 4th algorithm shape, `fullmesh`, calibrated directly to
   ns-3 as ground truth (not a wire-rate derivation like ring/tree/nvls).

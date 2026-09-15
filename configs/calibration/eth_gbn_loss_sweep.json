@@ -1,0 +1,433 @@
+{
+  "data_size": 16777216,
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "arms": {
+    "gobackn": "configs/protocol_configs/p2p-roce-lossy.cfg",
+    "sack": "configs/protocol_configs/p2p-roce-lossy-sack.cfg"
+  },
+  "reference": "srnic_fig11_cx6_reference.csv",
+  "results": {
+    "gobackn": [
+      {
+        "plr": 0.0,
+        "mean_ns": 2521509,
+        "goodput_gbps": 53.23,
+        "normalized": 1.0,
+        "reference_normalized": null,
+        "retransmitted": [
+          0,
+          0,
+          0
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          2521509,
+          2521509,
+          2521509
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 1e-06,
+        "mean_ns": 2521703.6666666665,
+        "goodput_gbps": 53.23,
+        "normalized": 1.0,
+        "reference_normalized": 1.0,
+        "retransmitted": [
+          382,
+          0,
+          0
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          2522093,
+          2521509,
+          2521509
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 1e-05,
+        "mean_ns": 2521703.6666666665,
+        "goodput_gbps": 53.23,
+        "normalized": 1.0,
+        "reference_normalized": 1.0,
+        "retransmitted": [
+          382,
+          0,
+          0
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          2522093,
+          2521509,
+          2521509
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.0001,
+        "mean_ns": 2554670,
+        "goodput_gbps": 52.54,
+        "normalized": 0.987,
+        "reference_normalized": 1.0,
+        "retransmitted": [
+          382,
+          0,
+          4292
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          2522296,
+          2521509,
+          2620205
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.001,
+        "mean_ns": 4011682.3333333335,
+        "goodput_gbps": 33.46,
+        "normalized": 0.629,
+        "reference_normalized": 0.933,
+        "retransmitted": [
+          12538,
+          1517,
+          14740
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          4813709,
+          2522093,
+          4699245
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.002,
+        "mean_ns": 4793472,
+        "goodput_gbps": 28.0,
+        "normalized": 0.526,
+        "reference_normalized": 0.889,
+        "retransmitted": [
+          24454,
+          11005,
+          31077
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          4959709,
+          4605830,
+          4814877
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.005,
+        "mean_ns": 4891914,
+        "goodput_gbps": 27.44,
+        "normalized": 0.515,
+        "reference_normalized": 0.744,
+        "retransmitted": [
+          64878,
+          41782,
+          53159
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          5019277,
+          4839252,
+          4817213
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.01,
+        "mean_ns": 4943246.666666667,
+        "goodput_gbps": 27.15,
+        "normalized": 0.51,
+        "reference_normalized": 0.467,
+        "retransmitted": [
+          111016,
+          74479,
+          115195
+        ],
+        "permanent_losses": [
+          32,
+          10,
+          21
+        ],
+        "sim_time_ns": [
+          5019277,
+          4880132,
+          4930331
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.02,
+        "mean_ns": 5032409,
+        "goodput_gbps": 26.67,
+        "normalized": 0.501,
+        "reference_normalized": 0.278,
+        "retransmitted": [
+          186468,
+          165563,
+          182371
+        ],
+        "permanent_losses": [
+          1517,
+          684,
+          1476
+        ],
+        "sim_time_ns": [
+          5019277,
+          4999446,
+          5078504
+        ],
+        "failed": 0
+      }
+    ],
+    "sack": [
+      {
+        "plr": 0.0,
+        "mean_ns": 2521509,
+        "goodput_gbps": 53.23,
+        "normalized": 1.0,
+        "reference_normalized": null,
+        "retransmitted": [
+          0,
+          0,
+          0
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          2521509,
+          2521509,
+          2521509
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 1e-06,
+        "mean_ns": 2521703.6666666665,
+        "goodput_gbps": 53.23,
+        "normalized": 1.0,
+        "reference_normalized": 1.0,
+        "retransmitted": [
+          1,
+          0,
+          0
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          2522093,
+          2521509,
+          2521509
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 1e-05,
+        "mean_ns": 2521703.6666666665,
+        "goodput_gbps": 53.23,
+        "normalized": 1.0,
+        "reference_normalized": 1.0,
+        "retransmitted": [
+          1,
+          0,
+          0
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          2522093,
+          2521509,
+          2521509
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.0001,
+        "mean_ns": 2522160.6666666665,
+        "goodput_gbps": 53.22,
+        "normalized": 1.0,
+        "reference_normalized": 1.0,
+        "retransmitted": [
+          1,
+          0,
+          2
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          2522296,
+          2521509,
+          2522677
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.001,
+        "mean_ns": 2686189.3333333335,
+        "goodput_gbps": 49.97,
+        "normalized": 0.939,
+        "reference_normalized": 0.99,
+        "retransmitted": [
+          17,
+          1,
+          7
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          3010472,
+          2522093,
+          2526003
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.002,
+        "mean_ns": 2690116,
+        "goodput_gbps": 49.89,
+        "normalized": 0.937,
+        "reference_normalized": 0.979,
+        "retransmitted": [
+          30,
+          6,
+          13
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          3013392,
+          2527246,
+          2529710
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.005,
+        "mean_ns": 2699467.3333333335,
+        "goodput_gbps": 49.72,
+        "normalized": 0.934,
+        "reference_normalized": 0.907,
+        "retransmitted": [
+          66,
+          20,
+          23
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          3022152,
+          2538264,
+          2537986
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.01,
+        "mean_ns": 2714835.6666666665,
+        "goodput_gbps": 49.44,
+        "normalized": 0.929,
+        "reference_normalized": 0.773,
+        "retransmitted": [
+          109,
+          36,
+          51
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          3034416,
+          2551059,
+          2559032
+        ],
+        "failed": 0
+      },
+      {
+        "plr": 0.02,
+        "mean_ns": 3050962.6666666665,
+        "goodput_gbps": 43.99,
+        "normalized": 0.826,
+        "reference_normalized": 0.619,
+        "retransmitted": [
+          182,
+          173,
+          185
+        ],
+        "permanent_losses": [
+          0,
+          0,
+          0
+        ],
+        "sim_time_ns": [
+          3049016,
+          3057192,
+          3046680
+        ],
+        "failed": 0
+      }
+    ]
+  }
+}

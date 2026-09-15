@@ -318,3 +318,98 @@ aggregate with no contention. Result in
   surrogate within 0.3% of ns-3 across N=8 AR+AG at {16,64,256} MiB (the
   calibrated [0.95, 1.05] band).
 
+
+## Loss recovery under injected packet loss — SRNIC Fig. 11 (measured) vs ns-3
+
+External measured anchor for the **loss-recovery mode** of the RoCE
+scale-out fabric: SRNIC, *"SRNIC: A Scalable Architecture for RDMA NICs"*,
+NSDI 2023, Figure 11
+(<https://www.cse.ust.hk/~kaichen/papers/srnic-nsdi23.pdf>). Testbed: two
+hosts on 100G links, perftest with 4 KB messages, congestion control
+**disabled**, an FPGA in the path injecting uniform random packet drops.
+Two measured curves: ConnectX-6 (go-back-N recovery — "drops rapidly when
+the packet loss rate exceeds 0.1%, and drops to 25 Gbps when the loss rate
+exceeds 1%") and the SRNIC prototype (bitmap selective repeat — "75 Gbps
+goodput under 1% packet loss rate"). Digitized points with provenance:
+[`configs/calibration/srnic_fig11_cx6_reference.csv`](../configs/calibration/srnic_fig11_cx6_reference.csv).
+
+This maps directly onto the fabric's two LLR modes — **the ns-3 sweep changes
+only `llrMode`** between arms:
+
+| ns-3 arm | cfg | measured analogue |
+|---|---|---|
+| `llrMode=gobackn` | `configs/protocol_configs/p2p-roce-lossy.cfg` | ConnectX-6 |
+| `llrMode=sack` | `configs/protocol_configs/p2p-roce-lossy-sack.cfg` | SRNIC |
+
+Sweep driver: [`configs/calibration/eth_gbn_loss_sweep.py`](../configs/calibration/eth_gbn_loss_sweep.py)
+(RoCE tor 100G, `--gpusPerNode=2` — required, see the cfg header —
+`--bulkChunkSize=4096` for perftest 4 KB granularity, 16 MiB transfer,
+`--packetLossRate` swept, 3 seeds). Results in
+`configs/calibration/eth_gbn_loss_sweep.json`. The comparison is
+**normalized per curve** (`G(p)/G(0)`): the ns-3 absolute plateau
+(53.2 Gbps: tor 2-link serialization + 4 KB chunk headers) intentionally
+differs from the testbed's single-link 90–97 Gbps.
+
+### Result (normalized goodput, 3-seed mean)
+
+| loss rate | ns-3 GBN | CX-6 measured | ns-3 SACK | SRNIC measured |
+|---|---|---|---|---|
+| ≤1e-4 | 0.99–1.00 | 1.000 | 1.000 | 1.000 |
+| 1e-3 | 0.629 | 0.933 | 0.939 | 0.990 |
+| 2e-3 | 0.526 | 0.889 | 0.937 | 0.979 |
+| 5e-3 | 0.515 | 0.744 | 0.934 | 0.907 |
+| 1e-2 | **0.510** | **0.467** | 0.929 | 0.773 |
+| 2e-2 | 0.501 | 0.278 | 0.826 | 0.619 |
+
+What reproduces (the point of the experiment):
+
+- **The recovery-mode spread**: selective repeat degrades gently while GBN
+  collapses — the qualitative core of Fig. 11. At 1% loss the ns-3 GBN arm
+  (0.510) sits within 5 points of the measured CX-6 collapse (0.467).
+- **SACK retransmit economy**: ns-3 SACK retransmits ≈ the actual drop count
+  (tens of packets), GBN retransmits 3–5 orders of magnitude more
+  (~10⁵ at 1–2% loss) for the same delivered bytes.
+
+What deviates, and why (structural, documented rather than tuned away):
+
+- **GBN collapses earlier than CX-6** (0.63 vs 0.93 at 0.1% loss). The bulk
+  sender assigns every chunk sequence number in one synchronous dispatch, so
+  a NACK re-blankets from the lost seq to the end of the *message* — the GBN
+  window is the whole remaining transfer, not the NIC's BDP/tx-depth window
+  that bounds CX-6's per-drop waste to ~RTT×C.
+- **GBN saturates at ~0.50 instead of following CX-6 down to 0.28**. For the
+  same reason the waste is bounded by ~one extra message time (the pipe stays
+  100% busy re-blanketing), while the real per-drop waste keeps growing with
+  drop count — the two asymptotics cross near 1% loss.
+- **SACK is more optimistic than SRNIC** (0.93 vs 0.77 at 1%): retransmitting
+  only lost 4 KB chunks over an otherwise idle reverse path is cheaper than a
+  real RNIC's bitmap/ACK machinery under load.
+- GBN `permanentLosses>0` at ≥1% loss are retry-limit exhaustions of packets
+  already delivered by an overlapping blanket (status stays `complete`).
+
+### Model fix exposed by this experiment (`--llrTimeoutRetransmit`)
+
+The SACK arm initially **deadlocked** under random loss: NACK emission at
+receiver drop time was the *only* recovery trigger, and `--packetLossRate`
+applies to control packets too (only BER/FEC has a control bypass) — a lost
+NACK stalled the transfer forever. Root cause: `LlrManager::OnRetryTimeout`
+only invoked a callback that *unit tests* registered; production had a no-op
+retry timeout. New opt-in `--llrTimeoutRetransmit=1` (default 0 = legacy
+no-op, parity-pinned) wires the endpoint to the timeout: on fire it
+re-issues the retransmission via the mode's own path (SACK single-seq /
+GBN blanket), re-arming timers and honoring `--llrRetryLimit`.
+
+Timeout sizing caveat (same whole-message-window bound as above): timers arm
+at StorePacket time and the dispatch is synchronous, so `--llrRetryTimeout`
+must exceed the worst-case delivery+RETRY_ACK delay of the *whole transfer*
+(~2.6 ms for 16 MiB here; the sweep uses 3 ms for SACK, and 20 ms on the GBN
+arm purely as deadlock insurance that never fires). A lost-NACK event
+therefore costs ~one transfer time to recover. Both lossy cfgs also raise
+`vcCredits` to effectively-infinite: CREDIT control packets are not
+LLR-protected, and the reference testbed has no link-level credit flow
+control, so a randomly dropped CREDIT under the default 64-credit budget
+would be an artifact stall.
+
+Layer caveat (same as the perftest section above): ns-3 models a bare-metal
+L2 fabric endpoint, not a verbs NIC — the comparison validates the
+*recovery-mode degradation shape*, not absolute goodput.

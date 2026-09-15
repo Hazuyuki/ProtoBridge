@@ -1492,21 +1492,67 @@ FabricEndpoint::ProcessNackPacket(Ptr<Packet> packet, const FabricHeader& header
             retransmissions = m_llrManager->HandleRetryRequest(seqNum, sourceRank, flowId);
         }
 
-        for (const auto& retransmission : retransmissions)
+        DispatchRetransmissions(retransmissions);
+    }
+}
+
+void
+FabricEndpoint::DispatchRetransmissions(
+    const std::vector<LlrManager::Retransmission>& retransmissions)
+{
+    for (const auto& retransmission : retransmissions)
+    {
+        if (retransmission.readyDelay > Time(0))
         {
-            if (retransmission.readyDelay > Time(0))
-            {
-                Simulator::Schedule(retransmission.readyDelay,
-                                    [this, retransmission]() {
-                                        SendRetransmission(retransmission);
-                                    });
-            }
-            else
-            {
-                SendRetransmission(retransmission);
-            }
+            Simulator::Schedule(retransmission.readyDelay,
+                                [this, retransmission]() {
+                                    SendRetransmission(retransmission);
+                                });
+        }
+        else
+        {
+            SendRetransmission(retransmission);
         }
     }
+}
+
+void
+FabricEndpoint::EnableLlrTimeoutRetransmit()
+{
+    if (m_llrManager)
+    {
+        m_llrManager->SetTimeoutCallback(
+            MakeCallback(&FabricEndpoint::OnLlrRetryTimeout, this));
+    }
+}
+
+void
+FabricEndpoint::OnLlrRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+{
+    NS_LOG_FUNCTION(this << seqNum << destRank << flowId);
+
+    if (!m_llrEnabled || !m_llrManager)
+    {
+        return;
+    }
+
+    // Sender-side timeout backstop: the entry is still un-ACKed when its
+    // retry timer fires, so retransmit it exactly as a NACK would have.
+    // The Handle*Request paths re-arm the timer and enforce the retry limit,
+    // so a persistently-lost packet still degrades to permanent loss instead
+    // of looping forever. destRank plays the role of the NACK's sourceRank
+    // (both name the flow's remote end).
+    std::vector<LlrManager::Retransmission> retransmissions;
+    if (m_llrManager->GetLlrMode() == LlrMode::SACK)
+    {
+        std::unordered_set<uint32_t> nackSet{seqNum};
+        retransmissions = m_llrManager->HandleSackRequest(nackSet, destRank, flowId);
+    }
+    else
+    {
+        retransmissions = m_llrManager->HandleRetryRequest(seqNum, destRank, flowId);
+    }
+    DispatchRetransmissions(retransmissions);
 }
 
 void

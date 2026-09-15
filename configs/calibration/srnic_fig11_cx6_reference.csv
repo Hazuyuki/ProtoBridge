@@ -1,0 +1,36 @@
+# SRNIC (NSDI'23) Figure 11 -- measured 100G RNIC goodput vs injected packet
+# loss rate. Digitized from the paper figure (curve-read precision ~+-2 Gbps).
+#
+# Source: "SRNIC: A Scalable Architecture for RDMA NICs", NSDI 2023.
+#   https://www.cse.ust.hk/~kaichen/papers/srnic-nsdi23.pdf
+# Testbed (paper Sec 5.2): two hosts, 100G links, perftest with 4 KB messages,
+# congestion control DISABLED, FPGA device between the hosts injects uniform
+# random packet drops at the stated rate.
+#   - cx6 curve: ConnectX-6 100G RNIC, go-back-N loss recovery. Text anchor:
+#     "the goodput of CX-6 drops rapidly when the packet loss rate exceeds
+#      0.1%, and drops to 25 Gbps when the loss rate exceeds 1%".
+#   - srnic curve: SRNIC FPGA prototype, selective repeat (bitmap-based)
+#     recovery. Text anchor: "SRNIC achieves 75 Gbps goodput ... under 1%
+#     packet loss rate", i.e. only a 22% drop from its ~97 Gbps zero-loss
+#     goodput.
+# normalized = goodput / zero-loss plateau of the SAME curve (cx6: 90, srnic: 97).
+#
+# Used by configs/calibration/eth_gbn_loss_sweep.py as the reference for the
+# ns-3 llrMode=gobackn (cx6 analogue) vs llrMode=sack (srnic analogue) sweep.
+curve,loss_rate,goodput_gbps,normalized
+cx6,1e-6,90,1.000
+cx6,1e-5,90,1.000
+cx6,1e-4,90,1.000
+cx6,1e-3,84,0.933
+cx6,2e-3,80,0.889
+cx6,5e-3,67,0.744
+cx6,1e-2,42,0.467
+cx6,2e-2,25,0.278
+srnic,1e-6,97,1.000
+srnic,1e-5,97,1.000
+srnic,1e-4,97,1.000
+srnic,1e-3,96,0.990
+srnic,2e-3,95,0.979
+srnic,5e-3,88,0.907
+srnic,1e-2,75,0.773
+srnic,2e-2,60,0.619
