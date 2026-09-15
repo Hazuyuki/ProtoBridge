@@ -98,6 +98,27 @@ LLR retransmit (`--voqDropThreshold`/`--llrMode`/`--llrRetryLimit`) for plain
 Ethernet — matching real hardware (RDMA uses ECN/PFC, not per-packet credits;
 NVLink is credit-based). Tuning `vcCredits` therefore only affects Su latency.
 
+**RTTCC delay-based congestion control (`--rttcc`).** DCQCN needs the RoCE
+ECN/CNP loop, which the plain lossy Ethernet fabric does not have (and the
+DCQCN So gate keys on `WireEfficiency<1.0`, which `EthernetProtocolModel`
+locks at 1.0) — so ETH gets a delay-based option instead (NVIDIA RTT-CC /
+Swift-style). With `--rttcc=1`, each So endpoint mounts an `RttccRateMachine`:
+the sender emits at most one `RTT_PROBE` control packet per
+`--rttccProbeIntervalNs` (default 5000) per flow alongside the data, the
+receiver reflects it as an `RTT_RESPONSE`, and each echo becomes an RTT
+sample: at/below `--rttccTargetRttNs` (default 10000) the flow rate ramps by
+`AdditiveIncreaseGbps` (attribute, default 10) toward the line rate; above
+target it decays by `1 − Beta·(rtt−target)/rtt` (Beta default 0.8, floor
+`MinRateGbps`). The rate is enforced as a per-flow pacer at the same egress
+chokepoint as DCQCN and composes with it (`max` of the two delays). Probes
+are control packets: never tail-dropped, BER-bypassed, LLR-skipped — but
+still queued through switch VOQs, so the sampled RTT sees real congestion.
+Default off is byte-identical; RESULT reports `rttccProbesSent` /
+`rttccRttSamples` / `rttccMinRttNs` / `rttccMaxRttNs` / `rttccMinRateGbps`.
+Idealizations: a probe always returns a sample (control path is loss-free at
+BER=0), and reflection is unconditional (no receiver-side machine). Works on
+any So fabric type but only shapes inter-node flows (`numNodes>1`).
+
 **WFQ contention model (`--contention*Weight`, `--bgP2p*`).** Each endpoint
 carries a `ContentionModel` that does weighted-fair-queuing over three traffic
 classes — COLLECTIVE / MEMORY / P2P (`--contentionCollectiveWeight` /

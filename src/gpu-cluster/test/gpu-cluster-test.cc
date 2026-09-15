@@ -23,6 +23,7 @@
 #include "ns3/roce-payload-builder.h"
 #include "ns3/so-header.h"
 #include "ns3/dcqcn-rate-machine.h"
+#include "ns3/rttcc-rate-machine.h"
 #include "ns3/nccl-protocol-payload-builder.h"
 #include "ns3/protocol-transaction.h"
 #include "ns3/packet.h"
@@ -4469,6 +4470,101 @@ class PerQpCeilingPacerTest : public TestCase
     }
 };
 
+// (1c) RTTCC rate machine: probe cadence, Swift-style MD/AI math, per-flow
+// pacer, and the parity foundation (unknown flow / at-line-rate flow shape
+// nothing). Probe/response timing is driven by scheduled events so the RTT
+// samples come from real simulator-time differences.
+class RttccRateMachineTest : public TestCase
+{
+  public:
+    RttccRateMachineTest()
+        : TestCase("RTTCC rate machine probe cadence, MD-AI math, per-flow pacer") {}
+    void DoRun() override
+    {
+        Ptr<RttccRateMachine> m = CreateObject<RttccRateMachine>();
+        // AI=200 so two below-target samples recover 240 -> 400 (line rate).
+        m->SetAttribute("AdditiveIncreaseGbps", DoubleValue(200.0));
+        const RttccRateMachine::FlowKey kA = 12345;
+        const RttccRateMachine::FlowKey kB = 67890;
+        const uint32_t chunk = 9000;
+
+        // (a) Parity: unknown flow -> ShapingDelay 0 (repeatedly, no state),
+        // rate reads as the line rate (400 default).
+        for (int i = 0; i < 3; ++i)
+        {
+            NS_TEST_ASSERT_MSG_EQ(m->ShapingDelay(chunk, kA).GetNanoSeconds(), 0,
+                "unknown flow must not be paced (parity-safe)");
+        }
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->GetRateGbps(kA), 400.0, 1e-9,
+            "unknown flow reads the line rate");
+
+        // (b) Probe cadence at t=0: first true, immediate second false
+        // (ProbeInterval=5000 default).
+        uint32_t seq0 = 99;
+        NS_TEST_ASSERT_MSG_EQ(m->MaybeStartProbe(kA, seq0), true,
+            "first chunk of a flow must probe");
+        NS_TEST_ASSERT_MSG_EQ(seq0, 0, "first probe seq is 0");
+        uint32_t seqX = 99;
+        NS_TEST_ASSERT_MSG_EQ(m->MaybeStartProbe(kA, seqX), false,
+            "second probe within ProbeInterval must be suppressed");
+
+        Simulator::Schedule(NanoSeconds(4000), [this, m, kA]() {
+            uint32_t s = 99;
+            NS_TEST_ASSERT_MSG_EQ(m->MaybeStartProbe(kA, s), false,
+                "probe at 4000ns (< 5000ns interval) must be suppressed");
+        });
+
+        // (c) Over-target response at t=20000: rtt=20000 > target 10000 ->
+        // factor = 1 - 0.8*(20000-10000)/20000 = 0.6 -> rate = 400*0.6 = 240.
+        // Pacer then spaces chunks at slot = 9000 B / (240*1.25e8 B/s) = 300ns:
+        // consecutive same-time calls yield 0 / 300 / 600.
+        Simulator::Schedule(NanoSeconds(20000), [this, m, kA, kB, chunk]() {
+            m->OnProbeResponse(kB, 0);   // unknown flow: ignored
+            m->OnProbeResponse(kA, 999); // stale seq: ignored
+            NS_TEST_ASSERT_MSG_EQ_TOL(m->GetRateGbps(kA), 400.0, 1e-9,
+                "ignored echoes must not change the rate");
+            m->OnProbeResponse(kA, 0);
+            NS_TEST_ASSERT_MSG_EQ_TOL(m->GetRateGbps(kA), 240.0, 1e-6,
+                "over-target MD: rate = 400 * (1 - 0.8*10000/20000) = 240");
+            const int64_t d0 = m->ShapingDelay(chunk, kA).GetNanoSeconds();
+            const int64_t d1 = m->ShapingDelay(chunk, kA).GetNanoSeconds();
+            const int64_t d2 = m->ShapingDelay(chunk, kA).GetNanoSeconds();
+            NS_TEST_ASSERT_MSG_EQ(d0, 0, "throttled flow: first chunk unpaced");
+            NS_TEST_ASSERT_MSG_EQ(d1, 300, "chunk 1 paced one 300ns slot");
+            NS_TEST_ASSERT_MSG_EQ(d2, 600, "chunk 2 paced two 300ns slots");
+            // Interval elapsed (20000 >= 0+5000): a new probe fires (seq 1).
+            uint32_t s = 99;
+            NS_TEST_ASSERT_MSG_EQ(m->MaybeStartProbe(kA, s), true,
+                "probe after ProbeInterval elapsed must fire");
+            NS_TEST_ASSERT_MSG_EQ(s, 1, "second probe seq is 1");
+        });
+
+        // (d) Below-target response at t=21000 (rtt=1000 <= 10000): AI
+        // 240+200=440, capped at line 400 -> stored as the 0.0 "at line rate"
+        // sentinel -> ShapingDelay back to a 0-delay no-op.
+        Simulator::Schedule(NanoSeconds(21000), [this, m, kA, chunk]() {
+            m->OnProbeResponse(kA, 1);
+            NS_TEST_ASSERT_MSG_EQ_TOL(m->GetRateGbps(kA), 400.0, 1e-9,
+                "AI recovery must cap at the line rate");
+            NS_TEST_ASSERT_MSG_EQ(m->ShapingDelay(chunk, kA).GetNanoSeconds(), 0,
+                "at line rate the pacer must be a 0-delay no-op again");
+        });
+
+        Simulator::Stop(MicroSeconds(30));
+        Simulator::Run();
+
+        // (e) Aggregate stats: 2 probes, 2 samples, min/max RTT 1000/20000,
+        // min flow rate back at 400 after recovery.
+        NS_TEST_ASSERT_MSG_EQ(m->GetProbesSent(), 2, "two probes sent");
+        NS_TEST_ASSERT_MSG_EQ(m->GetRttSamples(), 2, "two RTT samples");
+        NS_TEST_ASSERT_MSG_EQ(m->GetMinRttNs(), 1000, "min RTT 1000ns");
+        NS_TEST_ASSERT_MSG_EQ(m->GetMaxRttNs(), 20000, "max RTT 20000ns");
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->GetMinFlowRateGbps(), 400.0, 1e-9,
+            "recovered flow reads the line rate");
+        Simulator::Destroy();
+    }
+};
+
 // (2) CNP received -> ProcessCnpPacket -> OnCnp (NOT ProcessCreditPacket). The
 // CNP is injected over the real P2P wire (ReceiveFromDevice is private); Alpha
 // growing proves the CNP reached the DCQCN rate machine. Had it been misrouted
@@ -5679,6 +5775,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new CnpReactionTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
+    AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SoOnlyPredicateTest, TestCase::Duration::QUICK);
     AddTestCase(new DormantTest, TestCase::Duration::QUICK);

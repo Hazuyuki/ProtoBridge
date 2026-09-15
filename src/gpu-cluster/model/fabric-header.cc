@@ -320,7 +320,9 @@ FabricHeader::IsControlPacket() const
            type == FabricPacketType::ACK ||
            type == FabricPacketType::NACK ||
            type == FabricPacketType::PERMANENT_LOSS ||
-           type == FabricPacketType::CNP;
+           type == FabricPacketType::CNP ||
+           type == FabricPacketType::RTT_PROBE ||
+           type == FabricPacketType::RTT_RESPONSE;
 }
 
 bool

@@ -41,6 +41,7 @@
 #include "ns3/roce-protocol-model.h"
 #include "ns3/ethernet-protocol-model.h"
 #include "ns3/dcqcn-rate-machine.h"
+#include "ns3/rttcc-rate-machine.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/nccl-protocol-payload-builder.h"
 #include "ns3/ub-payload-builder.h"
@@ -58,6 +59,7 @@
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <queue>
 #include <unordered_map>
 #include <vector>
@@ -287,6 +289,16 @@ main(int argc, char* argv[])
     // DCQCN rate machine (its true per-flow pacer enforces the cap) even when
     // --dcqcn is off. Calibrated to the ~49 Gbps single-QP ib_write_bw ceiling.
     double perQpCeilingGbps = 0.0;
+    // RTTCC (RTT-probe-based congestion control, NVIDIA RTT-CC / Swift
+    // style). Off by default: no RttccRateMachine mounted => no probes, no
+    // pacing, byte-identical baseline. On, each So endpoint mounts its OWN
+    // machine (the flow key carries no source rank, so a shared machine
+    // would merge per-flow state across incast senders). Fabric-agnostic:
+    // unlike DCQCN it needs no ECN/CNP loop, so it is the congestion-control
+    // option for the plain lossy Ethernet fabric (and also runs on RoCE).
+    bool enableRttcc = false;
+    uint64_t rttccTargetRttNs = 0;      // 0 = machine default (10000 ns)
+    uint64_t rttccProbeIntervalNs = 0;  // 0 = machine default (5000 ns)
     std::string intraNodeTopology = "switched";
     std::string intraNodeAlgorithm = "fullmesh";
 
@@ -480,6 +492,9 @@ main(int argc, char* argv[])
     cmd.AddValue("voqDropThreshold", "Plain-Ethernet lossy VOQ tail-drop threshold (pkts); 0=off. Must be < switchVoqDepth (default 10000)", voqDropThreshold);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
+    cmd.AddValue("rttcc", "Enable RTTCC (RTT-probe-based) congestion control on So endpoints (off=parity-safe baseline)", enableRttcc);
+    cmd.AddValue("rttccTargetRttNs", "RTTCC target RTT in ns (0=default 10000); must exceed the base zero-queue RTT", rttccTargetRttNs);
+    cmd.AddValue("rttccProbeIntervalNs", "RTTCC min spacing between RTT probes per flow in ns (0=default 5000)", rttccProbeIntervalNs);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
     cmd.AddValue("intraNodeAlgorithm", "Intra-node algorithm for hierarchical: ring/fullmesh", intraNodeAlgorithm);
     std::string stepTraceFile = "";
@@ -780,6 +795,16 @@ main(int argc, char* argv[])
 
     // Build topology
     std::vector<Ptr<FabricEndpoint>> endpoints;
+    // RTTCC machines (one per So endpoint, --rttcc): kept for RESULT stats.
+    std::vector<Ptr<RttccRateMachine>> rttccMachines;
+    // RTTCC is mounted only on multi-node (So) endpoints -- the shaping gate
+    // is !IsLocalRank(destRank), so a single-node run has nothing to shape.
+    if (enableRttcc && numNodes <= 1)
+    {
+        std::cerr << "Warning: --rttcc has no effect with numNodes=1 (RTTCC "
+                     "shapes only inter-node (So) flows; machines are mounted "
+                     "in the multi-node path).\n";
+    }
 
     // Create protocol model and payload builder based on type
     ObjectFactory protoFactory(protocolModelType);
@@ -1025,6 +1050,28 @@ main(int argc, char* argv[])
             if (dcqcnMachine)
             {
                 ep->SetDcqcnRateMachine(dcqcnMachine);
+            }
+            // RTTCC: one machine PER endpoint (not shared like DCQCN's) —
+            // the flow key (destRank,vc,flowId) carries no source rank, so a
+            // shared machine would merge the per-flow pacer/probe state of
+            // two incast senders targeting the same flow coordinates. The
+            // line rate is the So NIC rate (the link RTTCC paces onto).
+            if (enableRttcc)
+            {
+                Ptr<RttccRateMachine> rttccMachine = CreateObject<RttccRateMachine>();
+                rttccMachine->SetAttribute("LineRateGbps",
+                                           DoubleValue(static_cast<double>(interNodeBandwidthGbps)));
+                if (rttccTargetRttNs > 0)
+                {
+                    rttccMachine->SetAttribute("TargetRtt", TimeValue(NanoSeconds(rttccTargetRttNs)));
+                }
+                if (rttccProbeIntervalNs > 0)
+                {
+                    rttccMachine->SetAttribute("ProbeInterval",
+                                               TimeValue(NanoSeconds(rttccProbeIntervalNs)));
+                }
+                ep->SetRttccRateMachine(rttccMachine);
+                rttccMachines.push_back(rttccMachine);
             }
             ep->SetBulkChunkSize(bulkChunkSize);
             ep->SetDeviceType(deviceType);
@@ -2278,6 +2325,29 @@ main(int argc, char* argv[])
     std::cout << "fecCorrectable=" << (fecModel ? fecModel->GetCorrectableCount() : 0) << std::endl;
     std::cout << "fecUncorrectable=" << (fecModel ? fecModel->GetUncorrectableCount() : 0) << std::endl;
     std::cout << "bgP2pEnabled=" << (bgP2pEnabled ? "true" : "false") << std::endl;
+    std::cout << "rttccEnabled=" << (enableRttcc ? "true" : "false") << std::endl;
+    if (!rttccMachines.empty())
+    {
+        uint64_t rttccProbesSent = 0;
+        uint64_t rttccRttSamples = 0;
+        int64_t rttccMinRttNs = std::numeric_limits<int64_t>::max();
+        int64_t rttccMaxRttNs = 0;
+        double rttccMinRateGbps = std::numeric_limits<double>::max();
+        for (const auto& rm : rttccMachines)
+        {
+            rttccProbesSent += rm->GetProbesSent();
+            rttccRttSamples += rm->GetRttSamples();
+            rttccMinRttNs = std::min(rttccMinRttNs, rm->GetMinRttNs());
+            rttccMaxRttNs = std::max(rttccMaxRttNs, rm->GetMaxRttNs());
+            rttccMinRateGbps = std::min(rttccMinRateGbps, rm->GetMinFlowRateGbps());
+        }
+        std::cout << "rttccProbesSent=" << rttccProbesSent << std::endl;
+        std::cout << "rttccRttSamples=" << rttccRttSamples << std::endl;
+        std::cout << "rttccMinRttNs="
+                  << (rttccRttSamples > 0 ? rttccMinRttNs : 0) << std::endl;
+        std::cout << "rttccMaxRttNs=" << rttccMaxRttNs << std::endl;
+        std::cout << "rttccMinRateGbps=" << rttccMinRateGbps << std::endl;
+    }
     if (bgP2p)
     {
         std::cout << "bgP2pBytesSent=" << bgP2p->GetBytesSent() << std::endl;

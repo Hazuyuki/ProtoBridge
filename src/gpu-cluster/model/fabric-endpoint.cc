@@ -1194,6 +1194,17 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         // intercepted before the generic control (ProcessCreditPacket) branch.
         ProcessCnpPacket(header);
     }
+    else if (header.GetPacketType() == FabricPacketType::RTT_PROBE)
+    {
+        // RTTCC probe: reflect it straight back to the prober. Intercepted
+        // before the generic control branch (a probe is not a credit).
+        SendRttResponsePacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::RTT_RESPONSE)
+    {
+        // RTTCC echo: turn it into an RTT sample for the rate machine.
+        ProcessRttResponsePacket(header);
+    }
     else if (header.IsControlPacket())
     {
         ProcessCreditPacket(pkt, header);
@@ -1259,6 +1270,17 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
         // is control traffic but must not be consumed as a credit, so it is
         // intercepted before the generic control (ProcessCreditPacket) branch.
         ProcessCnpPacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::RTT_PROBE)
+    {
+        // RTTCC probe: reflect it straight back to the prober. Intercepted
+        // before the generic control branch (a probe is not a credit).
+        SendRttResponsePacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::RTT_RESPONSE)
+    {
+        // RTTCC echo: turn it into an RTT sample for the rate machine.
+        ProcessRttResponsePacket(header);
     }
     else if (header.IsControlPacket())
     {
@@ -1804,6 +1826,99 @@ FabricEndpoint::GetDcqcnRateMachine() const
 }
 
 void
+FabricEndpoint::SendRttProbePacket(uint16_t destRank, uint8_t vcId, uint16_t flowId,
+                                   uint32_t probeSeq)
+{
+    NS_LOG_FUNCTION(this << destRank << probeSeq);
+
+    // An RTT probe is a control packet: it rides the same VOQ queues and
+    // links as the data it accompanies (so the measured RTT includes the
+    // queueing the flow experiences) but bypasses BER sampling, lossy
+    // tail-drop, LLR retry state, and the rate machines themselves (a probe
+    // must never be paced by the rate it is measuring). The send timestamp
+    // stays sender-local in the RttccRateMachine, keyed by probeSeq — no
+    // timestamp goes on the wire; the response only echoes probeSeq.
+    Ptr<Packet> packet = Create<Packet>();
+    FabricHeader header;
+    header.SetPacketType(FabricPacketType::RTT_PROBE);
+    header.SetFabricType(GetFabricTypeForDest(destRank));
+    header.SetVirtualChannel(vcId);
+    header.SetSequenceNumber(probeSeq);
+    header.SetFlowId(flowId);
+    header.SetSourceRank(m_rank);
+    header.SetDestRank(destRank);
+    header.SetSourceMac(m_address);
+    header.SetDestMac(ResolveDestMac(destRank));
+    packet->AddHeader(header);
+
+    if (!m_devices.empty())
+    {
+        uint32_t deviceIndex = ResolveDeviceIndex(destRank);
+        SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(destRank));
+    }
+}
+
+void
+FabricEndpoint::SendRttResponsePacket(const FabricHeader& probeHeader)
+{
+    NS_LOG_FUNCTION(this << probeHeader.GetSourceRank());
+
+    // Hardware-style immediate reflection: echo the probe's sequence number
+    // (and flow coordinates) straight back to the prober. Unconditional — a
+    // receiver needs no rate machine to reflect; with --rttcc off no probes
+    // exist, so this path never fires on the baseline (parity-safe).
+    Ptr<Packet> packet = Create<Packet>();
+    FabricHeader header;
+    header.SetPacketType(FabricPacketType::RTT_RESPONSE);
+    header.SetFabricType(GetFabricTypeForDest(probeHeader.GetSourceRank()));
+    header.SetVirtualChannel(probeHeader.GetVirtualChannel());
+    header.SetSequenceNumber(probeHeader.GetSequenceNumber());
+    header.SetFlowId(probeHeader.GetFlowId());
+    header.SetSourceRank(m_rank);
+    header.SetDestRank(probeHeader.GetSourceRank());
+    header.SetSourceMac(m_address);
+    header.SetDestMac(ResolveDestMac(probeHeader.GetSourceRank()));
+    packet->AddHeader(header);
+
+    if (!m_devices.empty())
+    {
+        uint32_t deviceIndex = ResolveDeviceIndex(probeHeader.GetSourceRank());
+        SendPacketOnDevice(packet, deviceIndex,
+                           ResolveDestMac(probeHeader.GetSourceRank()));
+    }
+}
+
+void
+FabricEndpoint::ProcessRttResponsePacket(const FabricHeader& respHeader)
+{
+    NS_LOG_FUNCTION(this << respHeader.GetSourceRank());
+
+    // The response's source is the flow's receiver, so at the prober the flow
+    // key is MakeSeqKey(respHeader.GetSourceRank(), vc, flowId) — the same
+    // key the send path used (mirrors ProcessCnpPacket).
+    if (!m_rttccRate)
+    {
+        return; // dormant baseline: no machine mounted (--rttcc off)
+    }
+    uint64_t flowKey = MakeSeqKey(respHeader.GetSourceRank(),
+                                 respHeader.GetVirtualChannel(),
+                                 respHeader.GetFlowId());
+    m_rttccRate->OnProbeResponse(flowKey, respHeader.GetSequenceNumber());
+}
+
+void
+FabricEndpoint::SetRttccRateMachine(Ptr<RttccRateMachine> machine)
+{
+    m_rttccRate = machine;
+}
+
+Ptr<RttccRateMachine>
+FabricEndpoint::GetRttccRateMachine() const
+{
+    return m_rttccRate;
+}
+
+void
 FabricEndpoint::TrySendQueuedPackets()
 {
     NS_LOG_FUNCTION(this);
@@ -1877,6 +1992,38 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                                              hdr.GetVirtualChannel(),
                                              hdr.GetFlowId());
                 shapingDelay = m_dcqcnRate->ShapingDelay(packet->GetSize(), flowKey);
+            }
+        }
+    }
+
+    // RTTCC shaping: RTT-probe-based rate control for So (inter-node) data
+    // traffic, fabric-agnostic — it also covers the plain lossy Ethernet
+    // fabric, whose WireEfficiency==1.0 makes the DCQCN eff<1.0 gate above
+    // unusable and which has no ECN/CNP loop at all. Gated on the dest being
+    // a REMOTE rank (the honest So predicate). The pacer delay composes with
+    // DCQCN via max (both are earliest-egress constraints on the same chunk).
+    // At the line rate (the initial state, before any over-target RTT sample)
+    // ShapingDelay is zero, so the baseline is byte-identical (parity-safe).
+    if (m_rttccRate)
+    {
+        FabricHeader hdr;
+        packet->PeekHeader(hdr);
+        if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket() &&
+            !IsLocalRank(hdr.GetDestRank()))
+        {
+            uint64_t flowKey = MakeSeqKey(hdr.GetDestRank(),
+                                         hdr.GetVirtualChannel(),
+                                         hdr.GetFlowId());
+            shapingDelay = std::max(shapingDelay,
+                                    m_rttccRate->ShapingDelay(packet->GetSize(), flowKey));
+            // At most one probe per ProbeInterval rides ahead of the data
+            // chunk it accompanies (probe = control packet: the recursive
+            // SendPacketOnDevice call skips both rate machines).
+            uint32_t probeSeq = 0;
+            if (m_rttccRate->MaybeStartProbe(flowKey, probeSeq))
+            {
+                SendRttProbePacket(hdr.GetDestRank(), hdr.GetVirtualChannel(),
+                                   hdr.GetFlowId(), probeSeq);
             }
         }
     }

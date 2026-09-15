@@ -6,6 +6,45 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — RTTCC (RTT-probe-based congestion control) for the plain-Ethernet So fabric
+
+`--rttcc` (default off) adds a second congestion-control option beside DCQCN,
+targeted at the **lossy plain-Ethernet fabric where DCQCN cannot operate**
+(ETH has no ECN/CNP loop, and `EthernetProtocolModel` locks
+`WireEfficiency=1.0`, which the DCQCN So gate keys on). RTTCC senses
+congestion from delay instead (NVIDIA RTT-CC / Swift-style):
+
+* **Probe/response loop.** At the `SendPacketOnDevice` egress chokepoint the
+  sender emits at most one `RTT_PROBE` per `ProbeInterval` per flow alongside
+  the data; the receiver reflects it as an `RTT_RESPONSE` echoing only the
+  probe sequence (timestamps never go on the wire — the sender keeps a local
+  seq→sentNs map). Both new packet types are CONTROL packets: they bypass BER
+  sampling, VOQ tail-drop, ECN marking, LLR storage and both rate machines'
+  shaping, but are still ENQUEUED into switch VOQs — so the measured RTT
+  reflects real congestion queueing.
+* **Swift-style rate law** (`RttccRateMachine`, one per So endpoint):
+  `rtt<=TargetRtt` → rate += `AdditiveIncreaseGbps` (cap `LineRateGbps`);
+  `rtt>TargetRtt` → rate ×= `1 − Beta·(rtt−target)/rtt` (floor
+  `MinRateGbps`). The rate is enforced as a TRUE per-flow pacer (per-flow
+  next-send bookkeeping, same mechanism as the DCQCN per-QP ceiling) and
+  COMPOSES with DCQCN via `max(dcqcnDelay, rttccDelay)`.
+* **Per-endpoint mount** (unlike DCQCN's shared machine): the flow key
+  carries no source rank, so a shared machine would merge the pacer/probe
+  state of two incast senders targeting the same (dest, vc, flow).
+* **Parity.** Default off mounts nothing; the incast baseline
+  (simTimeNs 68664 / drops 87 / retx 285 / permLoss 0) and the RoCE triple
+  (su 4769616 / 2n 15307388 / 4n 13421212) stay byte-identical. Even when
+  mounted, an uncongested flow sits at the line rate and the pacer is a
+  0-delay no-op. On the long 4MB `p2p-eth-incast.cfg` run RTTCC reduces
+  drops 16388→16317, retransmits 25151→24911 and permanent losses 280→272.
+* CLI: `--rttcc`, `--rttccTargetRttNs` (default 10000), `--rttccProbeIntervalNs`
+  (default 5000); RESULT block reports `rttccProbesSent/RttSamples/
+  MinRttNs/MaxRttNs/MinRateGbps`. Gates: `RttccRateMachineTest` (C++) +
+  `test/parity/test_rttcc_ethernet.py` (default-off byte-identity + loop-alive).
+* Idealizations (see `doc/RISKS.md`): probes ride the control path so they are
+  never tail-dropped (every probe returns a sample); the receiver reflects
+  unconditionally (no receiver-side machine).
+
 ### New — multi-operation temporal contention modeling (multi-node contention wiring + background P2P injection)
 
 ProtoBridge can now model **contention between a primary collective and a

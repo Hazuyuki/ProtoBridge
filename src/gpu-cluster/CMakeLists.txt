@@ -36,6 +36,7 @@ build_lib(
     model/so-header.cc
     model/ethernet-switch.cc
     model/dcqcn-rate-machine.cc
+    model/rttcc-rate-machine.cc
     model/llr-manager.cc
     model/ring-allreduce.cc
     model/sharp-allreduce.cc
@@ -96,6 +97,7 @@ build_lib(
     model/so-header.h
     model/ethernet-switch.h
     model/dcqcn-rate-machine.h
+    model/rttcc-rate-machine.h
     model/llr-manager.h
     model/ring-allreduce.h
     model/sharp-allreduce.h

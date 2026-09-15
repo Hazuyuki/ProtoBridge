@@ -41,7 +41,9 @@ enum class FabricPacketType : uint8_t
     RETRY_REQUEST = 13,
     RETRY_ACK = 14,
     PERMANENT_LOSS = 15,
-    CNP = 16 ///< Congestion Notification Packet (RoCEv2 ECN echo, scale-out only)
+    CNP = 16, ///< Congestion Notification Packet (RoCEv2 ECN echo, scale-out only)
+    RTT_PROBE = 17,   ///< RTTCC RTT probe (scale-out only; receiver reflects it)
+    RTT_RESPONSE = 18 ///< RTTCC probe reflection (echoes the probe's sequence number)
 };
 
 /**

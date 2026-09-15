@@ -22,6 +22,7 @@
 #include "protocol-payload-builder.h"
 #include "flow-control-policy.h"
 #include "dcqcn-rate-machine.h"
+#include "rttcc-rate-machine.h"
 
 #include "ns3/application.h"
 #include "ns3/net-device.h"
@@ -276,6 +277,13 @@ class FabricEndpoint : public Application
     // baseline (parity-safe).
     void SetDcqcnRateMachine(Ptr<DcqcnRateMachine> machine);
     Ptr<DcqcnRateMachine> GetDcqcnRateMachine() const;
+
+    // RTTCC rate machine (scale-out; RTT-probe-based, fabric-agnostic — works
+    // on lossy plain Ethernet where no ECN/CNP loop exists). Mount ONE
+    // machine per endpoint (the flow key carries no source rank). Null =>
+    // byte-identical to the unmounted baseline (parity-safe, --rttcc off).
+    void SetRttccRateMachine(Ptr<RttccRateMachine> machine);
+    Ptr<RttccRateMachine> GetRttccRateMachine() const;
     /**
      * @brief Send-gate dispatch. Returns true if the packet is admitted
      *        (credit consumed under CREDIT); false => caller backpressures.
@@ -498,6 +506,19 @@ class FabricEndpoint : public Application
     ///        machine (per-flow Alpha backoff) for the flow the CNP echoes.
     ///        No-op when no machine is mounted (dormant baseline).
     void ProcessCnpPacket(const FabricHeader& cnpHeader);
+
+    /// @brief Emit an RTTCC RTT probe on a flow (control packet: rides the
+    ///        same VOQ queues as data — the RTT sample sees congestion — but
+    ///        bypasses BER/tail-drop/LLR/shaping). Timestamps stay sender-
+    ///        local in the RttccRateMachine, keyed by probeSeq.
+    void SendRttProbePacket(uint16_t destRank, uint8_t vcId, uint16_t flowId,
+                            uint32_t probeSeq);
+    /// @brief Reflect an inbound RTT probe back to its source (hardware-style
+    ///        immediate echo; needs no rate machine on the receiver).
+    void SendRttResponsePacket(const FabricHeader& probeHeader);
+    /// @brief Receive-side handler for an RTT_RESPONSE: turns the echo into
+    ///        an RTT sample for the RTTCC machine. No-op when unmounted.
+    void ProcessRttResponsePacket(const FabricHeader& respHeader);
     void TrySendQueuedPackets();
 
     /**
@@ -551,6 +572,7 @@ class FabricEndpoint : public Application
     Ptr<CreditManager> m_creditManager;             ///< Credit manager
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
     Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
+    Ptr<RttccRateMachine> m_rttccRate{nullptr}; ///< RTTCC rate machine (So-only; null=dormant)
     std::unordered_map<uint32_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(VC,flowId) reorder buffers, key=(vcId<<16)|flowId
 
     // Send queue
