@@ -430,3 +430,10 @@ busbw) and dominate the total. The packet-level NVLS model cannot cover this
 regime (≥64 MB exceeds practical simulation time), so the collective-level
 comparison at multi-GB sizes is out of reach for ns-3; the surrogate's
 hierarchical model is the right tool there. Not pursued further.
+
+For the figure (`configs/calibration/crusoe_nccl_busbw.{png,pdf}`, generated
+by `plot_measured_anchors.py`) a 4 GB ns-3 point was added: 147.5 ms, i.e.
+algbw 29.1 GB/s — flat next to the 2 GB point's 29.0 GB/s, as expected for
+the bandwidth-dominated ring-intra regime. Sizes ≥8 GB abort in stock ns-3
+(`Queue::m_nBytes` is a 32-bit byte counter; `queue.h:551` assert), which
+bounds the packet-level range for this comparison at 4 GB.
