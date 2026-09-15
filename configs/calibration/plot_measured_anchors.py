@@ -18,6 +18,16 @@ Figure 2 (crusoe_nccl_busbw.{png,pdf}): measured 4-node x 8xH100 (IB NDR,
   ring); ns-3 points exist only at 2/4 GiB (>=8 GiB overflows the stock ns-3
   uint32 Queue byte counter, queue.h:551). See doc/CALIBRATION.md.
 
+Figure 3 (roce_p2p_perftest_comparison.{png,pdf}): the RoCE v2 P2P perftest
+  calibration (share_data/zhuyu/RoCEv2_benchmark_data.md, third-party
+  engineering blog, ConnectX-7 400G RoCEv2 single QP). Left: ib_write_lat
+  measured vs the calibrated surrogate (make_connectx7_p2p_perftest_theory,
+  computed live, MAPE 2.60%) vs the ns-3 best-fit sweep (roce_p2p_ns3_sweep
+  .json, MAPE 5.26%). Right: ib_write_bw single-QP bandwidth measured vs
+  ns-3 with the opt-in --perQpCeilingGbps=49 pacer (roce_p2p_bw_sweep.json,
+  MAPE 3.20% for >=64 MB; the <64 MB transition zone is un-paced and the
+  blog's small-size regime is msg-issue-limited, not modeled).
+
 Run:  python3 configs/calibration/plot_measured_anchors.py
 """
 
@@ -25,6 +35,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -35,6 +46,11 @@ import matplotlib.pyplot as plt
 HERE = Path(__file__).resolve().parent
 REFERENCE = HERE / "srnic_fig11_cx6_reference.csv"
 SWEEP = HERE / "eth_gbn_loss_sweep.json"
+NS3_LAT_SWEEP = HERE / "roce_p2p_ns3_sweep.json"
+NS3_BW_SWEEP = HERE / "roce_p2p_bw_sweep.json"
+
+sys.path.insert(0, str(HERE.parent.parent / "surrogate" / "theory"))
+import whitebox_surrogate_v2 as wb  # noqa: E402
 
 # saturncloud blog all_reduce_perf table (out-of-place columns):
 # size(B), time(us), algbw(GB/s), busbw(GB/s)
@@ -56,6 +72,21 @@ NS3_ROWS = [
     (2147483648, 74041.6),
     (4294967296, 147491.3),
 ]
+
+# ib_write_bw single-QP measured table (BW average, Gbps) from
+# share_data/zhuyu/RoCEv2_benchmark_data.md (ConnectX-7 400G, RoCEv2 GID3,
+# MTU 4096, RC, TX depth 128; third-party engineering blog).
+IB_WRITE_BW_MEASURED = [
+    (2, 0.13),
+    (4, 0.27),
+    (64, 4.18),
+    (1024, 41.89),
+    (4096, 48.76),
+    (65536, 49.07),
+    (1048576, 49.12),
+    (8388608, 49.14),
+]
+PER_QP_CEILING_GBPS = 49.0  # calibrated single-QP sustained ceiling
 
 
 def load_reference() -> dict[str, dict[float, float]]:
@@ -145,8 +176,77 @@ def fig_crusoe() -> None:
     plt.close(fig)
 
 
+def fig_roce_p2p() -> None:
+    lat_sweep = json.loads(NS3_LAT_SWEEP.read_text())
+    bw_sweep = json.loads(NS3_BW_SWEEP.read_text())
+
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(11.0, 4.2))
+
+    # -- Left: ib_write_lat ------------------------------------------------
+    meas_lat = {int(k): v for k, v in lat_sweep["ib_write_lat_points"].items()}
+    ns3_lat = {int(k): v for k, v in lat_sweep["best"]["pred"].items()}
+
+    s = wb.make_connectx7_p2p_perftest_theory()
+    surro_sizes = [2 ** e for e in range(1, 17)]  # 2 B .. 64 KiB
+    surro_lat = [s.predict(D, 2, "ring", credits=128, ber=0,
+                           collective="sendrecv") for D in surro_sizes]
+
+    xs = sorted(meas_lat)
+    axl.plot(xs, [meas_lat[x] for x in xs], "o-", color="#c0392b",
+             label="ib_write_lat measured (blog)")
+    axl.plot(surro_sizes, surro_lat, "-", color="#2e86c1",
+             label="surrogate (MAPE 2.60%)")
+    xs = sorted(ns3_lat)
+    axl.plot(xs, [ns3_lat[x] for x in xs], "s--", color="#27ae60",
+             label="ns-3 best fit (MAPE 5.26%)")
+    axl.set_xscale("log", base=2)
+    axl.set_xlabel("message size (bytes)")
+    axl.set_ylabel("single-write latency (µs)")
+    axl.set_title("ib_write_lat: ConnectX-7 400G RoCEv2, same switch")
+    axl.grid(True, which="both", alpha=0.3)
+    axl.legend(fontsize=8, loc="upper left")
+    axl.annotate("1–4 KB transition: measured is sublinear\n"
+                 "(NIC processing, S^0.669); models are linear",
+                 xy=(4096, 1.88), xytext=(30, 3.0), fontsize=8,
+                 arrowprops=dict(arrowstyle="->", color="0.4"), color="0.25")
+
+    # -- Right: ib_write_bw (single QP) ------------------------------------
+    m_sizes = [r[0] for r in IB_WRITE_BW_MEASURED]
+    m_bw = [r[1] for r in IB_WRITE_BW_MEASURED]
+    n_sizes = [r["size"] for r in bw_sweep["rows"]]
+    n_bw = [r["gbps"] for r in bw_sweep["rows"]]
+
+    axr.plot(m_sizes, m_bw, "o-", color="#c0392b",
+             label="ib_write_bw measured (blog)")
+    axr.plot(n_sizes, n_bw, "s--", color="#27ae60",
+             label="ns-3 --perQpCeilingGbps=49")
+    axr.axhline(PER_QP_CEILING_GBPS, color="0.4", ls=":", lw=1,
+                label="49 Gbps per-QP ceiling (calibrated)")
+    axr.set_xscale("log", base=2)
+    axr.set_yscale("log")
+    axr.set_xlabel("message size (bytes)")
+    axr.set_ylabel("bandwidth (Gbps)")
+    axr.set_title("ib_write_bw: single-QP bandwidth vs message size")
+    axr.grid(True, which="both", alpha=0.3)
+    axr.legend(fontsize=8, loc="lower right")
+    axr.annotate("≥64 MB: paced to the ceiling,\nMAPE 3.20%",
+                 xy=(n_sizes[-1], n_bw[-1]), xytext=(2e5, 8), fontsize=8,
+                 arrowprops=dict(arrowstyle="->", color="0.4"), color="0.25")
+    axr.annotate("<64 MB over-estimates: 8 MB-coalesced\nchunks un-paced "
+                 "(msg-issue limit not modeled)",
+                 xy=(n_sizes[0], n_bw[0]), xytext=(3, 110), fontsize=8,
+                 arrowprops=dict(arrowstyle="->", color="0.4"), color="0.25")
+
+    fig.tight_layout()
+    for ext in ("png", "pdf"):
+        fig.savefig(HERE / f"roce_p2p_perftest_comparison.{ext}", dpi=200)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     fig_srnic()
     fig_crusoe()
+    fig_roce_p2p()
     print("wrote", HERE / "srnic_fig11_comparison.{png,pdf}")
     print("wrote", HERE / "crusoe_nccl_busbw.{png,pdf}")
+    print("wrote", HERE / "roce_p2p_perftest_comparison.{png,pdf}")
