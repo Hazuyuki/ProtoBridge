@@ -413,3 +413,20 @@ would be an artifact stall.
 Layer caveat (same as the perftest section above): ns-3 models a bare-metal
 L2 fabric endpoint, not a verbs NIC — the comparison validates the
 *recovery-mode degradation shape*, not absolute goodput.
+
+### Collective-level anchor: attempted, regime mismatch (recorded to avoid re-runs)
+
+A third measured anchor was attempted: a published 4-node × 8×H100 (IB NDR,
+8×400G rails/node) `all_reduce_perf` run
+(<https://saturncloud.io/blog/crusoe-nccl-cluster-validation/>; 2–32 GB,
+algbw 372–377 GB/s ≈ 94% of the 400 GB/s per-node NIC aggregate, busbw
+~700 GB/s flat). The ns-3 counterpart (4 nodes × 8 GPU, hierarchical
+allreduce, `--interNodeBandwidth=3200` aggregated-rail approximation) gives
+74.0 ms for 2 GB vs 5.77 ms measured — a 12.8× gap that is an **algorithm
+regime mismatch, not a calibration error**: at these sizes NCCL runs NVLS
+intra-node phases (~450 GB/s busbw) and the transfer is NIC-bound, while our
+hierarchical injector's intra phases are the calibrated *ring* (~98 GB/s
+busbw) and dominate the total. The packet-level NVLS model cannot cover this
+regime (≥64 MB exceeds practical simulation time), so the collective-level
+comparison at multi-GB sizes is out of reach for ns-3; the surrogate's
+hierarchical model is the right tool there. Not pursued further.
