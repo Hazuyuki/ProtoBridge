@@ -6,6 +6,28 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — Demystifying-NCCL Fig. 6 anchor: Su protocol constants validated on third-party GH200 hardware
+
+Third external measured anchor, first for the **Su (NVLink) protocol axis**:
+*Demystifying NCCL* (arXiv:2507.04786) Fig. 6 intra-node panels — LL / LL128 /
+Simple × Ring/Tree AllReduce on a 4× GH200 quad (CSCS Alps, NCCL 2.19.1,
+2^14–2^32 B) — digitized by pixel extraction
+(`configs/calibration/demystify_nccl_fig6_reference.csv`, provenance in
+header) and compared against the stock `NcclProtocolModel` with only the
+physical spec changed (ring: `--numLanes=18 --bandwidth=200` = 450 GB/s
+per-GPU multi-ring aggregate; tree: fullmesh `--numLanes=6` = one 150 GB/s
+pair per edge). Only 6 startup intercepts fitted (anchored at 2^14);
+2^16–2^32 is a pure transfer test: per-curve MAPE 15–26% (one-sided
+optimistic, worst in the 2^22–2^26 transition regime), and the
+bandwidth-independent protocol-shape ratios at 2^32 transfer to within 3% on
+the tree path (tree LL/Simple 1.95 vs 2.01 measured; LL128/Simple 1.04 vs
+1.07) — independent confirmation of the LL=0.5 / LL128=0.9375 wire model.
+Ring LL undershoots 21% (our LL efficiency is NCCL's theoretical bound; the
+paper reports LL at 25–50% of peak) — documented, not tuned. Sweep:
+`configs/calibration/demystify_nccl_sweep.py` (60 runs) + comparison figure;
+write-up in `doc/CALIBRATION.md` §"NCCL protocol shapes (scale-up)". No
+model-code changes — measurement-only round.
+
 ### New — `--soGbnStrict` strict So go-back-N receive semantics (supersedes the GBN numbers below)
 
 The re-run below left the GBN arm optimistic at high loss (0.820 vs CX-6

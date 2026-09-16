@@ -500,3 +500,70 @@ algbw 29.1 GB/s — flat next to the 2 GB point's 29.0 GB/s, as expected for
 the bandwidth-dominated ring-intra regime. Sizes ≥8 GB abort in stock ns-3
 (`Queue::m_nBytes` is a 32-bit byte counter; `queue.h:551` assert), which
 bounds the packet-level range for this comparison at 4 GB.
+
+## NCCL protocol shapes (scale-up) — Demystifying NCCL Fig. 6 (measured) vs ns-3
+
+Third external measured anchor, and the **first for the Su (NVLink) protocol
+axis**: the LL / LL128 / Simple wire-efficiency constants and the ring/tree
+collective shapes had until now only been validated against our own A800/H200
+measurements. *Demystifying NCCL* (arXiv:2507.04786) publishes
+hardware-measured AllReduce runtimes for all three protocols × Ring/Tree on
+CSCS Alps (NCCL 2.19.1, protocols forced via `NCCL_PROTO`, 20 runs/point,
+medians), sizes 2^14–2^32 B. We use the two **intra-node** panels of Fig. 6:
+one Alps node = 4× GH200 fully connected all-to-all, six 200 Gb/s NVLink4
+links per GPU pair = **150 GB/s per direction per pair** (450 GB/s aggregate
+egress per GPU). The inter-node panels are *not* comparable (Cray Slingshot
+Dragonfly + NCCL host-proxy sync — a different fabric from our RoCE/ETH So
+models) and are used only qualitatively.
+
+Reference data: `configs/calibration/demystify_nccl_fig6_reference.csv`,
+digitized by pixel extraction (gridline-calibrated main panels ±2%, zoom
+insets for ≤2^22; provenance in the file header). Sweep driver:
+`configs/calibration/demystify_nccl_sweep.py` (60 runs, ~1 min); figure:
+`demystify_nccl_fig6_comparison.{png,pdf}`.
+
+**Mapping (spec-derived, no fitted bandwidth):**
+
+| arm | ns-3 CLI | physics |
+|---|---|---|
+| ring | `--topology=ring --numGpus=4 --numLanes=18 --bandwidth=200` | NCCL multi-channel rings aggregate all 3 pair-links → 450 GB/s per-GPU egress (same modeling decision as the H200 ring preset) |
+| tree | `--topology=fullmesh --numGpus=4 --numLanes=6 --bandwidth=200` | intra-node tree/chain edges are single GPU pairs → 150 GB/s per edge |
+
+The measured data itself confirms the mapping: ring Simple 2^32 busBW =
+4.29 GB × 1.5 / 19.2 ms = **335 GB/s (74% of the 450 GB/s aggregate)**; tree
+Simple 2^32 ≈ D/150 GB/s = 28.6 ms vs 27.5 ms measured (pair-limited).
+
+**Fitted constants: exactly 6 startup intercepts** (algorithm × protocol,
+anchored at 2^14: `startup = measured(2^14) − sim_wire(2^14, startup=0)`;
+ring 10.6/22.6/33.6 µs, tree 14.4/18.2/30.9 µs for LL/LL128/Simple — the
+right magnitude and ordering for NCCL kernel-launch + protocol setup).
+Everything else — LL 0.5 / LL128 0.9375 / Simple 1.0 wire efficiency, chunk
+sizes, credit flow, spraying — is the stock `NcclProtocolModel`. Sizes
+2^16–2^32 are therefore a pure transfer test on third-party hardware.
+
+**Results (per-curve MAPE over 2^16–2^32):** ring LL 25.1% / LL128 21.1% /
+Simple 18.0%; tree LL 16.9% / LL128 15.2% / Simple 26.4%. The deviation is
+one-sided: the sim is optimistic, worst in the 2^22–2^26 transition regime
+(ratio 0.45–0.73 — real NCCL pays chunk-scheduling/channel-ramp costs there
+that the model does not carry) and mildly optimistic at ≥2^28 (ratio
+0.71–0.86; measured plateau efficiency ~74% vs the model's ~89%).
+
+**Protocol-shape isolation (size-2^32 runtime ratios, bandwidth-independent):**
+
+| ratio | measured | ns-3 | dev |
+|---|---|---|---|
+| tree LL/Simple | 2.005 | 1.953 | −2.6% |
+| tree LL128/Simple | 1.073 | 1.041 | −3.0% |
+| ring LL/Simple | 2.363 | 1.872 | −21% |
+| ring LL128/Simple | 1.089 | 0.996 | −8.5% |
+| tree/ring (Simple) | 1.435 | 1.374 | −4.3% |
+
+On the pair-limited tree path the stock protocol constants transfer to
+within **3%** — independent confirmation of the LL=0.5 / LL128=0.9375 wire
+model. On the aggregated ring path LL undershoots by 21%: our LL efficiency
+is NCCL's theoretical bound, while the paper itself states LL reaches only
+25–50% of peak — multi-channel LL scheduling loses more than the 2× flag
+overhead. Documented, not tuned. The one qualitative miss: at ≥2^28 the sim
+has LL128 marginally *faster* than Simple on ring (0.996 vs measured 1.089 —
+a chunk-granularity artifact); ordering elsewhere (LL best small, Simple
+best large, LL crossover at ~2^22, tree slower than ring) all reproduces.

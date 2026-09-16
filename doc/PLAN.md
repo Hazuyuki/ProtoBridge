@@ -93,6 +93,30 @@ in two phases:
   write-up in `doc/CALIBRATION.md` §"Loss
   recovery under injected packet loss".
 
+- **Demystifying-NCCL Fig. 6 Su protocol anchor — DONE (task #36).** Third
+  external measured anchor, first for the *Su* (NVLink) protocol axis:
+  arXiv:2507.04786 Fig. 6 intra-node panels (LL/LL128/Simple × Ring/Tree
+  AllReduce, 4× GH200 quad on CSCS Alps, NCCL 2.19.1, 2^14–2^32 B) digitized
+  by pixel extraction (gridline-calibrated ±2%, zoom insets for ≤2^22) into
+  `configs/calibration/demystify_nccl_fig6_reference.csv`, and compared
+  against the stock `NcclProtocolModel` with only the physical spec changed:
+  ring = `--topology=ring --numLanes=18 --bandwidth=200` (450 GB/s per-GPU
+  multi-ring aggregate — the measured busBW of 335 GB/s confirms the
+  aggregation), tree = `--topology=fullmesh --numLanes=6` (one 150 GB/s pair
+  per edge — measured 27.5 ms at 2^32 ≈ D/150). Exactly 6 startup intercepts
+  fitted at 2^14; the rest is a zero-tune transfer test: per-curve MAPE
+  15–26% (one-sided optimistic; worst at the 2^22–2^26 transition), and the
+  bandwidth-independent 2^32 protocol ratios transfer within 3% on the tree
+  path (LL/Simple 1.95 vs 2.01; LL128/Simple 1.04 vs 1.07) — independent
+  confirmation of LL=0.5/LL128=0.9375. Known gaps documented, not tuned:
+  ring LL −21% (our 0.5 is NCCL's bound; paper says LL reaches 25–50% of
+  peak), LL128-vs-Simple ordering at ≥2^28 on ring inverted by ~2.5%
+  (chunk-granularity artifact). Inter-node panels not comparable (Slingshot
+  Dragonfly + host-proxy ≠ our RoCE/ETH). Artifacts:
+  `demystify_nccl_sweep.py` + `.json` + comparison figure;
+  `doc/CALIBRATION.md` §"NCCL protocol shapes (scale-up)". Measurement-only
+  round — no model-code changes, all parity pins untouched.
+
 - **Full-mesh surrogate algorithm (ns-3-calibrated) — DONE (this branch).** The
   surrogate gained a 4th algorithm shape, `fullmesh`, calibrated directly to
   ns-3 as ground truth (not a wire-rate derivation like ring/tree/nvls).
