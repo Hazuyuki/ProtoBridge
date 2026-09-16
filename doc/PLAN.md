@@ -61,18 +61,24 @@ in two phases:
   not exercise the 40 µs NCCL startup. Detail in `doc/CALIBRATION.md` §"RoCE v2
   P2P (scale-out)".
 
-- **SRNIC Fig. 11 measured loss-recovery comparison — DONE (task #33).** Second
-  external measured anchor for the So fabric: SRNIC (NSDI'23) Figure 11 (CX-6
-  go-back-N vs SRNIC selective repeat, 100G, perftest 4 KB, CC disabled,
-  FPGA-injected random loss) mapped onto the fabric's own `llrMode=gobackn` vs
-  `llrMode=sack` axis — only that axis changes between arms. Normalized
-  `G(p)/G(0)` sweep (9 loss points × 3 seeds): the recovery-mode spread
-  reproduces; GBN 0.510 vs measured CX-6 0.467 at 1% loss; structural
-  deviations documented, not tuned away (whole-message GBN window → early
-  collapse + saturating ~0.50 floor; SACK optimistic vs the real RNIC).
-  Exposed + fixed a production gap: the LLR retry timeout was a no-op outside
-  unit tests, so a lost NACK deadlocked SACK — new opt-in
-  `--llrTimeoutRetransmit` backstop (default 0, parity-pinned). Artifacts:
+- **SRNIC Fig. 11 measured loss-recovery comparison — DONE (task #33; re-run
+  after bug fixes, task #34).** Second external measured anchor for the So
+  fabric: SRNIC (NSDI'23) Figure 11 (CX-6 go-back-N vs SRNIC selective
+  repeat, 100G, perftest 4 KB, CC disabled, FPGA-injected random loss)
+  mapped onto the fabric's own `llrMode=gobackn` vs `llrMode=sack` axis —
+  only that axis changes between arms. First round exposed + fixed a
+  production gap (no-op LLR retry timeout → `--llrTimeoutRetransmit`
+  backstop, default 0, parity-pinned). Alignment analysis then exposed
+  three more model bugs, all fixed (task #34, inert at defaults): no
+  TX-depth/BDP window (new `--soTxWindow`, ACK-clocked over per-packet LLR
+  ACKs), retry timers armed at synchronous t≈0 dispatch (window makes
+  RTT-scale 500 µs timeouts sound), and NACK-of-NACK for plr-dropped
+  control packets (now dropped silently, matching the switch path).
+  Re-run (`--soTxWindow=16` = wire BDP, both arms): SACK tracks measured
+  SRNIC within ~5 points everywhere (0.823/0.773 @1%, 0.569/0.619 @2%);
+  GBN correct at low loss (0.977/0.933 @0.1%) but optimistic at high loss
+  (0.820/0.467 @1%) — receiver keeps out-of-order originals (no true-GBN
+  discard) and no RTO stalls; documented, not tuned away. Artifacts:
   `configs/calibration/srnic_fig11_cx6_reference.csv` + `eth_gbn_loss_sweep.py`
   + `p2p-roce-lossy{,-sack}.cfg`; write-up in `doc/CALIBRATION.md` §"Loss
   recovery under injected packet loss".

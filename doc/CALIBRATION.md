@@ -344,67 +344,90 @@ only `llrMode`** between arms:
 Sweep driver: [`configs/calibration/eth_gbn_loss_sweep.py`](../configs/calibration/eth_gbn_loss_sweep.py)
 (RoCE tor 100G, `--gpusPerNode=2` — required, see the cfg header —
 `--bulkChunkSize=4096` for perftest 4 KB granularity, 16 MiB transfer,
-`--packetLossRate` swept, 3 seeds). Results in
-`configs/calibration/eth_gbn_loss_sweep.json`. The comparison is
-**normalized per curve** (`G(p)/G(0)`): the ns-3 absolute plateau
-(53.2 Gbps: tor 2-link serialization + 4 KB chunk headers) intentionally
-differs from the testbed's single-link 90–97 Gbps.
+`--soTxWindow=16`, `--llrRetryTimeout=500us`, `--packetLossRate` swept,
+3 seeds). Results in `configs/calibration/eth_gbn_loss_sweep.json`. The
+comparison is **normalized per curve** (`G(p)/G(0)`): the ns-3 absolute
+plateau (53.2 Gbps: tor 2-link serialization + 4 KB chunk headers)
+intentionally differs from the testbed's single-link 90–97 Gbps.
 
 ### Result (normalized goodput, 3-seed mean)
 
 | loss rate | ns-3 GBN | CX-6 measured | ns-3 SACK | SRNIC measured |
 |---|---|---|---|---|
-| ≤1e-4 | 0.99–1.00 | 1.000 | 1.000 | 1.000 |
-| 1e-3 | 0.629 | 0.933 | 0.939 | 0.990 |
-| 2e-3 | 0.526 | 0.889 | 0.937 | 0.979 |
-| 5e-3 | 0.515 | 0.744 | 0.934 | 0.907 |
-| 1e-2 | **0.510** | **0.467** | 0.929 | 0.773 |
-| 2e-2 | 0.501 | 0.278 | 0.826 | 0.619 |
+| ≤1e-4 | 0.994–0.999 | 1.000 | 1.000 | 1.000 |
+| 1e-3 | 0.977 | 0.933 | 0.979 | 0.990 |
+| 2e-3 | 0.954 | 0.889 | 0.978 | 0.979 |
+| 5e-3 | 0.914 | 0.744 | 0.945 | 0.907 |
+| 1e-2 | 0.820 | **0.467** | **0.823** | **0.773** |
+| 2e-2 | 0.668 | 0.278 | 0.569 | 0.619 |
 
 What reproduces (the point of the experiment):
 
-- **The recovery-mode spread**: selective repeat degrades gently while GBN
-  collapses — the qualitative core of Fig. 11. At 1% loss the ns-3 GBN arm
-  (0.510) sits within 5 points of the measured CX-6 collapse (0.467).
+- **The SACK arm tracks the measured SRNIC curve within ~5 points at every
+  swept loss rate** (0.823 vs 0.773 at 1%, 0.569 vs 0.619 at 2%). This is
+  the arm whose recovery semantics (per-loss selective retransmit, timer
+  backstop for lost control packets) match its reference hardware.
 - **SACK retransmit economy**: ns-3 SACK retransmits ≈ the actual drop count
-  (tens of packets), GBN retransmits 3–5 orders of magnitude more
-  (~10⁵ at 1–2% loss) for the same delivered bytes.
+  (~80 packets at 1%), GBN retransmits ~10× more (blanket duplicates) for
+  the same delivered bytes.
+- **The GBN arm degrades monotonically** with the correct low-loss shape
+  (0.977 vs 0.933 at 0.1%) — no artificial floor or early collapse.
 
 What deviates, and why (structural, documented rather than tuned away):
 
-- **GBN collapses earlier than CX-6** (0.63 vs 0.93 at 0.1% loss). The bulk
-  sender assigns every chunk sequence number in one synchronous dispatch, so
-  a NACK re-blankets from the lost seq to the end of the *message* — the GBN
-  window is the whole remaining transfer, not the NIC's BDP/tx-depth window
-  that bounds CX-6's per-drop waste to ~RTT×C.
-- **GBN saturates at ~0.50 instead of following CX-6 down to 0.28**. For the
-  same reason the waste is bounded by ~one extra message time (the pipe stays
-  100% busy re-blanketing), while the real per-drop waste keeps growing with
-  drop count — the two asymptotics cross near 1% loss.
-- **SACK is more optimistic than SRNIC** (0.93 vs 0.77 at 1%): retransmitting
-  only lost 4 KB chunks over an otherwise idle reverse path is cheaper than a
-  real RNIC's bitmap/ACK machinery under load.
-- GBN `permanentLosses>0` at ≥1% loss are retry-limit exhaustions of packets
-  already delivered by an overlapping blanket (status stays `complete`).
+- **GBN is optimistic at high loss** (0.820 vs 0.467 at 1%; the arms even
+  invert at 2% — ns-3 GBN 0.668 > ns-3 SACK 0.569, whereas the measured
+  curves keep CX-6 far below SRNIC). Two missing penalties of real
+  go-back-N: (1) our receiver keeps out-of-order originals in the reorder
+  buffer, so blanket retransmissions arrive as duplicates and only cost
+  wire time — a real GBN receiver *discards* everything after a gap until
+  the retransmission arrives, wasting ~BDP of delivered goodput per drop;
+  (2) no RTO-scale stalls — a real NIC's drops that produce no NAK (e.g.
+  tail packets) park the QP for an RTO that is orders of magnitude longer
+  than our 500 µs NACK-driven recovery. The SACK-arm inversion at 2% is
+  the mirror image: our SACK pays the 500 µs timer for every lost ACK/NACK
+  (~80 lost control packets at 2% × 1/16 window share each), while GBN
+  blankets recover lost control packets collaterally.
+- GBN `permanentLosses` stays 0 across the sweep at `--llrRetryLimit=64`:
+  with the BDP window the blanket is 16 packets, so retry counts stay far
+  from the limit (the pre-window sweep exhausted retries at ≥1% loss).
 
-### Model fix exposed by this experiment (`--llrTimeoutRetransmit`)
+### TX window + timer fixes exposed by this experiment
 
-The SACK arm initially **deadlocked** under random loss: NACK emission at
-receiver drop time was the *only* recovery trigger, and `--packetLossRate`
-applies to control packets too (only BER/FEC has a control bypass) — a lost
-NACK stalled the transfer forever. Root cause: `LlrManager::OnRetryTimeout`
-only invoked a callback that *unit tests* registered; production had a no-op
-retry timeout. New opt-in `--llrTimeoutRetransmit=1` (default 0 = legacy
-no-op, parity-pinned) wires the endpoint to the timeout: on fire it
-re-issues the retransmission via the mode's own path (SACK single-seq /
-GBN blanket), re-arming timers and honoring `--llrRetryLimit`.
+Three model bugs found by aligning against Fig. 11, all fixed
+(parity-pinned: every change is inert at defaults):
 
-Timeout sizing caveat (same whole-message-window bound as above): timers arm
-at StorePacket time and the dispatch is synchronous, so `--llrRetryTimeout`
-must exceed the worst-case delivery+RETRY_ACK delay of the *whole transfer*
-(~2.6 ms for 16 MiB here; the sweep uses 3 ms for SACK, and 20 ms on the GBN
-arm purely as deadlock insurance that never fires). A lost-NACK event
-therefore costs ~one transfer time to recover. Both lossy cfgs also raise
+1. **No TX window** — the bulk sender dispatched *all* ~4300 chunks
+   synchronously at t≈0, so the GBN "window" was the whole remaining
+   message and a single NACK re-blanketed up to the full transfer. New
+   `--soTxWindow=N` (default 0 = legacy): ACK-clocked window over the
+   per-packet LLR ACKs, the NIC send-queue/`tx_depth` analog. The sweep
+   uses **16 chunks = wire BDP** (RTT ≈ 4.8 µs × 100G ≈ 60 KB ≈ 15×4 KB;
+   the testbed's `tx_depth=128` caps posted WQEs, but the go-back amount
+   of real GBN is the wire BDP, which is what the window models here).
+   The GBN blanket cascade is subcritical iff R = window × plr < 1:
+   w=16 keeps R ≤ 0.32 at 2%, while w=128 at 1% (R=1.28) explodes into a
+   111 ms retransmit storm with 3283 retry-limit exhaustions.
+2. **Retry timers armed at dispatch, not TX** — with the synchronous
+   dispatch, LLR retry timers all started at t≈0, forcing
+   `--llrRetryTimeout` to exceed the *whole transfer* tail (~2.6 ms) or
+   spuriously fire (500 µs at zero loss produced 8761 spurious
+   retransmits). The window fixes this structurally: StorePacket now
+   happens at window-gated TX time, so an RTT-scale timeout is sound. The
+   sweep uses **500 µs ≈ 100×RTT** on both arms (real RNIC RTO ≫ RTT;
+   100–200 µs starts inflating GBN retransmits under blanket load).
+3. **NACK-of-NACK** — the endpoint receive path emitted a NACK for
+   *control* packets dropped by `--packetLossRate` (the loss sample ran
+   before the protocol-control check), so a lost NACK/ACK spawned bogus
+   retry traffic for a sequence number that was never a data packet. Fixed:
+   control packets now drop silently (the switch path already sampled
+   after the control check); recovery of lost control packets is the
+   sender's retry timer, as in real link protocols.
+
+The `--llrTimeoutRetransmit=1` backstop (from the earlier round of this
+experiment) remains required: `LlrManager::OnRetryTimeout` fires a callback
+that only unit tests registered, so production retry timeout was a no-op
+and a lost NACK stalled SACK forever. Both lossy cfgs also raise
 `vcCredits` to effectively-infinite: CREDIT control packets are not
 LLR-protected, and the reference testbed has no link-level credit flow
 control, so a randomly dropped CREDIT under the default 64-credit budget

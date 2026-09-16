@@ -785,6 +785,73 @@ FabricEndpoint::SetBulkChunkSize(uint32_t bytes)
     m_bulkChunkSize = bytes;
 }
 
+void
+FabricEndpoint::SetSoTxWindow(uint32_t chunks)
+{
+    m_soTxWindow = chunks;
+}
+
+void
+FabricEndpoint::PumpBulkTxWindow()
+{
+    const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
+    while (!m_bulkTxQueue.empty() && m_bulkTxInflight < m_soTxWindow)
+    {
+        BulkTxChunk desc = m_bulkTxQueue.front();
+        m_bulkTxQueue.pop_front();
+
+        uint64_t seqKey = MakeSeqKey(desc.destRank, desc.vcId, desc.flowId);
+        uint32_t seqNum = m_nextSeqNum[seqKey]++;
+
+        const bool stamp = desc.stamp && (desc.wireChunk > soHeaderSize);
+        Ptr<Packet> chunkPacket = stamp
+            ? Create<Packet>(desc.wireChunk - soHeaderSize)
+            : Create<Packet>(desc.wireChunk);
+        if (stamp)
+        {
+            SoHeader soHeader;
+            soHeader.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+            soHeader.SetEcn(false); // marked in-flight by the So switch on congestion
+            soHeader.SetDataSize(desc.fragmentDataSize);
+            soHeader.SetChunkIndex(desc.chunkIndex);
+            chunkPacket->AddHeader(soHeader);
+        }
+
+        FabricHeader header;
+        header.SetPacketType(FabricPacketType::DATA);
+        header.SetFabricType(GetFabricTypeForDest(desc.destRank));
+        header.SetFlowId(desc.flowId);
+        header.SetSequenceNumber(seqNum);
+        header.SetVirtualChannel(desc.vcId);
+        header.SetSourceRank(m_rank);
+        header.SetDestRank(desc.destRank);
+        header.SetPayloadSize(desc.wireChunk);
+        header.SetSourceMac(m_address);
+        header.SetDestMac(ResolveDestMac(desc.destRank));
+        header.SetProtocol(stamp ? desc.protocolId : 0);
+        header.SetEffectiveDataSize(desc.fragmentDataSize);
+        header.SetTtl(64);
+        chunkPacket->AddHeader(header);
+
+        m_bulkTxInflight++;
+        SendPacketOnDevice(chunkPacket, desc.deviceIndex, ResolveDestMac(desc.destRank));
+
+        m_txTrace(chunkPacket->GetSize(), seqNum);
+        m_txPackets++;
+        m_txBytes += chunkPacket->GetSize();
+    }
+}
+
+void
+FabricEndpoint::ReleaseBulkTxSlot()
+{
+    if (m_bulkTxInflight > 0)
+    {
+        m_bulkTxInflight--;
+    }
+    PumpBulkTxWindow();
+}
+
 bool
 FabricEndpoint::GetLlrEnabled() const
 {
@@ -1013,7 +1080,13 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
             if (lossSample < m_linkDegradationModel->GetPacketLossRate())
             {
                 NS_LOG_DEBUG("Packet dropped by loss rate, FEC can't help");
-                if (m_llrEnabled && m_llrManager)
+                // NACK only lost DATA packets. A dropped control/retry packet
+                // (ACK, NACK, CREDIT, RETRY_ACK, ...) must be dropped silently:
+                // NACKing it makes the peer treat the control seqNum as an
+                // unACKed data seq (NACK-of-NACK -> retryMisses, duplicate
+                // retransmits, false timeouts). Real link protocols recover
+                // lost acks via the sender's retry timer, not via NACK.
+                if (m_llrEnabled && m_llrManager && !isProtocolControl)
                 {
                     FabricHeader nackHeader;
                     nackHeader.SetPacketType(FabricPacketType::NACK);
@@ -1374,6 +1447,15 @@ FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
 
     NS_LOG_FUNCTION(this << seqNum << destRank << static_cast<int>(vcId));
 
+    // A permanently lost chunk will never be ACKed: free its TX-window slot
+    // so the window can't leak closed (the store entry is already purged by
+    // the LlrManager before this callback fires, so a late ACK can't
+    // double-release).
+    if (m_soTxWindow > 0)
+    {
+        ReleaseBulkTxSlot();
+    }
+
     // Return the consumed credit for the permanently lost packet (sender-side)
     if (m_creditManager)
     {
@@ -1608,9 +1690,21 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
     if (m_llrEnabled && m_llrManager)
     {
+        // Release a TX-window slot exactly once per chunk: only when this ACK
+        // actually purges an outstanding store entry (duplicate ACKs from GBN
+        // blanket retransmits find the store already purged and don't
+        // over-release).
+        bool wasOutstanding = m_soTxWindow > 0 &&
+            m_llrManager->HasOutstandingPacket(header.GetSequenceNumber(),
+                                               header.GetSourceRank(),
+                                               header.GetFlowId());
         m_llrManager->RemovePacket(header.GetSequenceNumber(),
                                    header.GetSourceRank(),
                                    header.GetFlowId());
+        if (wasOutstanding)
+        {
+            ReleaseBulkTxSlot();
+        }
     }
 }
 
@@ -2370,6 +2464,42 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
         uint64_t wireChunkSize = (wireSize + numChunks - 1) / numChunks;
         uint64_t dataChunkSize = (dataSize + numChunks - 1) / numChunks;
+
+        // So TX window (perftest tx_depth analog): bound the number of
+        // in-flight chunks instead of dispatching the whole message
+        // synchronously at t=0. Chunk descriptors queue here; seqNums are
+        // assigned at dispatch (FIFO, so send order == seq order). The window
+        // is ACK-clocked: ProcessAckPacket releases a slot when the per-packet
+        // LLR ACK purges the retry store. So-only (remote rank, no credit
+        // interaction); 0 = legacy unbounded path below (parity default).
+        // This also moves StorePacket (and its retry-timer arming) to the
+        // window-gated dispatch instant, so the LLR retry timeout can be
+        // RTT-scale instead of whole-transfer-scale.
+        if (m_soTxWindow > 0 && !IsLocalRank(destRank))
+        {
+            for (uint64_t i = 0; i < numChunks; i++)
+            {
+                uint64_t wireOffset = i * wireChunkSize;
+                uint64_t dataOffset = i * dataChunkSize;
+                BulkTxChunk desc;
+                desc.destRank = destRank;
+                desc.flowId = flowId;
+                desc.vcId = vcId;
+                desc.protocolId = protocolId;
+                desc.wireChunk = static_cast<uint32_t>(
+                    std::min(wireChunkSize, wireSize - wireOffset));
+                desc.fragmentDataSize = static_cast<uint32_t>(
+                    std::min(dataChunkSize, dataSize - dataOffset));
+                desc.chunkIndex = static_cast<uint32_t>(i);
+                desc.deviceIndex = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
+                desc.stamp = stampSoHeader && (desc.wireChunk > soHeaderSize);
+                m_bulkTxQueue.push_back(desc);
+            }
+            m_globalSprayOffset = static_cast<uint32_t>(
+                (m_globalSprayOffset + numChunks) % sendDevices.size());
+            PumpBulkTxWindow();
+            return;
+        }
 
         for (uint64_t i = 0; i < numChunks; i++)
         {

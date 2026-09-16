@@ -6,6 +6,37 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — `--soTxWindow` ACK-clocked TX window; SRNIC Fig. 11 re-run (supersedes the entry below)
+
+Aligning against SRNIC Fig. 11 exposed three model bugs, all fixed and inert
+at defaults (parity-pinned byte-identical):
+
+1. **No TX-depth/BDP window**: `FabricEndpoint::SendBulkWireTransferSize`
+   dispatched every chunk synchronously at t≈0, making the effective GBN
+   window the whole remaining message. New `--soTxWindow=N` (default 0 =
+   legacy): bounds in-flight So bulk chunks per endpoint, clocked by the
+   per-packet LLR ACKs (requires `--llrEnabled`); the NIC send-queue /
+   perftest `tx_depth` analog. Window slots release on ACK or permanent
+   loss; duplicate ACKs from GBN blankets don't over-release.
+2. **Retry timers armed at dispatch, not TX**: with the synchronous dispatch,
+   LLR retry timers all started at t≈0, forcing whole-transfer-scale
+   timeouts (3/20 ms). With the window, `StorePacket` happens at
+   window-gated TX time, so RTT-scale timeouts (500 µs ≈ 100×RTT) are sound.
+3. **NACK-of-NACK**: the endpoint receive path emitted a NACK for *control*
+   packets dropped by `--packetLossRate` (loss sample ran before the
+   protocol-control check). Control packets now drop silently, matching the
+   switch path; lost control packets recover via the sender's retry timer.
+
+Re-run results (3-seed, `--soTxWindow=16` = wire BDP, 500 µs timeout, both
+arms): the SACK arm now tracks measured SRNIC within ~5 points at every loss
+rate (0.823 vs 0.773 at 1%, 0.569 vs 0.619 at 2%); the GBN arm has the
+correct low-loss shape (0.977 vs 0.933 at 0.1%) but is optimistic at high
+loss (0.820 vs 0.467 at 1%) because the receiver keeps out-of-order
+originals (no true-GBN discard) and there are no RTO-scale stalls — see
+`doc/CALIBRATION.md` for the honest gap analysis and the blanket-cascade
+subcriticality rule (R = window × plr < 1). The numbers and the
+"whole-message GBN window" caveats in the entry below are superseded.
+
 ### New — SRNIC Fig. 11 loss-recovery comparison + `--llrTimeoutRetransmit` backstop
 
 External measured anchor for the LLR recovery modes: SRNIC (NSDI'23) Figure 11

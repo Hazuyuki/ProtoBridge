@@ -13,15 +13,24 @@ Testbed mapping (see the cfg headers for the full rationale):
   --numNodes=2 --gpusPerNode=2 (gpn>=2 REQUIRED: m_localRankCount>1 guard)
   --interNodeFabricType=RoCE --interNodeTopology=tor --interNodeBandwidth=100
   --bulkChunkSize=4096 (perftest 4 KB messages) --ber=0 (loss only)
-  SACK arm: --llrRetryTimeout=3ms + --llrTimeoutRetransmit=1. The timeout is
-    the ONLY recovery for a lost NACK (selective repeat has no blanket
-    retransmission), and it must exceed the worst-case delivery+RETRY_ACK
-    delay of the whole synchronous dispatch (~2.6 ms for 16 MiB), so a
-    lost-NACK event costs ~one transfer time -- the same whole-message-window
-    structural bound documented for the GBN arm.
-  GBN arm: --llrRetryTimeout=20ms + --llrTimeoutRetransmit=1 as pure deadlock
-    insurance (blanket NACK retransmission normally covers lost NACKs; all
-    observed completions are < 6 ms so the 20 ms timers never fire).
+  --soTxWindow=16 (both arms): ACK-clocked BDP-scale TX window. The window is
+    sized from wire BDP, not curve-fit: RTT ~= 2 x 1 us prop + 2 x 328 ns
+    serialization + ACK return ~= 4.8 us; 100G x 4.8 us ~= 60 KB ~= 15 x 4 KB
+    chunks. Because chunk dispatch into the device queue is instantaneous,
+    window == in-flight == the GBN go-back blanket size, so the window must be
+    BDP-scale (a real NIC's tx_depth=128 caps posted WQEs, but its go-back
+    amount is still the wire BDP). The blanket cascade is subcritical when
+    R = window x plr < 1 (w=16 @ 2e-2 -> R = 0.32; w=128 @ 1e-2 -> R = 1.28
+    explodes to 111 ms with 3283 retry-limit exhaustions).
+  --llrRetryTimeout=500us + --llrTimeoutRetransmit=1 (both arms): with the
+    window, LLR retry timers arm at actual (window-gated) TX time instead of
+    the old synchronous t~=0 dispatch, so an RTT-scale timeout is finally
+    sound. 500 us ~= 100 x RTT mirrors real RNIC RTO >> RTT; shorter values
+    (100-200 us) inflate GBN retransmissions under blanket load (spurious
+    timeouts: 2407 vs 1539 retx @ 2e-2) without a principled basis. The
+    timeout is the only recovery for a lost NACK (SACK arm) and for a lost
+    per-packet ACK (both arms; a lost ACK parks one window slot until the
+    timer re-sends and the dup delivery re-ACKs).
 
 The comparison is NORMALIZED (G(p)/G(0) per curve): the ns-3 absolute goodput
 (~53 Gbps: tor 2-link serialization + per-4KB-chunk headers) intentionally
@@ -49,28 +58,30 @@ DATA_SIZE = 16 * 1024 * 1024  # 16 MiB, ~4300 x 4 KB chunks
 LOSS_RATES = [0.0, 1e-6, 1e-5, 1e-4, 1e-3, 2e-3, 5e-3, 1e-2, 2e-2]
 SEEDS = [1, 2, 3]
 
+TX_WINDOW = 16  # BDP-scale chunks (see docstring); identical for both arms
+RETRY_TIMEOUT_NS = 500_000  # ~100 x RTT; sound now that timers arm at TX time
+
 ARMS = {
     "gobackn": dict(
         cfg="configs/protocol_configs/p2p-roce-lossy.cfg",
-        retry_timeout_ns=20_000_000,  # deadlock insurance only, never fires
         reference_curve="cx6",
     ),
     "sack": dict(
         cfg="configs/protocol_configs/p2p-roce-lossy-sack.cfg",
-        retry_timeout_ns=3_000_000,  # lost-NACK backstop, > whole-dispatch ACK delay
         reference_curve="srnic",
     ),
 }
 
 
-def run_ns3(cfg: str, timeout_ns: int, plr: float, seed: int) -> dict | None:
+def run_ns3(cfg: str, plr: float, seed: int) -> dict | None:
     cmd = [
         str(BIN),
         "--numNodes=2", "--gpusPerNode=2",
         "--interNodeFabricType=RoCE", "--interNodeTopology=tor",
         "--interNodeBandwidth=100", "--interNodeLatency=1000",
-        f"--llrRetryTimeout={timeout_ns}", "--llrRetryLimit=64",
+        f"--llrRetryTimeout={RETRY_TIMEOUT_NS}", "--llrRetryLimit=64",
         "--llrBufferSize=8192", "--llrTimeoutRetransmit=1",
+        f"--soTxWindow={TX_WINDOW}",
         "--ber=0", f"--packetLossRate={plr}",
         "--bulkChunkSize=4096",
         f"--protocolConfig={cfg}",
@@ -109,7 +120,7 @@ def main() -> None:
         for plr in LOSS_RATES:
             times, retx, ploss, failed = [], [], [], 0
             for seed in SEEDS:
-                r = run_ns3(spec["cfg"], spec["retry_timeout_ns"], plr, seed)
+                r = run_ns3(spec["cfg"], plr, seed)
                 if r is None:
                     failed += 1
                     continue
@@ -155,6 +166,7 @@ def main() -> None:
 
     OUT_JSON.write_text(json.dumps(dict(
         data_size=DATA_SIZE, seeds=SEEDS, arms={a: s["cfg"] for a, s in ARMS.items()},
+        tx_window=TX_WINDOW, retry_timeout_ns=RETRY_TIMEOUT_NS,
         reference=str(REFERENCE.name), results=results), indent=2))
     print(f"\nwrote {OUT_JSON}")
 

@@ -132,8 +132,10 @@ def fig_srnic() -> None:
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8, loc="lower left")
 
-    ax.annotate("whole-message GBN window:\nearly collapse, ~0.50 floor",
-                xy=(5e-3, 0.515), xytext=(1.5e-5, 0.32), fontsize=8,
+    ax.annotate("GBN arm optimistic at high loss: receiver keeps\n"
+                "out-of-order originals (no true-GBN discard,\n"
+                "no RTO stalls); blanket dups only cost wire time",
+                xy=(1e-2, 0.82), xytext=(1.5e-5, 0.38), fontsize=8,
                 arrowprops=dict(arrowstyle="->", color="0.4"), color="0.25")
 
     fig.tight_layout()

@@ -248,6 +248,7 @@ main(int argc, char* argv[])
     std::string llrOverflowPolicyStr = "dropoldest";  // dropoldest/dropnewest
     uint64_t llrRetryTimeoutNs = 0;
     bool llrTimeoutRetransmit = false;  // opt-in sender-side timeout retransmit backstop
+    uint32_t soTxWindow = 0;  // opt-in So bulk TX window in chunks (perftest tx_depth analog; 0=unbounded)
     uint64_t llrReloadBandwidthGBps = 4800;
     uint64_t llrReloadLatencyNs = 300;
 
@@ -431,6 +432,12 @@ main(int argc, char* argv[])
                  "otherwise deadlocks the flow). Default 0 = timer fires but does nothing "
                  "(legacy behavior, parity-safe).",
                  llrTimeoutRetransmit);
+    cmd.AddValue("soTxWindow",
+                 "Bound the number of in-flight So bulk chunks per endpoint "
+                 "(NIC send-queue depth, perftest tx_depth analog; ACK-clocked "
+                 "via LLR per-packet ACKs, so it requires --llrEnabled). "
+                 "Default 0 = legacy unbounded synchronous dispatch.",
+                 soTxWindow);
     cmd.AddValue("llrReloadBandwidth",
                  "Backing-source bandwidth in GB/s for retry-buffer misses",
                  llrReloadBandwidthGBps);
@@ -1493,6 +1500,10 @@ main(int argc, char* argv[])
                 if (llrTimeoutRetransmit)
                 {
                     ep->EnableLlrTimeoutRetransmit();
+                }
+                if (soTxWindow > 0)
+                {
+                    ep->SetSoTxWindow(soTxWindow);
                 }
             }
         }

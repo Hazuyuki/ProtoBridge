@@ -33,6 +33,7 @@
 
 #include <vector>
 #include <queue>
+#include <deque>
 #include <unordered_map>
 
 namespace ns3
@@ -305,6 +306,15 @@ class FabricEndpoint : public Application
     virtual bool FlowControlGate(uint8_t vcId, uint32_t seqNum, bool creditBypass);
     void SetLaunchDelay(uint64_t delayNs);
     void SetBulkChunkSize(uint32_t bytes);
+    /**
+     * @brief Bound the number of in-flight bulk chunks to a remote (So) rank,
+     *        modeling a NIC send-queue depth (perftest tx_depth). 0 (default)
+     *        keeps the legacy unbounded synchronous dispatch. The window is
+     *        ACK-clocked: a slot is released when the per-packet LLR ACK
+     *        purges the retry store (or on permanent loss). So-only; requires
+     *        LLR (without LLR ACKs no slot is ever released).
+     */
+    void SetSoTxWindow(uint32_t chunks);
 
     // Callbacks
     typedef Callback<void, uint16_t, Ptr<Packet>, FabricHeader> ReceiveCallback;
@@ -593,6 +603,26 @@ class FabricEndpoint : public Application
     uint8_t m_numVcs;                               ///< Number of virtual channels
     uint64_t m_launchDelayNs;                       ///< NCCL launch delay
     uint32_t m_bulkChunkSize;                       ///< Maximum packet size for bulk transfers
+
+    // So TX window (NIC send-queue depth, perftest tx_depth analog).
+    // 0 = legacy unbounded synchronous bulk dispatch (parity default).
+    struct BulkTxChunk
+    {
+        uint16_t destRank;
+        uint16_t flowId;
+        uint8_t vcId;
+        uint8_t protocolId;
+        uint32_t wireChunk;         ///< on-wire bytes for this chunk
+        uint32_t fragmentDataSize;  ///< effective data bytes for this chunk
+        uint32_t chunkIndex;        ///< index within the bulk transfer (SoHeader)
+        uint32_t deviceIndex;       ///< egress device chosen at enqueue (spray order)
+        bool stamp;                 ///< stamp SoHeader (RoCE Seam B)
+    };
+    uint32_t m_soTxWindow{0};                       ///< Max in-flight bulk chunks to remote ranks (0=off)
+    uint32_t m_bulkTxInflight{0};                   ///< Chunks dispatched but not yet ACK-purged
+    std::deque<BulkTxChunk> m_bulkTxQueue;          ///< Chunks awaiting a window slot
+    void PumpBulkTxWindow();                        ///< Dispatch queued chunks while window has room
+    void ReleaseBulkTxSlot();                       ///< Free one window slot and pump
 
     // Link degradation
     Ptr<LinkDegradationModel> m_linkDegradationModel; ///< Link degradation model
