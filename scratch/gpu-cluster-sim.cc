@@ -249,6 +249,7 @@ main(int argc, char* argv[])
     uint64_t llrRetryTimeoutNs = 0;
     bool llrTimeoutRetransmit = false;  // opt-in sender-side timeout retransmit backstop
     uint32_t soTxWindow = 0;  // opt-in So bulk TX window in chunks (perftest tx_depth analog; 0=unbounded)
+    bool soGbnStrict = false; // opt-in strict So go-back-N receive semantics (in-order-only + one NAK/gap)
     uint64_t llrReloadBandwidthGBps = 4800;
     uint64_t llrReloadLatencyNs = 300;
 
@@ -438,6 +439,13 @@ main(int argc, char* argv[])
                  "via LLR per-packet ACKs, so it requires --llrEnabled). "
                  "Default 0 = legacy unbounded synchronous dispatch.",
                  soTxWindow);
+    cmd.AddValue("soGbnStrict",
+                 "Strict go-back-N receive semantics for So flows in "
+                 "llrMode=gobackn: in-order-only acceptance, out-of-order "
+                 "arrivals discarded (no ACK), one NAK per gap (IB responder "
+                 "behavior). Su (NVLink) traffic is never affected. "
+                 "Default false = legacy dedup that keeps OOO originals.",
+                 soGbnStrict);
     cmd.AddValue("llrReloadBandwidth",
                  "Backing-source bandwidth in GB/s for retry-buffer misses",
                  llrReloadBandwidthGBps);
@@ -1504,6 +1512,10 @@ main(int argc, char* argv[])
                 if (soTxWindow > 0)
                 {
                     ep->SetSoTxWindow(soTxWindow);
+                }
+                if (soGbnStrict)
+                {
+                    ep->SetSoGbnStrict(true);
                 }
             }
         }

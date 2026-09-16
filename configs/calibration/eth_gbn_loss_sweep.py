@@ -13,24 +13,22 @@ Testbed mapping (see the cfg headers for the full rationale):
   --numNodes=2 --gpusPerNode=2 (gpn>=2 REQUIRED: m_localRankCount>1 guard)
   --interNodeFabricType=RoCE --interNodeTopology=tor --interNodeBandwidth=100
   --bulkChunkSize=4096 (perftest 4 KB messages) --ber=0 (loss only)
-  --soTxWindow=16 (both arms): ACK-clocked BDP-scale TX window. The window is
-    sized from wire BDP, not curve-fit: RTT ~= 2 x 1 us prop + 2 x 328 ns
-    serialization + ACK return ~= 4.8 us; 100G x 4.8 us ~= 60 KB ~= 15 x 4 KB
-    chunks. Because chunk dispatch into the device queue is instantaneous,
-    window == in-flight == the GBN go-back blanket size, so the window must be
-    BDP-scale (a real NIC's tx_depth=128 caps posted WQEs, but its go-back
-    amount is still the wire BDP). The blanket cascade is subcritical when
-    R = window x plr < 1 (w=16 @ 2e-2 -> R = 0.32; w=128 @ 1e-2 -> R = 1.28
-    explodes to 111 ms with 3283 retry-limit exhaustions).
+  --soTxWindow: ACK-clocked TX window, per arm. SACK: w=16 = wire BDP
+    (RTT ~= 2 x 1 us prop + 2 x 328 ns serialization + ACK return ~= 4.8 us;
+    100G x 4.8 us ~= 60 KB ~= 15 x 4 KB chunks) -- selective repeat has no
+    rewind, so the window only bounds in-flight. GBN: --soGbnStrict=1 (true
+    go-back-N receive: in-order-only acceptance, OOO discarded with no ACK,
+    one NAK per gap) + w=64 -- under strict semantics the window IS the
+    rewind span, calibrated against the CX-6 anchor within the physical
+    bounds [BDP=16, testbed tx_depth=128] (see the ARMS comment).
   --llrRetryTimeout=500us + --llrTimeoutRetransmit=1 (both arms): with the
     window, LLR retry timers arm at actual (window-gated) TX time instead of
     the old synchronous t~=0 dispatch, so an RTT-scale timeout is finally
     sound. 500 us ~= 100 x RTT mirrors real RNIC RTO >> RTT; shorter values
     (100-200 us) inflate GBN retransmissions under blanket load (spurious
-    timeouts: 2407 vs 1539 retx @ 2e-2) without a principled basis. The
-    timeout is the only recovery for a lost NACK (SACK arm) and for a lost
-    per-packet ACK (both arms; a lost ACK parks one window slot until the
-    timer re-sends and the dup delivery re-ACKs).
+    timeouts) without a principled basis. The timeout is the only recovery
+    for a lost NACK/NAK and for a lost per-packet ACK (a lost ACK parks one
+    window slot until the timer re-sends and the dup delivery re-ACKs).
 
 The comparison is NORMALIZED (G(p)/G(0) per curve): the ns-3 absolute goodput
 (~53 Gbps: tor 2-link serialization + per-4KB-chunk headers) intentionally
@@ -58,22 +56,42 @@ DATA_SIZE = 16 * 1024 * 1024  # 16 MiB, ~4300 x 4 KB chunks
 LOSS_RATES = [0.0, 1e-6, 1e-5, 1e-4, 1e-3, 2e-3, 5e-3, 1e-2, 2e-2]
 SEEDS = [1, 2, 3]
 
-TX_WINDOW = 16  # BDP-scale chunks (see docstring); identical for both arms
+TX_WINDOW = 16  # SACK arm: BDP-scale chunks (see docstring)
+GBN_TX_WINDOW = 64  # GBN arm: strict-GBN rewind span, see ARMS comment below
 RETRY_TIMEOUT_NS = 500_000  # ~100 x RTT; sound now that timers arm at TX time
 
+# Per-arm knobs beyond the cfg:
+#   gobackn runs with --soGbnStrict=1 (true go-back-N receive semantics:
+#     in-order-only acceptance, OOO arrivals discarded with no ACK, one NAK
+#     per gap like an IB responder). Under strict semantics the TX window IS
+#     the rewind span (instantaneous dispatch => every dispatched-unACKed
+#     chunk is retransmitted AND its queued original still burns wire time),
+#     so it is calibrated against the CX-6 anchor within the physical bounds
+#     [wire BDP = 16, testbed tx_depth = 128]: w=64 (3-seed norms
+#     0.919/0.725/0.580/0.383 vs CX-6 0.933/0.744/0.467/0.278; w=16 is
+#     optimistic at high loss, w=128 = tx_depth pessimistic in the middle).
+#     The CX-6 curve itself reverse-solves to a per-drop waste of 70-130
+#     packets (G = 1/(1+n*p)) -- between BDP and tx_depth, matching w=64.
+#   sack keeps w=16 (BDP): selective repeat has no rewind, the window only
+#     bounds in-flight, and the BDP-derived value already tracks SRNIC
+#     within ~5 pts everywhere.
 ARMS = {
     "gobackn": dict(
         cfg="configs/protocol_configs/p2p-roce-lossy.cfg",
         reference_curve="cx6",
+        tx_window=GBN_TX_WINDOW,
+        extra_args=["--soGbnStrict=1"],
     ),
     "sack": dict(
         cfg="configs/protocol_configs/p2p-roce-lossy-sack.cfg",
         reference_curve="srnic",
+        tx_window=TX_WINDOW,
+        extra_args=[],
     ),
 }
 
 
-def run_ns3(cfg: str, plr: float, seed: int) -> dict | None:
+def run_ns3(spec: dict, plr: float, seed: int) -> dict | None:
     cmd = [
         str(BIN),
         "--numNodes=2", "--gpusPerNode=2",
@@ -81,10 +99,11 @@ def run_ns3(cfg: str, plr: float, seed: int) -> dict | None:
         "--interNodeBandwidth=100", "--interNodeLatency=1000",
         f"--llrRetryTimeout={RETRY_TIMEOUT_NS}", "--llrRetryLimit=64",
         "--llrBufferSize=8192", "--llrTimeoutRetransmit=1",
-        f"--soTxWindow={TX_WINDOW}",
+        f"--soTxWindow={spec['tx_window']}",
+        *spec["extra_args"],
         "--ber=0", f"--packetLossRate={plr}",
         "--bulkChunkSize=4096",
-        f"--protocolConfig={cfg}",
+        f"--protocolConfig={spec['cfg']}",
         f"--dataSize={DATA_SIZE}",
         f"--RngRun={seed}",
     ]
@@ -120,7 +139,7 @@ def main() -> None:
         for plr in LOSS_RATES:
             times, retx, ploss, failed = [], [], [], 0
             for seed in SEEDS:
-                r = run_ns3(spec["cfg"], plr, seed)
+                r = run_ns3(spec, plr, seed)
                 if r is None:
                     failed += 1
                     continue
@@ -165,8 +184,10 @@ def main() -> None:
               f"| {fmt(s,'normalized'):>9} {fmt(s,'reference_normalized'):>10}")
 
     OUT_JSON.write_text(json.dumps(dict(
-        data_size=DATA_SIZE, seeds=SEEDS, arms={a: s["cfg"] for a, s in ARMS.items()},
-        tx_window=TX_WINDOW, retry_timeout_ns=RETRY_TIMEOUT_NS,
+        data_size=DATA_SIZE, seeds=SEEDS,
+        arms={a: dict(cfg=s["cfg"], tx_window=s["tx_window"],
+                      extra_args=s["extra_args"]) for a, s in ARMS.items()},
+        retry_timeout_ns=RETRY_TIMEOUT_NS,
         reference=str(REFERENCE.name), results=results), indent=2))
     print(f"\nwrote {OUT_JSON}")
 

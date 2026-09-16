@@ -6,6 +6,32 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### New — `--soGbnStrict` strict So go-back-N receive semantics (supersedes the GBN numbers below)
+
+The re-run below left the GBN arm optimistic at high loss (0.820 vs CX-6
+0.467 at 1%, arms inverting at 2%): the receive path kept the bypass-mode
+dedup, so out-of-order originals were accepted (and re-ACKed) and blanket
+retransmits arrived as cheap duplicates. New `--soGbnStrict` (default 0 =
+legacy, So-only — the gate requires a remote source rank, so the sprayed Su
+NVLink fabric where OOO is normal is never touched) switches `llrMode=gobackn`
+So receive to real IB responder behavior: in-order-only acceptance,
+out-of-order arrivals discarded with no ACK, exactly one NAK per gap (lost
+NAKs covered by the 500 µs retry-timer backstop), duplicates re-ACKed only,
+and the drop site no longer emits the oracle per-drop NACK (which also kills
+the R = window × plr blanket cascade that made large windows explode).
+Under strict semantics the TX window IS the rewind span; the GBN arm uses
+w=64, a calibrated back-fit against the CX-6 anchor within the physical
+bounds [wire BDP = 16, testbed tx_depth = 128] (CX-6 reverse-solves to a
+per-drop waste of 70–130 packets). SRNIC Fig. 11 sweep re-run (3-seed):
+strict GBN tracks CX-6 within ~3 points up to 0.5% loss (0.919/0.933 at
+0.1%, 0.725/0.744 at 0.5%), stays ~10 points optimistic at 1–2% (no
+RTO-scale stalls modeled: 0.580/0.467, 0.383/0.278), and restores the
+measured mode ordering at every loss rate (GBN below SACK — the legacy arms
+inverted at 2%). SACK arm unchanged (w=16, within ~5 points everywhere).
+Gates: build clean, C++ EXTENSIVE, surrogate 64, all 5 parity suites, new
+`test/parity/test_so_gbn_strict.py` (default-off legacy pin 3185174 ns +
+strict-on lossless baseline 2521509 ns + strict-on lossy pin 4276850 ns).
+
 ### New — `--soTxWindow` ACK-clocked TX window; SRNIC Fig. 11 re-run (supersedes the entry below)
 
 Aligning against SRNIC Fig. 11 exposed three model bugs, all fixed and inert

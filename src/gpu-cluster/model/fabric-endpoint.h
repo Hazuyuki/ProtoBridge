@@ -316,6 +316,19 @@ class FabricEndpoint : public Application
      */
     void SetSoTxWindow(uint32_t chunks);
 
+    /**
+     * @brief Strict go-back-N receive semantics for So (remote-rank) flows in
+     *        GOBACKN mode: the receiver only accepts the next expected
+     *        sequence number per flow, discards out-of-order arrivals
+     *        (no delivery, no ACK), and emits ONE NAK per gap (further OOO
+     *        arrivals for the same gap are dropped silently, like an IB
+     *        responder). Duplicates below the expected seq are re-ACKed only.
+     *        Default false = legacy bypass-mode dedup (keeps OOO originals).
+     *        Su (local-rank) traffic is never affected: on the 18-lane sprayed
+     *        NVLink fabric out-of-order arrival is normal, not loss.
+     */
+    void SetSoGbnStrict(bool enable);
+
     // Callbacks
     typedef Callback<void, uint16_t, Ptr<Packet>, FabricHeader> ReceiveCallback;
     typedef Callback<void, uint16_t, uint64_t, uint32_t> MemoryRequestCallback;
@@ -623,6 +636,14 @@ class FabricEndpoint : public Application
     std::deque<BulkTxChunk> m_bulkTxQueue;          ///< Chunks awaiting a window slot
     void PumpBulkTxWindow();                        ///< Dispatch queued chunks while window has room
     void ReleaseBulkTxSlot();                       ///< Free one window slot and pump
+
+    // Strict So go-back-N receive semantics (opt-in, see SetSoGbnStrict)
+    bool m_soGbnStrict{false};                      ///< In-order-only So receive in GOBACKN mode
+    std::map<uint64_t, uint32_t> m_strictNextExpected; ///< Per-flow next expected seq (strict GBN)
+    std::map<uint64_t, uint32_t> m_strictNakPending;   ///< Per-flow seq a NAK was already sent for
+    std::map<uint64_t, std::set<uint32_t>> m_strictPermLost; ///< Permanently lost seqs ahead of expected
+    bool IsStrictGbnFlow(const FabricHeader& header) const; ///< Strict semantics apply to this packet?
+    void SendStrictGbnNak(const FabricHeader& dataHeader, uint32_t expectedSeq); ///< One NAK per gap
 
     // Link degradation
     Ptr<LinkDegradationModel> m_linkDegradationModel; ///< Link degradation model

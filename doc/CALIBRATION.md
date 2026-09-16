@@ -344,22 +344,24 @@ only `llrMode`** between arms:
 Sweep driver: [`configs/calibration/eth_gbn_loss_sweep.py`](../configs/calibration/eth_gbn_loss_sweep.py)
 (RoCE tor 100G, `--gpusPerNode=2` — required, see the cfg header —
 `--bulkChunkSize=4096` for perftest 4 KB granularity, 16 MiB transfer,
-`--soTxWindow=16`, `--llrRetryTimeout=500us`, `--packetLossRate` swept,
-3 seeds). Results in `configs/calibration/eth_gbn_loss_sweep.json`. The
+`--llrRetryTimeout=500us`, `--packetLossRate` swept, 3 seeds). Per-arm
+knobs: the SACK arm runs `--soTxWindow=16` (wire BDP); the GBN arm runs
+`--soGbnStrict=1 --soTxWindow=64` (strict go-back-N receive semantics, see
+below). Results in `configs/calibration/eth_gbn_loss_sweep.json`. The
 comparison is **normalized per curve** (`G(p)/G(0)`): the ns-3 absolute
 plateau (53.2 Gbps: tor 2-link serialization + 4 KB chunk headers)
 intentionally differs from the testbed's single-link 90–97 Gbps.
 
 ### Result (normalized goodput, 3-seed mean)
 
-| loss rate | ns-3 GBN | CX-6 measured | ns-3 SACK | SRNIC measured |
+| loss rate | ns-3 GBN (strict) | CX-6 measured | ns-3 SACK | SRNIC measured |
 |---|---|---|---|---|
-| ≤1e-4 | 0.994–0.999 | 1.000 | 1.000 | 1.000 |
-| 1e-3 | 0.977 | 0.933 | 0.979 | 0.990 |
-| 2e-3 | 0.954 | 0.889 | 0.978 | 0.979 |
-| 5e-3 | 0.914 | 0.744 | 0.945 | 0.907 |
-| 1e-2 | 0.820 | **0.467** | **0.823** | **0.773** |
-| 2e-2 | 0.668 | 0.278 | 0.569 | 0.619 |
+| ≤1e-4 | 0.976–0.995 | 1.000 | 1.000 | 1.000 |
+| 1e-3 | 0.919 | 0.933 | 0.979 | 0.990 |
+| 2e-3 | 0.861 | 0.889 | 0.978 | 0.979 |
+| 5e-3 | 0.725 | 0.744 | 0.945 | 0.907 |
+| 1e-2 | 0.580 | 0.467 | **0.823** | **0.773** |
+| 2e-2 | 0.383 | 0.278 | 0.569 | 0.619 |
 
 What reproduces (the point of the experiment):
 
@@ -367,30 +369,67 @@ What reproduces (the point of the experiment):
   swept loss rate** (0.823 vs 0.773 at 1%, 0.569 vs 0.619 at 2%). This is
   the arm whose recovery semantics (per-loss selective retransmit, timer
   backstop for lost control packets) match its reference hardware.
-- **SACK retransmit economy**: ns-3 SACK retransmits ≈ the actual drop count
-  (~80 packets at 1%), GBN retransmits ~10× more (blanket duplicates) for
-  the same delivered bytes.
-- **The GBN arm degrades monotonically** with the correct low-loss shape
-  (0.977 vs 0.933 at 0.1%) — no artificial floor or early collapse.
+- **The strict-GBN arm tracks the measured CX-6 curve within ~3 points up
+  to 0.5% loss** (0.919 vs 0.933 at 0.1%, 0.725 vs 0.744 at 0.5%) and
+  keeps the measured **mode ordering at every loss rate** (GBN below SACK,
+  no inversion — the legacy semantics inverted the arms at 2%).
+- **Recovery-mode retransmit economy**: ns-3 SACK retransmits ≈ the actual
+  drop count (~80 packets at 1%), strict GBN retransmits ~35× more (real
+  rewind blankets) for the same delivered bytes — the defining go-back-N
+  waste.
 
 What deviates, and why (structural, documented rather than tuned away):
 
-- **GBN is optimistic at high loss** (0.820 vs 0.467 at 1%; the arms even
-  invert at 2% — ns-3 GBN 0.668 > ns-3 SACK 0.569, whereas the measured
-  curves keep CX-6 far below SRNIC). Two missing penalties of real
-  go-back-N: (1) our receiver keeps out-of-order originals in the reorder
-  buffer, so blanket retransmissions arrive as duplicates and only cost
-  wire time — a real GBN receiver *discards* everything after a gap until
-  the retransmission arrives, wasting ~BDP of delivered goodput per drop;
-  (2) no RTO-scale stalls — a real NIC's drops that produce no NAK (e.g.
-  tail packets) park the QP for an RTO that is orders of magnitude longer
-  than our 500 µs NACK-driven recovery. The SACK-arm inversion at 2% is
-  the mirror image: our SACK pays the 500 µs timer for every lost ACK/NACK
-  (~80 lost control packets at 2% × 1/16 window share each), while GBN
-  blankets recover lost control packets collaterally.
-- GBN `permanentLosses` stays 0 across the sweep at `--llrRetryLimit=64`:
-  with the BDP window the blanket is 16 packets, so retry counts stay far
-  from the limit (the pre-window sweep exhausted retries at ≥1% loss).
+- **Strict GBN is still ~10 points optimistic at 1–2% loss** (0.580 vs
+  0.467, 0.383 vs 0.278): no RTO-scale stalls are modeled — a real NIC's
+  drops that produce no NAK (e.g. tail packets, or a lost NAK itself) park
+  the QP for an RTO orders of magnitude longer than our 500 µs timer
+  backstop.
+- GBN `permanentLosses` stays 0 across the sweep at `--llrRetryLimit=64`.
+
+### Strict go-back-N receive semantics (`--soGbnStrict`)
+
+The first fix round left the GBN arm optimistic at high loss (0.820 vs
+0.467 at 1%) with the arms inverting at 2%, because the receive path kept
+the bypass-mode dedup semantics: out-of-order originals were accepted (and
+even re-ACKed), so a blanket retransmission arrived as pure duplicates
+costing only wire time. Reverse-solving `G = 1/(1+n·p)` on the measured
+CX-6 curve gives a per-drop goodput waste of n ≈ 70–130 packets
+(`tx_depth` scale); the legacy semantics gave n ≈ 19–25 (window scale).
+
+`--soGbnStrict=1` (default 0 = legacy, parity-pinned by
+`test/parity/test_so_gbn_strict.py`) switches the **So receive path** in
+`llrMode=gobackn` to a real IB responder's behavior:
+
+- **in-order-only acceptance**: a packet is delivered (and ACKed) only if
+  its sequence number is the per-flow next-expected;
+- **out-of-order arrivals are discarded** — no delivery, no ACK, no state;
+- **one NAK per gap** (further OOO arrivals for the same gap drop
+  silently); a lost NAK is covered by the sender's 500 µs retry-timer
+  backstop;
+- duplicates below the expected sequence are re-ACKed only (their ACK may
+  have been lost);
+- the drop site no longer emits the oracle per-drop NACK for strict flows
+  (a real receiver never sees the dropped packet — the gap is detected on
+  the next arrival), which also removes the R = window × plr NACK cascade
+  that made large windows explode in the first round.
+
+**Su (NVLink) traffic is never affected**: the gate requires a remote
+source rank. On the 18-lane sprayed Su fabric out-of-order arrival is
+normal (the reorder/dedup layer's job) and a gap does not mean loss; real
+NVLink LLR is per-physical-link in-order replay *below* the spray layer.
+All Su calibration and BER-resilience results are unchanged (RoCE parity
+triple re-verified byte-identical).
+
+Under strict semantics the TX window **is** the rewind span (dispatch into
+the device queue is instantaneous, so every dispatched-unACKed chunk is
+both retransmitted *and* its queued original still burns wire time). The
+GBN arm's `w=64` is a **calibrated back-fit against the CX-6 anchor within
+the physical bounds** [wire BDP = 16, testbed `tx_depth` = 128]: w=16 is
+optimistic at high loss (0.464 vs 0.278 at 2%), w=128 pessimistic in the
+mid-range (0.539 vs 0.744 at 0.5%), w=64 matches the reverse-solved
+per-drop waste. The SACK arm keeps the BDP-derived w=16 — selective repeat
+has no rewind, so its window only bounds in-flight.
 
 ### TX window + timer fixes exposed by this experiment
 
@@ -401,13 +440,14 @@ Three model bugs found by aligning against Fig. 11, all fixed
    synchronously at t≈0, so the GBN "window" was the whole remaining
    message and a single NACK re-blanketed up to the full transfer. New
    `--soTxWindow=N` (default 0 = legacy): ACK-clocked window over the
-   per-packet LLR ACKs, the NIC send-queue/`tx_depth` analog. The sweep
-   uses **16 chunks = wire BDP** (RTT ≈ 4.8 µs × 100G ≈ 60 KB ≈ 15×4 KB;
-   the testbed's `tx_depth=128` caps posted WQEs, but the go-back amount
-   of real GBN is the wire BDP, which is what the window models here).
-   The GBN blanket cascade is subcritical iff R = window × plr < 1:
-   w=16 keeps R ≤ 0.32 at 2%, while w=128 at 1% (R=1.28) explodes into a
-   111 ms retransmit storm with 3283 retry-limit exhaustions.
+   per-packet LLR ACKs, the NIC send-queue/`tx_depth` analog. The SACK arm
+   uses **16 chunks = wire BDP** (RTT ≈ 4.8 µs × 100G ≈ 60 KB ≈ 15×4 KB);
+   the strict GBN arm uses the calibrated rewind span w=64 (see the
+   `--soGbnStrict` section above). Under the *legacy* (non-strict)
+   semantics the GBN blanket cascade was subcritical only iff
+   R = window × plr < 1 (w=128 at 1%, R=1.28, exploded into a 111 ms
+   retransmit storm with 3283 retry-limit exhaustions) — an artifact of
+   the oracle drop-site NACK that strict semantics removes.
 2. **Retry timers armed at dispatch, not TX** — with the synchronous
    dispatch, LLR retry timers all started at t≈0, forcing
    `--llrRetryTimeout` to exceed the *whole transfer* tail (~2.6 ms) or

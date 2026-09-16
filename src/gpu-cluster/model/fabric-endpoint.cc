@@ -792,6 +792,49 @@ FabricEndpoint::SetSoTxWindow(uint32_t chunks)
 }
 
 void
+FabricEndpoint::SetSoGbnStrict(bool enable)
+{
+    m_soGbnStrict = enable;
+}
+
+bool
+FabricEndpoint::IsStrictGbnFlow(const FabricHeader& header) const
+{
+    if (!m_soGbnStrict || !m_llrEnabled || !m_llrManager || !m_bypassReorderBuffer)
+    {
+        return false;
+    }
+    if (m_llrManager->GetLlrMode() != LlrMode::GO_BACK_N)
+    {
+        return false;
+    }
+    // So-only: never touch the sprayed Su fabric, where out-of-order arrival
+    // is normal (the reorder/dedup layer's job) and a gap does not mean loss.
+    return !IsLocalRank(header.GetSourceRank());
+}
+
+void
+FabricEndpoint::SendStrictGbnNak(const FabricHeader& dataHeader, uint32_t expectedSeq)
+{
+    FabricHeader nackHeader;
+    nackHeader.SetPacketType(FabricPacketType::NACK);
+    nackHeader.SetFabricType(GetFabricTypeForDest(dataHeader.GetSourceRank()));
+    nackHeader.SetSourceRank(dataHeader.GetDestRank());
+    nackHeader.SetDestRank(dataHeader.GetSourceRank());
+    nackHeader.SetSequenceNumber(expectedSeq);
+    nackHeader.SetFlowId(dataHeader.GetFlowId());
+    nackHeader.SetVirtualChannel(dataHeader.GetVirtualChannel());
+    nackHeader.SetSourceMac(m_address);
+    nackHeader.SetDestMac(ResolveDestMac(dataHeader.GetSourceRank()));
+
+    Ptr<Packet> nackPkt = Create<Packet>(0);
+    nackPkt->AddHeader(nackHeader);
+
+    uint32_t deviceIndex = ResolveDeviceIndex(dataHeader.GetSourceRank());
+    SendPacketOnDevice(nackPkt, deviceIndex, ResolveDestMac(dataHeader.GetSourceRank()));
+}
+
+void
 FabricEndpoint::PumpBulkTxWindow()
 {
     const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
@@ -1086,7 +1129,11 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
                 // unACKed data seq (NACK-of-NACK -> retryMisses, duplicate
                 // retransmits, false timeouts). Real link protocols recover
                 // lost acks via the sender's retry timer, not via NACK.
-                if (m_llrEnabled && m_llrManager && !isProtocolControl)
+                // Strict So GBN flows are also silent here: a real receiver
+                // never sees the dropped packet — the gap is detected on the
+                // next in-flight arrival (or the sender's retry timer).
+                if (m_llrEnabled && m_llrManager && !isProtocolControl &&
+                    !IsStrictGbnFlow(header))
                 {
                     FabricHeader nackHeader;
                     nackHeader.SetPacketType(FabricPacketType::NACK);
@@ -1333,9 +1380,43 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
         uint8_t vcId = header.GetVirtualChannel();
         uint16_t flowId = header.GetFlowId();
         uint32_t lostSeqNum = header.GetSequenceNumber();
-        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
-        rb->MarkPermanentGap(lostSeqNum, header);
-        rb->DeliverReadyPackets();
+        if (IsStrictGbnFlow(header))
+        {
+            // Strict So GBN keeps its own per-flow expected counter instead
+            // of a reorder buffer: advance past the lost seq (or park it for
+            // consumption when expected catches up).
+            uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
+                               (static_cast<uint64_t>(flowId) << 32) |
+                               header.GetSourceRank();
+            uint32_t& expected = m_strictNextExpected[flowKey];
+            if (lostSeqNum == expected)
+            {
+                expected++;
+                auto pl = m_strictPermLost.find(flowKey);
+                if (pl != m_strictPermLost.end())
+                {
+                    while (pl->second.erase(expected) > 0)
+                    {
+                        expected++;
+                    }
+                    if (pl->second.empty())
+                    {
+                        m_strictPermLost.erase(pl);
+                    }
+                }
+                m_strictNakPending.erase(flowKey);
+            }
+            else if (lostSeqNum > expected)
+            {
+                m_strictPermLost[flowKey].insert(lostSeqNum);
+            }
+        }
+        else
+        {
+            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
+            rb->MarkPermanentGap(lostSeqNum, header);
+            rb->DeliverReadyPackets();
+        }
     }
     else if (header.GetPacketType() == FabricPacketType::CNP)
     {
@@ -1389,10 +1470,59 @@ FabricEndpoint::ProcessDataPacket(Ptr<Packet> packet, const FabricHeader& header
     // Bypass reorder buffer for direct links (no multi-path reordering needed)
     if (m_bypassReorderBuffer)
     {
-        // Track out-of-order arrivals even in bypass mode
         uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
                            (static_cast<uint64_t>(flowId) << 32) |
                            header.GetSourceRank();
+
+        // Strict So go-back-N: in-order-only acceptance, like a real IB
+        // responder in GBN mode. Exactly one NAK per gap; everything after
+        // the gap is discarded (no delivery, no ACK, no state), so blanket
+        // retransmits are real work, not cheap duplicates. Lost NAKs are
+        // covered by the sender's retry-timer backstop.
+        if (IsStrictGbnFlow(header))
+        {
+            uint32_t seq = header.GetSequenceNumber();
+            uint32_t& expected = m_strictNextExpected[flowKey];
+            if (seq == expected)
+            {
+                expected++;
+                // Consume any permanently-lost seqs immediately following
+                auto pl = m_strictPermLost.find(flowKey);
+                if (pl != m_strictPermLost.end())
+                {
+                    while (pl->second.erase(expected) > 0)
+                    {
+                        expected++;
+                    }
+                    if (pl->second.empty())
+                    {
+                        m_strictPermLost.erase(pl);
+                    }
+                }
+                m_strictNakPending.erase(flowKey);
+                OnPacketDelivered(packet, seq, header);
+            }
+            else if (seq < expected)
+            {
+                // Duplicate of an already-delivered seq: its ACK may have
+                // been lost, so re-ACK (So flows owe no credit, task #29).
+                SendLlrAckPacket(header, false);
+            }
+            else
+            {
+                // Gap: discard, and NAK the missing seq once per gap.
+                m_bypassReorderEvents++;
+                auto nak = m_strictNakPending.find(flowKey);
+                if (nak == m_strictNakPending.end() || nak->second != expected)
+                {
+                    m_strictNakPending[flowKey] = expected;
+                    SendStrictGbnNak(header, expected);
+                }
+            }
+            return;
+        }
+
+        // Track out-of-order arrivals even in bypass mode
         auto it = m_bypassNextExpectedSeq.find(flowKey);
         if (it != m_bypassNextExpectedSeq.end())
         {

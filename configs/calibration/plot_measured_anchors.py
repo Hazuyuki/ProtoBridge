@@ -117,7 +117,7 @@ def fig_srnic() -> None:
     ax.plot(*curve(ref["cx6"]), "o-", color="#c0392b",
             label="CX-6 measured (go-back-N, SRNIC Fig. 11)")
     ax.plot(*curve(ns3["gobackn"]), "s--", color="#e67e22",
-            label="ns-3 llrMode=gobackn (3-seed mean)")
+            label="ns-3 llrMode=gobackn strict (3-seed mean)")
     ax.plot(*curve(ref["srnic"]), "o-", color="#1f618d",
             label="SRNIC measured (selective repeat, Fig. 11)")
     ax.plot(*curve(ns3["sack"]), "s--", color="#2e86c1",
@@ -132,10 +132,11 @@ def fig_srnic() -> None:
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8, loc="lower left")
 
-    ax.annotate("GBN arm optimistic at high loss: receiver keeps\n"
-                "out-of-order originals (no true-GBN discard,\n"
-                "no RTO stalls); blanket dups only cost wire time",
-                xy=(1e-2, 0.82), xytext=(1.5e-5, 0.38), fontsize=8,
+    ax.annotate("GBN arm: strict go-back-N receive (--soGbnStrict:\n"
+                "OOO discarded, one NAK per gap, w=64 rewind span);\n"
+                "within ~3 pts of CX-6 up to 0.5%, optimistic ~+10 pts\n"
+                "at 1-2% (no RTO-scale stalls modeled)",
+                xy=(1e-2, 0.58), xytext=(1.5e-5, 0.30), fontsize=8,
                 arrowprops=dict(arrowstyle="->", color="0.4"), color="0.25")
 
     fig.tight_layout()

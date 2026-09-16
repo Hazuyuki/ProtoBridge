@@ -62,7 +62,8 @@ in two phases:
   P2P (scale-out)".
 
 - **SRNIC Fig. 11 measured loss-recovery comparison — DONE (task #33; re-run
-  after bug fixes, task #34).** Second external measured anchor for the So
+  after bug fixes, task #34; strict-GBN receive semantics, task #35).**
+  Second external measured anchor for the So
   fabric: SRNIC (NSDI'23) Figure 11 (CX-6 go-back-N vs SRNIC selective
   repeat, 100G, perftest 4 KB, CC disabled, FPGA-injected random loss)
   mapped onto the fabric's own `llrMode=gobackn` vs `llrMode=sack` axis —
@@ -74,13 +75,22 @@ in two phases:
   ACKs), retry timers armed at synchronous t≈0 dispatch (window makes
   RTT-scale 500 µs timeouts sound), and NACK-of-NACK for plr-dropped
   control packets (now dropped silently, matching the switch path).
-  Re-run (`--soTxWindow=16` = wire BDP, both arms): SACK tracks measured
-  SRNIC within ~5 points everywhere (0.823/0.773 @1%, 0.569/0.619 @2%);
-  GBN correct at low loss (0.977/0.933 @0.1%) but optimistic at high loss
-  (0.820/0.467 @1%) — receiver keeps out-of-order originals (no true-GBN
-  discard) and no RTO stalls; documented, not tuned away. Artifacts:
+  The remaining GBN-arm optimism (#34: 0.820/0.467 @1%, arms inverting at
+  2%) traced to the receive path: bypass-mode dedup kept out-of-order
+  originals, so blanket retransmits arrived as cheap duplicates. Task #35
+  adds `--soGbnStrict` (default off, So-only — the gate requires a remote
+  source rank, so the sprayed Su NVLink fabric is byte-identical): true IB
+  responder semantics (in-order-only acceptance, OOO discard with no ACK,
+  one NAK per gap, oracle drop-NACK suppressed → the window×plr cascade is
+  gone). GBN arm re-calibrated at w=64 (rewind span; back-fit within
+  [BDP=16, tx_depth=128], CX-6 reverse-solves to 70–130 pkts/drop). Final:
+  strict GBN within ~3 pts of CX-6 up to 0.5% loss (0.919/0.933 @0.1%,
+  0.725/0.744 @0.5%), ~+10 pts optimistic at 1–2% (no RTO-scale stalls;
+  0.580/0.467, 0.383/0.278), mode ordering (GBN < SACK) restored at every
+  rate; SACK unchanged within ~5 pts everywhere. Artifacts:
   `configs/calibration/srnic_fig11_cx6_reference.csv` + `eth_gbn_loss_sweep.py`
-  + `p2p-roce-lossy{,-sack}.cfg`; write-up in `doc/CALIBRATION.md` §"Loss
+  + `p2p-roce-lossy{,-sack}.cfg` + `test/parity/test_so_gbn_strict.py`;
+  write-up in `doc/CALIBRATION.md` §"Loss
   recovery under injected packet loss".
 
 - **Full-mesh surrogate algorithm (ns-3-calibrated) — DONE (this branch).** The
