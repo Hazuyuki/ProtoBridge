@@ -6,6 +6,31 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — TreeAllReduce carried only D/N per edge; rewritten as full-volume chunk-pipelined tree
+
+The Demystifying-NCCL anchor (below) exposed a structural bug: the old
+`TreeAllReduce` sent `m_chunkSize = dataSize/numGpus` per tree hop per step,
+so the total per-edge volume was D/N instead of D — the sim's effective
+per-edge bandwidth (193.7 GB/s) exceeded the 150 GB/s GH200 pair spec and the
+sim beat the physical bound D/BW = 28.6 ms (22.2 ms at 2^32). The old
+schedule also never sent GPU 3's reduce contribution at N=4
+(`targetLevel = depth−1−k` skipped level 2). The model is rewritten as a
+chunk-pipelined binary tree (heap arithmetic parent=(g−1)/2 kept): reduce
+flow sends the full D up every edge (interior GPUs forward
+`[sent, min-over-children-received)`), broadcast flow re-sends the full D
+down, forwarding quantized to `clamp(D/(32·depth), 64 KiB, 8 MiB)` uniform
+chunks (no per-hop re-fragmentation cascade), progress byte-counted per
+(flow, edge) so spray reorder and GBN duplicates cannot regress it; sw
+overhead knobs pace each hop (perStep at first chunk + perByte rate tax,
+defaults 0 = zero extra events). Public API unchanged. Demystify tree arm
+post-fix: MAPE LL 16.9→5.8%, LL128 15.2→8.1%, Simple 26.4→16.3%; 2^32 Simple
+28.84 ms = 1.007× physical bound (was impossibly under it); 2^32 protocol
+ratios within 1% of measured. Ring arm byte-identical; all parity pins
+(RoCE triple, ETH, strict-GBN, config-vs-inline incl. the tree case)
+unchanged. Note: `h200-tree-allreduce.cfg` per-protocol `linkDataRate`
+80/100/50 was fitted against the old under-transferring model and needs
+recalibration before its absolute numbers are reused.
+
 ### New — Demystifying-NCCL Fig. 6 anchor: Su protocol constants validated on third-party GH200 hardware
 
 Third external measured anchor, first for the **Su (NVLink) protocol axis**:

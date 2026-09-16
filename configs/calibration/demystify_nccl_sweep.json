@@ -3,9 +3,9 @@
   "ring/ll": 10589,
   "ring/ll128": 22550,
   "ring/simple": 33630,
-  "tree/ll": 14436,
-  "tree/ll128": 18182,
-  "tree/simple": 30947
+  "tree/ll": 13424,
+  "tree/ll128": 17502,
+  "tree/simple": 30290
  },
  "results": [
   {
@@ -261,72 +261,72 @@
    "protocol": "ll",
    "size": 65536,
    "measured_ms": 0.016663,
-   "sim_ms": 0.015996,
-   "ratio": 0.9599711936626057
+   "sim_ms": 0.018124,
+   "ratio": 1.0876792894436775
   },
   {
    "algorithm": "tree",
    "protocol": "ll",
    "size": 262144,
    "measured_ms": 0.02069,
-   "sim_ms": 0.017961,
-   "ratio": 0.8681005316578058
+   "sim_ms": 0.020761,
+   "ratio": 1.0034316094731754
   },
   {
    "algorithm": "tree",
    "protocol": "ll",
    "size": 1048576,
    "measured_ms": 0.032141,
-   "sim_ms": 0.025827,
-   "ratio": 0.8035530941787746
+   "sim_ms": 0.031405,
+   "ratio": 0.9771008991630628
   },
   {
    "algorithm": "tree",
    "protocol": "ll",
    "size": 4194304,
    "measured_ms": 0.073511,
-   "sim_ms": 0.057285,
-   "ratio": 0.7792711294908244
+   "sim_ms": 0.073969,
+   "ratio": 1.0062303600821645
   },
   {
    "algorithm": "tree",
    "protocol": "ll",
    "size": 16777216,
    "measured_ms": 0.220044,
-   "sim_ms": 0.183114,
-   "ratio": 0.8321699296504336
+   "sim_ms": 0.249655,
+   "ratio": 1.1345685408372872
   },
   {
    "algorithm": "tree",
    "protocol": "ll",
    "size": 67108864,
    "measured_ms": 0.92933,
-   "sim_ms": 0.68643,
-   "ratio": 0.7386289046947802
+   "sim_ms": 0.952217,
+   "ratio": 1.0246274197540164
   },
   {
    "algorithm": "tree",
    "protocol": "ll",
    "size": 268435456,
    "measured_ms": 3.333333,
-   "sim_ms": 3.03525,
-   "ratio": 0.9105750910575091
+   "sim_ms": 3.762398,
+   "ratio": 1.1287195128719514
   },
   {
    "algorithm": "tree",
    "protocol": "ll",
    "size": 1073741824,
    "measured_ms": 13.74902,
-   "sim_ms": 11.088354,
-   "ratio": 0.8064832257135418
+   "sim_ms": 14.668474,
+   "ratio": 1.0668741481211024
   },
   {
    "algorithm": "tree",
    "protocol": "ll",
    "size": 4294967296,
    "measured_ms": 55.216817,
-   "sim_ms": 43.30077,
-   "ratio": 0.7841953294772497
+   "sim_ms": 57.623482,
+   "ratio": 1.0435857249794027
   },
   {
    "algorithm": "tree",
@@ -341,72 +341,72 @@
    "protocol": "ll128",
    "size": 65536,
    "measured_ms": 0.020016,
-   "sim_ms": 0.019439,
-   "ratio": 0.9711730615507596
+   "sim_ms": 0.020574,
+   "ratio": 1.0278776978417266
   },
   {
    "algorithm": "tree",
    "protocol": "ll128",
    "size": 262144,
    "measured_ms": 0.021552,
-   "sim_ms": 0.020486,
-   "ratio": 0.9505382331106161
+   "sim_ms": 0.021978,
+   "ratio": 1.0197661469933184
   },
   {
    "algorithm": "tree",
    "protocol": "ll128",
    "size": 1048576,
    "measured_ms": 0.029121,
-   "sim_ms": 0.02468,
-   "ratio": 0.8474983688746952
+   "sim_ms": 0.027738,
+   "ratio": 0.9525084990213247
   },
   {
    "algorithm": "tree",
    "protocol": "ll128",
    "size": 4194304,
    "measured_ms": 0.05721,
-   "sim_ms": 0.041459,
-   "ratio": 0.7246809998252055
+   "sim_ms": 0.050766,
+   "ratio": 0.8873623492396434
   },
   {
    "algorithm": "tree",
    "protocol": "ll128",
    "size": 16777216,
    "measured_ms": 0.10004,
-   "sim_ms": 0.108566,
-   "ratio": 1.0852259096361454
+   "sim_ms": 0.144456,
+   "ratio": 1.4439824070371852
   },
   {
    "algorithm": "tree",
    "protocol": "ll128",
    "size": 67108864,
    "measured_ms": 0.514463,
-   "sim_ms": 0.377003,
-   "ratio": 0.7328087734200516
+   "sim_ms": 0.519187,
+   "ratio": 1.0091823901816068
   },
   {
    "algorithm": "tree",
    "protocol": "ll128",
    "size": 268435456,
    "measured_ms": 2.039904,
-   "sim_ms": 1.92797,
-   "ratio": 0.9451278099361539
+   "sim_ms": 2.01791,
+   "ratio": 0.9892181200683955
   },
   {
    "algorithm": "tree",
    "protocol": "ll128",
    "size": 1073741824,
    "measured_ms": 7.721251,
-   "sim_ms": 5.909348,
-   "ratio": 0.7653355654414032
+   "sim_ms": 7.835007,
+   "ratio": 1.014732845752586
   },
   {
    "algorithm": "tree",
    "protocol": "ll128",
    "size": 4294967296,
    "measured_ms": 29.557823,
-   "sim_ms": 23.092889,
-   "ratio": 0.7812784114716432
+   "sim_ms": 30.747135,
+   "ratio": 1.040236792811162
   },
   {
    "algorithm": "tree",
@@ -421,80 +421,80 @@
    "protocol": "simple",
    "size": 65536,
    "measured_ms": 0.036874,
-   "sim_ms": 0.03218,
-   "ratio": 0.8727016325866465
+   "sim_ms": 0.033246,
+   "ratio": 0.9016108911428107
   },
   {
    "algorithm": "tree",
    "protocol": "simple",
    "size": 262144,
    "measured_ms": 0.038948,
-   "sim_ms": 0.033164,
-   "ratio": 0.8514943000924309
+   "sim_ms": 0.034563,
+   "ratio": 0.8874139878812776
   },
   {
    "algorithm": "tree",
    "protocol": "simple",
    "size": 1048576,
    "measured_ms": 0.052956,
-   "sim_ms": 0.037094,
-   "ratio": 0.7004683133167158
+   "sim_ms": 0.039975,
+   "ratio": 0.7548719691819623
   },
   {
    "algorithm": "tree",
    "protocol": "simple",
    "size": 4194304,
    "measured_ms": 0.109142,
-   "sim_ms": 0.052823,
-   "ratio": 0.48398416741492734
+   "sim_ms": 0.061611,
+   "ratio": 0.5645031243700867
   },
   {
    "algorithm": "tree",
    "protocol": "simple",
    "size": 16777216,
    "measured_ms": 0.226108,
-   "sim_ms": 0.115739,
-   "ratio": 0.5118748562633786
+   "sim_ms": 0.149405,
+   "ratio": 0.6607683054115733
   },
   {
    "algorithm": "tree",
    "protocol": "simple",
    "size": 67108864,
    "measured_ms": 0.547606,
-   "sim_ms": 0.367397,
-   "ratio": 0.6709148548408892
+   "sim_ms": 0.500686,
+   "ratio": 0.9143179585322293
   },
   {
    "algorithm": "tree",
    "protocol": "simple",
    "size": 268435456,
    "measured_ms": 1.801802,
-   "sim_ms": 2.045123,
-   "ratio": 1.1350431401452545
+   "sim_ms": 1.90581,
+   "ratio": 1.0577244336503124
   },
   {
    "algorithm": "tree",
    "protocol": "simple",
    "size": 1073741824,
    "measured_ms": 7.034093,
-   "sim_ms": 6.071675,
-   "ratio": 0.8631780955981104
+   "sim_ms": 7.359296,
+   "ratio": 1.0462323998275256
   },
   {
    "algorithm": "tree",
    "protocol": "simple",
    "size": 4294967296,
    "measured_ms": 27.53526,
-   "sim_ms": 22.177883,
-   "ratio": 0.8054357576431093
+   "sim_ms": 28.839488,
+   "ratio": 1.0473657412350563
   }
  ],
  "mape_pct": {
   "ring/ll": 25.1089486620084,
   "ring/ll128": 21.13467851088329,
   "ring/simple": 17.971944302371334,
-  "tree/ll": 16.856128560183055,
-  "tree/ll128": 15.186496511173525,
-  "tree/simple": 26.38879069321163
+  "tree/ll": 5.762396737774608,
+  "tree/ll128": 8.074325692091348,
+  "tree/simple": 16.309292646588382
  }
 }

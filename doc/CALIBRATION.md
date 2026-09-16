@@ -535,35 +535,58 @@ Simple 2^32 ≈ D/150 GB/s = 28.6 ms vs 27.5 ms measured (pair-limited).
 
 **Fitted constants: exactly 6 startup intercepts** (algorithm × protocol,
 anchored at 2^14: `startup = measured(2^14) − sim_wire(2^14, startup=0)`;
-ring 10.6/22.6/33.6 µs, tree 14.4/18.2/30.9 µs for LL/LL128/Simple — the
+ring 10.6/22.6/33.6 µs, tree 13.4/17.5/30.3 µs for LL/LL128/Simple — the
 right magnitude and ordering for NCCL kernel-launch + protocol setup).
 Everything else — LL 0.5 / LL128 0.9375 / Simple 1.0 wire efficiency, chunk
 sizes, credit flow, spraying — is the stock `NcclProtocolModel`. Sizes
 2^16–2^32 are therefore a pure transfer test on third-party hardware.
 
+**TreeAllReduce volume fix (2026-09, motivated by this anchor):** the
+first sweep against this data exposed a structural bug — the old
+`TreeAllReduce` moved only D/N bytes per tree edge per direction, so the
+sim's effective per-edge bandwidth (193.7 GB/s) exceeded the 150 GB/s pair
+spec and the sim *beat the physical bound* D/BW = 28.6 ms (22.2 ms at 2^32).
+The model was rewritten as a chunk-pipelined tree carrying the full D over
+every edge in each direction (reduce up + broadcast down, byte-counted
+progress, forwarding quantized to `clamp(D/(32·depth), 64 KiB, 8 MiB)`).
+Post-fix the tree Simple 2^32 lands at 28.84 ms — 1.007× the physical bound,
+1.047× the measured 27.5 ms (NCCL's split dual-tree keeps both directions of
+each edge busy and sits marginally *under* the naive single-tree bound).
+Note: the historical H200 `h200-tree-allreduce.cfg` per-protocol
+`linkDataRate` values (80/100/50) were fitted against the *old* under-
+transferring model and were compensating the volume deficit; that config
+needs recalibration before its absolute numbers are used again.
+
 **Results (per-curve MAPE over 2^16–2^32):** ring LL 25.1% / LL128 21.1% /
-Simple 18.0%; tree LL 16.9% / LL128 15.2% / Simple 26.4%. The deviation is
-one-sided: the sim is optimistic, worst in the 2^22–2^26 transition regime
-(ratio 0.45–0.73 — real NCCL pays chunk-scheduling/channel-ramp costs there
-that the model does not carry) and mildly optimistic at ≥2^28 (ratio
-0.71–0.86; measured plateau efficiency ~74% vs the model's ~89%).
+Simple 18.0%; tree LL 5.8% / LL128 8.1% / Simple 16.3% (pre-fix tree was
+16.9/15.2/26.4% *with* an unphysical volume model). Ring deviation is
+one-sided optimistic, worst in the 2^22–2^26 transition regime (ratio
+0.45–0.73 — real NCCL pays chunk-scheduling/channel-ramp costs there that
+the model does not carry) and mildly optimistic at ≥2^28 (ratio 0.71–0.86;
+measured plateau efficiency ~74% vs the model's ~89%). Post-fix tree is
+near-neutral at large sizes (≥2^26 ratios 0.91–1.13, mildly pessimistic on
+average) with the transition-regime optimism remaining only on tree Simple
+(2^20–2^24 ratio 0.57–0.76).
 
 **Protocol-shape isolation (size-2^32 runtime ratios, bandwidth-independent):**
 
 | ratio | measured | ns-3 | dev |
 |---|---|---|---|
-| tree LL/Simple | 2.005 | 1.953 | −2.6% |
-| tree LL128/Simple | 1.073 | 1.041 | −3.0% |
+| tree LL/Simple | 2.005 | 1.998 | −0.3% |
+| tree LL128/Simple | 1.073 | 1.066 | −0.7% |
 | ring LL/Simple | 2.363 | 1.872 | −21% |
 | ring LL128/Simple | 1.089 | 0.996 | −8.5% |
-| tree/ring (Simple) | 1.435 | 1.374 | −4.3% |
+| tree/ring (Simple) | 1.435 | 1.787 | +24.5% |
 
 On the pair-limited tree path the stock protocol constants transfer to
-within **3%** — independent confirmation of the LL=0.5 / LL128=0.9375 wire
+within **1%** — independent confirmation of the LL=0.5 / LL128=0.9375 wire
 model. On the aggregated ring path LL undershoots by 21%: our LL efficiency
 is NCCL's theoretical bound, while the paper itself states LL reaches only
 25–50% of peak — multi-channel LL scheduling loses more than the 2× flag
-overhead. Documented, not tuned. The one qualitative miss: at ≥2^28 the sim
+overhead. Documented, not tuned. The tree/ring cross ratio is now +24.5%
+because the tree arm is honest while the ring arm keeps its untuned plateau
+optimism (sim 89% vs measured 74% efficiency) — pre-fix the two errors
+cancelled to a misleading −4.3%. The one qualitative miss: at ≥2^28 the sim
 has LL128 marginally *faster* than Simple on ring (0.996 vs measured 1.089 —
 a chunk-granularity artifact); ordering elsewhere (LL best small, Simple
 best large, LL crossover at ~2^22, tree slower than ring) all reproduces.

@@ -117,6 +117,31 @@ in two phases:
   `doc/CALIBRATION.md` §"NCCL protocol shapes (scale-up)". Measurement-only
   round — no model-code changes, all parity pins untouched.
 
+- **TreeAllReduce full-volume rewrite — DONE (task #37, deviation A of the
+  #36 analysis).** The Demystify anchor proved the old tree model unphysical:
+  it moved only D/N bytes per tree edge per direction (one `m_chunkSize`
+  send per step per hop), giving an effective per-edge bandwidth 129% of the
+  150 GB/s GH200 pair spec and a 2^32 runtime (22.2 ms) *below* the physical
+  bound D/BW = 28.6 ms; at N=4 the old schedule also never sent GPU 3's
+  reduce contribution. Rewritten as a chunk-pipelined binary tree (public
+  API unchanged, heap parent=(g−1)/2 kept): full D up every edge in reduce,
+  full D down in broadcast, interior GPUs forward
+  `[sent, min-over-children-received)` quantized to
+  `clamp(D/(32·depth), 64 KiB, 8 MiB)` uniform chunks; progress is
+  byte-counted per (flow, edge) — spray reorder / GBN duplicates safe; sw
+  overhead knobs pace per hop (defaults 0 = zero extra events). Gotcha
+  fixed on the way: `FabricEndpoint`'s receive callback passes the
+  *receiver's* rank as its first argument, so the sender must be read from
+  `header.GetSourceRank()`. Post-fix Demystify tree arm: MAPE LL 5.8% /
+  LL128 8.1% / Simple 16.3% (was 16.9/15.2/26.4), 2^32 Simple 28.84 ms =
+  1.007× physical bound, 2^32 protocol ratios within 1%; tree/ring cross
+  ratio now +24.5% (tree honest, ring plateau optimism — deviation D —
+  remains, pre-fix errors cancelled). Ring arm byte-identical; all gates
+  green (C++ EXTENSIVE, surrogate 64, 5 parity suites incl. tree
+  config-vs-inline bit-identical). `h200-tree-allreduce.cfg` linkDataRate
+  80/100/50 flagged for recalibration. Deviations B–F recorded in memory
+  (`demystify-deviation-backlog`), not approved for implementation.
+
 - **Full-mesh surrogate algorithm (ns-3-calibrated) — DONE (this branch).** The
   surrogate gained a 4th algorithm shape, `fullmesh`, calibrated directly to
   ns-3 as ground truth (not a wire-rate derivation like ring/tree/nvls).
