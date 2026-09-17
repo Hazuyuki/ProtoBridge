@@ -284,7 +284,11 @@ AlltoAllInjector::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricH
         (header.GetFlowId() & 0x8000) != 0)
     {
         uint16_t finalDest = header.GetFlowId() & 0x7fff;
-        auto key = std::make_pair(srcRank, finalDest);
+        // NOTE: the callback's first argument is the RECEIVING endpoint's rank
+        // (FabricEndpoint passes m_rank), so the true sender must come from
+        // the header; keying on srcRank pooled every same-row sender's bytes
+        // into one counter and the erase() below discarded the overshoot.
+        auto key = std::make_pair(header.GetSourceRank(), finalDest);
         uint64_t& received = m_firstHopReceivedBytes[key];
         received += effectiveSize;
         if (received >= m_chunkSize)

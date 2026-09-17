@@ -6,6 +6,23 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — 2D AlltoAll relay keyed first-hop accounting on the wrong rank (latent)
+
+`AlltoAllInjector::OnPacketReceived` keyed the 2D-mode (UB-Mesh
+`--topology=2dfullmesh`) first-hop relay counter on the receive callback's
+first argument — which is the *receiving* endpoint's own rank
+(`FabricEndpoint` passes `m_rank`), not the sender. Every same-row sender's
+bytes toward the same final destination pooled into one counter, and the
+threshold-crossing `erase()` would discard overshoot bytes. The bug is
+latent today: bulk-transfer deliveries arrive atomically (one callback per
+completed transfer with `effectiveDataSize` = the full chunk), so pooled
+crossings landed exactly on chunk boundaries and nothing was lost — verified
+byte-identical pre/post fix on 2×2/3×3/4×4 grids at 4–64 MB including
+forced fragmentation (`--sprayChunkSize=8192`). Any future fragmented
+delivery (e.g. partial spans under loss) would have deadlocked the relay.
+Now keyed on `header.GetSourceRank()` (same trap as the TreeAllReduce fix
+below). All parity pins and gates unchanged.
+
 ### Fixed — TreeAllReduce carried only D/N per edge; rewritten as full-volume chunk-pipelined tree
 
 The Demystifying-NCCL anchor (below) exposed a structural bug: the old

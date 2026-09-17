@@ -142,6 +142,23 @@ in two phases:
   80/100/50 flagged for recalibration. Deviations B–F recorded in memory
   (`demystify-deviation-backlog`), not approved for implementation.
 
+- **Collective-injector correctness audit + 2D AlltoAll relay-key fix — DONE
+  (task #38).** All 15 injectors swept for the two #37 bug patterns. Fixed:
+  `AlltoAllInjector` 2D mode (UB-Mesh `--topology=2dfullmesh`) keyed the
+  first-hop relay counter on the receive callback's first argument — the
+  *receiver's* own rank — pooling every same-row sender's bytes toward the
+  same final destination into one counter whose threshold `erase()` discarded
+  overshoot; now keyed on `header.GetSourceRank()`. The bug is latent: bulk
+  deliveries arrive atomically (one callback per completed transfer with
+  effectiveSize = the full chunk), so pre/post timings are byte-identical on
+  2×2/3×3/4×4 grids even with forced `--sprayChunkSize` fragmentation; any
+  future fragmented delivery (loss paths) would have deadlocked the relay.
+  Known open, recorded but not approved to fix: RingBroadcast delivers only
+  D/N per GPU (time (N−1)/N·D/BW beats the physical bound); RingReduce moves
+  (N−1)/N·D per link. Also flagged: surrogate `make_h200_tree_theory`
+  calibrated against the pre-#37 tree. All gates green, parity pins
+  unchanged.
+
 - **Full-mesh surrogate algorithm (ns-3-calibrated) — DONE (this branch).** The
   surrogate gained a 4th algorithm shape, `fullmesh`, calibrated directly to
   ns-3 as ground truth (not a wire-rate derivation like ring/tree/nvls).
