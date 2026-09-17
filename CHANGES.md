@@ -6,6 +6,28 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — RingBroadcast/RingReduce moved less than D per edge; rewritten as chunk-pipelined full-volume chains
+
+The two rooted ring collectives beat the physical lower bound D/BW (NCCL
+busbw factor for broadcast/reduce is 1: every ring edge must carry the full
+D). Old RingBroadcast relayed a single D/N segment sequentially — each
+non-root GPU received only 1/N of the array (wrong semantics on top of the
+volume error); old RingReduce ran N−1 parallel steps of D/N per link
+((N−1)/N·D per edge — the *reduce-scatter* volume, but the root needs the
+whole result, and completion checked only the root's step counter). Both
+rewritten in the TreeAllReduce (#37) style: chunk-pipelined chains carrying
+full D per edge (`clamp(D/(32·(N−1)), 64 KiB, 8 MiB)` forwarding quanta,
+byte-counted order-insensitive progress, uint64 `SendBulkWireTransferSize`).
+Broadcast: root streams D around the ring, last-before-root does not
+forward, done when all N−1 non-roots hold D. Reduce: the chain head (root's
+ring predecessor) streams D toward the root; interiors forward the running
+partial sum gated on received bytes; done when the root holds D. Post-fix
+64 MB times sit just above the D/BW bound and are nearly N-independent
+(n=4 751.6 µs / n=8 757.6 µs vs old 569.8/655.7 = (N−1)/N·bound); small
+sizes get slightly *faster* (old paid full store-and-forward latency per
+hop — two errors partially cancelled). Neither collective is in any
+calibration or parity path; all pins unchanged, all gates green.
+
 ### Fixed — 2D AlltoAll relay keyed first-hop accounting on the wrong rank (latent)
 
 `AlltoAllInjector::OnPacketReceived` keyed the 2D-mode (UB-Mesh

@@ -2,10 +2,14 @@
  * SPDX-License-Identifier: GPL-2.0-only
  * ring-reduce.h
  *
- * Pipelined Ring Reduce injector. Derives from CollectiveInjector.
- * Reverse of Broadcast: N-1 steps counterclockwise.
- * Each GPU sends its segment toward root.
- * After N-1 steps root has fully reduced dataSize.
+ * Chunk-pipelined Ring Reduce injector. Derives from CollectiveInjector.
+ * Data flows counterclockwise toward the root along a chain of N-1 ring
+ * edges: the chain head (the root's ring predecessor) streams its FULL
+ * dataSize D; every interior GPU forwards the running element-wise partial
+ * sum (still D bytes — reduction does not shrink the array) after folding in
+ * its local contribution.  Per-edge volume is D, so the completion time
+ * respects the physical lower bound D/BW (plus pipeline fill).  The root is
+ * done when it has received D from its ring successor.
  * Needs rootRank parameter.
  */
 
@@ -54,25 +58,25 @@ private:
     void SetupReceiveCallbacks();
     void OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header);
     void TriggerInitialSends();
-    void SendGpuStepData(uint16_t gpu, uint32_t step);
-    void OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step);
-    void CheckGlobalCompletion();
+    uint16_t RingPrevOf(uint16_t gpu) const;
+    void PumpForward(uint16_t gpu);
     void Complete();
 
     uint16_t m_numGpus;
     uint64_t m_dataSize;
-    uint64_t m_segmentSize;
+    uint64_t m_chunkSize;      // D/N, protocol-threshold selection only
+    uint64_t m_pipeChunkSize;  // pipeline forwarding quantum
     uint16_t m_flowId;
     uint16_t m_rootRank;
+    uint16_t m_headRank;       // chain head = the root's ring predecessor
     uint8_t m_protocolId;
 
     ReduceState m_state;
     uint64_t m_startupDelayNs;
 
-    std::vector<uint32_t> m_gpuCompletedStep;
-    std::vector<uint64_t> m_gpuStepReceivedBytes;
-    uint32_t m_gpuDoneCount;
-    uint32_t m_totalSteps;
+    // Byte-counted per-GPU progress (order-insensitive)
+    std::vector<uint64_t> m_recvBytes;  // received from ring successor
+    std::vector<uint64_t> m_fwdBytes;   // forwarded to ring predecessor
 
     uint64_t m_startTimeNs;
     uint64_t m_endTimeNs;

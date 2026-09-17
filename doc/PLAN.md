@@ -159,6 +159,19 @@ in two phases:
   calibrated against the pre-#37 tree. All gates green, parity pins
   unchanged.
 
+- **RingBroadcast/RingReduce full-volume rewrite — DONE (task #39, closes
+  the two known-open #38 findings).** Both rooted ring collectives beat the
+  physical D/BW bound (broadcast/reduce busbw factor is 1: every ring edge
+  carries full D). Broadcast additionally had wrong semantics — each
+  non-root received only D/N. Rewritten chunk-pipelined in the #37 style:
+  broadcast streams D from the root around the ring; reduce streams D from
+  the chain head (root's ring predecessor) toward the root with interior
+  forwarding gated on received bytes. Post-fix 64 MB times ≈ old × N/(N−1)
+  and nearly N-invariant, just above D/BW; small sizes slightly faster
+  (the old sequential store-and-forward latency per hop partially cancelled
+  the volume deficit). Neither collective is calibrated or parity-pinned;
+  all pins unchanged, all gates green.
+
 - **Full-mesh surrogate algorithm (ns-3-calibrated) — DONE (this branch).** The
   surrogate gained a 4th algorithm shape, `fullmesh`, calibrated directly to
   ns-3 as ground truth (not a wire-rate derivation like ring/tree/nvls).

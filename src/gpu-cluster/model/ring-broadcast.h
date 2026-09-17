@@ -2,10 +2,12 @@
  * SPDX-License-Identifier: GPL-2.0-only
  * ring-broadcast.h
  *
- * Ring Broadcast injector. Derives from CollectiveInjector.
- * Root rank has dataSize data. N-1 steps clockwise:
- * each step, current holder forwards segment to (gpu+1)%N.
- * After N-1 steps all GPUs have root's data.
+ * Chunk-pipelined Ring Broadcast injector. Derives from CollectiveInjector.
+ * The root streams the FULL dataSize D around the ring in pipeline chunks;
+ * every non-root GPU receives D on its single inbound ring edge and forwards
+ * it to its ring successor (the GPU whose successor is the root does not
+ * forward).  Per-edge volume is D, so the completion time respects the
+ * physical lower bound D/BW (plus pipeline fill).
  * Needs rootRank parameter.
  */
 
@@ -54,12 +56,14 @@ private:
     void SetupReceiveCallbacks();
     void OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header);
     void TriggerInitialSends();
-    void SendStepData(uint16_t sender, uint32_t step);
+    uint16_t RingNextOf(uint16_t gpu) const;
+    void PumpForward(uint16_t gpu);
     void Complete();
 
     uint16_t m_numGpus;
     uint64_t m_dataSize;
-    uint64_t m_segmentSize;
+    uint64_t m_chunkSize;      // D/N, protocol-threshold selection only
+    uint64_t m_pipeChunkSize;  // pipeline forwarding quantum
     uint16_t m_flowId;
     uint16_t m_rootRank;
     uint8_t m_protocolId;
@@ -67,12 +71,10 @@ private:
     BroadcastState m_state;
     uint64_t m_startupDelayNs;
 
-    // Sequential tracking: one sender at a time
-    uint16_t m_currentSenderRank;
-    uint32_t m_currentStep;
-    uint64_t m_senderReceivedBytes;
+    // Byte-counted per-GPU progress (order-insensitive)
+    std::vector<uint64_t> m_recvBytes;  // received from ring predecessor
+    std::vector<uint64_t> m_fwdBytes;   // forwarded to ring successor
     uint32_t m_gpuDoneCount;
-    uint32_t m_totalSteps;
 
     uint64_t m_startTimeNs;
     uint64_t m_endTimeNs;

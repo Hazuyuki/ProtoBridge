@@ -2,10 +2,20 @@
  * SPDX-License-Identifier: GPL-2.0-only
  * ring-reduce.cc
  *
- * Pipelined Ring Reduce with protocol-aware sending.
- * Reverse of Broadcast: N-1 steps counterclockwise.
- * Each GPU sends its segment toward root (CCW).
- * After N-1 steps root has fully reduced dataSize.
+ * Chunk-pipelined Ring Reduce carrying the FULL data size D over every ring
+ * edge of the chain toward the root (see ring-reduce.h for the volume model).
+ *
+ * Mechanics:
+ * - The chain head (the root's ring predecessor) streams its D toward its
+ *   own ring predecessor in m_pipeChunkSize quanta; each interior GPU can
+ *   forward byte i of the partial sum only after receiving byte i from
+ *   upstream (its own contribution is local), so its forward progress is
+ *   gated on its received bytes.
+ * - Forwarding is quantized to m_pipeChunkSize = clamp(D/(32*(N-1)), 64 KiB,
+ *   8 MiB): pipeline-fill error <= ~(N-2)*chunk/D, bounded event count.
+ *   Sub-chunk tails are held until the flow end.
+ * - Progress is byte-counted per GPU; packet order never matters.
+ * - Completion: the root has received D from its ring successor.
  */
 
 #include "ring-reduce.h"
@@ -14,12 +24,21 @@
 #include "nccl-protocol.h"
 #include "protocol-model.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
 NS_LOG_COMPONENT_DEFINE("RingReduce");
 
 NS_OBJECT_ENSURE_REGISTERED(RingReduce);
+
+namespace
+{
+constexpr uint16_t NO_RANK = 0xFFFF;
+constexpr uint64_t PIPE_CHUNK_MIN = 64ULL * 1024;
+constexpr uint64_t PIPE_CHUNK_MAX = 8ULL * 1024 * 1024;
+} // namespace
 
 TypeId
 RingReduce::GetTypeId()
@@ -34,13 +53,14 @@ RingReduce::GetTypeId()
 RingReduce::RingReduce()
     : m_numGpus(0),
       m_dataSize(0),
-      m_segmentSize(0),
+      m_chunkSize(0),
+      m_pipeChunkSize(0),
       m_flowId(1),
       m_rootRank(0),
+      m_headRank(0),
+      m_protocolId(0),
       m_state(ReduceState::IDLE),
       m_startupDelayNs(0),
-      m_gpuDoneCount(0),
-      m_totalSteps(0),
       m_startTimeNs(0),
       m_endTimeNs(0)
 {
@@ -66,17 +86,20 @@ RingReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
-    m_segmentSize = dataSize / numGpus;
-    if (m_segmentSize == 0)
+    // D/N, kept only for protocol-threshold selection (same per-step payload
+    // granularity the ring collectives use to pick LL/LL128/SIMPLE).
+    m_chunkSize = dataSize / numGpus;
+    if (m_chunkSize == 0)
     {
-        m_segmentSize = dataSize;
+        m_chunkSize = dataSize;
     }
 
-    m_totalSteps = numGpus - 1;
+    uint64_t hops = (numGpus > 1) ? static_cast<uint64_t>(numGpus - 1) : 1;
+    m_pipeChunkSize = std::clamp<uint64_t>(dataSize / (32ULL * hops),
+                                           PIPE_CHUNK_MIN, PIPE_CHUNK_MAX);
 
-    m_gpuCompletedStep.resize(numGpus, 0);
-    m_gpuStepReceivedBytes.resize(numGpus, 0);
-    m_gpuDoneCount = 0;
+    m_recvBytes.assign(numGpus, 0);
+    m_fwdBytes.assign(numGpus, 0);
 
     m_flowId = 1;
 
@@ -87,16 +110,14 @@ RingReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     {
         m_startupDelayNs = protoModel->GetStartupDelayNs(static_cast<uint8_t>(startupProto), m_numGpus);
     }
-    NcclProtocol wireProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_segmentSize));
+    NcclProtocol wireProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_chunkSize));
     m_protocolId = static_cast<uint8_t>(wireProto);
-
 
     SetupReceiveCallbacks();
 
     NS_LOG_INFO("RingReduce initialized: numGpus=" << numGpus
-                << " dataSize=" << dataSize << " segmentSize=" << m_segmentSize
+                << " dataSize=" << dataSize << " pipeChunk=" << m_pipeChunkSize
                 << " rootRank=" << m_rootRank
-                << " totalSteps=" << m_totalSteps
                 << " protocol=" << static_cast<int>(wireProto)
                 << " startupDelay=" << m_startupDelayNs << "ns");
 }
@@ -146,94 +167,90 @@ RingReduce::Start()
 void
 RingReduce::TriggerInitialSends()
 {
-    // All GPUs send step 0 simultaneously (CCW toward root)
-    for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
+    if (m_numGpus <= 1)
     {
-        SendGpuStepData(gpu, 0);
+        Complete();
+        return;
     }
+    // The chain head is the root's ring predecessor: nothing flows into it,
+    // so its full contribution is ready at start.
+    m_headRank = RingPrevOf(m_rootRank);
+    PumpForward(m_headRank);
+}
+
+uint16_t
+RingReduce::RingPrevOf(uint16_t gpu) const
+{
+    // Counterclockwise (toward root). Prefer topology-embedded prev neighbor,
+    // fall back to rank arithmetic when no embedding is installed.
+    uint16_t prev = m_endpoints[gpu]->GetRingPrev();
+    return (prev != NO_RANK) ? prev : (gpu - 1 + m_numGpus) % m_numGpus;
 }
 
 void
-RingReduce::SendGpuStepData(uint16_t gpu, uint32_t step)
+RingReduce::PumpForward(uint16_t gpu)
 {
-    if (gpu >= m_endpoints.size() || !m_endpoints[gpu])
+    if (gpu >= m_endpoints.size() || !m_endpoints[gpu] || gpu == m_rootRank)
     {
         return;
     }
 
-    // Reduce: counterclockwise. Prefer topology-embedded prev neighbor,
-    // fall back to rank arithmetic when no embedding is installed.
-    uint16_t prev = m_endpoints[gpu]->GetRingPrev();
-    uint16_t target = (prev != 0xFFFF) ? prev : (gpu - 1 + m_numGpus) % m_numGpus;
-    std::vector<uint8_t> data(m_segmentSize, 0xAB);
-
-    uint16_t stepFlowId = m_flowId + step;
-
-    m_endpoints[gpu]->SendDataWithProtocol(target, data.data(), m_segmentSize, m_protocolId, stepFlowId, 0);
-
-    NS_LOG_DEBUG("GPU " << gpu << " sending step " << step
-                 << " to GPU " << target
-                 << " flowId=" << stepFlowId);
+    uint16_t target = RingPrevOf(gpu);
+    uint64_t ready = (gpu == m_headRank)
+                         ? m_dataSize
+                         : std::min(m_recvBytes[gpu], m_dataSize);
+    while (m_fwdBytes[gpu] < ready)
+    {
+        uint64_t remaining = ready - m_fwdBytes[gpu];
+        if (remaining < m_pipeChunkSize && ready < m_dataSize)
+        {
+            break;  // hold the sub-chunk tail until more bytes (or flow end)
+        }
+        uint64_t chunk = std::min(remaining, m_pipeChunkSize);
+        NS_LOG_DEBUG("GPU " << gpu << " -> " << target << " " << chunk << " bytes");
+        m_endpoints[gpu]->SendBulkWireTransferSize(target, chunk, m_protocolId, m_flowId, 0);
+        m_fwdBytes[gpu] += chunk;
+    }
 }
 
 void
 RingReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
 {
+    // NOTE: the callback's first argument is the RECEIVING endpoint's rank
+    // (FabricEndpoint passes m_rank); the sender would be header.GetSourceRank().
     if (header.GetPacketType() != FabricPacketType::DATA)
     {
         return;
     }
 
     uint16_t destRank = header.GetDestRank();
-    uint32_t effectiveSize = header.GetEffectiveDataSize();
+    if (destRank >= m_numGpus || m_state != ReduceState::RUNNING)
+    {
+        return;
+    }
+
+    uint64_t effectiveSize = header.GetEffectiveDataSize();
     if (effectiveSize == 0)
     {
         effectiveSize = packet->GetSize();
     }
 
-    uint32_t currentStep = m_gpuCompletedStep[destRank];
-    m_gpuStepReceivedBytes[destRank] += effectiveSize;
+    m_recvBytes[destRank] += effectiveSize;
 
-    NS_LOG_DEBUG("Packet: src=" << header.GetSourceRank() << " -> dest=" << destRank
-                 << " effectiveSize=" << effectiveSize
-                 << " totalReceived=" << m_gpuStepReceivedBytes[destRank]
-                 << " step=" << currentStep);
+    NS_LOG_DEBUG("GPU " << destRank << " received " << effectiveSize
+                 << " (total " << m_recvBytes[destRank] << "/" << m_dataSize << ")");
 
-    if (m_gpuStepReceivedBytes[destRank] >= m_segmentSize)
+    if (destRank == m_rootRank)
     {
-        m_gpuStepReceivedBytes[destRank] = 0;
-        m_gpuCompletedStep[destRank] = currentStep + 1;
-
-        NS_LOG_INFO("GPU " << destRank << " completed step " << currentStep
-                     << " (now at step " << m_gpuCompletedStep[destRank] << ")");
-
-        OnGpuStepReceiveComplete(destRank, currentStep);
-    }
-}
-
-void
-RingReduce::OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step)
-{
-    if (m_gpuCompletedStep[gpu] >= m_totalSteps)
-    {
-        m_gpuDoneCount++;
-        NS_LOG_INFO("GPU " << gpu << " DONE (total done=" << m_gpuDoneCount << "/" << m_numGpus << ")");
-        CheckGlobalCompletion();
+        if (m_recvBytes[destRank] >= m_dataSize)
+        {
+            NS_LOG_INFO("Root " << destRank << " received fully reduced data");
+            Complete();
+        }
         return;
     }
 
-    Simulator::ScheduleNow(&RingReduce::SendGpuStepData, this, gpu, step + 1);
-}
-
-void
-RingReduce::CheckGlobalCompletion()
-{
-    // Only root needs to have fully received all data
-    // But we track all GPU completions — when root has completed N-1 steps, done
-    if (m_gpuCompletedStep[m_rootRank] >= m_totalSteps)
-    {
-        Complete();
-    }
+    PumpForward(destRank);
 }
 
 CollectiveType
