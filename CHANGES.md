@@ -6,6 +6,36 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Changed — surrogate tree preset recalibrated to the post-volume-fix ns-3 tree; 4-preset consistency regression added
+
+The theory-surrogate tree constants were fitted against the pre-#37
+under-transferring TreeAllReduce and undershot the rewritten injector by up
+to ~10x at 256 MB. Recalibrated against a 27-point ns-3 sweep
+(`configs/calibration/tree_ns3_sweep.py`, N∈{4,8,16} × 9 sizes,
+`--linkDataRate=3060` = the full 18×170 Gbps GPU↔NVSwitch trunk): the old
+serial term `D(N−1)/N/(log₂N·tree_bw)` *decreases* in N while measured
+large-size cost grows (α = 2.505/3.894/3.993 trunk-loads at N=4/8/16), so
+the formula changed, not just constants — per-step volume is now
+`α(N)·D/steps` with the structural trunk-load `α(N)=1/2/3` (N≤2/N≤4/N≥5,
+busiest GPU↔switch trunk of the heap-shaped chunk-pipelined tree), applied
+in `_per_step` so predict/predict_tail/BER-packet paths all inherit it.
+Fitted `tree_bw_per_level=270653 B/µs` (η=0.7076 vs the 382500 B/µs trunk)
+and `t_min_switch=2.99 µs` (relative-error-weighted LS; MAPE 7.59% all /
+5.02% SIMPLE). `make_surrogate_from_wire` tree derivation is now
+`eta_tree·B_agg` with default `eta_tree=0.60` (270000, −0.24% vs fit).
+`h200-tree-allreduce.cfg` header now recommends `--linkDataRate=3060` and
+retires the pre-fix 80/100/50 Gbps guidance. Ring/nvls/fullmesh presets and
+all from-wire non-tree numbers are byte-identical; optical/connectx7 tree
+constants are untouched historical placeholders. New regression
+`configs/calibration/surrogate_ns3_consistency.py` records all four presets
+vs current ns-3 at N=8: ring MAPE 1.87%, tree 7.39%, fullmesh 0.12%; nvls
+is convention-dependent (0.09–0.16× vs the cfg's single-170G-link default,
+1.07–1.17× vs the full trunk — the historical "≈0.566× lower bound" note's
+conditions were unrecorded and match neither; documented in
+`doc/CALIBRATION.md`). 3 new unit tests (α values, ns-3 ground-truth
+reproduction within 12%, monotonicity in N); 67 pytest green; config-vs-
+inline parity unchanged.
+
 ### Fixed — RingBroadcast/RingReduce moved less than D per edge; rewritten as chunk-pipelined full-volume chains
 
 The two rooted ring collectives beat the physical lower bound D/BW (NCCL

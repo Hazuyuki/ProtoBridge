@@ -1,0 +1,22 @@
+{
+  "source": "ns-3 TreeAllReduce (chunk-pipelined full-volume, post volume-fix) on --topology=switched via h200-tree-allreduce.cfg",
+  "model": "T = S(D) + 2*log2(N)*t_min_switch + alpha(N)*D/tree_bw; alpha = 1 (N<=2) / 2 (N<=4) / 3 (N>=5) = busiest GPU<->NVSwitch trunk load in D units",
+  "fit_set": "all points, relative-error weighted (1/T^2); N in {4,8,16} x 1-256 MB",
+  "tree_bw_per_level_bytes_per_us": 270652.58836126665,
+  "t_min_switch_us": 2.9865605552495946,
+  "eta_tree": 0.7075884663039651,
+  "mape_all_pct": 7.585929770081323,
+  "mape_simple_pct": 5.023793208533499,
+  "n_fit_points": 27,
+  "ns3_config": {
+    "cfg": "configs/protocol_configs/h200-tree-allreduce.cfg",
+    "link_data_rate_gbps": 3060,
+    "startup_us": {
+      "LL": 15.0,
+      "LL128": 25.0,
+      "SIMPLE": 46.0
+    }
+  },
+  "trunk_physics_bytes_per_us": 382500.0,
+  "sweep_csv": "tree_sweep.csv"
+}

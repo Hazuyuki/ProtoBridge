@@ -1,0 +1,213 @@
+{
+  "purpose": "4-preset surrogate vs current ns-3 consistency regression; report, not a pass/fail gate -- each preset's expected band follows its anchoring (see notes)",
+  "num_gpus": 8,
+  "summary": {
+    "ring": {
+      "points": 4,
+      "mape_pct": 1.87,
+      "ratio_min": 0.9593,
+      "ratio_max": 1.0185,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    "tree": {
+      "points": 4,
+      "mape_pct": 7.39,
+      "ratio_min": 0.8778,
+      "ratio_max": 1.0727,
+      "note": "ns-3 back-fit (this recalibration)"
+    },
+    "nvls": {
+      "points": 3,
+      "mape_pct": 87.66,
+      "ratio_min": 0.0941,
+      "ratio_max": 0.1591,
+      "note": "preset vs single-170G-link switched cfg"
+    },
+    "nvls_trunk3060": {
+      "points": 3,
+      "mape_pct": 11.82,
+      "ratio_min": 1.0695,
+      "ratio_max": 1.1668,
+      "note": "preset vs full-trunk switched cfg (tree-calibration convention)"
+    },
+    "fullmesh": {
+      "points": 3,
+      "mape_pct": 0.12,
+      "ratio_min": 0.9969,
+      "ratio_max": 0.9998,
+      "note": "ns-3 back-fit (MAPE 0.10%)"
+    }
+  },
+  "rows": [
+    {
+      "preset": "ring",
+      "numGpus": 8,
+      "dataSizeMB": 4,
+      "ns3SimTimeUs": 75.4,
+      "surrogateUs": 72.33,
+      "ratio": 0.9593,
+      "absErrPct": 4.07,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    {
+      "preset": "ring",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 135.0,
+      "surrogateUs": 134.54,
+      "ratio": 0.9966,
+      "absErrPct": 0.34,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    {
+      "preset": "ring",
+      "numGpus": 8,
+      "dataSizeMB": 64,
+      "ns3SimTimeUs": 378.7,
+      "surrogateUs": 383.35,
+      "ratio": 1.0123,
+      "absErrPct": 1.23,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    {
+      "preset": "ring",
+      "numGpus": 8,
+      "dataSizeMB": 256,
+      "ns3SimTimeUs": 1353.6,
+      "surrogateUs": 1378.61,
+      "ratio": 1.0185,
+      "absErrPct": 1.85,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    {
+      "preset": "tree",
+      "numGpus": 8,
+      "dataSizeMB": 4,
+      "ns3SimTimeUs": 125.8,
+      "surrogateUs": 110.43,
+      "ratio": 0.8778,
+      "absErrPct": 12.22,
+      "note": "ns-3 back-fit (this recalibration)"
+    },
+    {
+      "preset": "tree",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 269.0,
+      "surrogateUs": 249.9,
+      "ratio": 0.929,
+      "absErrPct": 7.1,
+      "note": "ns-3 back-fit (this recalibration)"
+    },
+    {
+      "preset": "tree",
+      "numGpus": 8,
+      "dataSizeMB": 64,
+      "ns3SimTimeUs": 784.4,
+      "surrogateUs": 807.8,
+      "ratio": 1.0298,
+      "absErrPct": 2.98,
+      "note": "ns-3 back-fit (this recalibration)"
+    },
+    {
+      "preset": "tree",
+      "numGpus": 8,
+      "dataSizeMB": 256,
+      "ns3SimTimeUs": 2833.5,
+      "surrogateUs": 3039.36,
+      "ratio": 1.0727,
+      "absErrPct": 7.27,
+      "note": "ns-3 back-fit (this recalibration)"
+    },
+    {
+      "preset": "nvls",
+      "numGpus": 8,
+      "dataSizeMB": 4,
+      "ns3SimTimeUs": 248.0,
+      "surrogateUs": 39.47,
+      "ratio": 0.1591,
+      "absErrPct": 84.09,
+      "note": "preset vs single-170G-link switched cfg"
+    },
+    {
+      "preset": "nvls_trunk3060",
+      "numGpus": 8,
+      "dataSizeMB": 4,
+      "ns3SimTimeUs": 36.9,
+      "surrogateUs": 39.47,
+      "ratio": 1.0695,
+      "absErrPct": 6.95,
+      "note": "preset vs full-trunk switched cfg (tree-calibration convention)"
+    },
+    {
+      "preset": "nvls",
+      "numGpus": 8,
+      "dataSizeMB": 8,
+      "ns3SimTimeUs": 471.5,
+      "surrogateUs": 55.13,
+      "ratio": 0.1169,
+      "absErrPct": 88.31,
+      "note": "preset vs single-170G-link switched cfg"
+    },
+    {
+      "preset": "nvls_trunk3060",
+      "numGpus": 8,
+      "dataSizeMB": 8,
+      "ns3SimTimeUs": 49.3,
+      "surrogateUs": 55.13,
+      "ratio": 1.1183,
+      "absErrPct": 11.83,
+      "note": "preset vs full-trunk switched cfg (tree-calibration convention)"
+    },
+    {
+      "preset": "nvls",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 918.4,
+      "surrogateUs": 86.46,
+      "ratio": 0.0941,
+      "absErrPct": 90.59,
+      "note": "preset vs single-170G-link switched cfg"
+    },
+    {
+      "preset": "nvls_trunk3060",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 74.1,
+      "surrogateUs": 86.46,
+      "ratio": 1.1668,
+      "absErrPct": 16.68,
+      "note": "preset vs full-trunk switched cfg (tree-calibration convention)"
+    },
+    {
+      "preset": "fullmesh",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 25.2,
+      "surrogateUs": 25.12,
+      "ratio": 0.9969,
+      "absErrPct": 0.31,
+      "note": "ns-3 back-fit (MAPE 0.10%)"
+    },
+    {
+      "preset": "fullmesh",
+      "numGpus": 8,
+      "dataSizeMB": 64,
+      "ns3SimTimeUs": 53.1,
+      "surrogateUs": 53.09,
+      "ratio": 0.9998,
+      "absErrPct": 0.02,
+      "note": "ns-3 back-fit (MAPE 0.10%)"
+    },
+    {
+      "preset": "fullmesh",
+      "numGpus": 8,
+      "dataSizeMB": 256,
+      "ns3SimTimeUs": 165.0,
+      "surrogateUs": 164.97,
+      "ratio": 0.9998,
+      "absErrPct": 0.02,
+      "note": "ns-3 back-fit (MAPE 0.10%)"
+    }
+  ]
+}

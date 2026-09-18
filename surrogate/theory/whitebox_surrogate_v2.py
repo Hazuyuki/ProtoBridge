@@ -77,11 +77,11 @@ class TheoryDerivedSurrogate:
       Bandwidth — serialized-bytes term (bytes/µs):
         packet_bw_bytes_per_us         (177000)  retransmission chunk serialize (ber>0)
         ring_bw_bytes_per_us           (177000)  ring per-step transfer        [ring mean]
-        tree_bw_per_level_bytes_per_us (26250)   tree per-level transfer       [tree mean]
+        tree_bw_per_level_bytes_per_us (270653)  tree GPU<->NVSwitch trunk     [tree mean]
         nvls_bw_bytes_per_us           (535500)  NVLS aggregate transfer       [nvls mean]
       Latency — fixed term (µs unless noted):
         link_latency_us                (0.4 = 400 ns) per-hop propagation  [ring/nvls mean]
-        t_min_switch_us                 (1.1)    NVSwitch pipeline fill      [tree mean]
+        t_min_switch_us                 (2.99)   NVSwitch pipeline fill      [tree mean]
         startup_us                      (15.0)   protocol startup (LL/LL128) [all mean]
         nvls_startup_us                 (23.0)   NVLS startup (used for nvls) [nvls mean]
         fec_encode_ns / fec_decode_ns   (50 / 80 ns) FEC pipeline latency   [FEC on]
@@ -104,7 +104,7 @@ class TheoryDerivedSurrogate:
     def __init__(self,
                  packet_bw_bytes_per_us=177000,
                  ring_bw_bytes_per_us=177000,
-                 tree_bw_per_level_bytes_per_us=26250,
+                 tree_bw_per_level_bytes_per_us=270653,
                  nvls_bw_bytes_per_us=535500,
                  fullmesh_bw_bytes_per_us=449890,
                  link_latency_us=0.4,
@@ -113,7 +113,7 @@ class TheoryDerivedSurrogate:
                  spray_chunk_bytes=131072,
                  bulk_chunk_bytes=8 * 1024 * 1024,
                  num_lanes=18,
-                 t_min_switch_us=1.1,
+                 t_min_switch_us=2.99,
                  fec_n=544, fec_k=514, fec_t=15,
                  fec_symbol_bits=10,
                  fec_encode_ns=50, fec_decode_ns=80,
@@ -198,13 +198,40 @@ class TheoryDerivedSurrogate:
             return 2
         return 2 * (N - 1)
 
+    @staticmethod
+    def _tree_trunk_load(N):
+        """Busiest GPU<->NVSwitch trunk load, in units of D, for the tree.
+
+        ns-3 ``TreeAllReduce`` (post volume-fix) is a heap-shaped binary tree
+        (node i -> children 2i+1, 2i+2) with overlapped reduce-up +
+        broadcast-down chunk pipelines; every tree edge carries the full D in
+        each direction, and each GPU's single switch trunk carries the sum of
+        its tree-edge traffic in the busier direction:
+
+          N <= 2: single edge, load D
+          N <= 4: the root receives 2D (two children) and sends 2D
+          N >= 5: an interior node moves 2D child + 1D parent traffic
+
+        Measured ns-3 large-size cost alpha(N)*D/trunk: alpha = 2.505 (N=4),
+        3.894 (N=8), 3.993 (N=16) -- the extra ~0.9-1.0 over the pure trunk
+        load is pipeline fill absorbed into the fitted trunk efficiency.
+        """
+        if N <= 2:
+            return 1.0
+        if N <= 4:
+            return 2.0
+        return 3.0
+
     def _per_step(self, D, N, algo, steps, collective=None):
         """Bytes moved in one phase of (collective, algorithm).
 
         AlltoAll moves D*(N-1)/N per GPU (each GPU ships (N-1)/N of its data,
         split over its N-1 partner phases -> D/N per phase); Send-Recv moves
         the full D in its single hop. AllReduce/AllGather keep the legacy
-        volume D*(N-1)/N (ring/tree) or D/N (nvls multicast share).
+        volume D*(N-1)/N (ring) or D/N (nvls multicast share). Tree AllReduce
+        moves alpha(N)*D/steps: the full-volume chunk-pipelined tree carries
+        the whole D over every edge, so the busiest GPU<->NVSwitch trunk
+        serializes alpha(N)*D total (see ``_tree_trunk_load``).
         """
         collective = self._validate_collective(collective)
         if collective == 'sendrecv':
@@ -215,6 +242,8 @@ class TheoryDerivedSurrogate:
             # concurrent, so the per-step serialized volume is D/N, not the
             # ring's D*(N-1)/N).
             return D / N
+        if algo == 'tree' and collective == 'allreduce':
+            return self._tree_trunk_load(N) * D / steps
         return D * (N - 1) / N / steps
 
     def _bdp(self, N, algo, collective=None):
@@ -237,7 +266,9 @@ class TheoryDerivedSurrogate:
         (AlltoAll and Send-Recv serialize over the per-link wire rate, same as
         the ring schedule; AlltoAll contention is captured via the topology
         bisection cap, not a separate bandwidth constant.)
-        Tree: T_step = T_min_switch + per_step / (B_tree × log₂N)
+        Tree: T_step = T_min_switch + per_step / B_tree  (B_tree is the
+        GPU<->NVSwitch trunk rate; per_step already carries the alpha(N)
+        trunk-load factor via ``_per_step``)
         NVLS: T_step = (N × per_step) / B_nvls + lat
 
         With ``topology`` the schedule bandwidth is capped by the fabric
@@ -249,8 +280,7 @@ class TheoryDerivedSurrogate:
         hop = topology.hop_count if topology is not None else 1.0
         extra_lat = (hop - 1.0) * self.lat
         if algo == 'tree':
-            log2N = max(1, int(math.log2(N)))
-            bw_tree = min(self.tree_bw_per_level * log2N, bsec)
+            bw_tree = min(self.tree_bw_per_level, bsec)
             return self.T_min_switch + extra_lat + per_step / bw_tree
         elif algo == 'nvls':
             return extra_lat + self.lat + (per_step * N) / min(self.nvls_bw, bsec)
@@ -453,7 +483,7 @@ class TheoryDerivedSurrogate:
             return 1.0
 
         if algo == 'tree':
-            schedule_bw = self.tree_bw_per_level * max(1, int(math.log2(N)))
+            schedule_bw = self.tree_bw_per_level
         elif algo == 'nvls':
             schedule_bw = self.nvls_bw
         elif algo == 'fullmesh':
@@ -804,9 +834,8 @@ class TheoryDerivedSurrogate:
         hop = topology.hop_count if topology is not None else 1.0
 
         if algo == 'tree':
-            log2N = max(1, int(math.log2(num_gpus)))
             T_fixed_step = self.T_min_switch + (hop - 1.0) * self.lat
-            T_serial_step = per_step / min(self.tree_bw_per_level * log2N, bsec)
+            T_serial_step = per_step / min(self.tree_bw_per_level, bsec)
         elif algo == 'nvls':
             T_fixed_step = self.lat + (hop - 1.0) * self.lat
             T_serial_step = (per_step * num_gpus) / min(self.nvls_bw, bsec)
@@ -894,7 +923,7 @@ def make_h200_ring_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=270653,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=0.4,
         credit_bdp_ring_packets=91.5,
@@ -902,7 +931,7 @@ def make_h200_ring_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=4,
-        t_min_switch_us=1.1,
+        t_min_switch_us=2.99,
         startup_us=15.0,
     )
     defaults.update(overrides)
@@ -910,10 +939,18 @@ def make_h200_ring_theory(**overrides):
 
 
 def make_h200_tree_theory(**overrides):
-    """H200 tree profile: NVSwitch bisection bandwidth + link credit pressure.
+    """H200 tree profile: chunk-pipelined binary tree through the NVSwitch.
 
-    Accepts the same ``overrides`` as the ring profile (defaults to
-    ``num_lanes=18``).
+    Calibrated to the post-volume-fix ns-3 ``TreeAllReduce`` (every tree edge
+    carries the full D; see ``configs/calibration/tree_ns3_sweep.py`` /
+    ``tree_calib.json``): ``tree_bw_per_level`` = 270653 B/us is the fitted
+    effective GPU<->NVSwitch trunk rate (eta = 0.71 vs the 18 x 170 Gbps =
+    382500 B/us trunk physics), ``t_min_switch`` = 2.99 us the fitted switch
+    pipeline fill. The serial term is alpha(N) * D / trunk with the
+    ``_tree_trunk_load`` alpha (1/2/3): MAPE 7.6% over the 27-point N={4,8,16}
+    x 1-256 MB ns-3 sweep (5.0% on the SIMPLE regime). ns-3-anchored -- no
+    H200 tree hardware ground truth exists in this repo. Accepts the same
+    ``overrides`` as the ring profile (defaults to ``num_lanes=18``).
     """
     overrides.setdefault('num_lanes', 18)
     return make_h200_ring_theory(**overrides)
@@ -927,7 +964,7 @@ def make_h200_nvls_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=270653,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=0.4,
         credit_bdp_ring_packets=91.5,
@@ -935,7 +972,7 @@ def make_h200_nvls_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=18,
-        t_min_switch_us=1.1,
+        t_min_switch_us=2.99,
         startup_us=23.0,
         nvls_startup_us=23.0,
     )
@@ -962,7 +999,7 @@ def make_h200_fullmesh_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=270653,
         nvls_bw_bytes_per_us=535500,
         fullmesh_bw_bytes_per_us=449890,
         link_latency_us=0.4,
@@ -971,7 +1008,7 @@ def make_h200_fullmesh_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=18,
-        t_min_switch_us=1.1,
+        t_min_switch_us=2.99,
         startup_us=15.0,
     )
     defaults.update(overrides)
@@ -1032,7 +1069,7 @@ def make_h200_roce_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=160000,
         ring_bw_bytes_per_us=160000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=270653,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=1.0,
         credit_bdp_ring_packets=91.5,
@@ -1081,7 +1118,7 @@ def make_h200_ethernet_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=160000,
         ring_bw_bytes_per_us=160000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=270653,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=3.0,
         credit_bdp_ring_packets=91.5,
@@ -1180,7 +1217,7 @@ def make_surrogate(algo, **overrides):
 
 
 def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
-                             eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20,
+                             eta_ring=0.40, eta_tree=0.60, eta_nvls=1.20,
                              eta_fullmesh=1.0, **overrides):
     """Derive every schedule bandwidth from ONE NVLink wire-rate input.
 
@@ -1193,8 +1230,12 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
                            ~0.40 (AllReduce algorithm-bandwidth realization;
                                   bus bw 2(N-1)/N * alBw ~= 0.69 * B_agg,
                                   in NCCL's typical 60-80% band)
-      tree_bw = (B_agg / num_lanes) * eta_tree
-                           ~1.05 (one NVLink + NCCL/FEC overhead; ~= n_fec/k_fec)
+      tree_bw = eta_tree * B_agg
+                           ~0.60 (effective GPU<->NVSwitch trunk realization:
+                                  the ns-3 back-fit 270653 B/us over the
+                                  382500 B/us trunk = eta 0.71 vs the
+                                  effective 170 Gbps/lane rate, i.e. 0.60 of
+                                  the 25000 B/us physical wire aggregate)
       nvls_bw = eta_nvls * B_agg
                            ~1.20 (NVSwitch hardware multicast amplification)
       fullmesh_bw = eta_fullmesh * B_agg
@@ -1203,10 +1244,10 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
                                   serialization, unlike nvls)
 
     For H200 (b_link=25000 B/us, num_lanes=18, B_agg=450000) this yields
-    ring/packet=180000 (calibrated 177000, +1.7%), tree=26250 (exact),
-    nvls=540000 (calibrated 535500, +0.8%), fullmesh=450000 (ns-3-calibrated,
-    the dedicated 18-lane-per-pair bundle within the fit band). Pass
-    ``ring_bw_bytes_per_us=`` etc.
+    ring/packet=180000 (calibrated 177000, +1.7%), tree=270000 (ns-3-calibrated
+    270653, -0.2%), nvls=540000 (calibrated 535500, +0.8%), fullmesh=450000
+    (ns-3-calibrated, the dedicated 18-lane-per-pair bundle within the fit
+    band). Pass ``ring_bw_bytes_per_us=`` etc.
     in ``overrides`` to override any derived value. The calibrated
     ``make_h200_*`` factories still ship the exact measured values; this is
     the single-parameter entry point for new platforms where only the
@@ -1216,7 +1257,7 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
     derived = dict(
         packet_bw_bytes_per_us=eta_ring * b_agg,
         ring_bw_bytes_per_us=eta_ring * b_agg,
-        tree_bw_per_level_bytes_per_us=(b_agg / num_lanes) * eta_tree,
+        tree_bw_per_level_bytes_per_us=eta_tree * b_agg,
         nvls_bw_bytes_per_us=eta_nvls * b_agg,
         fullmesh_bw_bytes_per_us=eta_fullmesh * b_agg,
         num_lanes=num_lanes,

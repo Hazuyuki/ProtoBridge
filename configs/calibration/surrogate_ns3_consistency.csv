@@ -1,0 +1,18 @@
+preset,numGpus,dataSizeMB,ns3SimTimeUs,surrogateUs,ratio,absErrPct,note
+ring,8,4,75.4,72.33,0.9593,4.07,HW back-fit; lower bound vs ns-3
+ring,8,16,135.0,134.54,0.9966,0.34,HW back-fit; lower bound vs ns-3
+ring,8,64,378.7,383.35,1.0123,1.23,HW back-fit; lower bound vs ns-3
+ring,8,256,1353.6,1378.61,1.0185,1.85,HW back-fit; lower bound vs ns-3
+tree,8,4,125.8,110.43,0.8778,12.22,ns-3 back-fit (this recalibration)
+tree,8,16,269.0,249.9,0.929,7.1,ns-3 back-fit (this recalibration)
+tree,8,64,784.4,807.8,1.0298,2.98,ns-3 back-fit (this recalibration)
+tree,8,256,2833.5,3039.36,1.0727,7.27,ns-3 back-fit (this recalibration)
+nvls,8,4,248.0,39.47,0.1591,84.09,preset vs single-170G-link switched cfg
+nvls_trunk3060,8,4,36.9,39.47,1.0695,6.95,preset vs full-trunk switched cfg (tree-calibration convention)
+nvls,8,8,471.5,55.13,0.1169,88.31,preset vs single-170G-link switched cfg
+nvls_trunk3060,8,8,49.3,55.13,1.1183,11.83,preset vs full-trunk switched cfg (tree-calibration convention)
+nvls,8,16,918.4,86.46,0.0941,90.59,preset vs single-170G-link switched cfg
+nvls_trunk3060,8,16,74.1,86.46,1.1668,16.68,preset vs full-trunk switched cfg (tree-calibration convention)
+fullmesh,8,16,25.2,25.12,0.9969,0.31,ns-3 back-fit (MAPE 0.10%)
+fullmesh,8,64,53.1,53.09,0.9998,0.02,ns-3 back-fit (MAPE 0.10%)
+fullmesh,8,256,165.0,164.97,0.9998,0.02,ns-3 back-fit (MAPE 0.10%)

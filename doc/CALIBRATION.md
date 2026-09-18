@@ -21,8 +21,9 @@ recipe below carries the exact runtime values it uses.
 
 | Surrogate | Calibration set | Metric | Value |
 |-----------|-----------------|--------|-------|
-| Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive (≈0.566× vs 8-GPU ns-3) |
+| Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive, and its vs-ns-3 ratio depends on the switched-fabric link-rate convention: ≈0.09–0.16× vs the cfg default (each GPU on ONE 170 Gbps switch link) and ≈1.07–1.17× vs the `--linkDataRate=3060` full trunk (the historical "≈0.566×" note's run conditions were unrecorded and match neither — 2026-09 drift finding, see `configs/calibration/surrogate_ns3_consistency.py`) |
 | Theory-derived full-mesh (`surrogate/theory/`) | ns-3-calibrated — `fullmesh_bw=449890 B/µs` back-fit to the ns-3 `FullMeshAllReduce`/`FullMeshAllGather` sweep (η=0.9998 vs the 18×25000 dedicated-bundle physics) | vs ns-3 | MAPE 0.10% on the SIMPLE-regime sweep points (N∈{4,8,16}, 1–256 MiB); parity within 0.3% at N=8 AR+AG {16,64,256} MiB (see the Full-mesh section below) |
+| Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — `tree_bw_per_level=270653 B/µs` (η=0.7076 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs) + `t_min_switch=2.99 µs`, back-fit to the post-volume-fix ns-3 `TreeAllReduce` on `h200-tree-allreduce.cfg` + `--linkDataRate=3060` (`configs/calibration/tree_ns3_sweep.py`); serial term = α(N)·D/trunk with α = 1/2/3 (N≤2 / N≤4 / N≥5) = busiest trunk load in D units (the old `D(N−1)/N/(log₂N·bw)` shape *decreased* with N, opposite the measured saturating increase) | vs ns-3 | MAPE 7.59% over all 27 sweep points (N∈{4,8,16} × 1–256 MiB), 5.02% on the SIMPLE regime; relative-error-weighted fit — no H200 tree HW ground truth exists in this repo |
 
 ## Generate fresh ns-3 baselines
 
@@ -319,6 +320,74 @@ aggregate with no contention. Result in
   calibrated [0.95, 1.05] band).
 
 
+## Tree AllReduce — ns-3-calibrated (post-volume-fix)
+
+Recalibration of the surrogate tree preset against the chunk-pipelined
+full-volume `TreeAllReduce` (the 2026-09 volume fix described in the
+Demystifying-NCCL section below made the previous fit — and the historical
+`h200-tree-allreduce.cfg` per-protocol 80/100/50 `linkDataRate` values —
+obsolete: both were compensating the old model's volume deficit).
+
+### Anchor configuration
+
+`h200-tree-allreduce.cfg` (h200-ll128 profile: 170 Gbps/lane, 18 lanes,
+400 ns, startup 15/25/46 µs) + `--linkDataRate=3060` — 18 × 170 Gbps = the
+full GPU↔NVSwitch trunk (382500 B/µs); in the `switched` topology each GPU
+hangs off the NVSwitch by ONE link at this rate. **ns-3-anchored**: no H200
+tree hardware ground truth exists in this repo.
+
+### Model shape (the α(N) trunk-load term)
+
+The old surrogate serial term `D(N−1)/N / (log₂N · tree_bw)` *decreases*
+with N; the measured ns-3 large-size cost is α(N)·D/trunk with α = 2.505 /
+3.894 / 3.993 at N = 4/8/16 — saturating-*increasing*. A constant-only refit
+therefore cannot converge; the formula was changed to
+
+```
+T = S(D) + 2⌊log₂N⌋ · t_min_switch + α(N) · D / tree_bw
+α(N) = 1 (N≤2, single edge) / 2 (N≤4, root moves 2D) / 3 (N≥5, interior
+       node moves 2D child + 1D parent traffic)
+```
+
+α is the busiest GPU↔NVSwitch trunk load in units of D for the heap-shaped
+binary tree (node i → children 2i+1, 2i+2) with overlapped reduce-up +
+broadcast-down chunk pipelines. The required effective trunk rate per N
+spreads only ±3%, so a single fitted constant covers all N.
+
+### Sweep + fit (`configs/calibration/tree_ns3_sweep.py`)
+
+N ∈ {4,8,16} × 1–256 MiB (27 points), relative-error-weighted (1/T²) least
+squares over ALL points → `tree_bw_per_level = 270653 B/µs` (η = 0.7076 vs
+trunk physics), `t_min_switch = 2.99 µs`. MAPE 7.59% all-27 / 5.02% SIMPLE
+regime. (A SIMPLE-only unweighted fit — the full-mesh precedent — reaches
+2.1% SIMPLE but with an unphysical 9.45 µs intercept that inflates ≤4 MiB
+points by up to ~90%; the weighted fit trades that for a balanced error and
+a physical ~3 µs switch-pipeline intercept.) Raw sweep: `tree_sweep.csv`;
+fit record: `tree_calib.json`.
+
+### Scope + limits
+
+- Looser than the full-mesh fit (0.10%) by design: the tree's per-size error
+  is regime-structured (LL128 points +7…+13%, mid-SIMPLE −5…−7%, 256 MiB
+  +5…+11%) — a two-constant scalar model over a 3-protocol sweep.
+- `make_surrogate_from_wire` derives the trunk as `eta_tree · B_agg` with
+  `eta_tree = 0.60` vs the *physical* 25000 B/µs-per-lane aggregate
+  (0.60 × 450000 = 270000, −0.24% vs the fit).
+- `credit_bdp_tree_packets = 35.5` is retained from the pre-fix calibration
+  and untested against the new tree (the sweep runs at the profile's PEX
+  credit default, where Φ_credit = 1).
+- Non-NVLink presets (`make_1024_optical_fattree_theory` 20725,
+  `make_connectx7_p2p_perftest_theory` 24000) keep their historical tree
+  constants; under the new α(N) formula their tree predictions are
+  uncalibrated placeholders (both presets are ring/sendrecv studies).
+
+### Verification
+
+3 unit tests (`surrogate/test/test_theory.py`): α(N) values, ns-3
+reproduction at 256 MiB (N ∈ {4,8,16}, ≤12%), and the shape regression
+(latency non-decreasing in N at fixed D).
+
+
 ## Loss recovery under injected packet loss — SRNIC Fig. 11 (measured) vs ns-3
 
 External measured anchor for the **loss-recovery mode** of the RoCE
@@ -554,8 +623,11 @@ Post-fix the tree Simple 2^32 lands at 28.84 ms — 1.007× the physical bound,
 each edge busy and sits marginally *under* the naive single-tree bound).
 Note: the historical H200 `h200-tree-allreduce.cfg` per-protocol
 `linkDataRate` values (80/100/50) were fitted against the *old* under-
-transferring model and were compensating the volume deficit; that config
-needs recalibration before its absolute numbers are used again.
+transferring model and were compensating the volume deficit; they are
+retired. The recalibration (2026-09, `configs/calibration/tree_ns3_sweep.py`)
+anchors the cfg at `--linkDataRate=3060` (18 lanes × 170 Gbps effective =
+the full GPU↔NVSwitch trunk, 382500 B/µs) and back-fits the surrogate tree
+preset to the post-fix ns-3 tree — see the Tree AllReduce section above.
 
 **Results (per-curve MAPE over 2^16–2^32):** ring LL 25.1% / LL128 21.1% /
 Simple 18.0%; tree LL 5.8% / LL128 8.1% / Simple 16.3% (pre-fix tree was
