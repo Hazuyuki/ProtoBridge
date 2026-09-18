@@ -6,6 +6,20 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — h200-nvls-allgather.cfg run recipe left the GPU↔NVSwitch trunk 18× under-provisioned
+
+The cfg's documented run command passed no `--linkDataRate`, so the switched
+builder fell back to the profile's `bandwidthGbps=170` — a PER-LANE value
+(375 GB/s aggregate ÷ 18 lanes; correct for ring/fullmesh, whose builders
+instantiate 18 physical lanes) — for the ONE link the switched topology
+gives each GPU. The NVSwitch's full-D multicast egress then serialized on a
+single 170 Gbps link (16 MB allgather: 918 µs observed ≈ the 790 µs
+single-link bound), the root cause of the ≈0.09–0.16× surrogate/ns-3 ratio
+in the consistency regression. Header now recommends and the run example
+passes `--linkDataRate=3060` (18×170 = the full trunk, the tree-calibration
+convention). Comments only — config-vs-inline parity re-verified
+bit-identical.
+
 ### Changed — surrogate tree preset recalibrated to the post-volume-fix ns-3 tree; 4-preset consistency regression added
 
 The theory-surrogate tree constants were fitted against the pre-#37
