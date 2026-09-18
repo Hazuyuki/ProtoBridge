@@ -23,8 +23,8 @@ spray -- is the stock protocol model.  Sizes 2^16..2^32 are therefore a
 pure transfer test of the protocol shape constants on third-party hardware.
 
 Usage:
-    python3 configs/calibration/demystify_nccl_sweep.py            # run + report
-    python3 configs/calibration/demystify_nccl_sweep.py --plot     # + figure
+    python3 examples/gpu-cluster/demystify_nccl_sweep.py            # run + report
+    python3 examples/gpu-cluster/demystify_nccl_sweep.py --plot     # + figure
 """
 
 import csv
@@ -36,8 +36,9 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-REF = os.path.join(ROOT, "configs", "calibration", "demystify_nccl_fig6_reference.csv")
-OUT_JSON = os.path.join(ROOT, "configs", "calibration", "demystify_nccl_sweep.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+REF = os.path.join(HERE, "demystify_nccl_fig6_reference.csv")
+OUT_JSON = os.path.join(HERE, "demystify_nccl_sweep.json")
 
 SIZES = [2 ** k for k in range(14, 33, 2)]
 PROTOS = {"ll": 1, "ll128": 2, "simple": 3}
@@ -170,8 +171,7 @@ def plot(results):
                  "(startup anchored at 2^14; protocol constants stock)", fontsize=10)
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        out = os.path.join(ROOT, "configs", "calibration",
-                           "demystify_nccl_fig6_comparison." + ext)
+        out = os.path.join(HERE, "demystify_nccl_fig6_comparison." + ext)
         fig.savefig(out, dpi=150)
         print("wrote", out)
 

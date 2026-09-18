@@ -15,7 +15,7 @@
 #     goodput.
 # normalized = goodput / zero-loss plateau of the SAME curve (cx6: 90, srnic: 97).
 #
-# Used by configs/calibration/eth_gbn_loss_sweep.py as the reference for the
+# Used by examples/gpu-cluster/eth_gbn_loss_sweep.py as the reference for the
 # ns-3 llrMode=gobackn (cx6 analogue) vs llrMode=sack (srnic analogue) sweep.
 curve,loss_rate,goodput_gbps,normalized
 cx6,1e-6,90,1.000

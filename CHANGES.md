@@ -6,6 +6,25 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Changed — alignment demos moved to `examples/gpu-cluster/`
+
+`configs/calibration/` had accumulated 30 unindexed files mixing two roles.
+The external/HW-anchor alignment demonstrations (consistency regression,
+Demystifying-NCCL Fig. 6 sweep, SRNIC Fig. 11 loss sweep, ConnectX-7
+perftest lat/bw sweeps, anchor re-plot script, plus their reference CSVs,
+result JSONs and figures — 22 files) moved to a new `examples/gpu-cluster/`
+with a README table of every aligned scenario, its reference and the
+achieved alignment. The fit machinery that produces calibrated constants
+(`tree_ns3_sweep`, `fullmesh_ns3_sweep`, `roce_p2p_calib` + their outputs)
+stays in `configs/calibration/`. Scripts are `__file__`-relative so they
+run unchanged from the new location (`demystify_nccl_sweep.py`'s hardcoded
+paths were fixed in the move); cross-references in the `.cfg` headers,
+`doc/CALIBRATION.md`, `doc/PLAN.md`/`doc/TASKS.md`, `README.md` and
+`CONTRIBUTING.md` updated (historical entries below keep the old paths).
+The directory is build-inert (no `CMakeLists.txt`, so the stock examples
+scan skips it). No code changes — config-vs-inline parity re-verified
+bit-identical, 67 surrogate tests green.
+
 ### Fixed — h200-nvls-allgather.cfg run recipe left the GPU↔NVSwitch trunk 18× under-provisioned
 
 The cfg's documented run command passed no `--linkDataRate`, so the switched

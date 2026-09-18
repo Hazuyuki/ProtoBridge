@@ -20,7 +20,7 @@ calib JSON); only the ceiling is. Small sizes undershoot because the 1.5 us
 per-message floor is not yet amortized -- the same structural floor as the
 ib_write_lat sweep.
 
-Run:  python3 configs/calibration/roce_p2p_bw_sweep.py
+Run:  python3 examples/gpu-cluster/roce_p2p_bw_sweep.py
 """
 
 from __future__ import annotations

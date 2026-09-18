@@ -8,7 +8,7 @@ collective injectors, credit flow control, four-tier FEC/retry resilience),
 the `surrogate/` latency models (calibrated on H200 NVLink4), and `configs/`
 profiles. **Everything outside `src/gpu-cluster/`, `surrogate/`,
 `configs/protocol_profiles/`, `configs/protocol_configs/`, `configs/dse/`,
-`test/parity/`, `doc/ARCHITECTURE.md`, `doc/CALIBRATION.md`,
+`configs/calibration/`, `examples/gpu-cluster/`, `test/parity/`, `doc/ARCHITECTURE.md`, `doc/CALIBRATION.md`,
 `doc/CONFIG_GUIDE.md`, `scratch/gpu-cluster-sim.cc`, and
 `scratch/protocol-profile-demo.cc` is stock ns-3** — direct those questions to
 the upstream ns-3 project, not here. The root-level `README.md`,

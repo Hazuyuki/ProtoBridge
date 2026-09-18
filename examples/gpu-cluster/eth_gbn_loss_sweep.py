@@ -3,7 +3,7 @@
 ns-3 go-back-N vs selective-repeat loss-recovery sweep, compared against the
 SRNIC (NSDI'23) Figure 11 measurement (ConnectX-6 GBN vs SRNIC selective
 repeat, 100G, perftest 4 KB messages, CC disabled, FPGA-injected uniform
-random loss). Reference: configs/calibration/srnic_fig11_cx6_reference.csv.
+random loss). Reference: examples/gpu-cluster/srnic_fig11_cx6_reference.csv.
 
 Two ns-3 arms, identical except for the recovery mode:
   gobackn -> configs/protocol_configs/p2p-roce-lossy.cfg       (CX-6 analogue)
@@ -35,8 +35,8 @@ The comparison is NORMALIZED (G(p)/G(0) per curve): the ns-3 absolute goodput
 differs from the single-link 90-97 Gbps testbed plateau. What the experiment
 tests is the RECOVERY-MODE degradation shape, not the absolute rate.
 
-Run:  python3 configs/calibration/eth_gbn_loss_sweep.py
-Writes configs/calibration/eth_gbn_loss_sweep.json + prints the table.
+Run:  python3 examples/gpu-cluster/eth_gbn_loss_sweep.py
+Writes examples/gpu-cluster/eth_gbn_loss_sweep.json + prints the table.
 """
 
 from __future__ import annotations

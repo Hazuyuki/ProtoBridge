@@ -28,7 +28,7 @@ Figure 3 (roce_p2p_perftest_comparison.{png,pdf}): the RoCE v2 P2P perftest
   MAPE 3.20% for >=64 MB; the <64 MB transition zone is un-paced and the
   blog's small-size regime is msg-issue-limited, not modeled).
 
-Run:  python3 configs/calibration/plot_measured_anchors.py
+Run:  python3 examples/gpu-cluster/plot_measured_anchors.py
 """
 
 from __future__ import annotations

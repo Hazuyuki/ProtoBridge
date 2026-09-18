@@ -44,7 +44,7 @@ in two phases:
   vs 0.988; line rate 400 Gbps match) — **no ns-3 model change warranted**.
   **ns-3 `ib_write_lat` direct comparison — DONE:** the inter-node `RoceProtocolModel`
   was already wired out-of-band, so a `h200-roce.profile` was not needed;
-  `configs/calibration/roce_p2p_ns3_sweep.py` + `--interNodeTopology=tor`
+  `examples/gpu-cluster/roce_p2p_ns3_sweep.py` + `--interNodeTopology=tor`
   (single shared leaf, 1 hop) reproduce `ib_write_lat` at **MAPE 5.26 %** (best fit
   `startup=950/interNodeLatency=100/switchCutThroughDelay=200/bw=400`; the 1–4 KB
   transition undershoots — ns-3 linear vs `ib_write_lat` sublinear S^0.669,
@@ -52,7 +52,7 @@ in two phases:
   retracted). **ns-3 `ib_write_bw` per-QP ceiling — DONE:** opt-in
   `--perQpCeilingGbps=49` mounts `DcqcnRateMachine`'s true per-flow pacer
   (per-flow `nextSendNs`, spaces consecutive chunks to the ceiling);
-  `configs/calibration/roce_p2p_bw_sweep.py` → converged **MAPE 3.20 %** for
+  `examples/gpu-cluster/roce_p2p_bw_sweep.py` → converged **MAPE 3.20 %** for
   sizes ≥64 MB (256 MB 47.60 G ≈ 49 G per-QP), correcting the 7.1× no-ceiling
   overestimate (256 MB 348.3 G → 47.6 G). Transition zone <64 MB over-estimates
   (1–7 8 MB-coalesced chunks un-paced; the blog's sub-ceiling small-size regime
@@ -88,7 +88,7 @@ in two phases:
   0.725/0.744 @0.5%), ~+10 pts optimistic at 1–2% (no RTO-scale stalls;
   0.580/0.467, 0.383/0.278), mode ordering (GBN < SACK) restored at every
   rate; SACK unchanged within ~5 pts everywhere. Artifacts:
-  `configs/calibration/srnic_fig11_cx6_reference.csv` + `eth_gbn_loss_sweep.py`
+  `examples/gpu-cluster/srnic_fig11_cx6_reference.csv` + `eth_gbn_loss_sweep.py`
   + `p2p-roce-lossy{,-sack}.cfg` + `test/parity/test_so_gbn_strict.py`;
   write-up in `doc/CALIBRATION.md` §"Loss
   recovery under injected packet loss".
@@ -98,7 +98,7 @@ in two phases:
   arXiv:2507.04786 Fig. 6 intra-node panels (LL/LL128/Simple × Ring/Tree
   AllReduce, 4× GH200 quad on CSCS Alps, NCCL 2.19.1, 2^14–2^32 B) digitized
   by pixel extraction (gridline-calibrated ±2%, zoom insets for ≤2^22) into
-  `configs/calibration/demystify_nccl_fig6_reference.csv`, and compared
+  `examples/gpu-cluster/demystify_nccl_fig6_reference.csv`, and compared
   against the stock `NcclProtocolModel` with only the physical spec changed:
   ring = `--topology=ring --numLanes=18 --bandwidth=200` (450 GB/s per-GPU
   multi-ring aggregate — the measured busBW of 335 GB/s confirms the
@@ -193,7 +193,7 @@ in two phases:
 - [x] Phase A: SoHeader carrier + ECN mark + CNP echo + `--ecnThreshold` (parity-safe, dormant).
 - [x] Phase B: activate live SoHeader send path + DCQCN rate machine + egress chokepoint + `--dcqcn` + tests.
 - [x] RoCE P2P perftest calibration: surrogate `make_connectx7_p2p_perftest_theory` (MAPE 2.6 % vs `ib_write_lat`) + `roce_p2p_calib.py`/`.json` + `p2p-single.cfg` demo + `doc/CALIBRATION.md` §RoCE P2P.
-- [x] ns-3 RoCE P2P `ib_write_lat` direct comparison: DONE. The inter-node `RoceProtocolModel` was already wired out-of-band (no `h200-roce.profile` needed); `configs/calibration/roce_p2p_ns3_sweep.py` + new `--interNodeTopology=tor` (single shared leaf, 1 hop) reproduce `ib_write_lat` at **MAPE 5.26 %** (best fit `startup=950/interNodeLatency=100/switchCutThroughDelay=200/interNodeBandwidth=400`; 2-link 2×ser = single-write rate). The prior "`.cfg` SEND_P2P `latencyNs` is dispatch time" claim is **retracted** — completion is delivery-gated (`ProtocolConfigRunner` `m_startNs` → `PACKET_DELIVERED` → `durationNs`).
+- [x] ns-3 RoCE P2P `ib_write_lat` direct comparison: DONE. The inter-node `RoceProtocolModel` was already wired out-of-band (no `h200-roce.profile` needed); `examples/gpu-cluster/roce_p2p_ns3_sweep.py` + new `--interNodeTopology=tor` (single shared leaf, 1 hop) reproduce `ib_write_lat` at **MAPE 5.26 %** (best fit `startup=950/interNodeLatency=100/switchCutThroughDelay=200/interNodeBandwidth=400`; 2-link 2×ser = single-write rate). The prior "`.cfg` SEND_P2P `latencyNs` is dispatch time" claim is **retracted** — completion is delivery-gated (`ProtocolConfigRunner` `m_startNs` → `PACKET_DELIVERED` → `durationNs`).
 - [x] ns-3 RoCE P2P `ib_write_bw` per-QP ceiling: DONE. Opt-in `PerQpCeilingGbps` (~49 G) on `DcqcnRateMachine::ShapingDelay` as a true per-flow pacer (per-flow `nextSendNs`, not a per-chunk offset); `roce_p2p_bw_sweep.py` → converged MAPE 3.20 % (≥64 MB); corrects the 7.1× no-ceiling overestimate. Resolves R-SoH-4 (per-flow pacer mechanism now exists; DCQCN congestion still per-chunk, acceptable).
 - [ ] PFC: per-VC priority pause via `FlowControlGate` (F9 seam) — R-SoH-2 (deferred, invasive).
 - [ ] DCQCN e2e contention proof: multi-flow incast scenario saturating one switch output port — R-SoH-3 (deferred; unit tests cover every link).

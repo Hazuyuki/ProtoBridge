@@ -21,7 +21,7 @@ recipe below carries the exact runtime values it uses.
 
 | Surrogate | Calibration set | Metric | Value |
 |-----------|-----------------|--------|-------|
-| Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive, and its vs-ns-3 ratio depends on the switched-fabric link-rate convention: ≈0.09–0.16× vs the cfg default (each GPU on ONE 170 Gbps switch link) and ≈1.07–1.17× vs the `--linkDataRate=3060` full trunk (the historical "≈0.566×" note's run conditions were unrecorded and match neither — 2026-09 drift finding, see `configs/calibration/surrogate_ns3_consistency.py`) |
+| Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive, and its vs-ns-3 ratio depends on the switched-fabric link-rate convention: ≈0.09–0.16× vs the cfg default (each GPU on ONE 170 Gbps switch link) and ≈1.07–1.17× vs the `--linkDataRate=3060` full trunk (the historical "≈0.566×" note's run conditions were unrecorded and match neither — 2026-09 drift finding, see `examples/gpu-cluster/surrogate_ns3_consistency.py`) |
 | Theory-derived full-mesh (`surrogate/theory/`) | ns-3-calibrated — `fullmesh_bw=449890 B/µs` back-fit to the ns-3 `FullMeshAllReduce`/`FullMeshAllGather` sweep (η=0.9998 vs the 18×25000 dedicated-bundle physics) | vs ns-3 | MAPE 0.10% on the SIMPLE-regime sweep points (N∈{4,8,16}, 1–256 MiB); parity within 0.3% at N=8 AR+AG {16,64,256} MiB (see the Full-mesh section below) |
 | Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — `tree_bw_per_level=270653 B/µs` (η=0.7076 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs) + `t_min_switch=2.99 µs`, back-fit to the post-volume-fix ns-3 `TreeAllReduce` on `h200-tree-allreduce.cfg` + `--linkDataRate=3060` (`configs/calibration/tree_ns3_sweep.py`); serial term = α(N)·D/trunk with α = 1/2/3 (N≤2 / N≤4 / N≥5) = busiest trunk load in D units (the old `D(N−1)/N/(log₂N·bw)` shape *decreased* with N, opposite the measured saturating increase) | vs ns-3 | MAPE 7.59% over all 27 sweep points (N∈{4,8,16} × 1–256 MiB), 5.02% on the SIMPLE regime; relative-error-weighted fit — no H200 tree HW ground truth exists in this repo |
 
@@ -136,7 +136,7 @@ scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
   WAIT node; `OnComplete` computes `durationNs = Now - m_startNs` (runner.cc:185).
   The `latencyNs = 400` is only a config echo, not the measured duration. Proven
   empirically by the ib_write_lat sweep
-  ([`configs/calibration/roce_p2p_ns3_sweep.py`](../configs/calibration/roce_p2p_ns3_sweep.py)):
+  ([`examples/gpu-cluster/roce_p2p_ns3_sweep.py`](../examples/gpu-cluster/roce_p2p_ns3_sweep.py)):
   `simTimeUs` scales with size (2 B → 1.50 µs, 64 KB → 4.40 µs), impossible for
   fixed-dispatch. So `simTimeUs` **is** the single-transfer delivery latency,
   directly comparable to `ib_write_lat`.
@@ -153,7 +153,7 @@ scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
   stencil path). The opt-in per-QP ceiling (`PerQpCeilingGbps` ≈ 49 G) for
   **ib_write_bw** sustained-throughput parity is **DONE**:
   `--perQpCeilingGbps=49` mounts `DcqcnRateMachine`'s true per-flow pacer;
-  [`configs/calibration/roce_p2p_bw_sweep.py`](../configs/calibration/roce_p2p_bw_sweep.py)
+  [`examples/gpu-cluster/roce_p2p_bw_sweep.py`](../examples/gpu-cluster/roce_p2p_bw_sweep.py)
   → converged **MAPE 3.20 %** for sizes ≥64 MB (64 MB 50.74 G +3.5 %, 256 MB
   47.60 G −2.9 % ≈ 49 G per-QP), correcting the 7.1× no-ceiling overestimate
   (256 MB 348.3 G → 47.6 G). Transition zone <64 MB over-estimates (1–7
@@ -400,7 +400,7 @@ Two measured curves: ConnectX-6 (go-back-N recovery — "drops rapidly when
 the packet loss rate exceeds 0.1%, and drops to 25 Gbps when the loss rate
 exceeds 1%") and the SRNIC prototype (bitmap selective repeat — "75 Gbps
 goodput under 1% packet loss rate"). Digitized points with provenance:
-[`configs/calibration/srnic_fig11_cx6_reference.csv`](../configs/calibration/srnic_fig11_cx6_reference.csv).
+[`examples/gpu-cluster/srnic_fig11_cx6_reference.csv`](../examples/gpu-cluster/srnic_fig11_cx6_reference.csv).
 
 This maps directly onto the fabric's two LLR modes — **the ns-3 sweep changes
 only `llrMode`** between arms:
@@ -410,13 +410,13 @@ only `llrMode`** between arms:
 | `llrMode=gobackn` | `configs/protocol_configs/p2p-roce-lossy.cfg` | ConnectX-6 |
 | `llrMode=sack` | `configs/protocol_configs/p2p-roce-lossy-sack.cfg` | SRNIC |
 
-Sweep driver: [`configs/calibration/eth_gbn_loss_sweep.py`](../configs/calibration/eth_gbn_loss_sweep.py)
+Sweep driver: [`examples/gpu-cluster/eth_gbn_loss_sweep.py`](../examples/gpu-cluster/eth_gbn_loss_sweep.py)
 (RoCE tor 100G, `--gpusPerNode=2` — required, see the cfg header —
 `--bulkChunkSize=4096` for perftest 4 KB granularity, 16 MiB transfer,
 `--llrRetryTimeout=500us`, `--packetLossRate` swept, 3 seeds). Per-arm
 knobs: the SACK arm runs `--soTxWindow=16` (wire BDP); the GBN arm runs
 `--soGbnStrict=1 --soTxWindow=64` (strict go-back-N receive semantics, see
-below). Results in `configs/calibration/eth_gbn_loss_sweep.json`. The
+below). Results in `examples/gpu-cluster/eth_gbn_loss_sweep.json`. The
 comparison is **normalized per curve** (`G(p)/G(0)`): the ns-3 absolute
 plateau (53.2 Gbps: tor 2-link serialization + 4 KB chunk headers)
 intentionally differs from the testbed's single-link 90–97 Gbps.
@@ -563,7 +563,7 @@ regime (≥64 MB exceeds practical simulation time), so the collective-level
 comparison at multi-GB sizes is out of reach for ns-3; the surrogate's
 hierarchical model is the right tool there. Not pursued further.
 
-For the figure (`configs/calibration/crusoe_nccl_busbw.{png,pdf}`, generated
+For the figure (`examples/gpu-cluster/crusoe_nccl_busbw.{png,pdf}`, generated
 by `plot_measured_anchors.py`) a 4 GB ns-3 point was added: 147.5 ms, i.e.
 algbw 29.1 GB/s — flat next to the 2 GB point's 29.0 GB/s, as expected for
 the bandwidth-dominated ring-intra regime. Sizes ≥8 GB abort in stock ns-3
@@ -585,10 +585,10 @@ egress per GPU). The inter-node panels are *not* comparable (Cray Slingshot
 Dragonfly + NCCL host-proxy sync — a different fabric from our RoCE/ETH So
 models) and are used only qualitatively.
 
-Reference data: `configs/calibration/demystify_nccl_fig6_reference.csv`,
+Reference data: `examples/gpu-cluster/demystify_nccl_fig6_reference.csv`,
 digitized by pixel extraction (gridline-calibrated main panels ±2%, zoom
 insets for ≤2^22; provenance in the file header). Sweep driver:
-`configs/calibration/demystify_nccl_sweep.py` (60 runs, ~1 min); figure:
+`examples/gpu-cluster/demystify_nccl_sweep.py` (60 runs, ~1 min); figure:
 `demystify_nccl_fig6_comparison.{png,pdf}`.
 
 **Mapping (spec-derived, no fitted bandwidth):**

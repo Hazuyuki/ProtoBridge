@@ -22,7 +22,7 @@ JSON):
            see the NVLS scaling notes).
   fullmesh ns-3 back-fit (fullmesh_bw=449890, MAPE 0.10% SIMPLE regime).
 
-Run:  python3 configs/calibration/surrogate_ns3_consistency.py
+Run:  python3 examples/gpu-cluster/surrogate_ns3_consistency.py
 """
 
 from __future__ import annotations
