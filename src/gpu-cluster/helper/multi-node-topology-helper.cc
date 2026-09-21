@@ -15,6 +15,8 @@
 #include "ns3/mac48-address.h"
 #include "ns3/drop-tail-queue.h"
 
+#include <cmath>
+
 namespace ns3
 {
 
@@ -65,6 +67,132 @@ void MultiNodeTopologyHelper::SetInterNodeFabricType(FabricType type) { m_interN
 void MultiNodeTopologyHelper::SetInterNodeTopology(const std::string& topo) { m_interNodeTopology = topo; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchType(const std::string& typeId) { m_interNodeSwitchType = typeId; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchLlrEnabled(bool enabled) { m_interNodeSwitchLlrEnabled = enabled; }
+void MultiNodeTopologyHelper::SetInterNodeSpines(uint32_t spines) { m_interNodeSpines = spines; }
+void MultiNodeTopologyHelper::SetInterNodeTorusWidth(uint32_t width) { m_interNodeTorusWidth = width; }
+void MultiNodeTopologyHelper::SetInterNodeDragonflyGroupSize(uint32_t groupSize) { m_interNodeDragonflyGroupSize = groupSize; }
+
+Ptr<NvSwitch>
+MultiNodeTopologyHelper::CreateInterNodeSwitch(Ptr<Node>& switchNode)
+{
+    NvSwitchHelper switchHelper;
+    switchHelper.SetSwitchType(m_interNodeSwitchType);
+    switchNode = CreateObject<Node>();
+    Ptr<NetDevice> switchDevice = switchHelper.Install(switchNode);
+    Ptr<NvSwitch> sw = DynamicCast<NvSwitch>(switchDevice);
+    NS_ASSERT(sw);
+    sw->SetVoqDepth(m_switchVoqDepth);
+    sw->SetArbitrationInterval(m_switchArbIntervalNs);
+    if (m_switchCutThroughDelayNs > 0)
+    {
+        sw->SetCutThroughDelay(m_switchCutThroughDelayNs);
+    }
+    if (m_arbiter)
+    {
+        sw->SetArbiter(m_arbiter);
+    }
+    sw->SetLlrEnabled(m_interNodeSwitchLlrEnabled);
+    m_allSwitchNodes.Add(switchNode);
+    m_allNodes.Add(switchNode);
+    return sw;
+}
+
+uint32_t
+MultiNodeTopologyHelper::TorusWidth() const
+{
+    if (m_interNodeTorusWidth > 0)
+    {
+        NS_ABORT_MSG_IF(m_numNodes % m_interNodeTorusWidth != 0,
+                        "torus2d: numNodes=" << m_numNodes
+                        << " is not divisible by width=" << m_interNodeTorusWidth);
+        return m_interNodeTorusWidth;
+    }
+    // Auto: largest divisor of numNodes that is <= sqrt(numNodes)
+    uint32_t width = 1;
+    for (uint32_t w = 1; w * w <= m_numNodes; ++w)
+    {
+        if (m_numNodes % w == 0)
+        {
+            width = w;
+        }
+    }
+    return width;
+}
+
+uint32_t
+MultiNodeTopologyHelper::DragonflyGroupSize() const
+{
+    if (m_interNodeDragonflyGroupSize > 0)
+    {
+        NS_ABORT_MSG_IF(m_numNodes % m_interNodeDragonflyGroupSize != 0,
+                        "dragonfly: numNodes=" << m_numNodes
+                        << " is not divisible by groupSize=" << m_interNodeDragonflyGroupSize);
+        return m_interNodeDragonflyGroupSize;
+    }
+    // Auto: divisor of numNodes closest to sqrt(numNodes) (ties -> smaller)
+    uint32_t best = 1;
+    for (uint32_t g = 1; g <= m_numNodes; ++g)
+    {
+        if (m_numNodes % g != 0)
+        {
+            continue;
+        }
+        double target = std::sqrt(static_cast<double>(m_numNodes));
+        if (std::abs(static_cast<double>(g) - target) <
+            std::abs(static_cast<double>(best) - target))
+        {
+            best = g;
+        }
+    }
+    return best;
+}
+
+uint32_t
+MultiNodeTopologyHelper::GatewayNextHop(uint32_t nodeId, uint32_t dstNode) const
+{
+    NS_ASSERT(nodeId != dstNode);
+    if (m_interNodeTopology == "torus2d")
+    {
+        // Dimension-order (x then y) shortest-wrap routing
+        uint32_t width = TorusWidth();
+        uint32_t height = m_numNodes / width;
+        uint32_t x = nodeId % width;
+        uint32_t y = nodeId / width;
+        uint32_t dx = dstNode % width;
+        uint32_t dy = dstNode / width;
+        if (x != dx)
+        {
+            uint32_t forwardDist = (dx - x + width) % width;
+            uint32_t backwardDist = (x - dx + width) % width;
+            uint32_t nx = forwardDist <= backwardDist ? (x + 1) % width
+                                                      : (x + width - 1) % width;
+            return y * width + nx;
+        }
+        uint32_t forwardDist = (dy - y + height) % height;
+        uint32_t backwardDist = (y - dy + height) % height;
+        uint32_t ny = forwardDist <= backwardDist ? (y + 1) % height
+                                                  : (y + height - 1) % height;
+        return ny * width + x;
+    }
+    // dragonfly: minimal l-g-l routing
+    uint32_t groupSize = DragonflyGroupSize();
+    uint32_t srcGroup = nodeId / groupSize;
+    uint32_t dstGroup = dstNode / groupSize;
+    if (srcGroup == dstGroup)
+    {
+        return dstNode; // direct intra-group gateway link
+    }
+    // The node in srcGroup holding the global link to dstGroup (palmtree
+    // assignment, mirrored in BuildInterNodeLinks)
+    uint32_t holderIdx = (dstGroup - (dstGroup > srcGroup ? 1 : 0)) % groupSize;
+    uint32_t holder = srcGroup * groupSize + holderIdx;
+    if (nodeId != holder)
+    {
+        return holder; // intra-group hop toward the global-link holder
+    }
+    // Cross the global link to dstGroup's holder of the link back to srcGroup
+    uint32_t peerIdx = (srcGroup - (srcGroup > dstGroup ? 1 : 0)) % groupSize;
+    return dstGroup * groupSize + peerIdx;
+}
 
 uint16_t MultiNodeTopologyHelper::GetGlobalRank(uint32_t nodeId, uint32_t localIdx) const
 {
@@ -582,6 +710,227 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
             }
         }
     }
+    else if (m_interNodeTopology == "rail")
+    {
+        // Rail-optimized (DGX-SuperPOD compute-fabric pattern): gpusPerNode
+        // rail switches shared by ALL nodes; the GPU with local index k on
+        // every node hangs off rail switch k. Same-local-rank remote traffic
+        // crosses ONE switch hop on its rail; cross-local-rank traffic first
+        // moves intra-node to the same-local-rank proxy GPU (NCCL PXN) which
+        // forwards on its rail -- the endpoint routing shape is identical to
+        // 'fullmesh' (rdmaRouteMap + intra-node proxy), so
+        // PopulateInterNodeRouting reuses the 'fullmesh' block.
+        for (uint32_t rail = 0; rail < m_gpusPerNode; ++rail)
+        {
+            Ptr<Node> switchNode;
+            Ptr<NvSwitch> railSwitch = CreateInterNodeSwitch(switchNode);
+
+            std::vector<uint32_t> devIdx(m_numNodes);
+            std::vector<uint32_t> port(m_numNodes);
+            std::vector<Mac48Address> mac(m_numNodes);
+            for (uint32_t nodeId = 0; nodeId < m_numNodes; ++nodeId)
+            {
+                NodeInfo& info = m_nodeInfos[nodeId];
+                Ptr<Node> gpuNode = info.gpuNodes.Get(rail);
+                Ptr<FabricEndpoint> ep =
+                    DynamicCast<FabricEndpoint>(info.endpoints.Get(rail));
+                NetDeviceContainer devices = p2pInter.Install(gpuNode, switchNode);
+                Ptr<NetDevice> gpuDevice = devices.Get(0);
+                Ptr<NetDevice> switchPort = devices.Get(1);
+                devIdx[nodeId] = ep->AddNetDevice(gpuDevice);
+                port[nodeId] = railSwitch->AddPort(
+                    DynamicCast<PointToPointNetDevice>(switchPort));
+                mac[nodeId] = Mac48Address::ConvertFrom(gpuDevice->GetAddress());
+                info.interNodeDevices.push_back(gpuDevice);
+                info.interNodeDeviceIndices.push_back(devIdx[nodeId]);
+            }
+            // All NIC MACs known: rail-switch static routes + endpoint
+            // rdmaRouteMap (peer MAC = the remote GPU's rail NIC, which the
+            // switch forwards by static route).
+            for (uint32_t nodeId = 0; nodeId < m_numNodes; ++nodeId)
+            {
+                railSwitch->AddStaticRoute(mac[nodeId], port[nodeId]);
+                for (uint32_t remote = 0; remote < m_numNodes; ++remote)
+                {
+                    if (remote == nodeId)
+                    {
+                        continue;
+                    }
+                    m_nodeInfos[nodeId].rdmaRouteMap[{remote, rail}] =
+                        {devIdx[nodeId], mac[remote]};
+                }
+            }
+        }
+    }
+    else if (m_interNodeTopology == "leafspine")
+    {
+        // Two-tier Clos: one leaf per node, numSpines spines (0 = auto
+        // gpusPerNode = non-blocking at equal link rates), every leaf wired to
+        // every spine by one link. Endpoint side is the same one-NIC-per-GPU
+        // shape as 'host'/'tor' (PopulateInterNodeRouting reuses that block).
+        // Each leaf spreads remote-destined MACs across spines by destination
+        // local rank (destLocalIdx % numSpines -- deterministic, rail-aligned
+        // ECMP; static per-MAC routes cannot hash per flow).
+        uint32_t numSpines = m_interNodeSpines ? m_interNodeSpines : m_gpusPerNode;
+        std::vector<Ptr<Node>> leafNodes(m_numNodes);
+        std::vector<Ptr<NvSwitch>> leaves(m_numNodes);
+        std::vector<Ptr<Node>> spineNodes(numSpines);
+        std::vector<Ptr<NvSwitch>> spines(numSpines);
+        std::vector<std::vector<uint32_t>> gpuPorts(
+            m_numNodes, std::vector<uint32_t>(m_gpusPerNode));
+        std::vector<std::vector<uint32_t>> leafUpPorts(
+            m_numNodes, std::vector<uint32_t>(numSpines));
+        std::vector<std::vector<uint32_t>> spineDownPorts(
+            numSpines, std::vector<uint32_t>(m_numNodes));
+
+        for (uint32_t nodeId = 0; nodeId < m_numNodes; ++nodeId)
+        {
+            leaves[nodeId] = CreateInterNodeSwitch(leafNodes[nodeId]);
+        }
+        for (uint32_t s = 0; s < numSpines; ++s)
+        {
+            spines[s] = CreateInterNodeSwitch(spineNodes[s]);
+        }
+
+        for (uint32_t nodeId = 0; nodeId < m_numNodes; ++nodeId)
+        {
+            NodeInfo& info = m_nodeInfos[nodeId];
+            for (uint32_t localIdx = 0; localIdx < m_gpusPerNode; ++localIdx)
+            {
+                Ptr<Node> gpuNode = info.gpuNodes.Get(localIdx);
+                Ptr<FabricEndpoint> ep =
+                    DynamicCast<FabricEndpoint>(info.endpoints.Get(localIdx));
+                NetDeviceContainer devices = p2pInter.Install(gpuNode, leafNodes[nodeId]);
+                Ptr<NetDevice> gpuDevice = devices.Get(0);
+                Ptr<NetDevice> switchPort = devices.Get(1);
+                uint32_t deviceIndex = ep->AddNetDevice(gpuDevice);
+                gpuPorts[nodeId][localIdx] = leaves[nodeId]->AddPort(
+                    DynamicCast<PointToPointNetDevice>(switchPort));
+                info.interNodeDevices.push_back(gpuDevice);
+                info.interNodeDeviceIndices.push_back(deviceIndex);
+            }
+            for (uint32_t s = 0; s < numSpines; ++s)
+            {
+                NetDeviceContainer devices =
+                    p2pInter.Install(leafNodes[nodeId], spineNodes[s]);
+                leafUpPorts[nodeId][s] = leaves[nodeId]->AddPort(
+                    DynamicCast<PointToPointNetDevice>(devices.Get(0)));
+                spineDownPorts[s][nodeId] = spines[s]->AddPort(
+                    DynamicCast<PointToPointNetDevice>(devices.Get(1)));
+            }
+        }
+
+        for (uint32_t destNode = 0; destNode < m_numNodes; ++destNode)
+        {
+            for (uint32_t localIdx = 0; localIdx < m_gpusPerNode; ++localIdx)
+            {
+                Mac48Address destination = Mac48Address::ConvertFrom(
+                    m_nodeInfos[destNode].interNodeDevices[localIdx]->GetAddress());
+                uint32_t spine = localIdx % numSpines;
+                for (uint32_t leafId = 0; leafId < m_numNodes; ++leafId)
+                {
+                    leaves[leafId]->AddStaticRoute(
+                        destination,
+                        leafId == destNode ? gpuPorts[destNode][localIdx]
+                                           : leafUpPorts[leafId][spine]);
+                }
+                spines[spine]->AddStaticRoute(destination, spineDownPorts[spine][destNode]);
+            }
+        }
+    }
+    else if (m_interNodeTopology == "torus2d" || m_interNodeTopology == "dragonfly")
+    {
+        // Gateway direct topologies ('ring' generalized): GPU 0 on each node
+        // is the inter-node gateway; multi-hop paths are forwarded hop-by-hop
+        // by the intermediate gateways' own routing tables (FabricEndpoint
+        // forwards packets whose destRank is not its own).
+        //   torus2d:   W x H node grid, +/-x and +/-y neighbor links,
+        //              dimension-order shortest-wrap routing.
+        //   dragonfly: groups of g nodes, intra-group gateway fullmesh + one
+        //              global link per group pair (palmtree assignment),
+        //              minimal l-g-l routing (max 3 hops).
+        // Both build only DIRECT gateway-gateway links here; next hops are
+        // computed by GatewayNextHop in PopulateInterNodeRouting.
+        std::vector<std::pair<uint32_t, uint32_t>> links;
+        if (m_interNodeTopology == "torus2d")
+        {
+            uint32_t width = TorusWidth();
+            uint32_t height = m_numNodes / width;
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    // +x / +y wrap links; for a dimension of size 2 the wrap
+                    // link duplicates the forward link, so emit it only once
+                    if (width > 1 && !(width == 2 && x == 1))
+                    {
+                        links.push_back({y * width + x, y * width + (x + 1) % width});
+                    }
+                    if (height > 1 && !(height == 2 && y == 1))
+                    {
+                        links.push_back({y * width + x, ((y + 1) % height) * width + x});
+                    }
+                }
+            }
+        }
+        else
+        {
+            uint32_t groupSize = DragonflyGroupSize();
+            uint32_t numGroups = m_numNodes / groupSize;
+            // Intra-group gateway fullmesh
+            for (uint32_t g = 0; g < numGroups; ++g)
+            {
+                for (uint32_t a = 0; a < groupSize; ++a)
+                {
+                    for (uint32_t b = a + 1; b < groupSize; ++b)
+                    {
+                        links.push_back({g * groupSize + a, g * groupSize + b});
+                    }
+                }
+            }
+            // One global link per group pair (palmtree assignment, mirrored
+            // in GatewayNextHop)
+            for (uint32_t ga = 0; ga < numGroups; ++ga)
+            {
+                for (uint32_t gb = ga + 1; gb < numGroups; ++gb)
+                {
+                    // Holder in ga for gb: (gb-1) % g; holder in gb for ga:
+                    // ga % g (ga < gb) -- matches GatewayNextHop
+                    uint32_t nodeA = ga * groupSize + (gb - 1) % groupSize;
+                    uint32_t nodeB = gb * groupSize + ga % groupSize;
+                    links.push_back({nodeA, nodeB});
+                }
+            }
+        }
+
+        for (const auto& link : links)
+        {
+            uint32_t nodeA = link.first;
+            uint32_t nodeB = link.second;
+            Ptr<Node> nodeAObj = m_nodeInfos[nodeA].gpuNodes.Get(0);
+            Ptr<Node> nodeBObj = m_nodeInfos[nodeB].gpuNodes.Get(0);
+
+            NetDeviceContainer devPair = p2pInter.Install(nodeAObj, nodeBObj);
+            Ptr<NetDevice> devA = devPair.Get(0);
+            Ptr<NetDevice> devB = devPair.Get(1);
+
+            Ptr<FabricEndpoint> epA = DynamicCast<FabricEndpoint>(
+                m_nodeInfos[nodeA].endpoints.Get(0));
+            Ptr<FabricEndpoint> epB = DynamicCast<FabricEndpoint>(
+                m_nodeInfos[nodeB].endpoints.Get(0));
+
+            uint32_t devIdxA = epA->AddNetDevice(devA);
+            uint32_t devIdxB = epB->AddNetDevice(devB);
+
+            m_nodeInfos[nodeA].rdmaRouteMap[{nodeB, 0}] =
+                {devIdxA, Mac48Address::ConvertFrom(devB->GetAddress())};
+            m_nodeInfos[nodeB].rdmaRouteMap[{nodeA, 0}] =
+                {devIdxB, Mac48Address::ConvertFrom(devA->GetAddress())};
+
+            m_nodeInfos[nodeA].interNodeDevices.push_back(devA);
+            m_nodeInfos[nodeB].interNodeDevices.push_back(devB);
+        }
+    }
     else
     {
         NS_ABORT_MSG("Unsupported inter-node topology: " << m_interNodeTopology);
@@ -595,7 +944,10 @@ MultiNodeTopologyHelper::PopulateInterNodeRouting()
 
     if (m_numNodes <= 1) return;
 
-    if (m_interNodeTopology == "host" || m_interNodeTopology == "tor")
+    // One-inter-node-NIC-per-GPU switched topologies: every remote rank goes
+    // out the GPU's own NIC; the switch tier forwards by static route.
+    if (m_interNodeTopology == "host" || m_interNodeTopology == "tor" ||
+        m_interNodeTopology == "leafspine")
     {
         for (uint32_t nodeId = 0; nodeId < m_numNodes; ++nodeId)
         {
@@ -649,9 +1001,11 @@ MultiNodeTopologyHelper::PopulateInterNodeRouting()
                 {
                     uint16_t remoteRank = GetGlobalRank(remoteNodeId, remoteLocalIdx);
 
-                    if (m_interNodeTopology == "fullmesh")
+                    if (m_interNodeTopology == "fullmesh" || m_interNodeTopology == "rail")
                     {
-                        // Same-local-rank has direct RDMA NIC link
+                        // Same-local-rank has a direct path out this GPU's own
+                        // inter-node NIC (fullmesh: private RDMA link; rail:
+                        // one switch hop on this local rank's rail)
                         if (remoteLocalIdx == localIdx)
                         {
                             auto it = info.rdmaRouteMap.find({remoteNodeId, localIdx});
@@ -706,6 +1060,35 @@ MultiNodeTopologyHelper::PopulateInterNodeRouting()
                             Mac48Address peerMac = Mac48Address::ConvertFrom(
                                 m_nodeInfos[remoteNodeId].interNodeDevices[0]->GetAddress());
                             ep->SetRoutingEntry(remoteRank, rdmaDevIdx);
+                            ep->SetNeighborMac(remoteRank, peerMac);
+                        }
+                        else
+                        {
+                            // Non-gateway GPUs route via NVSwitch to GPU 0
+                            ep->SetRoutingEntry(remoteRank, 0);
+                            ep->SetNeighborMac(remoteRank, info.gpuMacs[0][0]);
+                        }
+                    }
+                    else if (m_interNodeTopology == "torus2d" ||
+                             m_interNodeTopology == "dragonfly")
+                    {
+                        // Gateway topologies with hop-by-hop forwarding: GPU 0
+                        // routes toward GatewayNextHop's direct link; the
+                        // intermediate gateways' own routing tables carry the
+                        // packet the rest of the way (FabricEndpoint forwards
+                        // packets whose destRank is not its own).
+                        NS_ABORT_MSG_IF(m_intraNodeTopology != "switched",
+                                        m_interNodeTopology
+                                        << " gateway routing requires "
+                                           "intraNodeTopology=switched");
+                        if (localIdx == 0)
+                        {
+                            uint32_t nextHop = GatewayNextHop(nodeId, remoteNodeId);
+                            auto it = info.rdmaRouteMap.find({nextHop, 0});
+                            NS_ASSERT(it != info.rdmaRouteMap.end());
+                            Mac48Address peerMac = Mac48Address::ConvertFrom(
+                                m_nodeInfos[remoteNodeId].interNodeDevices[0]->GetAddress());
+                            ep->SetRoutingEntry(remoteRank, it->second.first);
                             ep->SetNeighborMac(remoteRank, peerMac);
                         }
                         else

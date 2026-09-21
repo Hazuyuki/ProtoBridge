@@ -265,6 +265,9 @@ main(int argc, char* argv[])
     uint32_t numNodes = 1;
     uint32_t gpusPerNode = 8;
     std::string interNodeTopology = "fullmesh";
+    uint32_t interNodeSpines = 0;
+    uint32_t interNodeTorusWidth = 0;
+    uint32_t interNodeDragonflyGroupSize = 0;
     uint64_t interNodeBandwidthGbps = 400;
     uint64_t interNodeLatencyNs = 10000;
     std::string interNodeFabricTypeStr = "RoCE";
@@ -505,7 +508,10 @@ main(int argc, char* argv[])
     cmd.AddValue("bgP2pStartTimeNs", "Background P2P start time (ns from sim start)", bgP2pStartTimeNs);
     cmd.AddValue("numNodes", "Number of GPU nodes (1=single-node, 2+=multi-node)", numNodes);
     cmd.AddValue("gpusPerNode", "GPUs per node (multi-node mode)", gpusPerNode);
-    cmd.AddValue("interNodeTopology", "Inter-node topology: fullmesh/ring/host/tor (tor = single shared leaf, 1 hop, ib_write_lat style)", interNodeTopology);
+    cmd.AddValue("interNodeTopology", "Inter-node topology: fullmesh/ring/host/tor/rail/leafspine/torus2d/dragonfly (tor = single shared leaf, 1 hop, ib_write_lat style; rail = one switch per local rank; leafspine = 2-tier Clos; torus2d/dragonfly = GPU-0-gateway direct topologies)", interNodeTopology);
+    cmd.AddValue("interNodeSpines", "leafspine: spine switch count (0 = auto: gpusPerNode, non-blocking)", interNodeSpines);
+    cmd.AddValue("interNodeTorusWidth", "torus2d: grid width (0 = auto: largest divisor <= sqrt(numNodes))", interNodeTorusWidth);
+    cmd.AddValue("interNodeDragonflyGroupSize", "dragonfly: nodes per group (0 = auto: divisor closest to sqrt(numNodes))", interNodeDragonflyGroupSize);
     cmd.AddValue("interNodeBandwidth", "Inter-node link bandwidth in Gbps", interNodeBandwidthGbps);
     cmd.AddValue("interNodeLatency", "Inter-node link latency in nanoseconds", interNodeLatencyNs);
     cmd.AddValue("interNodeFabricType", "Inter-node fabric type: RoCE/ETH/NVLink", interNodeFabricTypeStr);
@@ -989,15 +995,17 @@ main(int argc, char* argv[])
             // no retransmit), so the lossy feature is inert under incast. Warn
             // (not abort): a non-incast P2P run on fullmesh/ring is still valid,
             // only the lossy-retransmit behaviour is unavailable.
-            if (interNodeTopology == "fullmesh" || interNodeTopology == "ring")
+            if (interNodeTopology == "fullmesh" || interNodeTopology == "ring" ||
+                interNodeTopology == "torus2d" || interNodeTopology == "dragonfly")
             {
                 std::cerr << "Warning: --interNodeFabricType=ETH with "
                              "--interNodeTopology=" << interNodeTopology
                           << " has no switch in the inter-node path, so the "
                              "lossy VOQ tail-drop + NACK retransmit path is "
                              "INERT (a P2P DropTailQueue overflow would drop "
-                             "silently). Use --interNodeTopology=host or tor "
-                             "to exercise the lossy fabric.\n";
+                             "silently). Use --interNodeTopology=host, tor, "
+                             "rail, or leafspine to exercise the lossy "
+                             "fabric.\n";
             }
             // The So switch's m_llrEnabled must be true or EmitNackBack
             // (nvswitch.cc) returns early -- the lossy drop stays silent and
@@ -1009,6 +1017,9 @@ main(int argc, char* argv[])
             multiTopo.SetInterNodeSwitchLlrEnabled(true);
         }
         multiTopo.SetInterNodeTopology(interNodeTopology);
+        multiTopo.SetInterNodeSpines(interNodeSpines);
+        multiTopo.SetInterNodeTorusWidth(interNodeTorusWidth);
+        multiTopo.SetInterNodeDragonflyGroupSize(interNodeDragonflyGroupSize);
         multiTopo.SetIntraNodeTopology(intraNodeTopology);
 
         NodeContainer nodes = multiTopo.Build();

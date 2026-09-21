@@ -6,6 +6,34 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Added — four scale-out topologies (rail / leafspine / torus2d / dragonfly) + gateway-forwarding flood fix
+
+`MultiNodeTopologyHelper` now supports eight `--interNodeTopology` values.
+New: `rail` (DGX-SuperPOD-style rail-optimized — one shared rail switch per
+local rank, cross-rank via the intra-node PXN proxy path), `leafspine`
+(2-tier Clos; `--interNodeSpines`, 0 = auto = gpusPerNode non-blocking; leaf
+spreads destination MACs across spines by `destLocalIdx % S` as deterministic
+rail-aligned ECMP), `torus2d` (GPU-0-gateway 2D torus; `--interNodeTorusWidth`,
+0 = auto; dimension-order shortest-wrap routing) and `dragonfly`
+(`--interNodeDragonflyGroupSize`, 0 = auto; palmtree global-link assignment,
+minimal l-g-l routing). Rail/leafspine switches are configured through a new
+`CreateInterNodeSwitch` helper (VOQ/arbitration/cut-through/LLR arming), so
+the lossy-ETH NACK/retransmit path works on them out of the box.
+
+Fixing the gateway shape exposed a latent bug in the pre-existing `ring`
+topology: the endpoint hop-by-hop forwarding path re-added the FabricHeader
+unchanged, so the DestMac still named the *first* hop's gateway. Switches
+route on the header's MACs, the stale MAC is unknown at the destination
+node's NVSwitch, and every forwarded packet flooded all ports — each
+non-target GPU then re-forwarded its flooded copy, storming exponentially at
+gpusPerNode ≥ 8 (a 64 KB 4-node run never terminated; at 4 GPUs/node it
+"worked" with a 477× receive amplification). The forwarder now rewrites the
+header DestMac to the current hop's next-hop MAC. New gate
+`test/parity/test_so_topologies.py` pins a completion + losslessness smoke
+for all eight topologies; all existing parity pins (So hierarchical
+4769616/15307388/13421212, config-vs-inline ETH, lossy recovery, C++
+EXTENSIVE, 67 surrogate tests) re-verified unchanged.
+
 ### Changed — alignment demos moved to `examples/gpu-cluster/`
 
 `configs/calibration/` had accumulated 30 unindexed files mixing two roles.

@@ -119,6 +119,20 @@ Idealizations: a probe always returns a sample (control path is loss-free at
 BER=0), and reflection is unconditional (no receiver-side machine). Works on
 any So fabric type but only shapes inter-node flows (`numNodes>1`).
 
+**So topologies (`--interNodeTopology` + shape knobs).** Eight inter-node
+topologies in three wiring shapes: one-NIC-per-GPU switched (`host`, `tor`,
+`leafspine`), direct rdmaRouteMap + intra-node PXN proxy (`fullmesh`, `rail`),
+and GPU-0 gateway multi-hop (`ring`, `torus2d`, `dragonfly` — these require
+`intraNodeTopology=switched` and funnel all cross-node traffic through each
+node's GPU 0). Shape knobs, all `0 = auto`: `--interNodeSpines` (leafspine
+spine count; auto = gpusPerNode, non-blocking), `--interNodeTorusWidth`
+(torus2d grid width W with height = numNodes/W; auto = largest divisor
+≤ √numNodes), `--interNodeDragonflyGroupSize` (nodes per dragonfly group;
+auto = divisor nearest √numNodes). The lossy-ETH VOQ tail-drop + NACK path
+needs a switch in the inter-node path, i.e. `host`/`tor`/`rail`/`leafspine`;
+the switchless/gateway topologies warn and run the fabric lossless.
+`test/parity/test_so_topologies.py` pins a completion smoke for all eight.
+
 **WFQ contention model (`--contention*Weight`, `--bgP2p*`).** Each endpoint
 carries a `ContentionModel` that does weighted-fair-queuing over three traffic
 classes — COLLECTIVE / MEMORY / P2P (`--contentionCollectiveWeight` /

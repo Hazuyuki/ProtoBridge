@@ -1267,11 +1267,15 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         NS_LOG_DEBUG("Forwarding packet from " << header.GetSourceRank()
                      << " to " << destRank << " at node " << m_rank);
 
-        // Re-add the header and forward
-        pkt->AddHeader(header);
-
         uint32_t deviceIndex = ResolveDeviceIndex(destRank);
         Mac48Address destMac = ResolveDestMac(destRank);
+        // Re-target the header's DestMac for THIS hop: switches route on the
+        // FabricHeader's MACs (nvswitch.cc), so a stale first-hop DestMac is
+        // unknown at the destination node's switch and floods every port --
+        // each non-target GPU then re-forwards the flooded copy, storming at
+        // high radix (gateway topologies: ring/torus2d/dragonfly).
+        header.SetDestMac(destMac);
+        pkt->AddHeader(header);
         SendPacketOnDevice(pkt, deviceIndex, destMac);
 
         return true;
@@ -1353,9 +1357,11 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
 
     if (destRank != m_rank && !m_routingTable.empty())
     {
-        pkt->AddHeader(header);
         uint32_t deviceIndex = ResolveDeviceIndex(destRank);
         Mac48Address destMac = ResolveDestMac(destRank);
+        // Re-target DestMac for this hop (see Receive's forwarding branch).
+        header.SetDestMac(destMac);
+        pkt->AddHeader(header);
         SendPacketOnDevice(pkt, deviceIndex, destMac);
         return;
     }
