@@ -179,7 +179,9 @@ FabricEndpoint::FabricEndpoint()
       m_txBytes(0),
       m_rxBytes(0),
       m_txPackets(0),
-      m_rxPackets(0)
+      m_rxPackets(0),
+      m_cnpPacketsSent(0),
+      m_cnpPacketsReceived(0)
 {
     NS_LOG_FUNCTION(this);
 
@@ -2061,6 +2063,7 @@ FabricEndpoint::SendCnpPacket(const FabricHeader& markedHeader)
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(markedHeader.GetSourceRank()));
     packet->AddHeader(header);
+    m_cnpPacketsSent++;
 
     if (!m_devices.empty())
     {
@@ -2074,6 +2077,7 @@ void
 FabricEndpoint::ProcessCnpPacket(const FabricHeader& cnpHeader)
 {
     NS_LOG_FUNCTION(this << cnpHeader.GetSourceRank());
+    m_cnpPacketsReceived++;
 
     // A CNP echoes the original flow back to its source. The CNP's source is
     // the receiver, so at the source endpoint the flow key (destRank=receiver,

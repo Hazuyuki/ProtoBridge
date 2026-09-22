@@ -369,6 +369,8 @@ class FabricEndpoint : public Application
     void GetReorderBufferStats(uint32_t& totalReorderEvents, uint32_t& maxOccupancy) const;
     uint32_t GetTxPackets() const { return m_txPackets; }
     uint32_t GetRxPackets() const { return m_rxPackets; }
+    uint64_t GetCnpPacketsSent() const { return m_cnpPacketsSent; }
+    uint64_t GetCnpPacketsReceived() const { return m_cnpPacketsReceived; }
 
     // Memory attributes (for MEMORY device type)
     void SetMemorySize(uint64_t size);
@@ -701,6 +703,8 @@ class FabricEndpoint : public Application
     uint64_t m_rxBytes;
     uint32_t m_txPackets;
     uint32_t m_rxPackets;
+    uint64_t m_cnpPacketsSent;     ///< CNPs emitted (receiver saw ECN-marked RoCE data)
+    uint64_t m_cnpPacketsReceived; ///< CNPs received back at the flow source
 };
 
 // Backward compatibility typedef

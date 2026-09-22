@@ -93,7 +93,10 @@ EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
     }
 
     // RoCE lossless path: mark the inner SoHeader ECN bit when congested.
-    (void)MarkEcnIfCongested(packet, voqDepth);
+    if (MarkEcnIfCongested(packet, voqDepth))
+    {
+        m_ecnMarkedPackets++;
+    }
     return true;
 }
 

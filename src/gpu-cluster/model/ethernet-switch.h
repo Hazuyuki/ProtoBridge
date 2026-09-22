@@ -66,11 +66,15 @@ class EthernetSwitch : public NvSwitch
     bool OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
                          uint32_t inPort, size_t voqDepth) override;
 
+    /// Data packets whose SoHeader ECN bit this switch marked (observability).
+    uint64_t GetEcnMarkedPackets() const { return m_ecnMarkedPackets; }
+
   private:
     uint32_t m_ecnThreshold;     ///< VOQ depth (packets) at which ECN is marked
     uint32_t m_voqDropThreshold; ///< VOQ depth (packets) at which a plain-Ethernet
                                  ///< data packet is tail-dropped with a NACK
                                  ///< (lossy); must be < NvSwitch::VoqDepth
+    uint64_t m_ecnMarkedPackets{0}; ///< count of ECN-marked data packets
 };
 
 } // namespace ns3

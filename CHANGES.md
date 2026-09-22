@@ -6,6 +6,33 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Added — uniform-random traffic mode (`--randTraffic`) + topology throughput-vs-injection experiment (DCQCN)
+
+New fixed-duration synthetic-load mode in `scratch/gpu-cluster-sim.cc`:
+every rank self-schedules fixed-interval `--randMsgBytes` messages to
+uniform-random ranks on other nodes at `--randInjectionRate` × the
+inter-node line rate; offered/delivered bytes are counted inside a
+`--randWarmupNs`/`--randMeasureNs` window (RngRun-seeded phases, default
+off = parity-safe). On the RoCE fabric the mode mounts `RocePayloadBuilder`
+and sends with protocol `RoceProtocol::SIMPLE`, so bulk packets carry a
+SoHeader and the ECN → CNP → DCQCN chain is live wherever an
+`EthernetSwitch` is in the So path (it stays structurally inert on the
+switchless fullmesh and the GPU-0-gateway shapes). New observability:
+`EthernetSwitch::GetEcnMarkedPackets` and per-endpoint CNP sent/received
+counters, reported as `ecnMarkedPackets`/`cnpPacketsSent`/
+`cnpPacketsReceived` in every RESULT block.
+
+Experiment `examples/gpu-cluster/random_traffic_dcqcn/` (sweep + figure):
+delivered throughput vs injection rate for all eight `--interNodeTopology`
+values at 8 nodes × 4 GPUs, RoCE 400G, `--dcqcn` on. Fullmesh is linear to
+line rate; the switched shapes (host/tor/rail/leafspine) bend at ~0.7 to
+the uniform-random destination-collision limit (~75%) with ECN/CNP rising
+sharply; the gateway shapes saturate early at the GPU-0 funnel (ring
+~2.2 Tbps, dragonfly ~3.8, torus2d ~4.5). New gate
+`test/parity/test_random_traffic.py` (fixed-duration completion,
+non-blocking delivery, and ECN/CNP/DCQCN activation under a 4:1
+oversubscribed leafspine); all existing parity pins re-verified unchanged.
+
 ### Added — four scale-out topologies (rail / leafspine / torus2d / dragonfly) + gateway-forwarding flood fix
 
 `MultiNodeTopologyHelper` now supports eight `--interNodeTopology` values.

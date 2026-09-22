@@ -190,6 +190,26 @@ who waits rather than adding latency monotonically. The regimes differ in
 baseline length and link type (credit-gated NVLink vs an over-driven 400G
 NIC), which is what separates their magnitudes, not the WFQ term.
 
+**Uniform-random traffic mode (`--randTraffic`).** Replaces the collective
+injector with a fixed-duration synthetic load: every rank self-schedules
+fixed-interval messages of `--randMsgBytes` (default 64 KiB) to
+uniform-random ranks on OTHER nodes, at `--randInjectionRate` × the
+inter-node line rate per source (interval = msgBytes×8 / (rate × interNodeBW),
+clamped ≥1 ns). The run stops at `--randWarmupNs + --randMeasureNs`
+(defaults 50 µs + 200 µs) and only bytes offered/delivered inside the
+measurement window are counted; per-source random initial phases avoid
+lockstep and everything is `--RngRun`-seeded. On the RoCE fabric the mode
+mounts `RocePayloadBuilder` and sends with protocol `RoceProtocol::SIMPLE`,
+so every data packet carries a SoHeader — the full ECN → CNP → DCQCN chain
+is live wherever an `EthernetSwitch` sits in the So path (switched
+topologies; the gateway shapes ring/torus2d/dragonfly and switchless
+fullmesh never mark). The result block reports `randMsgsSent` /
+`randOfferedBytes` / `randDeliveredBytes` / `randOfferedGbps` /
+`randDeliveredGbps`, plus the always-present `ecnMarkedPackets` /
+`cnpPacketsSent` / `cnpPacketsReceived` counters. Requires `--numNodes>1`;
+default off is parity-safe. Gate: `test/parity/test_random_traffic.py`;
+sweep + figure: `examples/gpu-cluster/random_traffic_dcqcn/`.
+
 **Fabric hardware + protocol startup + FEC + BER** (sourced into the local CLI
 variables — these are what make a `.cfg` reproduce a calibrated run without
 per-run flags):

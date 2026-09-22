@@ -13,6 +13,7 @@
 #include "ns3/gpu-cluster-helper.h"
 #include "ns3/fabric-endpoint.h"
 #include "ns3/nvswitch.h"
+#include "ns3/ethernet-switch.h"
 #include "ns3/ring-allreduce.h"
 #include "ns3/sharp-allreduce.h"
 #include "ns3/nvls-allgather.h"
@@ -44,6 +45,7 @@
 #include "ns3/rttcc-rate-machine.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/nccl-protocol-payload-builder.h"
+#include "ns3/roce-payload-builder.h"
 #include "ns3/ub-payload-builder.h"
 
 #include "ns3/link-degradation.h"
@@ -113,6 +115,61 @@ OnCollectiveComplete(uint64_t durationNs)
     g_durationNs = durationNs;
     g_collectiveCompleted = true;
     Simulator::Stop();
+}
+
+// ---------------------------------------------------------------------------
+// Random-traffic mode (--randTraffic): fixed-duration uniform-random So load.
+// Every rank injects fixed-size messages at a fixed interval derived from
+// --randInjectionRate (fraction of the inter-node line rate), each message to
+// a uniformly random rank on ANOTHER node. Messages go through
+// SendBulkWireTransferSize — the same SoHeader/ECN/DCQCN data path the
+// collectives use (SendP2p carries no SoHeader, so DCQCN would be inert).
+// Offered/delivered bytes are counted only inside the measurement window
+// [warmup, warmup+measure); the sim stops at the window end.
+// ---------------------------------------------------------------------------
+static bool g_randTrafficRan = false;
+static uint64_t g_randWindowStartNs = 0;
+static uint64_t g_randWindowEndNs = 0;
+static uint64_t g_randOfferedBytes = 0;
+static uint64_t g_randDeliveredBytes = 0;
+static uint64_t g_randMsgsSent = 0;
+
+static void
+RandTrafficReceive(uint16_t /*rank*/, Ptr<Packet> packet, FabricHeader header)
+{
+    uint64_t now = Simulator::Now().GetNanoSeconds();
+    if (now < g_randWindowStartNs || now >= g_randWindowEndNs)
+    {
+        return;
+    }
+    uint32_t bytes = header.GetEffectiveDataSize();
+    if (bytes == 0 && packet)
+    {
+        bytes = packet->GetSize();
+    }
+    g_randDeliveredBytes += bytes;
+}
+
+static void
+RandTrafficSend(Ptr<FabricEndpoint> ep,
+                std::vector<uint16_t> remoteRanks,
+                Ptr<UniformRandomVariable> destPick,
+                uint32_t msgBytes, uint64_t intervalNs, uint8_t protocolId)
+{
+    uint64_t now = Simulator::Now().GetNanoSeconds();
+    if (now >= g_randWindowEndNs)
+    {
+        return;
+    }
+    uint16_t dest = remoteRanks[destPick->GetInteger(0, remoteRanks.size() - 1)];
+    if (now >= g_randWindowStartNs)
+    {
+        g_randOfferedBytes += msgBytes;
+        g_randMsgsSent++;
+    }
+    ep->SendBulkWireTransferSize(dest, msgBytes, protocolId, ep->GetRank(), 0);
+    Simulator::Schedule(NanoSeconds(intervalNs), &RandTrafficSend, ep,
+                        remoteRanks, destPick, msgBytes, intervalNs, protocolId);
 }
 
 int
@@ -506,6 +563,20 @@ main(int argc, char* argv[])
     cmd.AddValue("bgP2pSizeBytes", "Background P2P packet size (bytes)", bgP2pSizeBytes);
     cmd.AddValue("bgP2pIntervalNs", "Background P2P send interval (0=back-to-back)", bgP2pIntervalNs);
     cmd.AddValue("bgP2pStartTimeNs", "Background P2P start time (ns from sim start)", bgP2pStartTimeNs);
+    // Random-traffic mode: replaces the collective injector with fixed-duration
+    // uniform-random cross-node bulk traffic (see the RandTrafficSend block
+    // above main). Default off (parity-identical). Injection rate is the
+    // per-source offered load as a fraction of the inter-node line rate.
+    bool randTrafficEnabled = false;
+    double randInjectionRate = 0.5;
+    uint32_t randMsgBytes = 65536;
+    uint64_t randWarmupNs = 50000;
+    uint64_t randMeasureNs = 200000;
+    cmd.AddValue("randTraffic", "Enable uniform-random cross-node traffic mode (replaces the collective; fixed-duration run)", randTrafficEnabled);
+    cmd.AddValue("randInjectionRate", "Per-source offered load as a fraction of the inter-node line rate (0,1]", randInjectionRate);
+    cmd.AddValue("randMsgBytes", "Random-traffic message size in bytes", randMsgBytes);
+    cmd.AddValue("randWarmupNs", "Random-traffic warmup before the measurement window (ns)", randWarmupNs);
+    cmd.AddValue("randMeasureNs", "Random-traffic measurement window length (ns); the sim stops at warmup+measure", randMeasureNs);
     cmd.AddValue("numNodes", "Number of GPU nodes (1=single-node, 2+=multi-node)", numNodes);
     cmd.AddValue("gpusPerNode", "GPUs per node (multi-node mode)", gpusPerNode);
     cmd.AddValue("interNodeTopology", "Inter-node topology: fullmesh/ring/host/tor/rail/leafspine/torus2d/dragonfly (tor = single shared leaf, 1 hop, ib_write_lat style; rail = one switch per local rank; leafspine = 2-tier Clos; torus2d/dragonfly = GPU-0-gateway direct topologies)", interNodeTopology);
@@ -1569,7 +1640,79 @@ main(int argc, char* argv[])
     // sourced the profile's values + the op axes into the local vars above,
     // so it falls through to the validated inline injector branches below
     // (bit-identical to the inline path run with the equivalent CLI flags).
-    if (configMode && pconfig.GetCollective().empty() && pconfig.GetAlgorithm().empty())
+    // Random-traffic mode replaces the collective injector entirely: every
+    // rank self-schedules fixed-interval messages to uniform-random ranks on
+    // other nodes, and the run is fixed-duration (stop at warmup+measure).
+    if (randTrafficEnabled)
+    {
+        NS_ABORT_MSG_IF(numNodes <= 1,
+                        "--randTraffic needs numNodes > 1 (traffic is cross-node only)");
+        NS_ABORT_MSG_IF(randInjectionRate <= 0.0 || randInjectionRate > 1.0,
+                        "--randInjectionRate must be in (0, 1]");
+        NS_ABORT_MSG_IF(interNodeBandwidthGbps == 0,
+                        "--randTraffic needs interNodeBandwidth > 0");
+        // Fixed per-source message interval: msgBytes at the requested fraction
+        // of the inter-node line rate. Clamped to >= 1 ns (same stall footgun
+        // as bgP2pIntervalNs=0: a 0 ns self-reschedule never advances time).
+        double intervalNsF = static_cast<double>(randMsgBytes) * 8.0 /
+                             (randInjectionRate * static_cast<double>(interNodeBandwidthGbps));
+        uint64_t intervalNs = std::max<uint64_t>(1, static_cast<uint64_t>(intervalNsF + 0.5));
+        g_randWindowStartNs = randWarmupNs;
+        g_randWindowEndNs = randWarmupNs + randMeasureNs;
+        g_randTrafficRan = true;
+
+        // DCQCN/ECN chain requirements: EthernetSwitch::MarkEcnIfCongested and
+        // the receiver's CNP echo both require the FabricHeader protocol to be
+        // RoceProtocol::SIMPLE(1) AND an inner SoHeader, and
+        // SendBulkWireTransferSize stamps that SoHeader only when the mounted
+        // payload builder is RocePayloadBuilder (Seam B guard). Inline runs
+        // mount the NCCL builder, so on the RoCE fabric remount the RoCE
+        // builder here — safe because randTraffic replaces the collective and
+        // all its traffic is cross-node So (the Su builder is unused).
+        uint8_t protocolId = static_cast<uint8_t>(NcclProtocol::SIMPLE);
+        Ptr<RocePayloadBuilder> roceBuilder;
+        if (FabricTypeFromString(interNodeFabricTypeStr) == FabricType::ROCE)
+        {
+            protocolId = static_cast<uint8_t>(RoceProtocol::SIMPLE);
+            roceBuilder = CreateObject<RocePayloadBuilder>();
+        }
+        // Per-source RNG streams: destination pick + initial phase offset
+        // (random phase avoids all sources injecting in lockstep). Both are
+        // RngRun-seeded, so a run is reproducible.
+        for (uint16_t rank = 0; rank < numGpus; ++rank)
+        {
+            Ptr<FabricEndpoint> ep = endpoints[rank];
+            if (!ep)
+            {
+                continue;
+            }
+            if (roceBuilder)
+            {
+                ep->SetProtocolPayloadBuilder(roceBuilder);
+            }
+            ep->SetReceiveCallback(MakeCallback(&RandTrafficReceive));
+            std::vector<uint16_t> remoteRanks;
+            for (uint16_t r = 0; r < numGpus; ++r)
+            {
+                if (endpoints[r] && endpoints[r]->GetNodeId() != ep->GetNodeId())
+                {
+                    remoteRanks.push_back(r);
+                }
+            }
+            if (remoteRanks.empty())
+            {
+                continue;
+            }
+            Ptr<UniformRandomVariable> destPick = CreateObject<UniformRandomVariable>();
+            Ptr<UniformRandomVariable> phase = CreateObject<UniformRandomVariable>();
+            uint64_t startNs = phase->GetInteger(0, intervalNs - 1);
+            Simulator::Schedule(NanoSeconds(startNs), &RandTrafficSend, ep,
+                                remoteRanks, destPick, randMsgBytes, intervalNs,
+                                protocolId);
+        }
+        Simulator::Stop(NanoSeconds(g_randWindowEndNs));
+    }
+    else if (configMode && pconfig.GetCollective().empty() && pconfig.GetAlgorithm().empty())
     {
         // Apply the profile's PEX bundle to the endpoints (overrides the inline
         // 1-VC convenience credit setup with the profile's VC count + per-VC
@@ -2169,6 +2312,11 @@ main(int argc, char* argv[])
     if (g_collectiveCompleted) {
         durationUs = g_durationNs / 1000.0;
         statusStr = "complete";
+    } else if (g_randTrafficRan) {
+        // Fixed-duration random-traffic run: completing the measurement window
+        // IS the success criterion (there is no collective to finish).
+        durationUs = Simulator::Now().GetMicroSeconds();
+        statusStr = "complete";
     } else {
         durationUs = Simulator::Now().GetMicroSeconds();
         statusStr = "incomplete";
@@ -2294,10 +2442,14 @@ main(int argc, char* argv[])
     std::cout << "reorderMaxOccupancy=" << maxReorderOccupancy << std::endl;
     uint64_t endpointTxPackets = 0;
     uint64_t endpointRxPackets = 0;
+    uint64_t cnpPacketsSent = 0;
+    uint64_t cnpPacketsReceived = 0;
     for (const auto& ep : endpoints)
     {
         endpointTxPackets += ep->GetTxPackets();
         endpointRxPackets += ep->GetRxPackets();
+        cnpPacketsSent += ep->GetCnpPacketsSent();
+        cnpPacketsReceived += ep->GetCnpPacketsReceived();
     }
     uint64_t switchTxPackets = 0;
     uint64_t switchRxPackets = 0;
@@ -2307,6 +2459,7 @@ main(int argc, char* argv[])
     uint64_t switchTtlDrops = 0;
     uint64_t switchVoqDrops = 0;
     uint64_t switchRouteUnavailableDrops = 0;
+    uint64_t ecnMarkedPackets = 0;
     for (auto node = NodeList::Begin(); node != NodeList::End(); ++node)
     {
         for (uint32_t device = 0; device < (*node)->GetNDevices(); ++device)
@@ -2321,6 +2474,11 @@ main(int argc, char* argv[])
             switchTtlDrops += nvSwitch->GetTtlDrops();
             switchVoqDrops += nvSwitch->GetVoqDrops();
             switchRouteUnavailableDrops += nvSwitch->GetRouteUnavailableDrops();
+            Ptr<EthernetSwitch> ethSwitch = DynamicCast<EthernetSwitch>(nvSwitch);
+            if (ethSwitch)
+            {
+                ecnMarkedPackets += ethSwitch->GetEcnMarkedPackets();
+            }
         }
     }
     std::cout << "endpointTxPackets=" << endpointTxPackets << std::endl;
@@ -2397,6 +2555,24 @@ main(int argc, char* argv[])
     {
         std::cout << "bgP2pBytesSent=" << bgP2p->GetBytesSent() << std::endl;
         std::cout << "bgP2pPacketsSent=" << bgP2p->GetPacketsSent() << std::endl;
+    }
+    std::cout << "ecnMarkedPackets=" << ecnMarkedPackets << std::endl;
+    std::cout << "cnpPacketsSent=" << cnpPacketsSent << std::endl;
+    std::cout << "cnpPacketsReceived=" << cnpPacketsReceived << std::endl;
+    std::cout << "randTrafficEnabled=" << (randTrafficEnabled ? "true" : "false") << std::endl;
+    if (randTrafficEnabled)
+    {
+        double measureSec = static_cast<double>(g_randWindowEndNs - g_randWindowStartNs) * 1e-9;
+        std::cout << "randMsgsSent=" << g_randMsgsSent << std::endl;
+        std::cout << "randOfferedBytes=" << g_randOfferedBytes << std::endl;
+        std::cout << "randDeliveredBytes=" << g_randDeliveredBytes << std::endl;
+        std::cout << std::setprecision(3);
+        std::cout << "randOfferedGbps="
+                  << (measureSec > 0 ? g_randOfferedBytes * 8.0 / measureSec * 1e-9 : 0)
+                  << std::endl;
+        std::cout << "randDeliveredGbps="
+                  << (measureSec > 0 ? g_randDeliveredBytes * 8.0 / measureSec * 1e-9 : 0)
+                  << std::endl;
     }
     std::cout << "RESULT_END" << std::endl;
 

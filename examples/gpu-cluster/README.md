@@ -42,6 +42,15 @@ Tree and NVLS run over the switched fabric and need the full GPU↔NVSwitch
 trunk on the CLI (`--linkDataRate=3060` = 18 × 170 Gbps; the profile's
 `bandwidthGbps=170` is a per-lane value — see the `.cfg` headers).
 
+## Topology-comparison experiments
+
+Not alignments against a measured reference — sweeps that compare
+simulator configurations against each other:
+
+| Experiment | What it compares |
+|---|---|
+| [`random_traffic_dcqcn/`](random_traffic_dcqcn/) | delivered throughput vs injection rate for the 8 `--interNodeTopology` values under uniform-random cross-node traffic (`--randTraffic`), RoCE 400G with DCQCN on; plus the ECN-mark congestion signal per topology |
+
 ## Notes
 
 - Every script writes its outputs next to itself, so a re-run regenerates
