@@ -1134,6 +1134,20 @@ main(int argc, char* argv[])
             }
         }
 
+        // So payload builder: opting into DCQCN implies RoCE SoHeader framing
+        // on inter-node sends -- the switch ECN-mark and receiver CNP-echo
+        // guards key on RoceProtocol::SIMPLE + SoHeader, which inline runs'
+        // NCCL builder never stamps (config-mode RoCE profiles mount the RoCE
+        // builder globally; inline collectives would otherwise leave the whole
+        // ECN->CNP->DCQCN chain dormant). The dedicated So builder leaves Su
+        // (intra-node) framing/timing untouched. Off (--dcqcn=0, default) ->
+        // null -> byte-identical.
+        Ptr<RocePayloadBuilder> soPayloadBuilder;
+        if (interNodeFabricType == FabricType::ROCE && enableDcqcn)
+        {
+            soPayloadBuilder = CreateObject<RocePayloadBuilder>();
+        }
+
         ApplicationContainer apps = multiTopo.GetAllEndpoints();
         for (uint32_t i = 0; i < apps.GetN(); ++i)
         {
@@ -1154,6 +1168,10 @@ main(int argc, char* argv[])
             if (dcqcnMachine)
             {
                 ep->SetDcqcnRateMachine(dcqcnMachine);
+            }
+            if (soPayloadBuilder)
+            {
+                ep->SetSoPayloadBuilder(soPayloadBuilder);
             }
             // RTTCC: one machine PER endpoint (not shared like DCQCN's) —
             // the flow key (destRank,vc,flowId) carries no source rank, so a

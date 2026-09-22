@@ -210,6 +210,20 @@ fullmesh never mark). The result block reports `randMsgsSent` /
 default off is parity-safe. Gate: `test/parity/test_random_traffic.py`;
 sweep + figure: `examples/gpu-cluster/random_traffic_dcqcn/`.
 
+**So payload-builder seam (DCQCN on inline collectives).** Inline collective
+runs mount the NCCL payload builder, which never stamps a SoHeader — so the
+switch ECN-mark and receiver CNP-echo guards (both key on
+`RoceProtocol::SIMPLE` + SoHeader) would leave the whole ECN → CNP → DCQCN
+chain dormant. `--dcqcn=1` on a RoCE fabric therefore mounts a dedicated So
+`RocePayloadBuilder` via `FabricEndpoint::SetSoPayloadBuilder`: remote-rank
+bulk sends are framed by it, with the wire protocol id overridden to the So
+protocol model's own id, while local-rank (Su) traffic keeps the NCCL
+builder's framing/timing untouched. The 10-byte SoHeader sits within the
+wire-size budget, so chunk count and egress serialization are unchanged —
+`--dcqcn=0` (default, seam unmounted) is byte-identical to before. Gate:
+`test/parity/test_collective_dcqcn.py`; experiment (2 collectives × 8
+topologies × 5 sizes at 16 n × 8 g): `examples/gpu-cluster/collective_topology_dcqcn/`.
+
 **Fabric hardware + protocol startup + FEC + BER** (sourced into the local CLI
 variables — these are what make a `.cfg` reproduce a calibrated run without
 per-run flags):

@@ -358,6 +358,15 @@ class FabricEndpoint : public Application
     void SetProtocolPayloadBuilder(Ptr<ProtocolPayloadBuilder> builder);
     Ptr<ProtocolPayloadBuilder> GetProtocolPayloadBuilder() const;
 
+    // Inter-node (So) payload builder seam, mirroring SetInterNodeProtocolModel:
+    // when non-null the endpoint frames remote-rank bulk sends with it (and the
+    // So protocol model's own protocol id) while local-rank (Su) traffic keeps
+    // m_payloadBuilder. Null (default) -> m_payloadBuilder everywhere,
+    // byte-identical (parity-safe). Inline runs mount a RocePayloadBuilder here
+    // to light the RoCE SoHeader/ECN/CNP/DCQCN chain without touching Su framing.
+    void SetSoPayloadBuilder(Ptr<ProtocolPayloadBuilder> builder);
+    Ptr<ProtocolPayloadBuilder> GetPayloadBuilderForRank(uint16_t rank) const;
+
     // Link degradation
     void SetLinkDegradationModel(Ptr<LinkDegradationModel> model);
     Ptr<LinkDegradationModel> GetLinkDegradationModel() const;
@@ -656,6 +665,7 @@ class FabricEndpoint : public Application
 
     // Protocol payload builder (defaults to NcclProtocolPayloadBuilder)
     Ptr<ProtocolPayloadBuilder> m_payloadBuilder;     ///< Vendor-specific payload builder
+    Ptr<ProtocolPayloadBuilder> m_soPayloadBuilder{nullptr}; ///< Inter-node (So) builder; null -> use m_payloadBuilder
 
     // Reorder buffer control
     bool m_bypassReorderBuffer;                     ///< Bypass reorder buffer for direct links

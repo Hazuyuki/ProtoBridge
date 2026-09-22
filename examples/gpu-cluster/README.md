@@ -50,6 +50,7 @@ simulator configurations against each other:
 | Experiment | What it compares |
 |---|---|
 | [`random_traffic_dcqcn/`](random_traffic_dcqcn/) | delivered throughput vs injection rate for the 8 `--interNodeTopology` values under uniform-random cross-node traffic (`--randTraffic`), RoCE 400G with DCQCN on; plus the ECN-mark congestion signal per topology |
+| [`collective_topology_dcqcn/`](collective_topology_dcqcn/) | hierarchical allreduce + alltoall completion time and bus bandwidth vs data size (1–256 MiB) for the 8 `--interNodeTopology` values, 16 nodes × 8 GPUs (128 ranks), RoCE 400G with DCQCN on (via the So payload-builder seam) |
 
 ## Notes
 

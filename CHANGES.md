@@ -6,6 +6,36 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Added — So payload-builder seam + collective-vs-topology experiment (16 n × 8 g, DCQCN)
+
+`FabricEndpoint::SetSoPayloadBuilder` / `GetPayloadBuilderForRank(rank)`
+mirror the existing `SetInterNodeProtocolModel` Su/So split: when a
+dedicated inter-node payload builder is mounted, remote-rank bulk sends are
+framed by it (with the wire protocol id overridden to the So protocol
+model's own id) while local-rank (Su) traffic keeps the vendor builder's
+framing and timing. This closes the DCQCN gap on inline collectives: the
+NCCL builder never stamps a SoHeader, so the switch ECN-mark and receiver
+CNP-echo guards (both keyed on `RoceProtocol::SIMPLE` + SoHeader) left the
+whole ECN → CNP → DCQCN chain dormant on inline collective runs. With
+`--dcqcn=1` on a RoCE fabric, `scratch/gpu-cluster-sim.cc` now mounts a
+shared So `RocePayloadBuilder`; the 10-byte SoHeader sits within the
+wire-size budget so chunk count and egress serialization are unchanged, and
+the default (`--dcqcn=0`, seam unmounted) stays byte-identical (all parity
+pins intact).
+
+Experiment `examples/gpu-cluster/collective_topology_dcqcn/` (sweep +
+figure): hierarchical allreduce + alltoall completion time and NCCL bus
+bandwidth vs data size (1–256 MiB per GPU) for all eight
+`--interNodeTopology` values at 16 nodes × 8 GPUs (128 ranks), RoCE 400G,
+DCQCN on. Fullmesh dominates (dedicated per-pair links; allreduce ~463,
+alltoall ~694 Gbps busbw at 256 MiB); the switched shapes cluster at the
+single-NIC-per-GPU bound with live ECN/CNP counters; ring is worst at this
+scale (GPU-0 gateway funnel; alltoall ~21 Gbps); the gateway shapes show
+structurally-zero ECN. The lossless-fabric DCQCN finding extends to finite
+collectives: on/off completion time is bit-identical on an oversubscribed
+leafspine, with activity visible only in the ECN/CNP counters. New gate
+`test/parity/test_collective_dcqcn.py` pins dormant-off + chain-alive-on.
+
 ### Added — uniform-random traffic mode (`--randTraffic`) + topology throughput-vs-injection experiment (DCQCN)
 
 New fixed-duration synthetic-load mode in `scratch/gpu-cluster-sim.cc`:

@@ -728,6 +728,24 @@ FabricEndpoint::GetProtocolPayloadBuilder() const
 }
 
 void
+FabricEndpoint::SetSoPayloadBuilder(Ptr<ProtocolPayloadBuilder> builder)
+{
+    m_soPayloadBuilder = builder;
+}
+
+Ptr<ProtocolPayloadBuilder>
+FabricEndpoint::GetPayloadBuilderForRank(uint16_t rank) const
+{
+    // Mirrors GetProtocolModelForDest's Su/So split: the So builder (when
+    // mounted) frames inter-node traffic; Su traffic keeps the vendor builder.
+    if (m_soPayloadBuilder && !IsLocalRank(rank) && m_localRankCount > 1)
+    {
+        return m_soPayloadBuilder;
+    }
+    return m_payloadBuilder;
+}
+
+void
 FabricEndpoint::SetBypassReorderBuffer(bool bypass)
 {
     m_bypassReorderBuffer = bypass;
@@ -2555,6 +2573,18 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
 {
     NS_LOG_FUNCTION(this << destRank << dataSize << static_cast<int>(protocolId) << flowId << vcId);
 
+    // So payload-builder seam: when a dedicated So builder is mounted (inline
+    // runs opting into the RoCE ECN/DCQCN chain via --dcqcn), remote-dest bulk
+    // sends use it together with the So protocol model's own protocol id
+    // (RoceProtocol::SIMPLE) so the wire protocol matches the SoHeader framing
+    // that the switch ECN-mark and receiver CNP-echo guards key on. Su
+    // (local-rank) sends keep the caller's protocol id and the Su builder.
+    Ptr<ProtocolPayloadBuilder> payloadBuilder = GetPayloadBuilderForRank(destRank);
+    if (payloadBuilder != m_payloadBuilder)
+    {
+        protocolId = GetProtocolModelForDest(destRank)->GetProtocolId(dataSize);
+    }
+
     const double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
     const uint64_t wireSize = GetProtocolModelForDest(destRank)->GetWireSize(dataSize, protocolId);
 
@@ -2577,8 +2607,8 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
     // keeps Su NVLink LL packets out of this path, so the two byte-1
     // populations never cross-fire.
     const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
-    const bool stampSoHeader = (efficiency < 1.0) && m_payloadBuilder &&
-        (m_payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
+    const bool stampSoHeader = (efficiency < 1.0) && payloadBuilder &&
+        (payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
 
     std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
     const uint64_t MAX_CHUNK_BYTES = m_bulkChunkSize;
@@ -2891,10 +2921,12 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
         SendCnpPacket(header);
     }
 
-    // Extract pure data from protocol-aware payload
+    // Extract pure data from protocol-aware payload (So sources use the So
+    // builder when one is mounted -- matches the send-side framing split)
     std::vector<uint8_t> extractedData(effectiveSize);
-    uint64_t extracted = m_payloadBuilder->ExtractData(packet, protocolId,
-                                                        extractedData.data(), effectiveSize);
+    uint64_t extracted = GetPayloadBuilderForRank(header.GetSourceRank())
+                             ->ExtractData(packet, protocolId,
+                                           extractedData.data(), effectiveSize);
 
     if (extracted > 0)
     {
