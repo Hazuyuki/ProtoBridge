@@ -22,6 +22,38 @@ STYLES = {
 }
 COLLECTIVES = ["allreduce", "alltoall"]
 
+# Analytic So wire bound for iso-hardware "one 400G NIC per GPU" (an ideal
+# contention-free non-blocking fabric at the switched shapes' NIC count).
+# Inter-node bytes through each GPU's NIC, as a fraction of the per-GPU data
+# size S: hierarchical allreduce is rail-parallel (inter RS + inter AG move
+# 2*(n-1)/(g*n)*S each way); alltoall moves the (N-g)/N inter-node fraction.
+# busbw bound = busbw_factor / wire_fraction * B (S cancels, so it is a
+# horizontal asymptote on the busbw panels and a diagonal on the log-log
+# time panels). Fullmesh may exceed it: it has 15 dedicated 400G links per
+# GPU, not one NIC.
+NUM_NODES, GPUS, NRANKS = 16, 8, 128
+B_GBPS = 400.0
+
+
+def wire_fraction(coll):
+    if coll == "allreduce":
+        return 2.0 * (NUM_NODES - 1) / (GPUS * NUM_NODES)
+    return (NRANKS - GPUS) / NRANKS
+
+
+def busbw_factor(coll):
+    if coll == "allreduce":
+        return 2.0 * (NRANKS - 1) / NRANKS
+    return (NRANKS - 1) / NRANKS
+
+
+def wire_bound_us(coll, size_bytes):
+    return wire_fraction(coll) * size_bytes * 8.0 / B_GBPS / 1e3  # ns -> us
+
+
+def wire_bound_gbps(coll):
+    return busbw_factor(coll) / wire_fraction(coll) * B_GBPS
+
 
 def load():
     rows = []
@@ -38,6 +70,7 @@ def main():
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     for i, coll in enumerate(COLLECTIVES):
         ax_t, ax_bw = axes[i]
+        bw_max = 0.0
         for topo, style in STYLES.items():
             pts = sorted(
                 ((int(r["dataSize"]), float(r["timeUs"]), float(r["busbwGbps"]))
@@ -48,6 +81,25 @@ def main():
             sizes = [p[0] / (1 << 20) for p in pts]
             ax_t.plot(sizes, [p[1] for p in pts], label=topo, lw=1.5, ms=5, **style)
             ax_bw.plot(sizes, [p[2] for p in pts], label=topo, lw=1.5, ms=5, **style)
+            bw_max = max(bw_max, max(p[2] for p in pts))
+        # Analytic So wire bound (iso-hardware, 1x400G NIC per GPU):
+        # a lower-bound diagonal on the time panel, a horizontal upper bound
+        # on the busbw panel (annotated instead when it sits off-scale).
+        all_sizes = sorted({int(r["dataSize"]) for r in rows if r["collective"] == coll})
+        ax_t.plot([s / (1 << 20) for s in all_sizes],
+                  [wire_bound_us(coll, s) for s in all_sizes],
+                  "k--", lw=1.2, label="So wire bound\n(1×400G NIC/GPU)")
+        bound = wire_bound_gbps(coll)
+        if bound <= bw_max * 1.3:
+            ax_bw.axhline(bound, color="k", ls="--", lw=1.2)
+            ax_bw.annotate(f"So wire bound {bound:.0f} Gbps (1×400G NIC/GPU)",
+                           xy=(0.02, bound), xycoords=("axes fraction", "data"),
+                           xytext=(0, 4), textcoords="offset points", fontsize=8)
+        else:
+            ax_bw.annotate(f"So wire bound ≈{bound:.0f} Gbps (off-scale):\n"
+                           "intra-node + startup bound, not the So fabric",
+                           xy=(0.02, 0.97), xycoords="axes fraction",
+                           va="top", fontsize=8)
         ax_t.set_xscale("log", base=2)
         ax_t.set_yscale("log")
         ax_t.set_xlabel("data size per GPU (MiB)")

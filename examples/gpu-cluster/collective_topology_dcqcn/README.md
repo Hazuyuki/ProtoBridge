@@ -30,17 +30,33 @@ python3 plot_collectives.py       # -> collective_vs_topology.{pdf,png}
 
 ## Reading the figure
 
-- **fullmesh** wins both collectives at large sizes (allreduce ~463 Gbps,
-  alltoall ~694 Gbps busbw at 256 MiB): every node pair has a dedicated
-  400G link, so the all-to-all phase of the hierarchical schedule never
-  shares a port. No switch in the So path -> ECN never marks.
-- **host / tor / rail / leafspine** (switched, one NIC per GPU) cluster
-  together (allreduce ~340-360 Gbps, alltoall ~160-210 Gbps): the
-  bottleneck is each GPU's single 400G NIC, identical across them; the
-  small spread is switch-hop count. These are the only topologies where
-  DCQCN is active (ECN/CNP counters in `results.csv`); `tor` and `rail`
-  are bit-identical for hierarchical allreduce (same effective So paths)
-  but diverge slightly on alltoall.
+The dashed line is the **analytic So wire bound for iso-hardware "one 400G
+NIC per GPU"** — the completion-time floor (busbw ceiling) of an ideal
+contention-free non-blocking fabric at the switched shapes' NIC count,
+counting only the inter-node bytes each GPU's NIC must move: hierarchical
+allreduce is rail-parallel, `2(n-1)/(g·n)·S ≈ 0.23S` per GPU → busbw bound
+`(N-1)/(n-1)·B ≈ 3387 Gbps`; alltoall moves the `(N-g)/N ≈ 0.94S`
+inter-node fraction → bound `(N-1)/(N-g)·B ≈ 423 Gbps`.
+
+- **fullmesh** wins both collectives, but it is NOT an iso-cost ideal: the
+  builder gives every node pair one link per rail (same-local-rank GPUs
+  directly connected), i.e. 15 dedicated 400G links per GPU — ~15× the
+  switched shapes' NIC bandwidth. On alltoall it crosses *below* the
+  iso-hardware wire bound from 16 MiB on (~694 vs 423 Gbps busbw at
+  256 MiB): the margin is extra hardware, not better switching. No switch
+  in the So path -> ECN never marks.
+- **allreduce is not So-limited at this scale**: the wire bound sits ~1
+  decade below every curve (panel a), and raising the So bandwidth 10×
+  moves tor only from 11.8 to 9.4 ms — completion is dominated by the
+  intra-node phases plus per-phase startup/ramp. That is why the switched
+  shapes cluster tightly (~340–360 Gbps) and even fullmesh only reaches
+  ~463: topology differences show up muted, through the inter-node phases'
+  share of a mostly intra-bound total. `tor` and `rail` are bit-identical
+  for allreduce (same effective So paths) but diverge slightly on alltoall.
+- **alltoall is So-limited**, so topology separates strongly there: the
+  switched shapes reach ~38–50% of their wire bound (~160–210 Gbps; the
+  gap is 15-to-1 incast at each destination NIC plus switch-hop
+  serialization), with DCQCN active (ECN/CNP counters in `results.csv`).
 - **ring** is worst at 128 ranks (allreduce ~123 Gbps, alltoall ~21 Gbps):
   all cross-node traffic of a node funnels through GPU 0's two ring links
   and multi-hop forwarding grows with node count. **torus2d / dragonfly**

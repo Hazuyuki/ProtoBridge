@@ -36,6 +36,16 @@ collectives: on/off completion time is bit-identical on an oversubscribed
 leafspine, with activity visible only in the ECN/CNP counters. New gate
 `test/parity/test_collective_dcqcn.py` pins dormant-off + chain-alive-on.
 
+The figure carries an analytic **So wire bound** reference (iso-hardware,
+one 400G NIC per GPU): allreduce is rail-parallel (`2(n-1)/(g·n)·S` per
+NIC, bound ≈3387 Gbps busbw — ~1 decade above every curve, showing
+allreduce at this scale is intra-node/startup-bound, verified by a 10×
+So-bandwidth run moving tor only 11.8→9.4 ms), while alltoall moves the
+`(N-g)/N` inter-node fraction (bound ≈423 Gbps — the switched shapes reach
+38–50% of it; fullmesh crosses above it because the builder gives one link
+per rail per node pair, i.e. 15×400G per GPU, extra hardware rather than an
+iso-cost ideal).
+
 ### Added — uniform-random traffic mode (`--randTraffic`) + topology throughput-vs-injection experiment (DCQCN)
 
 New fixed-duration synthetic-load mode in `scratch/gpu-cluster-sim.cc`:
