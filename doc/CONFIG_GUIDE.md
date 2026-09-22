@@ -119,6 +119,24 @@ Idealizations: a probe always returns a sample (control path is loss-free at
 BER=0), and reflection is unconditional (no receiver-side machine). Works on
 any So fabric type but only shapes inter-node flows (`numNodes>1`).
 
+**Real-NCCL ring allreduce (`--algorithm=ncclring`, `--ringChannels`).**
+Opt-in alternative to the default multi-node `hierarchical` allreduce
+schedule, modeled on what NCCL's ring algorithm actually does: C parallel
+channels (`--ringChannels`, `0 = auto` → gpusPerNode), each one global
+pipelined ring over all N ranks, rail-rotated so channel c enters each node
+at local GPU c and exits at local GPU (c+g−1)%g — one NIC in / one NIC out
+per ring per node, all rails busy concurrently. Each channel moves S/C
+bytes in 2(N−1) same-direction chunk steps (chunk = S/(C·N)), advanced
+event-driven with no inter-phase barriers, so intra- and inter-node hops
+overlap (max-of-bottleneck instead of the hierarchical sum-of-phases).
+Wins ≥2× at large sizes on switched topologies (741 vs 362 Gbps busbw at
+256 MiB, 16 n × 8 g RoCE 400G); loses below ~16 MiB where the 2(N−1)-step
+latency dominates — the same regime where real NCCL switches to tree.
+Honors the shared per-step knobs (`--perStepSwOverheadNs`,
+`--swOverheadPerByteNs`, `--computeBase*Ns`, `--llThreshold` /
+`--ll128Threshold`, `--startupDelayNs`). AllReduce only; gate
+`test/parity/test_ncclring.py`.
+
 **So topologies (`--interNodeTopology` + shape knobs).** Eight inter-node
 topologies in three wiring shapes: one-NIC-per-GPU switched (`host`, `tor`,
 `leafspine`), direct rdmaRouteMap + intra-node PXN proxy (`fullmesh`, `rail`),

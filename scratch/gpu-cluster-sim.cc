@@ -30,6 +30,7 @@
 #include "ns3/hierarchical-allgather.h"
 #include "ns3/hierarchical-reducescatter.h"
 #include "ns3/hierarchical-alltoall.h"
+#include "ns3/nccl-ring-allreduce.h"
 #include "ns3/multi-node-topology-helper.h"
 #include "ns3/device-type.h"
 #include "ns3/fabric-type.h"
@@ -369,7 +370,7 @@ main(int argc, char* argv[])
     CommandLine cmd;
     cmd.AddValue("topology", "Topology: ring/fullmesh/switched/fattree/railfattree/leafspine/nvl72/torus/mesh/hypercube/2dfullmesh/ndfullmesh/2dfullmeshclos", topology);
     cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce", collective);
-    cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain", algorithm);
+    cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain/hierarchical/ncclring", algorithm);
     cmd.AddValue("protocolModel", "Protocol model type: ns3::NcclProtocolModel/ns3::UbProtocolModel/ns3::McclProtocolModel", protocolModelType);
     cmd.AddValue("protocolWireEfficiency", "Protocol payload bytes divided by transmitted bytes", protocolWireEfficiency);
     cmd.AddValue("fabricType", "Fabric type: NVLink/ETH/ICI/HCCS/xGMI/MetaXLink/RoCE/UB", fabricTypeStr);
@@ -596,6 +597,8 @@ main(int argc, char* argv[])
     cmd.AddValue("rttccProbeIntervalNs", "RTTCC min spacing between RTT probes per flow in ns (0=default 5000)", rttccProbeIntervalNs);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
     cmd.AddValue("intraNodeAlgorithm", "Intra-node algorithm for hierarchical: ring/fullmesh", intraNodeAlgorithm);
+    uint32_t ringChannels = 0;
+    cmd.AddValue("ringChannels", "Channels (parallel rings) for ncclring algorithm, 0=auto(gpusPerNode)", ringChannels);
     std::string stepTraceFile = "";
     cmd.AddValue("stepTraceFile", "Path to write per-step completion CSV (gpu,step,startNs,completeNs,delayNs)", stepTraceFile);
     std::string protocolConfigPath = "";
@@ -1841,6 +1844,56 @@ main(int argc, char* argv[])
             {
                 ar->SetInterNodeStartupDelay(NanoSeconds(interNodeLatencyNs));
             }
+            ar->Start();
+            injector = ar;
+        }
+        else if (algo == "ncclring")
+        {
+            // Real-NCCL global pipelined ring: C rail-spread rings spanning all
+            // ranks, chunk-level pipelining (no per-phase barriers). Effective
+            // node geometry derivation mirrors the hierarchical branch.
+            uint32_t effectiveNumNodes = numNodes;
+            uint32_t effectiveGpusPerNode = gpusPerNode;
+            if (topology == "leafspine")
+            {
+                effectiveNumNodes = leafSwitches;
+                effectiveGpusPerNode = numGpus / leafSwitches;
+            }
+            else if (topology == "nvl72")
+            {
+                uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                effectiveNumNodes = numGpus / gpg;
+                effectiveGpusPerNode = gpg;
+            }
+            else if (numNodes <= 1)
+            {
+                effectiveNumNodes = 1;
+                effectiveGpusPerNode = numGpus;
+            }
+            Ptr<NcclRingAllReduce> ar = CreateObject<NcclRingAllReduce>();
+            ar->SetGpusPerNode(effectiveGpusPerNode);
+            ar->SetNumNodes(effectiveNumNodes);
+            ar->SetNumChannels(ringChannels);
+            ar->SetLlThreshold(llThreshold);
+            ar->SetLl128Threshold(ll128Threshold);
+            if (startupDelayNs > 0)
+            {
+                ar->SetStartupDelay(NanoSeconds(startupDelayNs));
+            }
+            if (perStepSwOverheadNs > 0)
+            {
+                ar->SetPerStepSwOverhead(NanoSeconds(perStepSwOverheadNs));
+            }
+            if (swOverheadPerByteNs > 0)
+            {
+                ar->SetSwOverheadPerByteNs(swOverheadPerByteNs);
+            }
+            if (computeBaseLLNs > 0 || computeBaseLL128Ns > 0 || computeBaseSIMPLENs > 0)
+            {
+                ar->SetComputeBaseDelays(NanoSeconds(computeBaseLLNs), NanoSeconds(computeBaseLL128Ns), NanoSeconds(computeBaseSIMPLENs));
+            }
+            ar->Initialize(numGpus, dataSize, endpoints);
+            ar->SetCompletionCallback(MakeCallback(&OnCollectiveComplete));
             ar->Start();
             injector = ar;
         }

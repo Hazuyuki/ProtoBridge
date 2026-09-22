@@ -6,6 +6,36 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Added — real-NCCL global pipelined ring allreduce (`--algorithm=ncclring`)
+
+`NcclRingAllReduce` (`src/gpu-cluster/model/nccl-ring-allreduce.{h,cc}`)
+models what NCCL's ring algorithm actually does at multi-node scale, as an
+opt-in alternative to the 4-phase barrier-separated `hierarchical`
+schedule: C parallel channels (default `--ringChannels=0` → gpusPerNode),
+each a single global ring over all N ranks, rail-rotated so channel c
+enters every node at local GPU c and exits at local GPU (c+g−1)%g — one
+NIC in, one NIC out per ring per node, all rails carrying inter-node
+crossings concurrently. Each channel moves S/C bytes in 2(N−1)
+same-direction chunk steps (chunk = S/(C·N); 256 MiB → 256 KiB, the NCCL
+SIMPLE regime), advanced per-(rank,channel) purely event-driven — no
+barriers, so intra- and inter-node hops pipeline and the completion time is
+the max-of-bottleneck rather than the hierarchical sum-of-phases.
+
+At 16 n × 8 g RoCE 400G 256 MiB, ncclring reaches 741 Gbps busbw on
+tor/leafspine vs hierarchical's 362 (2.05×), and 654 on fullmesh/rail —
+tor *beats* fullmesh because ring crossings are cross-rail
+((n,c−1)→(n+1,c)): a switch reaches any NIC in one hop while fullmesh must
+PXN-proxy through the rail peer, faithful to real NCCL's PXN behavior.
+Below ~16 MiB the 254-step latency dominates and hierarchical wins —
+exactly why real NCCL switches to tree at small sizes. `host` topology is
+the one shape whose single central switch sees enough incast to fire
+DCQCN under ncclring (≈32 k ECN marks at ≥16 MiB). Experiment
+`run_ncclring_sweep.py` + `plot_ncclring.py` (8 topologies × 5 sizes) in
+`examples/gpu-cluster/collective_topology_dcqcn/`; gate
+`test/parity/test_ncclring.py` pins 2 n × 8 g leafspine 16 MiB at
+444189 ns and ncclring < hierarchical. Default paths untouched: all
+existing parity pins byte-identical.
+
 ### Added — So payload-builder seam + collective-vs-topology experiment (16 n × 8 g, DCQCN)
 
 `FabricEndpoint::SetSoPayloadBuilder` / `GetPayloadBuilderForRank(rank)`

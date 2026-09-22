@@ -1,0 +1,353 @@
+/*
+ * SPDX-License-Identifier: GPL-2.0-only
+ * nccl-ring-allreduce.cc
+ *
+ * Real-NCCL-style global pipelined ring AllReduce (see header).
+ */
+
+#include "nccl-ring-allreduce.h"
+
+#include "nccl-protocol.h"
+#include "protocol-model.h"
+
+#include "ns3/log.h"
+#include "ns3/simulator.h"
+
+namespace ns3
+{
+
+NS_LOG_COMPONENT_DEFINE("NcclRingAllReduce");
+
+NS_OBJECT_ENSURE_REGISTERED(NcclRingAllReduce);
+
+TypeId
+NcclRingAllReduce::GetTypeId()
+{
+    static TypeId tid = TypeId("ns3::NcclRingAllReduce")
+                            .SetParent<CollectiveInjector>()
+                            .SetGroupName("GpuCluster")
+                            .AddConstructor<NcclRingAllReduce>();
+    return tid;
+}
+
+NcclRingAllReduce::NcclRingAllReduce()
+    : m_numGpus(0),
+      m_dataSize(0),
+      m_gpusPerNode(8),
+      m_numNodes(1),
+      m_numChannels(1),
+      m_numChannelsCfg(0),
+      m_chunkSize(0),
+      m_totalSteps(0),
+      m_flowIdBase(1),
+      m_protocolId(static_cast<uint8_t>(NcclProtocol::SIMPLE)),
+      m_running(false),
+      m_completed(false),
+      m_startupDelayNs(0),
+      m_perStepSwOverheadNs(0),
+      m_swOverheadPerByteNs(0),
+      m_computeBaseLLNs(0),
+      m_computeBaseLL128Ns(0),
+      m_computeBaseSIMPLENs(0),
+      m_llThreshold(8192),
+      m_ll128Threshold(2 * 1024 * 1024),
+      m_gpuDoneCount(0),
+      m_permanentLossCount(0),
+      m_startTimeNs(0),
+      m_endTimeNs(0)
+{
+}
+
+NcclRingAllReduce::~NcclRingAllReduce()
+{
+}
+
+void NcclRingAllReduce::SetGpusPerNode(uint32_t gpusPerNode) { m_gpusPerNode = gpusPerNode; }
+void NcclRingAllReduce::SetNumNodes(uint32_t numNodes) { m_numNodes = numNodes; }
+void NcclRingAllReduce::SetNumChannels(uint32_t numChannels) { m_numChannelsCfg = numChannels; }
+void NcclRingAllReduce::SetPerStepSwOverhead(Time delay) { m_perStepSwOverheadNs = delay.GetNanoSeconds(); }
+void NcclRingAllReduce::SetSwOverheadPerByteNs(uint64_t perByteNs) { m_swOverheadPerByteNs = perByteNs; }
+void NcclRingAllReduce::SetLlThreshold(uint64_t threshold) { m_llThreshold = threshold; }
+void NcclRingAllReduce::SetLl128Threshold(uint64_t threshold) { m_ll128Threshold = threshold; }
+
+void
+NcclRingAllReduce::SetComputeBaseDelays(Time ll, Time ll128, Time simple)
+{
+    m_computeBaseLLNs = ll.GetNanoSeconds();
+    m_computeBaseLL128Ns = ll128.GetNanoSeconds();
+    m_computeBaseSIMPLENs = simple.GetNanoSeconds();
+}
+
+uint64_t
+NcclRingAllReduce::GetPerStepSwOverheadNs(uint64_t chunkSize) const
+{
+    if (m_swOverheadPerByteNs > 0 ||
+        m_computeBaseLLNs > 0 || m_computeBaseLL128Ns > 0 || m_computeBaseSIMPLENs > 0)
+    {
+        uint64_t baseDelay;
+        if (chunkSize < m_llThreshold)
+            baseDelay = m_computeBaseLLNs;
+        else if (chunkSize < m_ll128Threshold)
+            baseDelay = m_computeBaseLL128Ns;
+        else
+            baseDelay = m_computeBaseSIMPLENs;
+        return baseDelay + m_swOverheadPerByteNs * chunkSize;
+    }
+    return m_perStepSwOverheadNs;
+}
+
+void
+NcclRingAllReduce::SetCompletionCallback(std::function<void(uint64_t durationNs)> cb)
+{
+    m_completionCallback = cb;
+}
+
+void
+NcclRingAllReduce::SetStartupDelay(Time delay)
+{
+    m_startupDelayNs = delay.GetNanoSeconds();
+}
+
+CollectiveType NcclRingAllReduce::GetCollectiveType() const { return CollectiveType::ALLREDUCE; }
+bool NcclRingAllReduce::IsCompleted() const { return m_completed; }
+
+void
+NcclRingAllReduce::DoDispose()
+{
+    m_endpoints.clear();
+    m_completionCallback = nullptr;
+    CollectiveInjector::DoDispose();
+}
+
+void
+NcclRingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
+                              const std::vector<Ptr<FabricEndpoint>>& endpoints)
+{
+    NS_ABORT_MSG_IF(numGpus < 2, "NcclRingAllReduce needs at least 2 ranks");
+    NS_ABORT_MSG_IF(m_numNodes * m_gpusPerNode != numGpus,
+                    "NcclRingAllReduce needs numGpus == numNodes * gpusPerNode "
+                    "(node-major rank layout)");
+    m_numGpus = numGpus;
+    m_dataSize = dataSize;
+    m_endpoints = endpoints;
+
+    m_numChannels = (m_numChannelsCfg > 0) ? m_numChannelsCfg : m_gpusPerNode;
+    if (m_numChannels > m_gpusPerNode)
+    {
+        m_numChannels = m_gpusPerNode; // one crossing per rail at most
+    }
+    m_totalSteps = 2 * (numGpus - 1);
+    m_chunkSize = dataSize / (static_cast<uint64_t>(m_numChannels) * numGpus);
+    if (m_chunkSize == 0)
+    {
+        m_chunkSize = 1;
+    }
+
+    BuildRings();
+
+    m_completedStep.assign(static_cast<size_t>(numGpus) * m_numChannels, 0);
+    m_recvBytes.assign(static_cast<size_t>(numGpus) * m_numChannels, 0);
+    m_doneChannels.assign(numGpus, 0);
+    m_gpuDoneCount = 0;
+
+    // Wire protocol from the per-step chunk size (LL/LL128/SIMPLE); startup
+    // from the total data size — same convention as RingAllReduce.
+    Ptr<ProtocolModel> protoModel = m_endpoints[0]->GetProtocolModel();
+    m_protocolId = protoModel->GetProtocolId(m_chunkSize);
+    if (m_startupDelayNs == 0)
+    {
+        uint8_t startupProto = protoModel->GetProtocolId(m_dataSize);
+        m_startupDelayNs = protoModel->GetStartupDelayNs(startupProto, m_numGpus);
+    }
+
+    SetupReceiveCallbacks();
+
+    NS_LOG_INFO("NcclRingAllReduce initialized: numGpus=" << numGpus
+                << " dataSize=" << dataSize
+                << " channels=" << m_numChannels
+                << " chunkSize=" << m_chunkSize
+                << " totalSteps=" << m_totalSteps
+                << " protocol=" << static_cast<int>(m_protocolId)
+                << " startupDelay=" << m_startupDelayNs << "ns");
+}
+
+// Channel c's ring visits node n's locals in the order c, c+1, ..., c+g-1
+// (mod g); the last one crosses to node n+1's local c. Rotating the entry
+// local per channel puts every channel's node crossing on a different GPU's
+// NIC (rail spread) and every intra-node hop on the Su fabric.
+void
+NcclRingAllReduce::BuildRings()
+{
+    const uint32_t g = m_gpusPerNode;
+    m_ringNext.assign(m_numChannels, std::vector<uint16_t>(m_numGpus, 0));
+    for (uint32_t c = 0; c < m_numChannels; ++c)
+    {
+        for (uint32_t node = 0; node < m_numNodes; ++node)
+        {
+            for (uint32_t k = 0; k < g; ++k)
+            {
+                uint16_t rank = static_cast<uint16_t>(node * g + (c + k) % g);
+                uint16_t next;
+                if (k + 1 < g)
+                {
+                    next = static_cast<uint16_t>(node * g + (c + k + 1) % g);
+                }
+                else
+                {
+                    next = static_cast<uint16_t>(((node + 1) % m_numNodes) * g + c % g);
+                }
+                m_ringNext[c][rank] = next;
+            }
+        }
+    }
+}
+
+void
+NcclRingAllReduce::SetupReceiveCallbacks()
+{
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(
+                MakeCallback(&NcclRingAllReduce::OnPacketReceived, this));
+        }
+    }
+}
+
+void
+NcclRingAllReduce::Start()
+{
+    m_running = true;
+    m_startTimeNs = Simulator::Now().GetNanoSeconds();
+    NS_LOG_INFO("Starting NcclRingAllReduce with startup delay " << m_startupDelayNs << " ns");
+    Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                        &NcclRingAllReduce::TriggerInitialSends, this);
+}
+
+void
+NcclRingAllReduce::TriggerInitialSends()
+{
+    // Every rank launches step 0 of every channel simultaneously; from here
+    // on each (rank, channel) advances as its predecessor's chunks arrive.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        for (uint32_t c = 0; c < m_numChannels; ++c)
+        {
+            SendStepData(gpu, c, 0);
+        }
+    }
+}
+
+void
+NcclRingAllReduce::SendStepData(uint16_t gpu, uint32_t channel, uint32_t step)
+{
+    if (gpu >= m_endpoints.size() || !m_endpoints[gpu])
+    {
+        return;
+    }
+    uint16_t target = m_ringNext[channel][gpu];
+    // Unique flowId per (channel, step) keeps sequence tracking per transfer
+    // distinct (same reason RingAllReduce uses one flowId per step).
+    uint16_t flowId = static_cast<uint16_t>(m_flowIdBase + channel * m_totalSteps + step);
+    m_endpoints[gpu]->SendBulkWireTransferSize(target, m_chunkSize, m_protocolId, flowId, 0);
+    NS_LOG_DEBUG("GPU " << gpu << " ch " << channel << " step " << step
+                 << " -> GPU " << target << " (" << m_chunkSize << "B)");
+}
+
+void
+NcclRingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
+{
+    if (header.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+    {
+        // Permanently lost data must not count toward collective progress:
+        // record and stall rather than complete with corrupt data.
+        m_permanentLossCount++;
+        NS_LOG_INFO("PERMANENT_LOSS: src=" << srcRank
+                    << " dest=" << header.GetDestRank());
+        return;
+    }
+    if (header.GetPacketType() != FabricPacketType::DATA)
+    {
+        return;
+    }
+
+    uint16_t destRank = header.GetDestRank();
+    uint16_t flowId = header.GetFlowId();
+    if (destRank >= m_numGpus || flowId < m_flowIdBase)
+    {
+        return;
+    }
+    uint32_t channel = (flowId - m_flowIdBase) / m_totalSteps;
+    if (channel >= m_numChannels)
+    {
+        return;
+    }
+
+    uint32_t effectiveSize = header.GetEffectiveDataSize();
+    if (effectiveSize == 0)
+    {
+        effectiveSize = packet->GetSize();
+    }
+
+    size_t idx = static_cast<size_t>(destRank) * m_numChannels + channel;
+    m_recvBytes[idx] += effectiveSize;
+
+    // Chunks of consecutive steps can interleave on the wire; subtracting one
+    // chunk per completed step (instead of resetting) keeps the carry-over.
+    while (m_completedStep[idx] < m_totalSteps && m_recvBytes[idx] >= m_chunkSize)
+    {
+        m_recvBytes[idx] -= m_chunkSize;
+        uint32_t step = m_completedStep[idx]++;
+        OnStepReceiveComplete(destRank, channel, step);
+    }
+}
+
+void
+NcclRingAllReduce::OnStepReceiveComplete(uint16_t gpu, uint32_t channel, uint32_t step)
+{
+    if (step + 1 >= m_totalSteps)
+    {
+        // This (rank, channel) pipeline is drained.
+        if (++m_doneChannels[gpu] >= m_numChannels)
+        {
+            m_gpuDoneCount++;
+            LogStepComplete(gpu, m_totalSteps - 1, m_startTimeNs,
+                            Simulator::Now().GetNanoSeconds());
+            NS_LOG_INFO("GPU " << gpu << " DONE ("
+                        << m_gpuDoneCount << "/" << m_numGpus << ")");
+            if (m_gpuDoneCount >= m_numGpus)
+            {
+                Complete();
+            }
+        }
+        return;
+    }
+
+    uint64_t swOverhead = GetPerStepSwOverheadNs(m_chunkSize);
+    if (swOverhead > 0)
+    {
+        Simulator::Schedule(NanoSeconds(swOverhead),
+                            &NcclRingAllReduce::SendStepData, this, gpu, channel, step + 1);
+    }
+    else
+    {
+        Simulator::ScheduleNow(&NcclRingAllReduce::SendStepData, this, gpu, channel, step + 1);
+    }
+}
+
+void
+NcclRingAllReduce::Complete()
+{
+    m_completed = true;
+    m_running = false;
+    m_endTimeNs = Simulator::Now().GetNanoSeconds();
+    uint64_t durationNs = m_endTimeNs - m_startTimeNs;
+    NS_LOG_INFO("NcclRingAllReduce COMPLETE in " << durationNs / 1000.0 << " µs");
+    if (m_completionCallback)
+    {
+        m_completionCallback(durationNs);
+    }
+}
+
+} // namespace ns3

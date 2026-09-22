@@ -54,6 +54,7 @@ build_lib(
     model/hierarchical-allgather.cc
     model/hierarchical-reducescatter.cc
     model/hierarchical-alltoall.cc
+    model/nccl-ring-allreduce.cc
     helper/gpu-cluster-helper.cc
     helper/hybrid-topology-helper.cc
     helper/multi-node-topology-helper.cc
@@ -115,6 +116,7 @@ build_lib(
     model/hierarchical-allgather.h
     model/hierarchical-reducescatter.h
     model/hierarchical-alltoall.h
+    model/nccl-ring-allreduce.h
     helper/gpu-cluster-helper.h
     helper/hybrid-topology-helper.h
     helper/multi-node-topology-helper.h

@@ -72,3 +72,48 @@ Smoke gate: `python3 test/parity/test_collective_dcqcn.py` (run directly)
 pins the seam's invariants: `--dcqcn=0` stays dormant (ecn=0, unchanged
 completion), `--dcqcn=1` lights the ECN->CNP chain on an oversubscribed
 leafspine allreduce.
+
+## ncclring: real-NCCL global pipelined ring (allreduce)
+
+```bash
+python3 run_ncclring_sweep.py     # 40 runs (8 topologies x 5 sizes, --algorithm=ncclring) -> results_ncclring.csv
+python3 plot_ncclring.py          # -> ncclring_vs_hierarchical.{pdf,png} (solid=hierarchical, dashed=ncclring)
+```
+
+`--algorithm=ncclring` replaces the 4-phase barrier-separated hierarchical
+schedule with what NCCL's ring algorithm actually does: 8 channels
+(= gpusPerNode), each a global ring over all 128 ranks, rail-rotated so
+channel c enters each node at local GPU c and exits at local GPU (c+7)%8 —
+one NIC in / one NIC out per ring per node, all 8 rails crossing
+concurrently. Each channel moves S/8 in 2(N-1)=254 chunk steps
+(chunk = S/1024; 256 MiB -> 256 KiB, NCCL SIMPLE regime), fully
+event-driven with no barriers, so intra- and inter-node hops pipeline.
+
+Findings (vs the hierarchical rows in `results.csv`):
+
+- **Large sizes: pipelining converts sum-of-phases into
+  max-of-bottleneck.** At 256 MiB, tor/leafspine reach **741 Gbps busbw
+  vs hierarchical's 362 (2.05x)** — the So NIC, intra-node hops, and
+  reduction all overlap instead of waiting on phase barriers.
+- **tor/leafspine BEAT fullmesh under ncclring** (741 vs 655 Gbps) —
+  inverted from hierarchical. Ring crossings are cross-rail
+  ((n, c−1) -> (n+1, c)): a switch reaches any NIC in one hop, while
+  fullmesh/rail only wire same-local-rank pairs and must PXN-proxy the
+  crossing through the rail peer plus an intra-node hop. This is the real
+  NCCL PXN situation, reproduced faithfully.
+- **Small sizes are latency-bound**: 254 steps put a ~810 us floor under
+  every topology at 1 MiB (vs hierarchical's ~270 us) — precisely why real
+  NCCL switches to tree at small sizes; the crossover here is ~16-32 MiB.
+- **Gateway shapes (ring/torus2d/dragonfly) converge under ncclring**
+  (~377 Gbps at 256 MiB, vs 123-215 hierarchical): with only one crossing
+  per node per channel, the GPU-0 funnel serializes 8 channels but no
+  longer multiplies with hop count the way phase-synchronized bulk
+  transfers did.
+- **`host` is the one topology where DCQCN fires under ncclring** (~32k
+  ECN marks at >=16 MiB): a single central switch sees all 128 NICs'
+  concurrent chunk streams, enough incast depth to mark; every other
+  shape's per-hop load stays below the marking threshold.
+
+Gate: `python3 test/parity/test_ncclring.py` (run directly) pins
+2n x 8g leafspine allreduce 16 MiB at simTimeNs=444189 and
+ncclring < hierarchical on the same config.
