@@ -30,16 +30,24 @@ python3 plot_collectives.py       # -> collective_vs_topology.{pdf,png}
 
 ## Reading the figure
 
-The allreduce panels carry both algorithms: **solid = hierarchical,
-dashed = `--algorithm=ncclring`** (from `results_ncclring.csv`, see the
-ncclring section below; alltoall has no ncclring variant). The dotted
-line is the **analytic So wire bound for iso-hardware "one 400G
-NIC per GPU"** — the completion-time floor (busbw ceiling) of an ideal
-contention-free non-blocking fabric at the switched shapes' NIC count,
-counting only the inter-node bytes each GPU's NIC must move: hierarchical
-allreduce is rail-parallel, `2(n-1)/(g·n)·S ≈ 0.23S` per GPU → busbw bound
+The allreduce panels (a)/(c) show **`--algorithm=ncclring`** (from
+`results_ncclring.csv`; see the ncclring section below for the full
+analysis — leafspine/tor lead at 741 Gbps busbw, fullmesh/rail follow at
+~655 because ring crossings must PXN-proxy there, gateway shapes converge
+at ~377, and small sizes are 254-step latency-bound). The alltoall panels
+(b)/(d) show the hierarchical algorithm (from `results.csv`; ncclring has
+no alltoall variant — real-NCCL alltoall is direct P2P, which the
+hierarchical injector already models).
+
+For reference, the analytic **So wire bound for iso-hardware "one 400G
+NIC per GPU"** (not drawn): counting only the inter-node bytes each GPU's
+NIC must move, hierarchical allreduce is rail-parallel,
+`2(n-1)/(g·n)·S ≈ 0.23S` per GPU → busbw bound
 `(N-1)/(n-1)·B ≈ 3387 Gbps`; alltoall moves the `(N-g)/N ≈ 0.94S`
 inter-node fraction → bound `(N-1)/(N-g)·B ≈ 423 Gbps`.
+
+Hierarchical findings (`results.csv`; the hierarchical-allreduce rows are
+no longer plotted, the alltoall rows are panels b/d):
 
 - **fullmesh** wins both collectives, but it is NOT an iso-cost ideal: the
   builder gives every node pair one link per rail (same-local-rank GPUs
@@ -48,8 +56,9 @@ inter-node fraction → bound `(N-1)/(N-g)·B ≈ 423 Gbps`.
   iso-hardware wire bound from 16 MiB on (~694 vs 423 Gbps busbw at
   256 MiB): the margin is extra hardware, not better switching. No switch
   in the So path -> ECN never marks.
-- **allreduce is not So-limited at this scale**: the wire bound sits ~1
-  decade below every curve (panel a), and raising the So bandwidth 10×
+- **hierarchical allreduce is not So-limited at this scale**: the wire
+  bound sits ~1 decade below every hierarchical curve, and raising the So
+  bandwidth 10×
   moves tor only from 11.8 to 9.4 ms — completion is dominated by the
   intra-node phases plus per-phase startup/ramp. That is why the switched
   shapes cluster tightly (~340–360 Gbps) and even fullmesh only reaches
