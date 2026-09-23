@@ -30,7 +30,10 @@ python3 plot_collectives.py       # -> collective_vs_topology.{pdf,png}
 
 ## Reading the figure
 
-The dashed line is the **analytic So wire bound for iso-hardware "one 400G
+The allreduce panels carry both algorithms: **solid = hierarchical,
+dashed = `--algorithm=ncclring`** (from `results_ncclring.csv`, see the
+ncclring section below; alltoall has no ncclring variant). The dotted
+line is the **analytic So wire bound for iso-hardware "one 400G
 NIC per GPU"** — the completion-time floor (busbw ceiling) of an ideal
 contention-free non-blocking fabric at the switched shapes' NIC count,
 counting only the inter-node bytes each GPU's NIC must move: hierarchical

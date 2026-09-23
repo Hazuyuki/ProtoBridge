@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Plot collective completion time + bus bandwidth vs data size per topology
-from results.csv (see run_sweep.py). Writes collective_vs_topology.pdf/.png."""
+from results.csv (see run_sweep.py). When results_ncclring.csv exists (see
+run_ncclring_sweep.py), the allreduce panels also carry the ncclring rows as
+dashed lines (solid = hierarchical). Writes collective_vs_topology.pdf/.png."""
 import csv
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 HERE = Path(__file__).resolve().parent
 
@@ -65,8 +68,22 @@ def load():
     return rows
 
 
+def load_ncclring():
+    path = HERE / "results_ncclring.csv"
+    if not path.exists():
+        return []
+    rows = []
+    with path.open() as f:
+        for r in csv.DictReader(f):
+            if r["status"] != "complete":
+                continue
+            rows.append(r)
+    return rows
+
+
 def main():
     rows = load()
+    nccl_rows = load_ncclring()
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     for i, coll in enumerate(COLLECTIVES):
         ax_t, ax_bw = axes[i]
@@ -82,16 +99,29 @@ def main():
             ax_t.plot(sizes, [p[1] for p in pts], label=topo, lw=1.5, ms=5, **style)
             ax_bw.plot(sizes, [p[2] for p in pts], label=topo, lw=1.5, ms=5, **style)
             bw_max = max(bw_max, max(p[2] for p in pts))
+            # ncclring overlay (allreduce only): same colors, dashed.
+            npts = sorted(
+                ((int(r["dataSize"]), float(r["timeUs"]), float(r["busbwGbps"]))
+                 for r in nccl_rows
+                 if r["collective"] == coll and r["topology"] == topo),
+                key=lambda p: p[0])
+            if npts:
+                nsizes = [p[0] / (1 << 20) for p in npts]
+                ax_t.plot(nsizes, [p[1] for p in npts], ls="--", lw=1.2, ms=4,
+                          alpha=0.8, **style)
+                ax_bw.plot(nsizes, [p[2] for p in npts], ls="--", lw=1.2, ms=4,
+                           alpha=0.8, **style)
+                bw_max = max(bw_max, max(p[2] for p in npts))
         # Analytic So wire bound (iso-hardware, 1x400G NIC per GPU):
         # a lower-bound diagonal on the time panel, a horizontal upper bound
         # on the busbw panel (annotated instead when it sits off-scale).
         all_sizes = sorted({int(r["dataSize"]) for r in rows if r["collective"] == coll})
         ax_t.plot([s / (1 << 20) for s in all_sizes],
                   [wire_bound_us(coll, s) for s in all_sizes],
-                  "k--", lw=1.2, label="So wire bound\n(1×400G NIC/GPU)")
+                  "k:", lw=1.2, label="So wire bound\n(1×400G NIC/GPU)")
         bound = wire_bound_gbps(coll)
         if bound <= bw_max * 1.3:
-            ax_bw.axhline(bound, color="k", ls="--", lw=1.2)
+            ax_bw.axhline(bound, color="k", ls=":", lw=1.2)
             ax_bw.annotate(f"So wire bound {bound:.0f} Gbps (1×400G NIC/GPU)",
                            xy=(0.02, bound), xycoords=("axes fraction", "data"),
                            xytext=(0, 4), textcoords="offset points", fontsize=8)
@@ -112,7 +142,12 @@ def main():
         ax_bw.set_title(f"({'cd'[i]}) {coll} — bus bandwidth")
         ax_bw.grid(True, which="both", alpha=0.3)
     axes[0][0].legend(fontsize=8, ncol=2)
-    fig.suptitle("Hierarchical collectives, 16 nodes × 8 GPUs, RoCE 400G, DCQCN on", y=0.995)
+    if nccl_rows:
+        axes[0][1].legend(handles=[
+            Line2D([], [], color="k", ls="-", lw=1.5, label="hierarchical"),
+            Line2D([], [], color="k", ls="--", lw=1.2, label="ncclring"),
+        ], fontsize=8, loc="center left", title="allreduce algorithm", title_fontsize=8)
+    fig.suptitle("Collectives vs So topology, 16 nodes × 8 GPUs, RoCE 400G, DCQCN on", y=0.995)
     fig.tight_layout()
     for ext in ("pdf", "png"):
         fig.savefig(HERE / f"collective_vs_topology.{ext}", dpi=150)
