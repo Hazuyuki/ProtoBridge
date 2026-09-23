@@ -242,6 +242,20 @@ wire-size budget, so chunk count and egress serialization are unchanged —
 `test/parity/test_collective_dcqcn.py`; experiment (2 collectives × 8
 topologies × 5 sizes at 16 n × 8 g): `examples/gpu-cluster/collective_topology_dcqcn/`.
 
+**DCQCN rate-machine knobs.** The `DcqcnRateMachine` TypeId attributes are
+CLI-exposed for parameter sweeps — `--dcqcnTFastNs` (fast-recovery timer,
+default 50000), `--dcqcnFastCycles` (default 5), `--dcqcnTAiNs`
+(additive-increase timer, default 100000), `--dcqcnRai` (default 0.01),
+`--dcqcnGInit` (initial multiplicative backoff g, default 0.5),
+`--dcqcnGDecay` (default 0.5), `--dcqcnAlphaFloor` (default 0.0). Each is
+only `SetAttribute`-ed when given (0 = keep the default), so the default
+path stays byte-identical. When `--dcqcn=1` the machine's `MaxRateBps`
+(the alpha shaping-delay math's rate anchor) is back-filled from
+`--interNodeBandwidth` — the TypeId default 50e9 B/s is only correct for
+400G links. Parameter-sensitivity sweep (host ncclring, the one scenario
+where the chain fires): `examples/gpu-cluster/collective_topology_dcqcn/`
+(`run_dcqcn_param_sweep.py`, `plot_dcqcn_params.py`).
+
 **Fabric hardware + protocol startup + FEC + BER** (sourced into the local CLI
 variables — these are what make a `.cfg` reproduce a calibrated run without
 per-run flags):

@@ -353,6 +353,16 @@ main(int argc, char* argv[])
     // DCQCN rate machine (its true per-flow pacer enforces the cap) even when
     // --dcqcn is off. Calibrated to the ~49 Gbps single-QP ib_write_bw ceiling.
     double perQpCeilingGbps = 0.0;
+    // DCQCN rate-machine knobs (0/negative = keep the TypeId default; set
+    // via SetAttribute only when the user overrides, so the default path is
+    // byte-identical).
+    uint64_t dcqcnTFastNs = 0;        // 0 = default 50000 ns
+    uint32_t dcqcnFastCycles = 0;     // 0 = default 5
+    uint64_t dcqcnTAiNs = 0;          // 0 = default 100000 ns
+    double dcqcnRai = 0.0;            // 0 = default 0.01
+    double dcqcnGInit = 0.0;          // 0 = default 0.5
+    double dcqcnGDecay = 0.0;         // 0 = default 0.5
+    double dcqcnAlphaFloor = 0.0;     // 0 = default 0.0 (negative = no-op)
     // RTTCC (RTT-probe-based congestion control, NVIDIA RTT-CC / Swift
     // style). Off by default: no RttccRateMachine mounted => no probes, no
     // pacing, byte-identical baseline. On, each So endpoint mounts its OWN
@@ -592,6 +602,13 @@ main(int argc, char* argv[])
     cmd.AddValue("voqDropThreshold", "Plain-Ethernet lossy VOQ tail-drop threshold (pkts); 0=off. Must be < switchVoqDepth (default 10000)", voqDropThreshold);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
+    cmd.AddValue("dcqcnTFastNs", "DCQCN fast-recovery timer interval in ns (0=default 50000)", dcqcnTFastNs);
+    cmd.AddValue("dcqcnFastCycles", "DCQCN fast-recovery cycles before additive increase (0=default 5)", dcqcnFastCycles);
+    cmd.AddValue("dcqcnTAiNs", "DCQCN additive-increase timer interval in ns (0=default 100000)", dcqcnTAiNs);
+    cmd.AddValue("dcqcnRai", "DCQCN additive Alpha decrement per AI tick (0=default 0.01)", dcqcnRai);
+    cmd.AddValue("dcqcnGInit", "DCQCN initial multiplicative step g on first CNP (0=default 0.5)", dcqcnGInit);
+    cmd.AddValue("dcqcnGDecay", "DCQCN multiplicative decay of g per fast cycle (0=default 0.5)", dcqcnGDecay);
+    cmd.AddValue("dcqcnAlphaFloor", "DCQCN Alpha floor, no shaping at/below (0=default 0.0)", dcqcnAlphaFloor);
     cmd.AddValue("rttcc", "Enable RTTCC (RTT-probe-based) congestion control on So endpoints (off=parity-safe baseline)", enableRttcc);
     cmd.AddValue("rttccTargetRttNs", "RTTCC target RTT in ns (0=default 10000); must exceed the base zero-queue RTT", rttccTargetRttNs);
     cmd.AddValue("rttccProbeIntervalNs", "RTTCC min spacing between RTT probes per flow in ns (0=default 5000)", rttccProbeIntervalNs);
@@ -1134,6 +1151,48 @@ main(int argc, char* argv[])
             if (perQpCeilingGbps > 0.0)
             {
                 dcqcnMachine->SetAttribute("PerQpCeilingGbps", DoubleValue(perQpCeilingGbps));
+            }
+            // MaxRateBps anchors the alpha shaping math (extra serialization
+            // time at the reduced rate) to the So NIC rate; the TypeId
+            // default 50e9 B/s is only right for 400G links. Inert until a
+            // CNP fires (alpha=0 -> ShapingDelay==0) and unused by the
+            // per-QP pacer, so this backfill is parity-neutral.
+            if (enableDcqcn && interNodeBandwidthGbps > 0)
+            {
+                dcqcnMachine->SetAttribute(
+                    "MaxRateBps",
+                    DoubleValue(interNodeBandwidthGbps * 1.25e8));
+            }
+            // User overrides: only SetAttribute when the flag was given, so
+            // the default path keeps the TypeId defaults byte-identically.
+            if (dcqcnTFastNs > 0)
+            {
+                dcqcnMachine->SetAttribute("TFast", TimeValue(NanoSeconds(dcqcnTFastNs)));
+            }
+            if (dcqcnFastCycles > 0)
+            {
+                dcqcnMachine->SetAttribute("FastRecoveryMaxCycles",
+                                           UintegerValue(dcqcnFastCycles));
+            }
+            if (dcqcnTAiNs > 0)
+            {
+                dcqcnMachine->SetAttribute("TAi", TimeValue(NanoSeconds(dcqcnTAiNs)));
+            }
+            if (dcqcnRai > 0.0)
+            {
+                dcqcnMachine->SetAttribute("RAI", DoubleValue(dcqcnRai));
+            }
+            if (dcqcnGInit > 0.0)
+            {
+                dcqcnMachine->SetAttribute("GInit", DoubleValue(dcqcnGInit));
+            }
+            if (dcqcnGDecay > 0.0)
+            {
+                dcqcnMachine->SetAttribute("GDecay", DoubleValue(dcqcnGDecay));
+            }
+            if (dcqcnAlphaFloor != 0.0)
+            {
+                dcqcnMachine->SetAttribute("AlphaFloor", DoubleValue(dcqcnAlphaFloor));
             }
         }
 

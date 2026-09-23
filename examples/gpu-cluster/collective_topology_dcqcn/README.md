@@ -129,3 +129,52 @@ Findings (vs the hierarchical rows in `results.csv`):
 Gate: `python3 test/parity/test_ncclring.py` (run directly) pins
 2n x 8g leafspine allreduce 16 MiB at simTimeNs=444189 and
 ncclring < hierarchical on the same config.
+
+## DCQCN parameter sensitivity
+
+```bash
+python3 run_dcqcn_param_sweep.py     # 46 runs: 5x3x3 grid + dcqcn=0 baseline, host ncclring 256 MiB -> results_dcqcn_params.csv
+python3 run_dcqcn_rand_sweep.py      # 46 runs: same grid on randTraffic 4:1 leafspine -> results_dcqcn_rand.csv
+python3 plot_dcqcn_params.py         # -> dcqcn_params.{pdf,png}
+```
+
+The 7 rate-machine knobs are CLI-exposed (0 = TypeId default):
+`--dcqcnTFastNs/--dcqcnFastCycles/--dcqcnTAiNs/--dcqcnRai/--dcqcnGInit/--dcqcnGDecay/--dcqcnAlphaFloor`,
+plus `--ecnThreshold` on the switch side. Sweep axes: marking threshold
+{1,4,8,16,32} x GInit {0.25,0.5,0.75} x TFast {10,50,100 µs}.
+
+Findings — **the alpha parameters are outcome-neutral in this lossless
+model**, across both regimes:
+
+- **Collective regime** (host + ncclring 256 MiB, the only collective
+  scenario where ECN fires, ~32k marks): all 45 grid points AND the dcqcn=0
+  baseline complete at exactly 11702.3 µs — nanosecond-identical.
+  Structural cause: ncclring's flowId = 1 + channel·steps + step is
+  **one-shot** (each flow carries a single 2-3-packet burst dispatched
+  back-to-back), so the CNP round trip — ≥1 RTT plus the queue wait that
+  earned the mark — always returns after the flow has finished sending:
+  Alpha rises on dead keys. `--soTxWindow=64 --llrEnabled=1` (ACK-clocked
+  dispatch) is also invariant: each endpoint holds ≤8 in-flight chunks
+  (< the window) and each flow still sends only once.
+- **Sustained-flow regime** (randTraffic on 4:1-oversubscribed leafspine,
+  0.8 injection; the random-traffic flowId is the source rank, so Alpha CAN
+  throttle the flow's later messages, and CNP feedback does arrive):
+  delivered 5136–5171 Gbps across the extreme corners vs 5140.6 at
+  dcqcn=0 (±0.4 %). A soft per-chunk deferral (≤1× the chunk's
+  serialization time, rateFactor ≥ 0.5) is absorbed by lossless deep-VOQ
+  bottleneck queueing: it relocates the wait from the switch VOQ to the
+  sender, it does not reduce the bottleneck's served rate. Contrast: the
+  hard pacers DO move outcomes — RTTCC (`--rttcc`) pins 68664→73700 ns on
+  the incast scenario, and `--perQpCeilingGbps` caps sustained rate.
+- **What does respond is the marking threshold** — the switch-side knob:
+  ECN-marked packets fall −2 % (collective) / −11 % (randTraffic) over
+  threshold 1→32, and delivered CNPs fall 1052→496. Marking is live
+  whenever the So payload builder is mounted (it needs no `--dcqcn`), so
+  the counters are a congestion *signal*, not a control loop.
+
+Implication for calibration: GInit/TFast/TAi/RAI/GDecay cannot be tuned
+against any throughput or completion-time observable in the lossless
+fabric — the ECN→CNP→DCQCN chain is a counters-observable there. It would
+become outcome-relevant only under lossy/finite queues (the plain-ETH
+tail-drop path) or hard pacing, which is why the RoCE fabric here pairs
+DCQCN (soft) with the opt-in per-QP pacer when a rate cap is wanted.

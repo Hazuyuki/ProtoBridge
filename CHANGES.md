@@ -6,6 +6,32 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Added — DCQCN rate-machine parameter CLI + sensitivity sweep
+
+The 7 `DcqcnRateMachine` TypeId attributes are now CLI-exposed for
+parameter sweeps — `--dcqcnTFastNs/--dcqcnFastCycles/--dcqcnTAiNs/--dcqcnRai/--dcqcnGInit/--dcqcnGDecay/--dcqcnAlphaFloor`
+(0 = keep the TypeId default, so the default path stays byte-identical),
+and when `--dcqcn=1` the machine's `MaxRateBps` (the alpha shaping-delay
+rate anchor) is back-filled from `--interNodeBandwidth` (the TypeId
+default 50e9 B/s was only correct for 400G links; the backfill is inert
+until a CNP fires).
+
+The 92-run sensitivity sweep
+(`examples/gpu-cluster/collective_topology_dcqcn/run_dcqcn_param_sweep.py`
++ `run_dcqcn_rand_sweep.py`, 5×3×3 grid + dcqcn=0 baselines in two
+regimes) establishes that the alpha parameters are **outcome-neutral in
+the lossless model**: the collective regime (host ncclring 256 MiB) is
+nanosecond-identical across all 46 runs — ncclring's per-step one-shot
+flowIds mean the CNP round trip always returns after the flow finished
+sending, so Alpha rises on dead keys — and the sustained-flow regime
+(randTraffic on 4:1 leafspine, where Alpha can throttle later messages)
+moves delivered Gbps by only ±0.4 %: a soft per-chunk deferral (≤1×
+serialization) is absorbed by lossless deep-VOQ bottleneck queueing. Only
+the switch-side marking threshold responds (ECN marks −2 %/−11 % over
+threshold 1→32). The chain is a counters-observable, not a throughput
+lever; the hard pacers (`--rttcc`, `--perQpCeilingGbps`) are the ones that
+move outcomes.
+
 ### Added — real-NCCL global pipelined ring allreduce (`--algorithm=ncclring`)
 
 `NcclRingAllReduce` (`src/gpu-cluster/model/nccl-ring-allreduce.{h,cc}`)
