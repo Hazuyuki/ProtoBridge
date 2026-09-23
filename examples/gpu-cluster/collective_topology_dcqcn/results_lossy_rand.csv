@@ -1,0 +1,11 @@
+arm,voqDropThreshold,status,randDeliveredGbps,randOfferedGbps,switchVoqDrops,retransmittedPackets,ecnMarkedPackets,cnpPacketsSent,cnpPacketsReceived,permanentLosses
+lossless,0,complete,642.253,2559.181,0,0,4849,1195,277,0
+dcqcn0,8,complete,644.874,2559.181,4535,300475,1220,1200,150,0
+default,8,complete,644.874,2559.181,4537,300810,1219,1201,152,0
+ginit,8,complete,644.874,2559.181,4535,300469,1221,1201,150,0
+dcqcn0,16,complete,646.840,2559.181,4516,301990,1239,1203,146,0
+default,16,complete,646.840,2559.181,4515,301659,1240,1203,147,0
+ginit,16,complete,646.840,2559.181,4516,301963,1239,1203,146,0
+dcqcn0,64,complete,644.219,2559.181,4417,293331,1321,1198,166,0
+default,64,complete,644.219,2559.181,4421,293890,1317,1198,166,0
+ginit,64,complete,644.219,2559.181,4419,293529,1319,1198,166,0

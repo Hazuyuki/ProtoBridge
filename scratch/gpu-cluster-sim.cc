@@ -599,7 +599,7 @@ main(int argc, char* argv[])
     cmd.AddValue("interNodeFabricType", "Inter-node fabric type: RoCE/ETH/NVLink", interNodeFabricTypeStr);
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
     cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
-    cmd.AddValue("voqDropThreshold", "Plain-Ethernet lossy VOQ tail-drop threshold (pkts); 0=off. Must be < switchVoqDepth (default 10000)", voqDropThreshold);
+    cmd.AddValue("voqDropThreshold", "Lossy VOQ tail-drop threshold (pkts); 0=off. Plain ETH: always applied (default 8). RoCE: an EXPLICIT flag opts into the lossy/no-PFC regime (unset = lossless). Must be < switchVoqDepth (default 10000); keep > ecnThreshold for mark-before-drop", voqDropThreshold);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
     cmd.AddValue("dcqcnTFastNs", "DCQCN fast-recovery timer interval in ns (0=default 50000)", dcqcnTFastNs);
@@ -981,27 +981,47 @@ main(int argc, char* argv[])
 
         FabricType interNodeFabricType = FabricTypeFromString(interNodeFabricTypeStr);
 
+        // --voqDropThreshold's CLI default is 8 (the plain-ETH legacy "lossy
+        // by nature" default), so "nonzero" cannot distinguish "user opted
+        // in" from "unset": scan argv for an explicit --voqDropThreshold. Only
+        // an explicit threshold opts RoCE into the lossy-RoCE (no-PFC)
+        // regime; an unset threshold keeps RoCE lossless (ECN-only parity).
+        bool voqDropThresholdSet = false;
+        for (int i = 1; i < argc; ++i)
+        {
+            if (std::string(argv[i]).rfind("--voqDropThreshold", 0) == 0)
+            {
+                voqDropThresholdSet = true;
+            }
+        }
+        const bool lossyRoce = interNodeFabricType == FabricType::ROCE
+                                   && voqDropThresholdSet
+                                   && voqDropThreshold != 0;
+
         // Plain (non-RoCE) lossy Ethernet REQUIRES link-level retry: the
         // EthernetSwitch tail-drops at VoqDropThreshold and emits a NACK back
         // to the source (EmitNackBack), which the sender retransmits via the
         // LLR/SACK path (StorePacket -> HandleRetryRequest/HandleSackRequest).
         // Without LLR the drop is silent and the transfer stalls forever.
         // Force LLR on for the Ethernet path (a fabric precondition, like
-        // RoCE's ECN/PFC infra). BOTH the local llrEnabled var AND
-        // pbundle.llrEnabled must be set: ProtocolConfigRunner::ApplyBundle
-        // (below) re-applies pbundle.llrEnabled to every endpoint
-        // (protocol-config-runner.cc:53), so the bundle must carry true or it
-        // clobbers this force after the endpoint loop sets m_llrEnabled.
-        if (interNodeFabricType == FabricType::ETHERNET)
+        // RoCE's ECN/PFC infra) -- and for lossy RoCE, which relies on the
+        // same NACK->LLR retransmit path once tail-drop fires. BOTH the
+        // local llrEnabled var AND pbundle.llrEnabled must be set:
+        // ProtocolConfigRunner::ApplyBundle (below) re-applies
+        // pbundle.llrEnabled to every endpoint (protocol-config-runner.cc:53),
+        // so the bundle must carry true or it clobbers this force after the
+        // endpoint loop sets m_llrEnabled.
+        if (interNodeFabricType == FabricType::ETHERNET || lossyRoce)
         {
             const bool wasLlr = llrEnabled;
             llrEnabled = true;
             pbundle.llrEnabled = true;
             if (!wasLlr)
             {
-                std::cerr << "Note: --interNodeFabricType=ETH is lossy (VOQ "
-                             "tail-drop) and requires LLR retransmission; "
-                             "forcing llrEnabled=1.\n";
+                std::cerr << "Note: the So fabric is lossy (VOQ tail-drop at "
+                             "threshold " << voqDropThreshold
+                             << ") and requires LLR retransmission; forcing "
+                             "llrEnabled=1.\n";
             }
         }
 
@@ -1054,6 +1074,47 @@ main(int argc, char* argv[])
             // on enqueue; the CNP+DCQCN reaction is gated by --dcqcn.
             Config::SetDefault("ns3::EthernetSwitch::EcnThreshold",
                                UintegerValue(ecnThreshold));
+            // Lossy RoCE (no-PFC) opt-in: an explicit --voqDropThreshold=N
+            // (N>0) arms the VOQ tail-drop + NACK->LLR retransmit path
+            // alongside ECN marking (mark at ecnThreshold, drop at
+            // voqDropThreshold; keep ecnThreshold < voqDropThreshold for
+            // mark-before-drop, the real RoCEv2 ordering). Without the
+            // explicit flag the switch's VoqDropThreshold stays at its
+            // lossless default (0) and RoCE keeps byte-identical parity.
+            if (lossyRoce)
+            {
+                NS_ABORT_MSG_IF(
+                    voqDropThreshold >= switchVoqDepth,
+                    "voqDropThreshold (" << voqDropThreshold
+                    << ") must be < switchVoqDepth (" << switchVoqDepth
+                    << ") or 0=off, else the base hard-cap drop fires before "
+                    << "the NACK path and the lossy transfer silently stalls.");
+                Config::SetDefault("ns3::EthernetSwitch::VoqDropThreshold",
+                                   UintegerValue(voqDropThreshold));
+                // The So switch's m_llrEnabled must be true or EmitNackBack
+                // (nvswitch.cc) returns early -- the lossy drop stays silent
+                // and the transfer stalls. The endpoint-side LLR force above
+                // arms the sender; this arms the NACK-originating switch.
+                multiTopo.SetInterNodeSwitchLlrEnabled(true);
+                // The lossy-NACK path lives in EthernetSwitch::OnPacketEnqueue
+                // and only engages when the inter-node topology instantiates a
+                // switch (host / tor / rail / leafspine). fullmesh / ring and
+                // friends build direct P2P links with no switch -- a drop
+                // there is silent. Warn (not abort): a non-incast P2P run on
+                // those topologies is still valid, only the lossy-retransmit
+                // behaviour is unavailable.
+                if (interNodeTopology == "fullmesh" || interNodeTopology == "ring" ||
+                    interNodeTopology == "torus2d" || interNodeTopology == "dragonfly")
+                {
+                    std::cerr << "Warning: --voqDropThreshold=" << voqDropThreshold
+                              << " with --interNodeTopology=" << interNodeTopology
+                              << " has no switch in the inter-node path, so the "
+                                 "lossy VOQ tail-drop + NACK retransmit path is "
+                                 "INERT. Use --interNodeTopology=host, tor, "
+                                 "rail, or leafspine to exercise the lossy "
+                                 "RoCE fabric.\n";
+                }
+            }
         }
         else if (interNodeFabricType == FabricType::ETHERNET)
         {

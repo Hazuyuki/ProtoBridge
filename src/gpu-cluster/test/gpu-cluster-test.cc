@@ -4060,12 +4060,14 @@ class EthernetSwitchDropTest : public TestCase
 {
   public:
     EthernetSwitchDropTest()
-        : TestCase("EthernetSwitch lossy VOQ tail-drop on plain Ethernet") {}
+        : TestCase("EthernetSwitch lossy VOQ tail-drop (plain Ethernet + "
+                   "lossy-RoCE opt-in)") {}
     void DoRun() override
     {
         Ptr<EthernetSwitch> sw = CreateObject<EthernetSwitch>();
-        // Small deterministic threshold; EcnThreshold stays at default 8 so the
-        // RoCE lossless path is exercised below at depth 10 without interference.
+        // Small deterministic threshold; EcnThreshold stays at default 8. The
+        // at-threshold drop (2) and the lossy-RoCE drop (3) both fire before
+        // ECN marking is consulted.
         sw->SetAttribute("VoqDropThreshold", UintegerValue(4));
 
         // Plain-Ethernet DATA = [FabricHeader(DATA, ETHERNET, proto=0)][payload].
@@ -4092,10 +4094,13 @@ class EthernetSwitchDropTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(deep, 0, 1, 4), false,
                               "at-threshold Ethernet DATA must be tail-dropped (lossy)");
 
-        // (3) RoCE DATA at deep queue (depth 10): NOT dropped -- RoCE is
-        // lossless, falls through to the ECN path (returns true). Guards the
-        // regression where the lossy drop would clobber RoCE traffic sharing
-        // the EthernetSwitch subtype.
+        // (3) RoCE DATA at deep queue (depth 10): tail-dropped too -- a
+        // nonzero VoqDropThreshold opts RoCE into the lossy-RoCE (no-PFC)
+        // regime where tail-drop + NACK->LLR retransmit coexists with ECN
+        // marking (mark-before-drop: ecnThreshold 8 < drop threshold 4 here is
+        // inverted, but the drop decision is what this unit pins). Guards the
+        // opt-in: the scratch RoCE path leaves the threshold at its lossless
+        // default (0) unless the user passes --voqDropThreshold explicitly.
         Ptr<Packet> roce = Create<Packet>(64);
         SoHeader soh;
         soh.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
@@ -4107,8 +4112,9 @@ class EthernetSwitchDropTest : public TestCase
         rfh.SetFabricType(FabricType::ROCE);
         rfh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
         roce->AddHeader(rfh);
-        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(roce, 0, 1, 10), true,
-                              "RoCE DATA must NOT be tail-dropped (lossless ECN path)");
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(roce, 0, 1, 10), false,
+                              "RoCE DATA must be tail-dropped when "
+                              "VoqDropThreshold opts into lossy RoCE");
 
         // (4) CREDIT control packet at deep queue: bypass (return true) --
         // dropping control feedback would deadlock the credit loop, matching
@@ -4121,14 +4127,29 @@ class EthernetSwitchDropTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(ctrl, 0, 1, 10), true,
                               "CREDIT control packet must bypass the lossy drop");
 
-        // (5) VoqDropThreshold=0 = lossless (disabled): an Ethernet DATA packet
-        // at a deep queue is admitted (return true). Guards the documented
-        // "0=off" semantics -- without the early-return guard, voqDepth >= 0
-        // would tail-drop every packet (a total-stall foot-gun).
+        // (5) VoqDropThreshold=0 = lossless (disabled): both an Ethernet and a
+        // RoCE DATA packet at a deep queue are admitted (return true). Guards
+        // the documented "0=off" semantics -- without the early-return guard,
+        // voqDepth >= 0 would tail-drop every packet (a total-stall foot-gun)
+        // -- and the RoCE lossless default that keeps the scratch RoCE path
+        // byte-identical unless the user opts in.
         sw->SetAttribute("VoqDropThreshold", UintegerValue(0));
         Ptr<Packet> disabled = makeEthData();
         NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(disabled, 0, 1, 10), true,
                               "VoqDropThreshold=0 (lossless) must admit Ethernet DATA");
+        Ptr<Packet> roceLossless = Create<Packet>(64);
+        SoHeader soh0;
+        soh0.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        soh0.SetEcn(false);
+        soh0.SetDataSize(64);
+        roceLossless->AddHeader(soh0);
+        FabricHeader rfh0;
+        rfh0.SetPacketType(FabricPacketType::DATA);
+        rfh0.SetFabricType(FabricType::ROCE);
+        rfh0.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        roceLossless->AddHeader(rfh0);
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(roceLossless, 0, 1, 10), true,
+                              "VoqDropThreshold=0 (lossless) must admit RoCE DATA");
     }
 };
 

@@ -32,12 +32,15 @@ EthernetSwitch::GetTypeId()
                                           MakeUintegerAccessor(&EthernetSwitch::m_ecnThreshold),
                                           MakeUintegerChecker<uint32_t>(0))
             .AddAttribute("VoqDropThreshold",
-                          "VOQ depth (packets) at which a plain-Ethernet data "
-                          "packet is tail-dropped with a NACK to the source "
-                          "(lossy fabric). Must be < NvSwitch::VoqDepth, else "
+                          "VOQ depth (packets) at which a data packet is "
+                          "tail-dropped with a NACK to the source (lossy "
+                          "fabric). Must be < NvSwitch::VoqDepth, else "
                           "the base hard-cap drop preempts the NACK path. "
-                          "Ignored for RoCE packets (lossless ECN path).",
-                          UintegerValue(8),
+                          "Plain-Ethernet and RoCE packets alike: 0 = "
+                          "lossless (RoCE falls through to ECN marking), "
+                          "> 0 opts the fabric into the lossy/no-PFC "
+                          "regime with LLR retransmit.",
+                          UintegerValue(0),
                           MakeUintegerAccessor(&EthernetSwitch::m_voqDropThreshold),
                           MakeUintegerChecker<uint32_t>(0));
     return tid;
@@ -45,7 +48,7 @@ EthernetSwitch::GetTypeId()
 
 EthernetSwitch::EthernetSwitch()
     : m_ecnThreshold(8),
-      m_voqDropThreshold(8)
+      m_voqDropThreshold(0)
 {
 }
 
@@ -67,14 +70,16 @@ EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
     FabricHeader fh;
     packet->PeekHeader(fh);
 
-    // Lossy drop: a plain-Ethernet (non-RoCE) DATA packet that meets the VOQ
-    // drop threshold is tail-dropped with a NACK back to the source, so the
-    // sender retransmits via the existing LLR/SACK path. Control and retry
-    // packets bypass (matching the BER bypass) -- dropping them would
-    // deadlock the credit/feedback loop. RoCE packets fall through to the
-    // lossless ECN path below.
+    // Lossy drop: a DATA packet (plain-Ethernet, or RoCE when
+    // --voqDropThreshold > 0 opts into the lossy-RoCE/no-PFC regime) that
+    // meets the VOQ drop threshold is tail-dropped with a NACK back to the
+    // source, so the sender retransmits via the existing LLR/SACK path.
+    // Control and retry packets bypass (matching the BER bypass) -- dropping
+    // them would deadlock the credit/feedback loop. Default threshold 0
+    // keeps BOTH fabrics lossless (RoCE falls through to ECN below).
     if (!fh.IsControlPacket() && !fh.IsRetryPacket()
-        && fh.GetFabricType() == FabricType::ETHERNET)
+        && (fh.GetFabricType() == FabricType::ETHERNET
+            || (fh.GetFabricType() == FabricType::ROCE && m_voqDropThreshold > 0)))
     {
         // 0 = lossless (disable the lossy drop): the documented "0=off".
         // Without this guard `voqDepth >= 0` is always true and every
@@ -89,7 +94,12 @@ EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
             EmitNackBack(fh, inPort, fh.GetSourceMac());
             return false; // drop: caller skips the push + counts m_voqDrops
         }
-        return true; // admit; plain Ethernet carries no SoHeader to ECN-mark
+        if (fh.GetFabricType() == FabricType::ETHERNET)
+        {
+            return true; // admit; plain Ethernet carries no SoHeader to ECN-mark
+        }
+        // Lossy RoCE: fall through to ECN marking (ecnThreshold < drop
+        // threshold gives mark-before-drop, the real RoCEv2 ordering).
     }
 
     // RoCE lossless path: mark the inner SoHeader ECN bit when congested.

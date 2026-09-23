@@ -178,3 +178,46 @@ fabric — the ECN→CNP→DCQCN chain is a counters-observable there. It would
 become outcome-relevant only under lossy/finite queues (the plain-ETH
 tail-drop path) or hard pacing, which is why the RoCE fabric here pairs
 DCQCN (soft) with the opt-in per-QP pacer when a rate cap is wanted.
+
+## Lossy-RoCE DCQCN sensitivity (where the knobs finally bite)
+
+```bash
+python3 run_lossy_roce_sweep.py   # 47 runs: lossy-RoCE OAT + loss-severity, hier AR 2n×8g -> results_lossy_roce.csv
+python3 run_lossy_rand_sweep.py   # 10 runs: same lossy regime on saturated randTraffic -> results_lossy_rand.csv
+python3 plot_lossy_roce.py        # -> lossy_roce_dcqcn.{pdf,png}
+```
+
+The lossless sweeps above left the alpha knobs outcome-neutral. Opting the
+RoCE fabric into the lossy (no-PFC) regime — an **explicit**
+`--voqDropThreshold=N` (N>0; the switch default is 0 = lossless, and the
+scratch CLI default 8 only applies to plain Ethernet) with
+`--ecnThreshold < N` for mark-before-drop — gives the chain a real job:
+keep the VOQ below the drop threshold, because each tail-drop costs a
+NACK→LLR retransmission stall. LLR is force-enabled with the opt-in.
+
+Findings (2n×8g hierarchical allreduce 256 MiB, drop=8, ecn=4):
+
+- **Drops are expensive for completion time**: lossless 15.25 ms → lossy
+  no-CC 20.20 ms (+32 %, 816 drops / 892 retransmissions). Default DCQCN
+  recovers to 18.35 ms (37 % of the excess); the best corner
+  (GDecay=0.125) reaches 17.93 ms (46 %).
+- **The step-size knobs bite**: one-at-a-time swings vs the default run —
+  GInit 7.9 % (U-shaped: 0.0625 under-backs-off → 19.44 ms; 0.125–0.25
+  → 18.01 ms; 0.5–1.0 → 18.35 ms), GDecay 8.4 % (0.125 best, 1.0 →
+  19.44 ms), AlphaFloor 6.4 % (0.25 best). The recovery timers are flat:
+  TFast 0 %, FastCycles 0 %, TAi ≤1.8 %, RAI ≤7.9 % only at 0.1.
+- **The benefit is threshold-severity-gated**: at drop=16 the 344 drops
+  cost 0.4 % and all CC arms are identical; at drop=32 nothing drops. The
+  GBN retransmission amplification is what turns a deep-drop regime into
+  a +32 % completion tax.
+- **Saturation contrast** (randTraffic 4:1 leafspine, same lossy regime):
+  delivered 644–647 Gbps vs 642 lossless (±0.7 %) with ~4.4 k drops and
+  ~300 k retransmissions per run — a saturated bottleneck serves
+  retransmissions instead of new data at the same rate, so goodput is
+  drop-free while completion time is not. DCQCN choice is irrelevant
+  under saturation; it matters exactly where a collective's completion
+  deadline is the metric.
+- Part of the dcqcn=1 delta is framing, not CC: `--dcqcn` also mounts the
+  RoCE SoHeader payload builder (+10 B/packet), which shifts timing even
+  with zero CNPs (21.15 → 19.01 ms at ecn=8=drop). The alpha-path
+  contribution is measured with marks live (ecn=4 < drop=8).
