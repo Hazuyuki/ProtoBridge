@@ -221,3 +221,32 @@ Findings (2n×8g hierarchical allreduce 256 MiB, drop=8, ecn=4):
   RoCE SoHeader payload builder (+10 B/packet), which shifts timing even
   with zero CNPs (21.15 → 19.01 ms at ecn=8=drop). The alpha-path
   contribution is measured with marks live (ecn=4 < drop=8).
+
+### Same-form grid sweep (the lossless figure's layout, lossy data)
+
+```bash
+python3 run_lossy_roce_grid.py   # 47 runs: 5(ecn) x 3(GInit) x 3(TFast) grid + dcqcn0/lossless refs, drop=8 -> results_lossy_grid.csv
+python3 plot_lossy_roce_grid.py  # -> lossy_roce_grid.{pdf,png}
+```
+
+The lossless figure (`dcqcn_params.png`) had 45 uniform heatmap cells
+(11702.3 µs everywhere). The same 3x3 layout under the lossy opt-in
+(ecn thresholds clipped to {1,2,4,6,8} — mark-before-drop requires
+ecn <= drop=8; GInit around the OAT optimum) actually varies:
+
+- **Early marks win**: best cells sit at thr 1–2 (best 16675.5 µs at
+  ecn=2 — recovers **71 %** of the drop tax); thr 4 matches the OAT
+  defaults (18.0–18.3 ms).
+- **Late marks backfire**: thr 6 (marks at depth 6–7, just before the
+  drop) is the WORST column (~19.3 ms mean) — worse than thr 8 (no
+  marks possible, 18.9 ms, pure framing). The CNP round trip from a
+  depth-6 mark arrives after the incast burst already reshaped the
+  queue: the backoff lands on the recovery phase and throttles the
+  retransmissions themselves.
+- **TFast is live only at early thresholds** (OAT at thr 4 showed 0 %):
+  within a (ecn=2, GInit=0.5) column the three TFast columns span
+  16675→18560 µs (~11 %); at thr ≥ 4 the columns are identical.
+- Retransmission heatmaps (row 2) separate the regimes: no-CC 892,
+  thr=8 978 (framing only), marked cells 1040–1228 — more marks, more
+  retransmissions, LESS completion time (shaping trades cheap deferral
+  for expensive drop stalls).
