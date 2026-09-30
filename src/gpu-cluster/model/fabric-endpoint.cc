@@ -234,7 +234,8 @@ FabricEndpoint::Initialize()
     // Initialize credit manager for VCs not already initialized
     for (uint8_t vc = 0; vc < m_numVcs; ++vc)
     {
-        if (m_creditManager->GetAvailableCredits(vc) == 0)
+        if (m_creditManager->GetAvailableCredits(vc) == 0
+            && m_configuredVcs.find(vc) == m_configuredVcs.end())
         {
             m_creditManager->InitializeVc(vc, 64);
         }
@@ -273,9 +274,12 @@ FabricEndpoint::StartApplication()
     }
 
     // Only initialize VCs that weren't already initialized via SetVcCredits
+    // (m_configuredVcs exemption: an exhausted-but-configured window must
+    // NOT be reset to the 64-credit default here — see SetVcCredits).
     for (uint8_t vc = 0; vc < m_numVcs; ++vc)
     {
-        if (m_creditManager->GetAvailableCredits(vc) == 0)
+        if (m_creditManager->GetAvailableCredits(vc) == 0
+            && m_configuredVcs.find(vc) == m_configuredVcs.end())
         {
             m_creditManager->InitializeVc(vc, 64);
         }
@@ -628,6 +632,14 @@ void
 FabricEndpoint::SetVcCredits(uint8_t vcId, uint32_t credits)
 {
     m_creditManager->InitializeVc(vcId, credits);
+    // Mark the VC as explicitly configured so the lazy default init in
+    // Initialize()/StartApplication() cannot clobber a legitimately
+    // exhausted window back to 64 credits (a window fully consumed before
+    // StartApplication runs is a working sliding window, not an unset VC).
+    if (credits > 0)
+    {
+        m_configuredVcs.insert(vcId);
+    }
 }
 
 void

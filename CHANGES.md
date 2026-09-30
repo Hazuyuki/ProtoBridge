@@ -6,6 +6,48 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — `StartApplication`/`Initialize` clobbered exhausted credit windows
+
+`FabricEndpoint::Initialize()` and `StartApplication()` lazily re-initialize
+any VC whose available credit count is zero to the 64-credit default — they
+cannot distinguish "never configured" from "configured and already
+exhausted". Application-start events are scheduled by `Node::DoInitialize`
+at `Simulator::Run` time with higher event uids than t=0 sends scheduled
+earlier in `main`, so a bare t=0 send can consume the whole configured
+window before `StartApplication` resets it back to 64 — silently
+unsqueezing any experiment that drives sends without injector startup
+delays. `SetVcCredits(credits>0)` now records the VC in a new
+`m_configuredVcs` set, and both lazy-init sites skip configured VCs.
+Parity-neutral: the allreduce credit-BDP experiment (injector startup
+delays push first sends after `StartApplication`) is unaffected — su pin
+4769616 bit-identical and the full parity battery unchanged.
+
+### Added — credit-BDP pattern sweep (p2p / incast / fanout / alltoall)
+
+`examples/gpu-cluster/credit_bdp_sweep/run_credit_patterns.py` extends the
+credit-BDP experiment beyond allreduce to four traffic shapes on the same
+8-GPU Su fabric (per-flow volume 256 MiB; alltoall passes 8× so each pair
+carries 256 MiB): p2p (1 flow), incast (7→1), fanout (1→7), and alltoall
+(56 flows), each swept over 5 bandwidths × 5 latencies × 6 windows on both
+the ring and the switched fabric (1200 runs). Findings (800 G, 200 µs):
+
+- **Switched** (every pair 2 hops — the clean window-sharing result):
+  p2p follows the per-flow BDP law; incast ≈ p2p (independent per-sender
+  windows, receiver ingress adds only ~2%); fanout and alltoall share ONE
+  per-endpoint window across their flows (a single VC), so the sender
+  serializes all 224 chunks through W — 7.08×/7.10× p2p at W=1, and
+  recovering p2p-level utilization needs ~W × flow-count credits, not W.
+  At W=1 alltoall ≡ fanout (217.1 vs 216.5 ms): the shared window
+  dominates; they diverge only at large W where alltoall's 56 concurrent
+  flows contend network-wide (T_∞ 35.5 vs 19.3 ms).
+- **Ring** (the scratch default): the credit RTT is additionally
+  **hop-distance dependent** — rank0→rank_k costs min(k, N−k) hops each
+  way, and NS_LOG traces show per-chunk credit RTTs of k·(ser + 2·lat).
+  p2p (adjacent ranks) is a direct 1-hop link; fanout pays the hop sum
+  (224 chunks × hop-distance sum 16 × 483.886 ns = 247.7 ms, matching the
+  observed 247.55 ms to 0.1%); incast is gated by the farthest sender
+  (rank 4, 4 hops).
+
 ### Fixed — single-node local-rank range (credit gate) in the 11 point-to-point topology builds
 
 The 11 single-node builds in `gpu-cluster-helper.cc` that call `SetRank`

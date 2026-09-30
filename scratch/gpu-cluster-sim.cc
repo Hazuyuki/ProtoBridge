@@ -74,6 +74,48 @@ NS_LOG_COMPONENT_DEFINE("GpuClusterSim");
 static uint64_t g_durationNs = 0;
 static bool g_collectiveCompleted = false;
 
+// ---------------------------------------------------------------------------
+// Wire-transfer patterns (p2p / fanout / incast): bare point-to-point bulk
+// transfers on the SAME credit-gated bulk path (SendBulkWireTransferSize)
+// the collectives use — the credit-BDP experiment's non-collective arms.
+// Unlike the collective injectors there is no NCCL startup (bare-transfer
+// semantics, p2p-single.cfg precedent): completion = last chunk delivered.
+// Patterns (root = --rootRank, default 0):
+//   p2p     : one flow      root -> (root+1)%N
+//   fanout  : N-1 flows     root -> every other rank       (1-to-many)
+//   incast  : N-1 flows     every other rank -> root       (many-to-1)
+// ---------------------------------------------------------------------------
+static uint64_t g_patternExpectedBytes = 0;
+static uint64_t g_patternReceivedBytes = 0;
+static uint64_t g_patternStartNs = 0;
+
+void OnCollectiveComplete(uint64_t durationNs);  // defined below
+
+static void
+PatternReceive(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
+{
+    (void)srcRank;
+    // Control-plane packets (CREDIT/ACK/NACK) do not advance a transfer, and
+    // permanently lost data cannot complete a delivery (mirrors the
+    // collective injectors; only reachable at ber>0 / lossy fabrics, which
+    // these lossless experiments do not use).
+    if (header.GetPacketType() != FabricPacketType::DATA)
+    {
+        return;
+    }
+    uint64_t bytes = header.GetEffectiveDataSize();
+    if (bytes == 0)
+    {
+        bytes = packet->GetSize();
+    }
+    g_patternReceivedBytes += bytes;
+    if (g_patternExpectedBytes > 0
+        && g_patternReceivedBytes >= g_patternExpectedBytes)
+    {
+        OnCollectiveComplete(Simulator::Now().GetNanoSeconds() - g_patternStartNs);
+    }
+}
+
 // Adaptive algorithm selection (NCCL-like): pick the collective algorithm
 // from (topology, message size, N). Small/latency-bound messages favor tree
 // (2*log2(N) steps); large/bandwidth-bound favor ring (2*(N-1) pipelined);
@@ -379,7 +421,7 @@ main(int argc, char* argv[])
 
     CommandLine cmd;
     cmd.AddValue("topology", "Topology: ring/fullmesh/switched/fattree/railfattree/leafspine/nvl72/torus/mesh/hypercube/2dfullmesh/ndfullmesh/2dfullmeshclos", topology);
-    cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce", collective);
+    cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce/p2p/fanout/incast", collective);
     cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain/hierarchical/ncclring", algorithm);
     cmd.AddValue("protocolModel", "Protocol model type: ns3::NcclProtocolModel/ns3::UbProtocolModel/ns3::McclProtocolModel", protocolModelType);
     cmd.AddValue("protocolWireEfficiency", "Protocol payload bytes divided by transmitted bytes", protocolWireEfficiency);
@@ -801,9 +843,9 @@ main(int argc, char* argv[])
     if (collective != "allreduce" && collective != "alltoall" &&
         collective != "allgather" && collective != "reducescatter" &&
         collective != "broadcast" && collective != "reduce" &&
-        collective != "p2p")
+        collective != "p2p" && collective != "fanout" && collective != "incast")
     {
-        NS_ABORT_MSG("Unknown collective: " << collective << ". Supported: allreduce, alltoall, allgather, reducescatter, broadcast, reduce, p2p");
+        NS_ABORT_MSG("Unknown collective: " << collective << ". Supported: allreduce, alltoall, allgather, reducescatter, broadcast, reduce, p2p, fanout, incast");
     }
 
     if (verbose)
@@ -2453,6 +2495,58 @@ main(int argc, char* argv[])
         rd->SetRootRank(rootRank);
         rd->Start();
         injector = rd;
+    }
+
+    else if (collective == "p2p" || collective == "fanout" || collective == "incast")
+    {
+        // Bare wire-transfer patterns on the credit-gated bulk path (see
+        // PatternReceive above). One SendBulkWireTransferSize per flow; the
+        // wire protocol is picked from the per-flow size exactly as the ring
+        // injectors do (SIMPLE at bulk sizes).
+        Ptr<ProtocolModel> protoModel = endpoints[0]->GetProtocolModel();
+        uint8_t protocolId = static_cast<uint8_t>(
+            protoModel->GetProtocolId(dataSize));
+        std::vector<std::pair<uint16_t, uint16_t>> flows;
+        if (collective == "p2p")
+        {
+            flows.emplace_back(rootRank, (rootRank + 1) % numGpus);
+        }
+        else
+        {
+            for (uint32_t r = 0; r < numGpus; ++r)
+            {
+                if (r == rootRank)
+                {
+                    continue;
+                }
+                if (collective == "fanout")
+                {
+                    flows.emplace_back(rootRank, static_cast<uint16_t>(r));
+                }
+                else  // incast
+                {
+                    flows.emplace_back(static_cast<uint16_t>(r), rootRank);
+                }
+            }
+        }
+        g_patternExpectedBytes = static_cast<uint64_t>(flows.size()) * dataSize;
+        g_patternReceivedBytes = 0;
+        g_patternStartNs = Simulator::Now().GetNanoSeconds();
+        for (auto& ep : endpoints)
+        {
+            ep->SetReceiveCallback(MakeCallback(&PatternReceive));
+        }
+        for (uint16_t i = 0; i < flows.size(); ++i)
+        {
+            Simulator::Schedule(NanoSeconds(0),
+                                [src = flows[i].first, dst = flows[i].second,
+                                 endpoints, dataSize, protocolId, i]()
+                                {
+                                    endpoints[src]->SendBulkWireTransferSize(
+                                        dst, dataSize,
+                                        protocolId, static_cast<uint16_t>(i + 1), 0);
+                                });
+        }
     }
 
     // Background P2P interferer: a self-driven P2pTraffic flow that shares the

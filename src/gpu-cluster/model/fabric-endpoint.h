@@ -614,6 +614,7 @@ class FabricEndpoint : public Application
 
     // Flow control
     Ptr<CreditManager> m_creditManager;             ///< Credit manager
+    std::set<uint8_t> m_configuredVcs;              ///< VCs whose credits were set explicitly (SetVcCredits, credits>0) — exempt from the lazy 64-credit default init
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
     Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
     Ptr<RttccRateMachine> m_rttccRate{nullptr}; ///< RTTCC rate machine (So-only; null=dormant)
