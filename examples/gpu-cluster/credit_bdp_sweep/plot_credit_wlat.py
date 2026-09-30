@@ -11,9 +11,11 @@ BW_GBPS (default 800 G).
             does each pattern need at this latency to reach full
             utilization": the curves rise to 1.0 and the required W shifts
             right ~linearly with latency (the credit RTT).
-  Row 3:    (a/b) utilization at W=24 vs latency per pattern (switched /
-            ring) -- the large-window ceiling each pattern can reach as
-            latency grows; (c) key numbers.
+  Row 3:    (a/b) utilization at W=CEIL_W (default 4) vs latency per
+            pattern (switched / ring) -- at a small window every pattern
+            is window-bound and latency-responsive (CEIL_W=24 restores
+            the "can it reach 1.0 at all" ceiling view); (c) key numbers;
+            (d) min W for >=95% utilization.
 
 Latency is an ordered magnitude, so the line series uses a sequential
 single-hue ramp (light -> dark = 0.5 -> 200 us) with distinct markers, not
@@ -31,6 +33,12 @@ import matplotlib.pyplot as plt
 HERE = Path(__file__).resolve().parent
 
 BW_GBPS = int(os.environ.get("BW_GBPS", "800"))
+# Window shown in the bottom-row cross-pattern panels. Small (4) by default:
+# at W=24 three of the four patterns are already saturated flat at 1.000 on
+# the switched fabric, so only the capped curve moves -- at a small W every
+# curve is window-bound and latency-responsive. Set CEIL_W=24 for the
+# "can this pattern reach 1.0 at all" ceiling view.
+CEIL_W = int(os.environ.get("CEIL_W", "4"))
 BANDWIDTHS = [100, 200, 400, 800, 1600]
 LATENCIES_US = [0.5, 10, 50, 100, 200]
 CREDITS = [1, 2, 4, 8, 24]
@@ -69,6 +77,8 @@ def util(by_key, pattern, topo, bw, lat, w):
 def main():
     if BW_GBPS not in BANDWIDTHS:
         raise SystemExit(f"BW_GBPS must be one of {BANDWIDTHS}, got {BW_GBPS}")
+    if CEIL_W not in CREDITS:
+        raise SystemExit(f"CEIL_W must be one of {CREDITS}, got {CEIL_W}")
     by_key = load()
     fig, axes = plt.subplots(3, 4, figsize=(18, 11), constrained_layout=True)
 
@@ -110,7 +120,7 @@ def main():
         for c, pat in zip(P_COLORS, PATTERNS):
             xs, ys = [], []
             for lat in LATENCIES_US:
-                u = util(by_key, pat, topo, BW_GBPS, lat * 1000, 24)
+                u = util(by_key, pat, topo, BW_GBPS, lat * 1000, CEIL_W)
                 if u is not None:
                     xs.append(lat)
                     ys.append(u)
@@ -119,22 +129,22 @@ def main():
         ax.set_xscale("log")
         ax.set_ylim(0, 1.05)
         ax.set_xlabel("one-way latency (µs, log)")
-        ax.set_ylabel("utilization (W = 24)")
-        ax.set_title(f"W=24, {BW_GBPS} G, {topo}: the large-window ceiling\n"
-                     "vs latency — alltoall (switched) / fanout (ring) stay"
-                     " window-bound", fontsize=10)
+        ax.set_ylabel(f"utilization (W = {CEIL_W})")
+        ax.set_title(f"W={CEIL_W}, {BW_GBPS} G, {topo}: window-bound at a\n"
+                     "small window — every pattern now moves with latency",
+                     fontsize=10)
         ax.grid(True, alpha=0.3, which="both")
         ax.legend(fontsize=8)
 
     # Row 3 (c): key numbers.
     ax = axes[2][2]
     ax.axis("off")
-    lines = [f"Utilization at {BW_GBPS} G, W = 24\n", "lat (µs):      "
+    lines = [f"Utilization at {BW_GBPS} G, W = {CEIL_W}\n", "lat (µs):      "
              "  0.5     10      50     100     200"]
     for topo in TOPOS:
         lines.append(f"--- {topo} ---")
         for pat in PATTERNS:
-            us = [util(by_key, pat, topo, BW_GBPS, lat * 1000, 24) or float("nan")
+            us = [util(by_key, pat, topo, BW_GBPS, lat * 1000, CEIL_W) or float("nan")
                   for lat in LATENCIES_US]
             lines.append(f"{PATTERN_LABEL[pat]:26s} " +
                          "".join(f"{u:7.3f}" for u in us))
@@ -143,10 +153,11 @@ def main():
         "Reading rows 1-2: the W needed for full",
         "utilization shifts right ~linearly with",
         "latency (credit RTT = hops·(ser+2·lat));",
-        "fanout/alltoall need ~W×flow-count",
-        "credits (shared 1-VC window), so even W=24",
-        "stays window-bound at 200 µs — the shared",
-        "window, not the link, is the bottleneck.",
+        "fanout/alltoall need ~W×flow-count credits",
+        "(shared 1-VC window) — the window, not the",
+        "link, is the bottleneck; at W=24 only",
+        "alltoall (switched) / fanout (ring) remain",
+        "capped (CEIL_W=24 for that ceiling view).",
     ]
     ax.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=9,
             family="monospace")
