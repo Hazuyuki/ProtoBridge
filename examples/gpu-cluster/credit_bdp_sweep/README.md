@@ -116,6 +116,23 @@ k·(ser + 2·lat) (chunks to rank 1/2/3 return at 1/2/3 × 483.886 µs). p2p
 observed 247.55 ms to 0.1%. incast is gated by the farthest sender
 (rank4, 4 hops: 32 × 4 × 483.886 = 61.9 ms observed 61.1 ms).
 
+**Fixed-bandwidth view** (`plot_credit_wlat.py` → `credit_patterns.{pdf,png}`
+figure `credit_patterns_wlat.{pdf,png}`, default 800 G, override with
+`BW_GBPS=1600 python3 plot_credit_wlat.py`): utilization vs W with one line
+per one-way latency. Reading it:
+
+- The W needed for full utilization shifts right ~linearly with latency —
+  the credit RTT is the horizontal asymptote of every curve.
+- incast is the cheapest (7 independent windows: W=2 holds 1.000 even at
+  200 µs); p2p next; fanout needs ~W×7 (W=24 just reaches 1.000 at 200 µs
+  on switched); alltoall never gets there (0.711 → 0.613 as latency rises
+  0.5 → 200 µs at W=24 — its 56 concurrent flows make even the
+  large-window ceiling latency-bound).
+- On the ring the roles swap at the ceiling: fanout is the capped one
+  (W=24 = 0.64 flat — the hop sum makes each credit worth less), while
+  alltoall nearly recovers (0.987 at 200 µs) because every rank's own
+  window sees an average 2-hop distance, not rank0's worst case.
+
 ## Files
 
 | File | What |
@@ -127,8 +144,10 @@ observed 247.55 ms to 0.1%. incast is gated by the farthest sender
 | `credit_bdp.{pdf,png}` | the figure |
 | `run_credit_patterns.py` | 1200-run pattern sweep (4 patterns × 2 topologies × 5 bw × 5 lat × 6 windows), writes `results_credit_patterns.csv` |
 | `plot_credit_patterns.py` | 12-panel pattern figure from the CSV |
+| `plot_credit_wlat.py` | fixed-bandwidth companion figure: utilization vs W, one line per latency (+ min-W-for-95% panel); `BW_GBPS` env overrides |
 | `results_credit_patterns.csv` | pattern sweep results (the table view) |
 | `credit_patterns.{pdf,png}` | the pattern figure |
+| `credit_patterns_wlat.{pdf,png}` | the fixed-bandwidth W/latency figure |
 
 ## Reproduce
 
@@ -137,6 +156,7 @@ python3 run_credit_bdp.py     # ~10 min, 16 parallel
 python3 plot_credit_bdp.py    # reads the CSV + cached trace
 python3 run_credit_patterns.py  # ~15 min, 16 parallel
 python3 plot_credit_patterns.py
+python3 plot_credit_wlat.py   # BW_GBPS=1600 to switch the fixed bandwidth
 ```
 
 Single-run example (the W=2 / 800 G / 200 µs sawtooth scenario):

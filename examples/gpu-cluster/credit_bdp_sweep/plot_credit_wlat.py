@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Plot the credit-BDP PATTERN sweep at FIXED bandwidth: utilization vs the
+credit window W, one line per one-way latency (results_credit_patterns.csv).
+
+Figure: credit_patterns_wlat.{pdf,png}, 3 rows x 4 cols, bandwidth fixed at
+BW_GBPS (default 800 G).
+
+  Rows 1-2: one panel per traffic pattern (top row switched fabric, second
+            row ring), x = W credits, y = utilization = T_inf / T_W, one
+            line per one-way latency 0.5-200 us. Reads as "how many credits
+            does each pattern need at this latency to reach full
+            utilization": the curves rise to 1.0 and the required W shifts
+            right ~linearly with latency (the credit RTT).
+  Row 3:    (a/b) utilization at W=24 vs latency per pattern (switched /
+            ring) -- the large-window ceiling each pattern can reach as
+            latency grows; (c) key numbers.
+
+Latency is an ordered magnitude, so the line series uses a sequential
+single-hue ramp (light -> dark = 0.5 -> 200 us) with distinct markers, not
+a categorical palette; identity is carried by the legend + the CSV table
+view. Static matplotlib: no hover layer.
+"""
+import csv
+import os
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+HERE = Path(__file__).resolve().parent
+
+BW_GBPS = int(os.environ.get("BW_GBPS", "800"))
+BANDWIDTHS = [100, 200, 400, 800, 1600]
+LATENCIES_US = [0.5, 10, 50, 100, 200]
+CREDITS = [1, 2, 4, 8, 24]
+PATTERNS = ["p2p", "incast", "fanout", "alltoall"]
+TOPOS = ["switched", "ring"]
+PATTERN_LABEL = {"p2p": "1-to-1 (p2p)", "incast": "many-to-1 (incast, 7→1)",
+                 "fanout": "1-to-many (fanout, 1→7)",
+                 "alltoall": "all-to-all (56 flows)"}
+TOPO_LABEL = {"switched": "switched fabric (every pair 2 hops)",
+              "ring": "ring (p2p direct; fanout pays hop sum)"}
+# Sequential single-hue ramp: light -> dark = 0.5 -> 200 us one-way latency.
+LAT_COLORS = ["#c6dbef", "#9ecae1", "#6baed6", "#3182bd", "#08519c"]
+P_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00"]
+REF_COLOR = "#7f7f7f"
+
+
+def load():
+    by_key = {}
+    with (HERE / "results_credit_patterns.csv").open() as f:
+        for r in csv.DictReader(f):
+            if r["status"] != "complete":
+                continue
+            by_key[(r["pattern"], r["topology"], int(r["bandwidthGbps"]),
+                    int(r["latencyNs"]), int(r["vcCredits"]))] = float(r["simTimeNs"])
+    return by_key
+
+
+def util(by_key, pattern, topo, bw, lat, w):
+    t_w = by_key.get((pattern, topo, bw, lat, w))
+    t_u = by_key.get((pattern, topo, bw, lat, 100000000))
+    if t_w is None or t_u is None or t_w == 0:
+        return None
+    return t_u / t_w
+
+
+def main():
+    if BW_GBPS not in BANDWIDTHS:
+        raise SystemExit(f"BW_GBPS must be one of {BANDWIDTHS}, got {BW_GBPS}")
+    by_key = load()
+    fig, axes = plt.subplots(3, 4, figsize=(18, 11), constrained_layout=True)
+
+    # Rows 1-2: utilization vs W, one line per latency, at fixed bandwidth.
+    for row, topo in enumerate(TOPOS):
+        for i, pat in enumerate(PATTERNS):
+            ax = axes[row][i]
+            for c, lat in zip(LAT_COLORS, LATENCIES_US):
+                xs, ys = [], []
+                for w in CREDITS:
+                    u = util(by_key, pat, topo, BW_GBPS, lat * 1000, w)
+                    if u is not None:
+                        xs.append(w)
+                        ys.append(u)
+                ax.plot(xs, ys, "o-", lw=2, ms=6, color=c,
+                        label=f"lat = {lat:g} µs")
+            ax.axhline(1.0, ls="--", lw=1.5, color=REF_COLOR)
+            ax.set_ylim(0, 1.05)
+            ax.set_xscale("log")
+            ax.set_xticks(CREDITS)
+            ax.set_xticklabels([str(w) for w in CREDITS])
+            ax.minorticks_off()
+            ax.set_xlabel("credit window W (chunks in flight)")
+            if i == 0:
+                ax.set_ylabel(f"{TOPO_LABEL[topo]}\nutilization = T$_∞$ / T$_W$",
+                              fontsize=9)
+            # First latency where W=24 no longer reaches 1.0.
+            flat = [lat for lat in LATENCIES_US
+                    if (util(by_key, pat, topo, BW_GBPS, lat * 1000, 24) or 0) < 0.999]
+            note = f"; W=24 < 1.0 from {min(flat):g} µs" if flat else ""
+            ax.set_title(f"{PATTERN_LABEL[pat]}\n{BW_GBPS} G{note}", fontsize=10)
+            ax.grid(True, alpha=0.3)
+            if row == 0 and i == 0:
+                ax.legend(fontsize=8, loc="lower right")
+
+    # Row 3 (a/b): utilization at W=24 vs latency per pattern.
+    for k, topo in enumerate(TOPOS):
+        ax = axes[2][k]
+        for c, pat in zip(P_COLORS, PATTERNS):
+            xs, ys = [], []
+            for lat in LATENCIES_US:
+                u = util(by_key, pat, topo, BW_GBPS, lat * 1000, 24)
+                if u is not None:
+                    xs.append(lat)
+                    ys.append(u)
+            ax.plot(xs, ys, "o-", lw=2, ms=6, color=c, label=PATTERN_LABEL[pat])
+        ax.axhline(1.0, ls="--", lw=1.5, color=REF_COLOR)
+        ax.set_xscale("log")
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("one-way latency (µs, log)")
+        ax.set_ylabel("utilization (W = 24)")
+        ax.set_title(f"W=24, {BW_GBPS} G, {topo}: the large-window ceiling\n"
+                     "vs latency — alltoall (switched) / fanout (ring) stay"
+                     " window-bound", fontsize=10)
+        ax.grid(True, alpha=0.3, which="both")
+        ax.legend(fontsize=8)
+
+    # Row 3 (c): key numbers.
+    ax = axes[2][2]
+    ax.axis("off")
+    lines = [f"Utilization at {BW_GBPS} G, W = 24\n", "lat (µs):      "
+             "  0.5     10      50     100     200"]
+    for topo in TOPOS:
+        lines.append(f"--- {topo} ---")
+        for pat in PATTERNS:
+            us = [util(by_key, pat, topo, BW_GBPS, lat * 1000, 24) or float("nan")
+                  for lat in LATENCIES_US]
+            lines.append(f"{PATTERN_LABEL[pat]:26s} " +
+                         "".join(f"{u:7.3f}" for u in us))
+    lines += [
+        "",
+        "Reading rows 1-2: the W needed for full",
+        "utilization shifts right ~linearly with",
+        "latency (credit RTT = hops·(ser+2·lat));",
+        "fanout/alltoall need ~W×flow-count",
+        "credits (shared 1-VC window), so even W=24",
+        "stays window-bound at 200 µs — the shared",
+        "window, not the link, is the bottleneck.",
+    ]
+    ax.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=9,
+            family="monospace")
+
+    # Row 3 (d): minimum W reaching 0.95 utilization vs latency (switched).
+    ax = axes[2][3]
+    for c, pat in zip(P_COLORS, PATTERNS):
+        xs, ys = [], []
+        for lat in LATENCIES_US:
+            for w in CREDITS:
+                u = util(by_key, pat, "switched", BW_GBPS, lat * 1000, w)
+                if u is not None and u >= 0.95:
+                    xs.append(lat)
+                    ys.append(w)
+                    break
+        if xs:
+            ax.plot(xs, ys, "o-", lw=2, ms=6, color=c, label=PATTERN_LABEL[pat])
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_yticks(CREDITS)
+    ax.set_yticklabels([str(w) for w in CREDITS])
+    ax.minorticks_off()
+    ax.set_xlabel("one-way latency (µs, log)")
+    ax.set_ylabel("min W with utilization ≥ 0.95")
+    ax.set_title(f"credits needed for ≥95% utilization, {BW_GBPS} G\n"
+                 "(switched; missing = not reached even at W=24)", fontsize=10)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(fontsize=8)
+
+    fig.suptitle(f"Credit flow control across traffic patterns at FIXED "
+                 f"bandwidth ({BW_GBPS} G, 8-GPU Su fabric, 256 MiB per "
+                 f"flow):\n"
+                 f"utilization vs credit window W and one-way latency — "
+                 f"dedicated (p2p/incast) vs shared (fanout/alltoall) "
+                 f"windows, ring vs switched")
+    for ext in ("pdf", "png"):
+        fig.savefig(HERE / f"credit_patterns_wlat.{ext}", dpi=150)
+    print(f"wrote credit_patterns_wlat.pdf/.png (bw={BW_GBPS}G)")
+
+
+if __name__ == "__main__":
+    main()
