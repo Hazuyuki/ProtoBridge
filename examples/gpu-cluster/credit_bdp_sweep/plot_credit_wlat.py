@@ -130,37 +130,34 @@ def main():
         ax.set_ylim(0, 1.05)
         ax.set_xlabel("one-way latency (µs, log)")
         ax.set_ylabel(f"utilization (W = {CEIL_W})")
-        ax.set_title(f"W={CEIL_W}, {BW_GBPS} G, {topo}: window-bound at a\n"
-                     "small window — every pattern now moves with latency "
-                     "(fullmesh: p2p == incast)", fontsize=10)
+        extra = "\np2p == incast" if topo == "fullmesh" else ""
+        ax.set_title(f"W={CEIL_W}, {BW_GBPS} G, {topo}:\n"
+                     "window-bound — every pattern\nmoves with latency" + extra,
+                     fontsize=10)
         ax.grid(True, alpha=0.3, which="both")
         ax.legend(fontsize=8)
 
     # Row 3 (c): key numbers.
     ax = axes[2][2]
     ax.axis("off")
-    lines = [f"Utilization at {BW_GBPS} G, W = {CEIL_W}\n", "lat (µs):      "
-             "  0.5     10      50     100     200"]
+    lines = [f"Utilization at {BW_GBPS} G, W = {CEIL_W}\n",
+             "lat(µs)   0.5    10    50   100   200"]
     for topo in TOPOS:
         lines.append(f"--- {topo} ---")
         for pat in PATTERNS:
             us = [util(by_key, pat, topo, BW_GBPS, lat * 1000, CEIL_W) or float("nan")
                   for lat in LATENCIES_US]
-            lines.append(f"{PATTERN_LABEL[pat]:26s} " +
-                         "".join(f"{u:7.3f}" for u in us))
+            lines.append(f"{pat:9s}" + "".join(f"{u:6.2f}" for u in us))
     lines += [
         "",
-        "Reading rows 1-2: the W needed for full",
-        "utilization shifts right ~linearly with",
-        "latency (credit RTT = hops·(ser+2·lat));",
-        "fanout/alltoall need ~W×flow-count credits",
-        "(shared 1-VC window) — the window, not the",
-        "link, is the bottleneck. On fullmesh T∞ is",
-        "7 links wide, so fanout/alltoall remain",
-        "window-bound even at W=24 (0.26/0.23 vs",
-        "p2p/incast 1.000); CEIL_W=24 shows it.",
+        "W needed for full utilization shifts",
+        "right ~linearly with latency (credit",
+        "RTT); fanout/alltoall need ~W×flows",
+        "credits (shared 1-VC window). Fullmesh",
+        "T∞ is 7 links wide → fanout/alltoall",
+        "capped even at W=24 (0.26/0.23).",
     ]
-    ax.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=9,
+    ax.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=7.5,
             family="monospace")
 
     # Row 3 (d): minimum W reaching 0.95 utilization vs latency (fullmesh).

@@ -160,20 +160,19 @@ def main():
         for pat in PATTERNS:
             t = by_key.get((pat, topo, 800, LAT_US, 1), 0) / 1e6
             ratio = t / t_p2p if (t_p2p and topo == "fullmesh") else None
-            extra = f"  ({ratio:.2f}x p2p)" if ratio else ""
-            lines.append(f"{topo:8s} {PATTERN_LABEL[pat]:26s} {t:8.2f}{extra}")
+            extra = f" ({ratio:.2f}x)" if ratio else ""
+            lines.append(f"{topo:8s} {pat:8s} {t:7.2f}{extra}")
     lines += [
         "",
-        "BDP law per FLOW: W·chunk/(ser + 2·lat).",
-        "One VC per endpoint -> fanout and alltoall",
-        "share ONE window across their flows, so the",
-        "sender serializes 224 chunks through W:",
-        "W=1 fullmesh = 7.1x p2p (uniform 1-hop RTT;",
-        "the switched fabric adds a switch traversal",
-        "to every credit RTT and doubles the p2p",
-        "cycle).",
+        "BDP law per FLOW: W·chunk/(ser+2·lat).",
+        "One VC per endpoint → fanout and",
+        "alltoall share ONE window: the sender",
+        "serializes 224 chunks through W.",
+        "W=1 fullmesh = 7.1x p2p (uniform",
+        "1-hop RTT; switched adds a switch",
+        "traversal to every credit RTT).",
     ]
-    ax.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=9,
+    ax.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=8,
             family="monospace")
 
     fig.suptitle("Credit flow control across traffic patterns on the Su fabric "
