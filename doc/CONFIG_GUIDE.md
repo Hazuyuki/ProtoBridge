@@ -98,6 +98,15 @@ LLR retransmit (`--voqDropThreshold`/`--llrMode`/`--llrRetryLimit`) for plain
 Ethernet — matching real hardware (RDMA uses ECN/PFC, not per-packet credits;
 NVLink is credit-based). Tuning `vcCredits` therefore only affects Su latency.
 
+**Lossy RoCE (no-PFC) is an explicit opt-in:** pass `--voqDropThreshold=N`
+(N>0) on a RoCE run to arm VOQ tail-drop + NACK→LLR retransmit beside ECN
+marking (set `--ecnThreshold < N` for mark-before-drop; LLR is
+force-enabled with the opt-in). Without the flag the RoCE fabric is
+lossless — the switch attribute default is 0 and the scratch CLI default 8
+applies only to plain Ethernet. In that lossy regime the DCQCN alpha knobs
+move completion time (GInit/GDecay up to ~8 % swing on a drop-heavy
+allreduce); see `examples/gpu-cluster/collective_topology_dcqcn/README.md`.
+
 **RTTCC delay-based congestion control (`--rttcc`).** DCQCN needs the RoCE
 ECN/CNP loop, which the plain lossy Ethernet fabric does not have (and the
 DCQCN So gate keys on `WireEfficiency<1.0`, which `EthernetProtocolModel`

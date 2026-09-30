@@ -6,6 +6,68 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — single-node local-rank range (credit gate) in the 11 point-to-point topology builds
+
+The 11 single-node builds in `gpu-cluster-helper.cc` that call `SetRank`
+(fullyconnected, fattree, rail-optimized fattree, ring, fullmesh, torus,
+mesh2d, hypercube, 2dfullmesh, ndfullmesh, 2dfullmeshclos) never called
+`SetLocalRankRange`, so the `FabricEndpoint` constructor default
+(`base=0, count=1`) made `IsLocalRank` treat **only rank 0** as local in
+single-node runs. Credit consume is gated on `IsLocalRank(destRank)` and
+per-delivery credit return on `IsLocalRank(sourceRank)`, so exactly one
+rank pair exchanged credits; every other flow sent blind, and a squeezed
+`--vcCredits` window deadlocked at the sim limit instead of degrading
+gracefully (the comment at fabric-endpoint.cc:2491 stated the intent —
+"single-node keeps all sources local" — the code did the opposite). Fix:
+`SetLocalRankRange(0, numGpus)` after each `SetRank`, the `BuildMultiPlane`
+precedent (rail-fattree's leaf-local domain is non-contiguous in rank
+space, so the contiguous-range API cannot express it — all-local is the
+uniform choice). Parity-neutral by construction: So TX-window / strict-GBN
+/ RTTCC guards stay default-off, and at the default 1e8 credits the added
+per-packet CREDIT returns ride idle reverse links and never bind — su pin
+4769616 bit-identical, h200 calibration point 1353.58 µs, and all other
+parity gates unchanged.
+
+With the gate fixed, `examples/gpu-cluster/credit_bdp_sweep/` demonstrates
+the credit-BDP phenomenon on the Su fabric: an 8-GPU ring allreduce
+(256 MiB, 1 credit = one 8-MiB bulk chunk) swept over bandwidth 100–1600 G
+× one-way latency 0.5–200 µs × window 1–24 chunks. Utilization
+(T_unlimited / T_W) follows the BDP law W·chunk/(serialization + 2·lat):
+at 200 µs latency W=1 collapses to 0.21 as bandwidth rises (completion
+flat past 200 G — bandwidth cannot be spent), W=2 to 0.43, while W≥8 stays
+at 1.00; the knee doubles with W as predicted. The sawtooth panel shows
+the oscillation itself — burst-drain-refill cycles whose median idle gap
+is 400 µs = 2·lat, the credit-return RTT.
+
+### Added — lossy-RoCE (no-PFC) fabric regime + DCQCN-where-it-bites sweep
+
+`EthernetSwitch::VoqDropThreshold` now applies to RoCE packets too (TypeId
+default 0 = lossless on both fabrics; the scratch CLI default 8 stays
+plain-Ethernet-only): an **explicit** `--voqDropThreshold=N` (N>0) on a RoCE
+run opts the fabric into the lossy-RoCE/no-PFC regime — VOQ tail-drop with a
+NACK back to the source beside ECN marking (keep `--ecnThreshold < N` for
+mark-before-drop), LLR retransmission force-enabled, and the switch-side
+`SetInterNodeSwitchLlrEnabled` armed so the NACK actually fires. The opt-in
+is detected by scanning argv for the flag (the CLI default 8 must not leak
+into RoCE), and the unset path is byte-identical: all RoCE parity pins
+unchanged (su 4769616 / 2n 15307388 / 4n 13421212, ncclring 444189,
+collective-dcqcn 1776084 + ecn=192, config-vs-inline ETH 50879434/49452004).
+
+The 57-run sweep in that regime
+(`examples/gpu-cluster/collective_topology_dcqcn/run_lossy_roce_sweep.py`
++ `run_lossy_rand_sweep.py`, `plot_lossy_roce.py`) is where the DCQCN alpha
+knobs finally move outcomes: on a 2n×8g hierarchical allreduce (256 MiB,
+drop=8, ecn=4) drops cost +32 % completion time and DCQCN recovers 37 % of
+the excess (best corner GDecay=0.125: 46 %); one-at-a-time swings — GInit
+7.9 % (U-shaped), GDecay 8.4 %, AlphaFloor 6.4 %, while TFast/FastCycles
+are flat. The benefit is severity-gated (drop=16 costs 0.4 %, drop=32
+nothing) and absent under saturated goodput (randTraffic: delivered ±0.7 %
+with ~4.4k drops — a full bottleneck serves retransmissions at the same
+rate), so DCQCN tuning matters exactly for completion-deadline loads on a
+deep-drop fabric. `--dcqcn` also mounts the RoCE SoHeader payload builder
+(+10 B/packet), which shifts timing even with zero CNPs — part of any
+dcqcn=1 delta is framing, not rate control.
+
 ### Added — DCQCN rate-machine parameter CLI + sensitivity sweep
 
 The 7 `DcqcnRateMachine` TypeId attributes are now CLI-exposed for
