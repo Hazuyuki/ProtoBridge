@@ -29,9 +29,9 @@ credit-BDP experiment beyond allreduce to four traffic shapes on the same
 8-GPU Su fabric (per-flow volume 256 MiB; alltoall passes 8× so each pair
 carries 256 MiB): p2p (1 flow), incast (7→1), fanout (1→7), and alltoall
 (56 flows), each swept over 5 bandwidths × 5 latencies × 6 windows on both
-the ring and the switched fabric (1200 runs). Findings (800 G, 200 µs):
+the fullmesh and the switched fabric (1200 runs). Findings (800 G, 200 µs):
 
-- **Switched** (every pair 2 hops — the clean window-sharing result):
+- **Switched** (every pair 2 hops):
   p2p follows the per-flow BDP law; incast ≈ p2p (independent per-sender
   windows, receiver ingress adds only ~2%); fanout and alltoall share ONE
   per-endpoint window across their flows (a single VC), so the sender
@@ -40,13 +40,18 @@ the ring and the switched fabric (1200 runs). Findings (800 G, 200 µs):
   At W=1 alltoall ≡ fanout (217.1 vs 216.5 ms): the shared window
   dominates; they diverge only at large W where alltoall's 56 concurrent
   flows contend network-wide (T_∞ 35.5 vs 19.3 ms).
-- **Ring** (the scratch default): the credit RTT is additionally
-  **hop-distance dependent** — rank0→rank_k costs min(k, N−k) hops each
-  way, and NS_LOG traces show per-chunk credit RTTs of k·(ser + 2·lat).
-  p2p (adjacent ranks) is a direct 1-hop link; fanout pays the hop sum
-  (224 chunks × hop-distance sum 16 × 483.886 ns = 247.7 ms, matching the
-  observed 247.55 ms to 0.1%); incast is gated by the farthest sender
-  (rank 4, 4 hops).
+- **Fullmesh** (every pair a DIRECT 1-hop link — the cleanest isolation:
+  the per-chunk credit RTT is uniformly ser + 2·lat, no hop-count or
+  switch-traversal confound): p2p == incast **exactly** (15284352 ns
+  bit-for-bit — 7 independent windows over 7 dedicated links, and the
+  receiver's ingress is 7 links wide so there is no receiver bottleneck);
+  fanout/alltoall = 7.08× p2p = 224 chunks × the uniform 483.886 µs RTT
+  (pure shared-window serialization). T_∞ is line-bound at 2.88 ms (7
+  parallel egress links), so the same window yields the lowest
+  utilization of the two fabrics — even at W=24 fanout/alltoall sit at
+  0.256/0.232 while p2p/incast reach 1.000 (completion still beats
+  switched, 11.3 vs 19.3 ms, because the 1-hop credit RTT makes each
+  credit worth more).
 
 ### Fixed — single-node local-rank range (credit gate) in the 11 point-to-point topology builds
 

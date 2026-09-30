@@ -5,14 +5,14 @@ credit window W, one line per one-way latency (results_credit_patterns.csv).
 Figure: credit_patterns_wlat.{pdf,png}, 3 rows x 4 cols, bandwidth fixed at
 BW_GBPS (default 800 G).
 
-  Rows 1-2: one panel per traffic pattern (top row switched fabric, second
-            row ring), x = W credits, y = utilization = T_inf / T_W, one
+  Rows 1-2: one panel per traffic pattern (top row fullmesh fabric, second
+            row switched), x = W credits, y = utilization = T_inf / T_W, one
             line per one-way latency 0.5-200 us. Reads as "how many credits
             does each pattern need at this latency to reach full
             utilization": the curves rise to 1.0 and the required W shifts
             right ~linearly with latency (the credit RTT).
   Row 3:    (a/b) utilization at W=CEIL_W (default 4) vs latency per
-            pattern (switched / ring) -- at a small window every pattern
+            pattern (fullmesh / switched) -- at a small window every pattern
             is window-bound and latency-responsive (CEIL_W=24 restores
             the "can it reach 1.0 at all" ceiling view); (c) key numbers;
             (d) min W for >=95% utilization.
@@ -43,12 +43,12 @@ BANDWIDTHS = [100, 200, 400, 800, 1600]
 LATENCIES_US = [0.5, 10, 50, 100, 200]
 CREDITS = [1, 2, 4, 8, 24]
 PATTERNS = ["p2p", "incast", "fanout", "alltoall"]
-TOPOS = ["switched", "ring"]
+TOPOS = ["fullmesh", "switched"]
 PATTERN_LABEL = {"p2p": "1-to-1 (p2p)", "incast": "many-to-1 (incast, 7→1)",
                  "fanout": "1-to-many (fanout, 1→7)",
                  "alltoall": "all-to-all (56 flows)"}
-TOPO_LABEL = {"switched": "switched fabric (every pair 2 hops)",
-              "ring": "ring (p2p direct; fanout pays hop sum)"}
+TOPO_LABEL = {"fullmesh": "fullmesh (every pair a direct 1-hop link)",
+              "switched": "switched fabric (every pair 2 hops)"}
 # Sequential single-hue ramp: light -> dark = 0.5 -> 200 us one-way latency.
 LAT_COLORS = ["#c6dbef", "#9ecae1", "#6baed6", "#3182bd", "#08519c"]
 P_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00"]
@@ -131,8 +131,8 @@ def main():
         ax.set_xlabel("one-way latency (µs, log)")
         ax.set_ylabel(f"utilization (W = {CEIL_W})")
         ax.set_title(f"W={CEIL_W}, {BW_GBPS} G, {topo}: window-bound at a\n"
-                     "small window — every pattern now moves with latency",
-                     fontsize=10)
+                     "small window — every pattern now moves with latency "
+                     "(fullmesh: p2p == incast)", fontsize=10)
         ax.grid(True, alpha=0.3, which="both")
         ax.legend(fontsize=8)
 
@@ -155,20 +155,21 @@ def main():
         "latency (credit RTT = hops·(ser+2·lat));",
         "fanout/alltoall need ~W×flow-count credits",
         "(shared 1-VC window) — the window, not the",
-        "link, is the bottleneck; at W=24 only",
-        "alltoall (switched) / fanout (ring) remain",
-        "capped (CEIL_W=24 for that ceiling view).",
+        "link, is the bottleneck. On fullmesh T∞ is",
+        "7 links wide, so fanout/alltoall remain",
+        "window-bound even at W=24 (0.26/0.23 vs",
+        "p2p/incast 1.000); CEIL_W=24 shows it.",
     ]
     ax.text(0.02, 0.95, "\n".join(lines), va="top", fontsize=9,
             family="monospace")
 
-    # Row 3 (d): minimum W reaching 0.95 utilization vs latency (switched).
+    # Row 3 (d): minimum W reaching 0.95 utilization vs latency (fullmesh).
     ax = axes[2][3]
     for c, pat in zip(P_COLORS, PATTERNS):
         xs, ys = [], []
         for lat in LATENCIES_US:
             for w in CREDITS:
-                u = util(by_key, pat, "switched", BW_GBPS, lat * 1000, w)
+                u = util(by_key, pat, "fullmesh", BW_GBPS, lat * 1000, w)
                 if u is not None and u >= 0.95:
                     xs.append(lat)
                     ys.append(w)
@@ -183,7 +184,7 @@ def main():
     ax.set_xlabel("one-way latency (µs, log)")
     ax.set_ylabel("min W with utilization ≥ 0.95")
     ax.set_title(f"credits needed for ≥95% utilization, {BW_GBPS} G\n"
-                 "(switched; missing = not reached even at W=24)", fontsize=10)
+                 "(fullmesh; missing = not reached even at W=24)", fontsize=10)
     ax.grid(True, alpha=0.3, which="both")
     ax.legend(fontsize=8)
 
@@ -192,7 +193,7 @@ def main():
                  f"flow):\n"
                  f"utilization vs credit window W and one-way latency — "
                  f"dedicated (p2p/incast) vs shared (fanout/alltoall) "
-                 f"windows, ring vs switched")
+                 f"windows, fullmesh vs switched")
     for ext in ("pdf", "png"):
         fig.savefig(HERE / f"credit_patterns_wlat.{ext}", dpi=150)
     print(f"wrote credit_patterns_wlat.pdf/.png (bw={BW_GBPS}G)")

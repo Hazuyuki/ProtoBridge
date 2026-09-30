@@ -82,8 +82,8 @@ shapes on the same 8-GPU Su fabric, per-FLOW volume fixed at 256 MiB:
 Each endpoint has a single VC (`SetNumVirtualChannels(1)`), so all flows
 originating at one endpoint serialize through the same W credits.
 
-**Switched fabric** (`--topology=switched`, every pair 2 hops) — the clean
-window-sharing result, lat = 200 µs, 800 G:
+**Switched fabric** (`--topology=switched`, every pair 2 hops) — lat =
+200 µs, 800 G:
 
 | Pattern | T_W=1 | T_∞ | vs p2p |
 |---|---|---|---|
@@ -104,17 +104,31 @@ contention.)
   aggregate, not each flow. Recovering p2p-level utilization needs
   ~W × flows credits, not W.
 - alltoall ≡ fanout at W=1 (217.1 vs 216.5 ms): the shared window dominates;
-  at W=∞ they diverge (44.4 vs 11.8 ms) because alltoall's 56 concurrent
+  at W=∞ they diverge (35.5 vs 19.3 ms) because alltoall's 56 concurrent
   flows contend network-wide while fanout only saturates the sender's egress.
 
-**Ring** (`--topology=ring`, the scratch default) — a second, additive
-effect: the credit RTT is **hop-distance dependent**. rank0→rank_k costs
-min(k, N−k) hops each way, and the trace shows per-chunk credit RTTs of
-k·(ser + 2·lat) (chunks to rank 1/2/3 return at 1/2/3 × 483.886 µs). p2p
-(rank0→rank1) is a direct 1-hop link, but fanout pays the hop sum:
-224 chunks × Σ_min(k,8−k) = 16 × 483.886 ns = 247.7 ms, matching the
-observed 247.55 ms to 0.1%. incast is gated by the farthest sender
-(rank4, 4 hops: 32 × 4 × 483.886 = 61.9 ms observed 61.1 ms).
+**Fullmesh** (`--topology=fullmesh`, every pair a DIRECT 1-hop link) — the
+cleanest isolation of the window-sharing effect: the per-chunk credit RTT is
+uniformly ser + 2·lat (no hop-count confound, no switch traversal), lat =
+200 µs, 800 G:
+
+| Pattern | T_W=1 | T_∞ | vs p2p |
+|---|---|---|---|
+| p2p | 15.28 ms | 2.88 ms | 1.0× |
+| incast | 15.28 ms | 2.88 ms | **1.00× (identical)** |
+| fanout | 108.19 ms | 2.88 ms | **7.08×** |
+| alltoall | 108.26 ms | 2.95 ms | **7.08×** |
+
+- p2p == incast **exactly** (15.28 ms, bit-for-bit): 7 senders with
+  independent windows over 7 dedicated links — no receiver bottleneck
+  because rank 0's ingress is also 7 links wide.
+- fanout/alltoall = 7.08× p2p = 224 chunks × the uniform 483.886 µs
+  per-chunk RTT — pure shared-window serialization.
+- T_∞ is line-bound at 2.88 ms (7 parallel egress links), so the same
+  window yields the **lowest utilization of the three fabrics**: even at
+  W=24, fanout/alltoall sit at 0.256/0.232 while p2p/incast reach 1.000.
+  (Completion time still beats the switched fabric — 11.3 vs 19.3 ms —
+  because the 1-hop credit RTT makes each window credit worth more.)
 
 **Fixed-bandwidth view** (`plot_credit_wlat.py` →
 `credit_patterns_wlat.{pdf,png}`, default 800 G / W=4; override with
@@ -123,17 +137,22 @@ latency. Reading it:
 
 - The W needed for full utilization shifts right ~linearly with latency —
   the credit RTT is the horizontal asymptote of every curve.
-- Bottom row at the small default W=4: every pattern is window-bound and
-  latency-responsive (p2p 0.98 → 0.26 as latency rises 0.5 → 200 µs,
-  fanout 0.93 → 0.20); incast is the outlier that stays 1.000 at every
-  latency (7 independent windows: 4 credits × 7 senders cover the
-  receiver-side BDP).
+- Bottom row at the small default W=4: every curve is window-bound and
+  latency-responsive somewhere. On the switched fabric p2p falls
+  1.000 → 0.418 and fanout 1.000 → 0.357 as latency rises 0.5 → 200 µs,
+  while incast stays 1.000 at every latency (7 independent windows:
+  4 credits × 7 senders cover the receiver-side BDP). On fullmesh p2p
+  and incast fall together 1.000 → 0.735 (the 1-hop credit RTT makes each
+  credit worth more, so the same W=4 binds only at the largest latency),
+  and fanout/alltoall sit near-flat at ~0.15 → 0.11 (the shared window
+  dominates at every latency).
 - `CEIL_W=24` restores the ceiling view ("can this pattern reach 1.0 at
-  all"): then only alltoall stays capped on switched (0.711 → 0.613 — its
-  56 concurrent flows make even the large-window ceiling latency-bound)
-  and only fanout on the ring (0.64 flat — the hop sum makes each credit
-  worth less), while alltoall recovers there (0.987) because every rank's
-  own window sees an average 2-hop distance, not rank0's worst case.
+  all"): on the switched fabric only alltoall stays capped (0.711 → 0.613 —
+  its 56 concurrent flows make even the large-window ceiling latency-bound);
+  on fullmesh **fanout and alltoall both stay capped** (0.286 → 0.256 and
+  0.253 → 0.232) because T_∞ there is 7 parallel links wide — the widest
+  T_∞ of the two fabrics shows the largest shared-window penalty in
+  utilization.
 
 ## Files
 

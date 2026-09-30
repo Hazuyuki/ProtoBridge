@@ -15,11 +15,12 @@ per FLOW; patterns differ in how many flows share each link and how the
 windows interact (independent per-sender windows on incast, ONE shared
 per-endpoint window across all 7 destinations on fanout).
 
-TOPOLOGY axis (ring = scratch default, switched): on the ring the credit
-RTT is HOP-DISTANCE dependent (rank0 -> rank_k costs min(k, N-k) hops each
-way, and p2p is a direct 1-hop link), so fanout also pays the hop-sum; on
-the switched fabric every pair is 2 hops through the switch, isolating the
-pure window-sharing effect (fanout = 7.08x p2p at W=1, alltoall == fanout).
+TOPOLOGY axis (switched, fullmesh): on fullmesh every pair is a DIRECT
+1-hop link, so the per-chunk credit RTT is uniformly ser + 2*lat and the
+window-sharing effect is isolated with no hop-count confound (fanout =
+224 chunks x one window = 7.1x p2p at W=1; p2p == incast); on the
+switched fabric every pair is 2 hops through the switch, adding a switch
+traversal to the credit RTT.
 
 Writes results_credit_patterns.csv; plot with plot_credit_patterns.py.
 """
@@ -48,7 +49,7 @@ PATTERNS = {
 BANDWIDTHS = [100, 200, 400, 800, 1600]
 LATENCIES_NS = [500, 10000, 50000, 100000, 200000]
 CREDITS = [1, 2, 4, 8, 24, 100000000]
-TOPOLOGIES = ["ring", "switched"]
+TOPOLOGIES = ["fullmesh", "switched"]
 
 MAX_PARALLEL = 16
 TIMEOUT_S = 600
