@@ -1,0 +1,1800 @@
++0.000000000s CreditManager:CreditManager(0x7ffe20961ee8)
++0.000000000s CreditManager:InitializeVc(0x7ffe20961f28, 0, 64)
++0.000000000s CreditManager:CreditManager(0x7ffe20961ee8)
++0.000000000s CreditManager:InitializeVc(0x7ffe20961f28, 0, 64)
++0.000000000s CreditManager:CreditManager(0x7ffe20961ee8)
++0.000000000s CreditManager:InitializeVc(0x7ffe20961f28, 0, 64)
++0.000000000s CreditManager:CreditManager(0x7ffe20961ee8)
++0.000000000s CreditManager:InitializeVc(0x7ffe20961f28, 0, 64)
++0.000000000s CreditManager:CreditManager(0x7ffe20961ee8)
++0.000000000s CreditManager:InitializeVc(0x7ffe20961f28, 0, 64)
++0.000000000s CreditManager:CreditManager(0x7ffe20961ee8)
++0.000000000s CreditManager:InitializeVc(0x7ffe20961f28, 0, 64)
++0.000000000s CreditManager:CreditManager(0x7ffe20961ee8)
++0.000000000s CreditManager:InitializeVc(0x7ffe20961f28, 0, 64)
++0.000000000s CreditManager:CreditManager(0x7ffe20961ee8)
++0.000000000s CreditManager:InitializeVc(0x7ffe20961f28, 0, 64)
++0.000000000s CreditManager:InitializeVc(0x7ffe20962618, 0, 2)
++0.000000000s CreditManager:InitializeVc(0x7ffe20962618, 0, 2)
++0.000000000s CreditManager:InitializeVc(0x7ffe20962618, 0, 2)
++0.000000000s CreditManager:InitializeVc(0x7ffe20962618, 0, 2)
++0.000000000s CreditManager:InitializeVc(0x7ffe20962618, 0, 2)
++0.000000000s CreditManager:InitializeVc(0x7ffe20962618, 0, 2)
++0.000000000s CreditManager:InitializeVc(0x7ffe20962618, 0, 2)
++0.000000000s CreditManager:InitializeVc(0x7ffe20962618, 0, 2)
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 0)
++0.000065000s Consumed credit for VC 0, remaining: 1
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 1)
++0.000065000s Consumed credit for VC 0, remaining: 0
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 0)
++0.000065000s Consumed credit for VC 0, remaining: 1
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 1)
++0.000065000s Consumed credit for VC 0, remaining: 0
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 0)
++0.000065000s Consumed credit for VC 0, remaining: 1
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 1)
++0.000065000s Consumed credit for VC 0, remaining: 0
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 0)
++0.000065000s Consumed credit for VC 0, remaining: 1
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 1)
++0.000065000s Consumed credit for VC 0, remaining: 0
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 0)
++0.000065000s Consumed credit for VC 0, remaining: 1
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 1)
++0.000065000s Consumed credit for VC 0, remaining: 0
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 0)
++0.000065000s Consumed credit for VC 0, remaining: 1
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 1)
++0.000065000s Consumed credit for VC 0, remaining: 0
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 0)
++0.000065000s Consumed credit for VC 0, remaining: 1
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 1)
++0.000065000s Consumed credit for VC 0, remaining: 0
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 0)
++0.000065000s Consumed credit for VC 0, remaining: 1
++0.000065000s CreditManager:ConsumeCredit(0x7ffe20961cc8, 0, 1)
++0.000065000s Consumed credit for VC 0, remaining: 0
++0.000548886s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000548886s Returned 1 credits for VC 0, now available: 1
++0.000548886s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.000548886s Consumed credit for VC 0, remaining: 0
++0.000548886s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000548886s Returned 1 credits for VC 0, now available: 1
++0.000548886s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.000548886s Consumed credit for VC 0, remaining: 0
++0.000548886s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000548886s Returned 1 credits for VC 0, now available: 1
++0.000548886s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.000548886s Consumed credit for VC 0, remaining: 0
++0.000548886s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000548886s Returned 1 credits for VC 0, now available: 1
++0.000548886s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.000548886s Consumed credit for VC 0, remaining: 0
++0.000548886s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000548886s Returned 1 credits for VC 0, now available: 1
++0.000548886s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.000548886s Consumed credit for VC 0, remaining: 0
++0.000548886s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000548886s Returned 1 credits for VC 0, now available: 1
++0.000548886s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.000548886s Consumed credit for VC 0, remaining: 0
++0.000548886s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000548886s Returned 1 credits for VC 0, now available: 1
++0.000548886s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.000548886s Consumed credit for VC 0, remaining: 0
++0.000548886s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000548886s Returned 1 credits for VC 0, now available: 1
++0.000548886s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.000548886s Consumed credit for VC 0, remaining: 0
++0.000632772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000632772s Returned 1 credits for VC 0, now available: 1
++0.000632772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.000632772s Consumed credit for VC 0, remaining: 0
++0.000632772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000632772s Returned 1 credits for VC 0, now available: 1
++0.000632772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.000632772s Consumed credit for VC 0, remaining: 0
++0.000632772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000632772s Returned 1 credits for VC 0, now available: 1
++0.000632772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.000632772s Consumed credit for VC 0, remaining: 0
++0.000632772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000632772s Returned 1 credits for VC 0, now available: 1
++0.000632772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.000632772s Consumed credit for VC 0, remaining: 0
++0.000632772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000632772s Returned 1 credits for VC 0, now available: 1
++0.000632772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.000632772s Consumed credit for VC 0, remaining: 0
++0.000632772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000632772s Returned 1 credits for VC 0, now available: 1
++0.000632772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.000632772s Consumed credit for VC 0, remaining: 0
++0.000632772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000632772s Returned 1 credits for VC 0, now available: 1
++0.000632772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.000632772s Consumed credit for VC 0, remaining: 0
++0.000632772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.000632772s Returned 1 credits for VC 0, now available: 1
++0.000632772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.000632772s Consumed credit for VC 0, remaining: 0
++0.001032772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001032772s Returned 1 credits for VC 0, now available: 1
++0.001032772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.001032772s Consumed credit for VC 0, remaining: 0
++0.001032772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001032772s Returned 1 credits for VC 0, now available: 1
++0.001032772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.001032772s Consumed credit for VC 0, remaining: 0
++0.001032772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001032772s Returned 1 credits for VC 0, now available: 1
++0.001032772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.001032772s Consumed credit for VC 0, remaining: 0
++0.001032772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001032772s Returned 1 credits for VC 0, now available: 1
++0.001032772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.001032772s Consumed credit for VC 0, remaining: 0
++0.001032772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001032772s Returned 1 credits for VC 0, now available: 1
++0.001032772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.001032772s Consumed credit for VC 0, remaining: 0
++0.001032772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001032772s Returned 1 credits for VC 0, now available: 1
++0.001032772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.001032772s Consumed credit for VC 0, remaining: 0
++0.001032772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001032772s Returned 1 credits for VC 0, now available: 1
++0.001032772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.001032772s Consumed credit for VC 0, remaining: 0
++0.001032772s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001032772s Returned 1 credits for VC 0, now available: 1
++0.001032772s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.001032772s Consumed credit for VC 0, remaining: 0
++0.001116658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001116658s Returned 1 credits for VC 0, now available: 1
++0.001116658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.001116658s Consumed credit for VC 0, remaining: 0
++0.001116658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001116658s Returned 1 credits for VC 0, now available: 1
++0.001116658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.001116658s Consumed credit for VC 0, remaining: 0
++0.001116658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001116658s Returned 1 credits for VC 0, now available: 1
++0.001116658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.001116658s Consumed credit for VC 0, remaining: 0
++0.001116658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001116658s Returned 1 credits for VC 0, now available: 1
++0.001116658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.001116658s Consumed credit for VC 0, remaining: 0
++0.001116658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001116658s Returned 1 credits for VC 0, now available: 1
++0.001116658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.001116658s Consumed credit for VC 0, remaining: 0
++0.001116658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001116658s Returned 1 credits for VC 0, now available: 1
++0.001116658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.001116658s Consumed credit for VC 0, remaining: 0
++0.001116658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001116658s Returned 1 credits for VC 0, now available: 1
++0.001116658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.001116658s Consumed credit for VC 0, remaining: 0
++0.001116658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001116658s Returned 1 credits for VC 0, now available: 1
++0.001116658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.001116658s Consumed credit for VC 0, remaining: 0
++0.001516658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001516658s Returned 1 credits for VC 0, now available: 1
++0.001516658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.001516658s Consumed credit for VC 0, remaining: 0
++0.001516658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001516658s Returned 1 credits for VC 0, now available: 1
++0.001516658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.001516658s Consumed credit for VC 0, remaining: 0
++0.001516658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001516658s Returned 1 credits for VC 0, now available: 1
++0.001516658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.001516658s Consumed credit for VC 0, remaining: 0
++0.001516658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001516658s Returned 1 credits for VC 0, now available: 1
++0.001516658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.001516658s Consumed credit for VC 0, remaining: 0
++0.001516658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001516658s Returned 1 credits for VC 0, now available: 1
++0.001516658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.001516658s Consumed credit for VC 0, remaining: 0
++0.001516658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001516658s Returned 1 credits for VC 0, now available: 1
++0.001516658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.001516658s Consumed credit for VC 0, remaining: 0
++0.001516658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001516658s Returned 1 credits for VC 0, now available: 1
++0.001516658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.001516658s Consumed credit for VC 0, remaining: 0
++0.001516658s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001516658s Returned 1 credits for VC 0, now available: 1
++0.001516658s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.001516658s Consumed credit for VC 0, remaining: 0
++0.001600544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001600544s Returned 1 credits for VC 0, now available: 1
++0.001600544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.001600544s Consumed credit for VC 0, remaining: 0
++0.001600544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001600544s Returned 1 credits for VC 0, now available: 1
++0.001600544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.001600544s Consumed credit for VC 0, remaining: 0
++0.001600544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001600544s Returned 1 credits for VC 0, now available: 1
++0.001600544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.001600544s Consumed credit for VC 0, remaining: 0
++0.001600544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001600544s Returned 1 credits for VC 0, now available: 1
++0.001600544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.001600544s Consumed credit for VC 0, remaining: 0
++0.001600544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001600544s Returned 1 credits for VC 0, now available: 1
++0.001600544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.001600544s Consumed credit for VC 0, remaining: 0
++0.001600544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001600544s Returned 1 credits for VC 0, now available: 1
++0.001600544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.001600544s Consumed credit for VC 0, remaining: 0
++0.001600544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001600544s Returned 1 credits for VC 0, now available: 1
++0.001600544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.001600544s Consumed credit for VC 0, remaining: 0
++0.001600544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.001600544s Returned 1 credits for VC 0, now available: 1
++0.001600544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.001600544s Consumed credit for VC 0, remaining: 0
++0.002000544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002000544s Returned 1 credits for VC 0, now available: 1
++0.002000544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002000544s Consumed credit for VC 0, remaining: 0
++0.002000544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002000544s Returned 1 credits for VC 0, now available: 1
++0.002000544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002000544s Consumed credit for VC 0, remaining: 0
++0.002000544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002000544s Returned 1 credits for VC 0, now available: 1
++0.002000544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002000544s Consumed credit for VC 0, remaining: 0
++0.002000544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002000544s Returned 1 credits for VC 0, now available: 1
++0.002000544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002000544s Consumed credit for VC 0, remaining: 0
++0.002000544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002000544s Returned 1 credits for VC 0, now available: 1
++0.002000544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002000544s Consumed credit for VC 0, remaining: 0
++0.002000544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002000544s Returned 1 credits for VC 0, now available: 1
++0.002000544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002000544s Consumed credit for VC 0, remaining: 0
++0.002000544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002000544s Returned 1 credits for VC 0, now available: 1
++0.002000544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002000544s Consumed credit for VC 0, remaining: 0
++0.002000544s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002000544s Returned 1 credits for VC 0, now available: 1
++0.002000544s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002000544s Consumed credit for VC 0, remaining: 0
++0.002084430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002084430s Returned 1 credits for VC 0, now available: 1
++0.002084430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.002084430s Consumed credit for VC 0, remaining: 0
++0.002084430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002084430s Returned 1 credits for VC 0, now available: 1
++0.002084430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.002084430s Consumed credit for VC 0, remaining: 0
++0.002084430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002084430s Returned 1 credits for VC 0, now available: 1
++0.002084430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.002084430s Consumed credit for VC 0, remaining: 0
++0.002084430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002084430s Returned 1 credits for VC 0, now available: 1
++0.002084430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.002084430s Consumed credit for VC 0, remaining: 0
++0.002084430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002084430s Returned 1 credits for VC 0, now available: 1
++0.002084430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.002084430s Consumed credit for VC 0, remaining: 0
++0.002084430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002084430s Returned 1 credits for VC 0, now available: 1
++0.002084430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.002084430s Consumed credit for VC 0, remaining: 0
++0.002084430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002084430s Returned 1 credits for VC 0, now available: 1
++0.002084430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.002084430s Consumed credit for VC 0, remaining: 0
++0.002084430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002084430s Returned 1 credits for VC 0, now available: 1
++0.002084430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.002084430s Consumed credit for VC 0, remaining: 0
++0.002484430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002484430s Returned 1 credits for VC 0, now available: 1
++0.002484430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.002484430s Consumed credit for VC 0, remaining: 0
++0.002484430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002484430s Returned 1 credits for VC 0, now available: 1
++0.002484430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.002484430s Consumed credit for VC 0, remaining: 0
++0.002484430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002484430s Returned 1 credits for VC 0, now available: 1
++0.002484430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.002484430s Consumed credit for VC 0, remaining: 0
++0.002484430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002484430s Returned 1 credits for VC 0, now available: 1
++0.002484430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.002484430s Consumed credit for VC 0, remaining: 0
++0.002484430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002484430s Returned 1 credits for VC 0, now available: 1
++0.002484430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.002484430s Consumed credit for VC 0, remaining: 0
++0.002484430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002484430s Returned 1 credits for VC 0, now available: 1
++0.002484430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.002484430s Consumed credit for VC 0, remaining: 0
++0.002484430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002484430s Returned 1 credits for VC 0, now available: 1
++0.002484430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.002484430s Consumed credit for VC 0, remaining: 0
++0.002484430s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002484430s Returned 1 credits for VC 0, now available: 1
++0.002484430s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.002484430s Consumed credit for VC 0, remaining: 0
++0.002568316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002568316s Returned 1 credits for VC 0, now available: 1
++0.002568316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.002568316s Consumed credit for VC 0, remaining: 0
++0.002568316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002568316s Returned 1 credits for VC 0, now available: 1
++0.002568316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.002568316s Consumed credit for VC 0, remaining: 0
++0.002568316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002568316s Returned 1 credits for VC 0, now available: 1
++0.002568316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.002568316s Consumed credit for VC 0, remaining: 0
++0.002568316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002568316s Returned 1 credits for VC 0, now available: 1
++0.002568316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.002568316s Consumed credit for VC 0, remaining: 0
++0.002568316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002568316s Returned 1 credits for VC 0, now available: 1
++0.002568316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.002568316s Consumed credit for VC 0, remaining: 0
++0.002568316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002568316s Returned 1 credits for VC 0, now available: 1
++0.002568316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.002568316s Consumed credit for VC 0, remaining: 0
++0.002568316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002568316s Returned 1 credits for VC 0, now available: 1
++0.002568316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.002568316s Consumed credit for VC 0, remaining: 0
++0.002568316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002568316s Returned 1 credits for VC 0, now available: 1
++0.002568316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.002568316s Consumed credit for VC 0, remaining: 0
++0.002968316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002968316s Returned 1 credits for VC 0, now available: 1
++0.002968316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002968316s Consumed credit for VC 0, remaining: 0
++0.002968316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002968316s Returned 1 credits for VC 0, now available: 1
++0.002968316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002968316s Consumed credit for VC 0, remaining: 0
++0.002968316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002968316s Returned 1 credits for VC 0, now available: 1
++0.002968316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002968316s Consumed credit for VC 0, remaining: 0
++0.002968316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002968316s Returned 1 credits for VC 0, now available: 1
++0.002968316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002968316s Consumed credit for VC 0, remaining: 0
++0.002968316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002968316s Returned 1 credits for VC 0, now available: 1
++0.002968316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002968316s Consumed credit for VC 0, remaining: 0
++0.002968316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002968316s Returned 1 credits for VC 0, now available: 1
++0.002968316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002968316s Consumed credit for VC 0, remaining: 0
++0.002968316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002968316s Returned 1 credits for VC 0, now available: 1
++0.002968316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002968316s Consumed credit for VC 0, remaining: 0
++0.002968316s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.002968316s Returned 1 credits for VC 0, now available: 1
++0.002968316s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.002968316s Consumed credit for VC 0, remaining: 0
++0.003052202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003052202s Returned 1 credits for VC 0, now available: 1
++0.003052202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.003052202s Consumed credit for VC 0, remaining: 0
++0.003052202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003052202s Returned 1 credits for VC 0, now available: 1
++0.003052202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.003052202s Consumed credit for VC 0, remaining: 0
++0.003052202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003052202s Returned 1 credits for VC 0, now available: 1
++0.003052202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.003052202s Consumed credit for VC 0, remaining: 0
++0.003052202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003052202s Returned 1 credits for VC 0, now available: 1
++0.003052202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.003052202s Consumed credit for VC 0, remaining: 0
++0.003052202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003052202s Returned 1 credits for VC 0, now available: 1
++0.003052202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.003052202s Consumed credit for VC 0, remaining: 0
++0.003052202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003052202s Returned 1 credits for VC 0, now available: 1
++0.003052202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.003052202s Consumed credit for VC 0, remaining: 0
++0.003052202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003052202s Returned 1 credits for VC 0, now available: 1
++0.003052202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.003052202s Consumed credit for VC 0, remaining: 0
++0.003052202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003052202s Returned 1 credits for VC 0, now available: 1
++0.003052202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.003052202s Consumed credit for VC 0, remaining: 0
++0.003452202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003452202s Returned 1 credits for VC 0, now available: 1
++0.003452202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.003452202s Consumed credit for VC 0, remaining: 0
++0.003452202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003452202s Returned 1 credits for VC 0, now available: 1
++0.003452202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.003452202s Consumed credit for VC 0, remaining: 0
++0.003452202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003452202s Returned 1 credits for VC 0, now available: 1
++0.003452202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.003452202s Consumed credit for VC 0, remaining: 0
++0.003452202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003452202s Returned 1 credits for VC 0, now available: 1
++0.003452202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.003452202s Consumed credit for VC 0, remaining: 0
++0.003452202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003452202s Returned 1 credits for VC 0, now available: 1
++0.003452202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.003452202s Consumed credit for VC 0, remaining: 0
++0.003452202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003452202s Returned 1 credits for VC 0, now available: 1
++0.003452202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.003452202s Consumed credit for VC 0, remaining: 0
++0.003452202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003452202s Returned 1 credits for VC 0, now available: 1
++0.003452202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.003452202s Consumed credit for VC 0, remaining: 0
++0.003452202s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003452202s Returned 1 credits for VC 0, now available: 1
++0.003452202s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.003452202s Consumed credit for VC 0, remaining: 0
++0.003536088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003536088s Returned 1 credits for VC 0, now available: 1
++0.003536088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.003536088s Consumed credit for VC 0, remaining: 0
++0.003536088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003536088s Returned 1 credits for VC 0, now available: 1
++0.003536088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.003536088s Consumed credit for VC 0, remaining: 0
++0.003536088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003536088s Returned 1 credits for VC 0, now available: 1
++0.003536088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.003536088s Consumed credit for VC 0, remaining: 0
++0.003536088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003536088s Returned 1 credits for VC 0, now available: 1
++0.003536088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.003536088s Consumed credit for VC 0, remaining: 0
++0.003536088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003536088s Returned 1 credits for VC 0, now available: 1
++0.003536088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.003536088s Consumed credit for VC 0, remaining: 0
++0.003536088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003536088s Returned 1 credits for VC 0, now available: 1
++0.003536088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.003536088s Consumed credit for VC 0, remaining: 0
++0.003536088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003536088s Returned 1 credits for VC 0, now available: 1
++0.003536088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.003536088s Consumed credit for VC 0, remaining: 0
++0.003536088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003536088s Returned 1 credits for VC 0, now available: 1
++0.003536088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.003536088s Consumed credit for VC 0, remaining: 0
++0.003936088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003936088s Returned 1 credits for VC 0, now available: 1
++0.003936088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.003936088s Consumed credit for VC 0, remaining: 0
++0.003936088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003936088s Returned 1 credits for VC 0, now available: 1
++0.003936088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.003936088s Consumed credit for VC 0, remaining: 0
++0.003936088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003936088s Returned 1 credits for VC 0, now available: 1
++0.003936088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.003936088s Consumed credit for VC 0, remaining: 0
++0.003936088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003936088s Returned 1 credits for VC 0, now available: 1
++0.003936088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.003936088s Consumed credit for VC 0, remaining: 0
++0.003936088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003936088s Returned 1 credits for VC 0, now available: 1
++0.003936088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.003936088s Consumed credit for VC 0, remaining: 0
++0.003936088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003936088s Returned 1 credits for VC 0, now available: 1
++0.003936088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.003936088s Consumed credit for VC 0, remaining: 0
++0.003936088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003936088s Returned 1 credits for VC 0, now available: 1
++0.003936088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.003936088s Consumed credit for VC 0, remaining: 0
++0.003936088s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.003936088s Returned 1 credits for VC 0, now available: 1
++0.003936088s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.003936088s Consumed credit for VC 0, remaining: 0
++0.004019974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004019974s Returned 1 credits for VC 0, now available: 1
++0.004019974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004019974s Consumed credit for VC 0, remaining: 0
++0.004019974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004019974s Returned 1 credits for VC 0, now available: 1
++0.004019974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004019974s Consumed credit for VC 0, remaining: 0
++0.004019974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004019974s Returned 1 credits for VC 0, now available: 1
++0.004019974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004019974s Consumed credit for VC 0, remaining: 0
++0.004019974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004019974s Returned 1 credits for VC 0, now available: 1
++0.004019974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004019974s Consumed credit for VC 0, remaining: 0
++0.004019974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004019974s Returned 1 credits for VC 0, now available: 1
++0.004019974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004019974s Consumed credit for VC 0, remaining: 0
++0.004019974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004019974s Returned 1 credits for VC 0, now available: 1
++0.004019974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004019974s Consumed credit for VC 0, remaining: 0
++0.004019974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004019974s Returned 1 credits for VC 0, now available: 1
++0.004019974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004019974s Consumed credit for VC 0, remaining: 0
++0.004019974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004019974s Returned 1 credits for VC 0, now available: 1
++0.004019974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004019974s Consumed credit for VC 0, remaining: 0
++0.004419974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004419974s Returned 1 credits for VC 0, now available: 1
++0.004419974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.004419974s Consumed credit for VC 0, remaining: 0
++0.004419974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004419974s Returned 1 credits for VC 0, now available: 1
++0.004419974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.004419974s Consumed credit for VC 0, remaining: 0
++0.004419974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004419974s Returned 1 credits for VC 0, now available: 1
++0.004419974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.004419974s Consumed credit for VC 0, remaining: 0
++0.004419974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004419974s Returned 1 credits for VC 0, now available: 1
++0.004419974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.004419974s Consumed credit for VC 0, remaining: 0
++0.004419974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004419974s Returned 1 credits for VC 0, now available: 1
++0.004419974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.004419974s Consumed credit for VC 0, remaining: 0
++0.004419974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004419974s Returned 1 credits for VC 0, now available: 1
++0.004419974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.004419974s Consumed credit for VC 0, remaining: 0
++0.004419974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004419974s Returned 1 credits for VC 0, now available: 1
++0.004419974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.004419974s Consumed credit for VC 0, remaining: 0
++0.004419974s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004419974s Returned 1 credits for VC 0, now available: 1
++0.004419974s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.004419974s Consumed credit for VC 0, remaining: 0
++0.004503860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004503860s Returned 1 credits for VC 0, now available: 1
++0.004503860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.004503860s Consumed credit for VC 0, remaining: 0
++0.004503860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004503860s Returned 1 credits for VC 0, now available: 1
++0.004503860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.004503860s Consumed credit for VC 0, remaining: 0
++0.004503860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004503860s Returned 1 credits for VC 0, now available: 1
++0.004503860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.004503860s Consumed credit for VC 0, remaining: 0
++0.004503860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004503860s Returned 1 credits for VC 0, now available: 1
++0.004503860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.004503860s Consumed credit for VC 0, remaining: 0
++0.004503860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004503860s Returned 1 credits for VC 0, now available: 1
++0.004503860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.004503860s Consumed credit for VC 0, remaining: 0
++0.004503860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004503860s Returned 1 credits for VC 0, now available: 1
++0.004503860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.004503860s Consumed credit for VC 0, remaining: 0
++0.004503860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004503860s Returned 1 credits for VC 0, now available: 1
++0.004503860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.004503860s Consumed credit for VC 0, remaining: 0
++0.004503860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004503860s Returned 1 credits for VC 0, now available: 1
++0.004503860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.004503860s Consumed credit for VC 0, remaining: 0
++0.004903860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004903860s Returned 1 credits for VC 0, now available: 1
++0.004903860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.004903860s Consumed credit for VC 0, remaining: 0
++0.004903860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004903860s Returned 1 credits for VC 0, now available: 1
++0.004903860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.004903860s Consumed credit for VC 0, remaining: 0
++0.004903860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004903860s Returned 1 credits for VC 0, now available: 1
++0.004903860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.004903860s Consumed credit for VC 0, remaining: 0
++0.004903860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004903860s Returned 1 credits for VC 0, now available: 1
++0.004903860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.004903860s Consumed credit for VC 0, remaining: 0
++0.004903860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004903860s Returned 1 credits for VC 0, now available: 1
++0.004903860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.004903860s Consumed credit for VC 0, remaining: 0
++0.004903860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004903860s Returned 1 credits for VC 0, now available: 1
++0.004903860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.004903860s Consumed credit for VC 0, remaining: 0
++0.004903860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004903860s Returned 1 credits for VC 0, now available: 1
++0.004903860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.004903860s Consumed credit for VC 0, remaining: 0
++0.004903860s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004903860s Returned 1 credits for VC 0, now available: 1
++0.004903860s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.004903860s Consumed credit for VC 0, remaining: 0
++0.004987746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004987746s Returned 1 credits for VC 0, now available: 1
++0.004987746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004987746s Consumed credit for VC 0, remaining: 0
++0.004987746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004987746s Returned 1 credits for VC 0, now available: 1
++0.004987746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004987746s Consumed credit for VC 0, remaining: 0
++0.004987746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004987746s Returned 1 credits for VC 0, now available: 1
++0.004987746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004987746s Consumed credit for VC 0, remaining: 0
++0.004987746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004987746s Returned 1 credits for VC 0, now available: 1
++0.004987746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004987746s Consumed credit for VC 0, remaining: 0
++0.004987746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004987746s Returned 1 credits for VC 0, now available: 1
++0.004987746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004987746s Consumed credit for VC 0, remaining: 0
++0.004987746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004987746s Returned 1 credits for VC 0, now available: 1
++0.004987746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004987746s Consumed credit for VC 0, remaining: 0
++0.004987746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004987746s Returned 1 credits for VC 0, now available: 1
++0.004987746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004987746s Consumed credit for VC 0, remaining: 0
++0.004987746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.004987746s Returned 1 credits for VC 0, now available: 1
++0.004987746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.004987746s Consumed credit for VC 0, remaining: 0
++0.005387746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005387746s Returned 1 credits for VC 0, now available: 1
++0.005387746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.005387746s Consumed credit for VC 0, remaining: 0
++0.005387746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005387746s Returned 1 credits for VC 0, now available: 1
++0.005387746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.005387746s Consumed credit for VC 0, remaining: 0
++0.005387746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005387746s Returned 1 credits for VC 0, now available: 1
++0.005387746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.005387746s Consumed credit for VC 0, remaining: 0
++0.005387746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005387746s Returned 1 credits for VC 0, now available: 1
++0.005387746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.005387746s Consumed credit for VC 0, remaining: 0
++0.005387746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005387746s Returned 1 credits for VC 0, now available: 1
++0.005387746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.005387746s Consumed credit for VC 0, remaining: 0
++0.005387746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005387746s Returned 1 credits for VC 0, now available: 1
++0.005387746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.005387746s Consumed credit for VC 0, remaining: 0
++0.005387746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005387746s Returned 1 credits for VC 0, now available: 1
++0.005387746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.005387746s Consumed credit for VC 0, remaining: 0
++0.005387746s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005387746s Returned 1 credits for VC 0, now available: 1
++0.005387746s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.005387746s Consumed credit for VC 0, remaining: 0
++0.005471632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005471632s Returned 1 credits for VC 0, now available: 1
++0.005471632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.005471632s Consumed credit for VC 0, remaining: 0
++0.005471632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005471632s Returned 1 credits for VC 0, now available: 1
++0.005471632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.005471632s Consumed credit for VC 0, remaining: 0
++0.005471632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005471632s Returned 1 credits for VC 0, now available: 1
++0.005471632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.005471632s Consumed credit for VC 0, remaining: 0
++0.005471632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005471632s Returned 1 credits for VC 0, now available: 1
++0.005471632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.005471632s Consumed credit for VC 0, remaining: 0
++0.005471632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005471632s Returned 1 credits for VC 0, now available: 1
++0.005471632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.005471632s Consumed credit for VC 0, remaining: 0
++0.005471632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005471632s Returned 1 credits for VC 0, now available: 1
++0.005471632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.005471632s Consumed credit for VC 0, remaining: 0
++0.005471632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005471632s Returned 1 credits for VC 0, now available: 1
++0.005471632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.005471632s Consumed credit for VC 0, remaining: 0
++0.005471632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005471632s Returned 1 credits for VC 0, now available: 1
++0.005471632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.005471632s Consumed credit for VC 0, remaining: 0
++0.005871632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005871632s Returned 1 credits for VC 0, now available: 1
++0.005871632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.005871632s Consumed credit for VC 0, remaining: 0
++0.005871632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005871632s Returned 1 credits for VC 0, now available: 1
++0.005871632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.005871632s Consumed credit for VC 0, remaining: 0
++0.005871632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005871632s Returned 1 credits for VC 0, now available: 1
++0.005871632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.005871632s Consumed credit for VC 0, remaining: 0
++0.005871632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005871632s Returned 1 credits for VC 0, now available: 1
++0.005871632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.005871632s Consumed credit for VC 0, remaining: 0
++0.005871632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005871632s Returned 1 credits for VC 0, now available: 1
++0.005871632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.005871632s Consumed credit for VC 0, remaining: 0
++0.005871632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005871632s Returned 1 credits for VC 0, now available: 1
++0.005871632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.005871632s Consumed credit for VC 0, remaining: 0
++0.005871632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005871632s Returned 1 credits for VC 0, now available: 1
++0.005871632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.005871632s Consumed credit for VC 0, remaining: 0
++0.005871632s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005871632s Returned 1 credits for VC 0, now available: 1
++0.005871632s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.005871632s Consumed credit for VC 0, remaining: 0
++0.005955518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005955518s Returned 1 credits for VC 0, now available: 1
++0.005955518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.005955518s Consumed credit for VC 0, remaining: 0
++0.005955518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005955518s Returned 1 credits for VC 0, now available: 1
++0.005955518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.005955518s Consumed credit for VC 0, remaining: 0
++0.005955518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005955518s Returned 1 credits for VC 0, now available: 1
++0.005955518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.005955518s Consumed credit for VC 0, remaining: 0
++0.005955518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005955518s Returned 1 credits for VC 0, now available: 1
++0.005955518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.005955518s Consumed credit for VC 0, remaining: 0
++0.005955518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005955518s Returned 1 credits for VC 0, now available: 1
++0.005955518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.005955518s Consumed credit for VC 0, remaining: 0
++0.005955518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005955518s Returned 1 credits for VC 0, now available: 1
++0.005955518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.005955518s Consumed credit for VC 0, remaining: 0
++0.005955518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005955518s Returned 1 credits for VC 0, now available: 1
++0.005955518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.005955518s Consumed credit for VC 0, remaining: 0
++0.005955518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.005955518s Returned 1 credits for VC 0, now available: 1
++0.005955518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.005955518s Consumed credit for VC 0, remaining: 0
++0.006355518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006355518s Returned 1 credits for VC 0, now available: 1
++0.006355518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.006355518s Consumed credit for VC 0, remaining: 0
++0.006355518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006355518s Returned 1 credits for VC 0, now available: 1
++0.006355518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.006355518s Consumed credit for VC 0, remaining: 0
++0.006355518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006355518s Returned 1 credits for VC 0, now available: 1
++0.006355518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.006355518s Consumed credit for VC 0, remaining: 0
++0.006355518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006355518s Returned 1 credits for VC 0, now available: 1
++0.006355518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.006355518s Consumed credit for VC 0, remaining: 0
++0.006355518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006355518s Returned 1 credits for VC 0, now available: 1
++0.006355518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.006355518s Consumed credit for VC 0, remaining: 0
++0.006355518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006355518s Returned 1 credits for VC 0, now available: 1
++0.006355518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.006355518s Consumed credit for VC 0, remaining: 0
++0.006355518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006355518s Returned 1 credits for VC 0, now available: 1
++0.006355518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.006355518s Consumed credit for VC 0, remaining: 0
++0.006355518s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006355518s Returned 1 credits for VC 0, now available: 1
++0.006355518s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.006355518s Consumed credit for VC 0, remaining: 0
++0.006439404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006439404s Returned 1 credits for VC 0, now available: 1
++0.006439404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.006439404s Consumed credit for VC 0, remaining: 0
++0.006439404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006439404s Returned 1 credits for VC 0, now available: 1
++0.006439404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.006439404s Consumed credit for VC 0, remaining: 0
++0.006439404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006439404s Returned 1 credits for VC 0, now available: 1
++0.006439404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.006439404s Consumed credit for VC 0, remaining: 0
++0.006439404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006439404s Returned 1 credits for VC 0, now available: 1
++0.006439404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.006439404s Consumed credit for VC 0, remaining: 0
++0.006439404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006439404s Returned 1 credits for VC 0, now available: 1
++0.006439404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.006439404s Consumed credit for VC 0, remaining: 0
++0.006439404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006439404s Returned 1 credits for VC 0, now available: 1
++0.006439404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.006439404s Consumed credit for VC 0, remaining: 0
++0.006439404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006439404s Returned 1 credits for VC 0, now available: 1
++0.006439404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.006439404s Consumed credit for VC 0, remaining: 0
++0.006439404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006439404s Returned 1 credits for VC 0, now available: 1
++0.006439404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.006439404s Consumed credit for VC 0, remaining: 0
++0.006839404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006839404s Returned 1 credits for VC 0, now available: 1
++0.006839404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.006839404s Consumed credit for VC 0, remaining: 0
++0.006839404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006839404s Returned 1 credits for VC 0, now available: 1
++0.006839404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.006839404s Consumed credit for VC 0, remaining: 0
++0.006839404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006839404s Returned 1 credits for VC 0, now available: 1
++0.006839404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.006839404s Consumed credit for VC 0, remaining: 0
++0.006839404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006839404s Returned 1 credits for VC 0, now available: 1
++0.006839404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.006839404s Consumed credit for VC 0, remaining: 0
++0.006839404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006839404s Returned 1 credits for VC 0, now available: 1
++0.006839404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.006839404s Consumed credit for VC 0, remaining: 0
++0.006839404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006839404s Returned 1 credits for VC 0, now available: 1
++0.006839404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.006839404s Consumed credit for VC 0, remaining: 0
++0.006839404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006839404s Returned 1 credits for VC 0, now available: 1
++0.006839404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.006839404s Consumed credit for VC 0, remaining: 0
++0.006839404s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006839404s Returned 1 credits for VC 0, now available: 1
++0.006839404s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.006839404s Consumed credit for VC 0, remaining: 0
++0.006923290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006923290s Returned 1 credits for VC 0, now available: 1
++0.006923290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.006923290s Consumed credit for VC 0, remaining: 0
++0.006923290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006923290s Returned 1 credits for VC 0, now available: 1
++0.006923290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.006923290s Consumed credit for VC 0, remaining: 0
++0.006923290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006923290s Returned 1 credits for VC 0, now available: 1
++0.006923290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.006923290s Consumed credit for VC 0, remaining: 0
++0.006923290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006923290s Returned 1 credits for VC 0, now available: 1
++0.006923290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.006923290s Consumed credit for VC 0, remaining: 0
++0.006923290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006923290s Returned 1 credits for VC 0, now available: 1
++0.006923290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.006923290s Consumed credit for VC 0, remaining: 0
++0.006923290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006923290s Returned 1 credits for VC 0, now available: 1
++0.006923290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.006923290s Consumed credit for VC 0, remaining: 0
++0.006923290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006923290s Returned 1 credits for VC 0, now available: 1
++0.006923290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.006923290s Consumed credit for VC 0, remaining: 0
++0.006923290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.006923290s Returned 1 credits for VC 0, now available: 1
++0.006923290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.006923290s Consumed credit for VC 0, remaining: 0
++0.007323290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007323290s Returned 1 credits for VC 0, now available: 1
++0.007323290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.007323290s Consumed credit for VC 0, remaining: 0
++0.007323290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007323290s Returned 1 credits for VC 0, now available: 1
++0.007323290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.007323290s Consumed credit for VC 0, remaining: 0
++0.007323290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007323290s Returned 1 credits for VC 0, now available: 1
++0.007323290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.007323290s Consumed credit for VC 0, remaining: 0
++0.007323290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007323290s Returned 1 credits for VC 0, now available: 1
++0.007323290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.007323290s Consumed credit for VC 0, remaining: 0
++0.007323290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007323290s Returned 1 credits for VC 0, now available: 1
++0.007323290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.007323290s Consumed credit for VC 0, remaining: 0
++0.007323290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007323290s Returned 1 credits for VC 0, now available: 1
++0.007323290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.007323290s Consumed credit for VC 0, remaining: 0
++0.007323290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007323290s Returned 1 credits for VC 0, now available: 1
++0.007323290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.007323290s Consumed credit for VC 0, remaining: 0
++0.007323290s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007323290s Returned 1 credits for VC 0, now available: 1
++0.007323290s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.007323290s Consumed credit for VC 0, remaining: 0
++0.007407176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007407176s Returned 1 credits for VC 0, now available: 1
++0.007407176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.007407176s Consumed credit for VC 0, remaining: 0
++0.007407176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007407176s Returned 1 credits for VC 0, now available: 1
++0.007407176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.007407176s Consumed credit for VC 0, remaining: 0
++0.007407176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007407176s Returned 1 credits for VC 0, now available: 1
++0.007407176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.007407176s Consumed credit for VC 0, remaining: 0
++0.007407176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007407176s Returned 1 credits for VC 0, now available: 1
++0.007407176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.007407176s Consumed credit for VC 0, remaining: 0
++0.007407176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007407176s Returned 1 credits for VC 0, now available: 1
++0.007407176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.007407176s Consumed credit for VC 0, remaining: 0
++0.007407176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007407176s Returned 1 credits for VC 0, now available: 1
++0.007407176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.007407176s Consumed credit for VC 0, remaining: 0
++0.007407176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007407176s Returned 1 credits for VC 0, now available: 1
++0.007407176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.007407176s Consumed credit for VC 0, remaining: 0
++0.007407176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007407176s Returned 1 credits for VC 0, now available: 1
++0.007407176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.007407176s Consumed credit for VC 0, remaining: 0
++0.007807176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007807176s Returned 1 credits for VC 0, now available: 1
++0.007807176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.007807176s Consumed credit for VC 0, remaining: 0
++0.007807176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007807176s Returned 1 credits for VC 0, now available: 1
++0.007807176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.007807176s Consumed credit for VC 0, remaining: 0
++0.007807176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007807176s Returned 1 credits for VC 0, now available: 1
++0.007807176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.007807176s Consumed credit for VC 0, remaining: 0
++0.007807176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007807176s Returned 1 credits for VC 0, now available: 1
++0.007807176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.007807176s Consumed credit for VC 0, remaining: 0
++0.007807176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007807176s Returned 1 credits for VC 0, now available: 1
++0.007807176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.007807176s Consumed credit for VC 0, remaining: 0
++0.007807176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007807176s Returned 1 credits for VC 0, now available: 1
++0.007807176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.007807176s Consumed credit for VC 0, remaining: 0
++0.007807176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007807176s Returned 1 credits for VC 0, now available: 1
++0.007807176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.007807176s Consumed credit for VC 0, remaining: 0
++0.007807176s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007807176s Returned 1 credits for VC 0, now available: 1
++0.007807176s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.007807176s Consumed credit for VC 0, remaining: 0
++0.007891062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007891062s Returned 1 credits for VC 0, now available: 1
++0.007891062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.007891062s Consumed credit for VC 0, remaining: 0
++0.007891062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007891062s Returned 1 credits for VC 0, now available: 1
++0.007891062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.007891062s Consumed credit for VC 0, remaining: 0
++0.007891062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007891062s Returned 1 credits for VC 0, now available: 1
++0.007891062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.007891062s Consumed credit for VC 0, remaining: 0
++0.007891062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007891062s Returned 1 credits for VC 0, now available: 1
++0.007891062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.007891062s Consumed credit for VC 0, remaining: 0
++0.007891062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007891062s Returned 1 credits for VC 0, now available: 1
++0.007891062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.007891062s Consumed credit for VC 0, remaining: 0
++0.007891062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007891062s Returned 1 credits for VC 0, now available: 1
++0.007891062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.007891062s Consumed credit for VC 0, remaining: 0
++0.007891062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007891062s Returned 1 credits for VC 0, now available: 1
++0.007891062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.007891062s Consumed credit for VC 0, remaining: 0
++0.007891062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.007891062s Returned 1 credits for VC 0, now available: 1
++0.007891062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.007891062s Consumed credit for VC 0, remaining: 0
++0.008291062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008291062s Returned 1 credits for VC 0, now available: 1
++0.008291062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.008291062s Consumed credit for VC 0, remaining: 0
++0.008291062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008291062s Returned 1 credits for VC 0, now available: 1
++0.008291062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.008291062s Consumed credit for VC 0, remaining: 0
++0.008291062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008291062s Returned 1 credits for VC 0, now available: 1
++0.008291062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.008291062s Consumed credit for VC 0, remaining: 0
++0.008291062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008291062s Returned 1 credits for VC 0, now available: 1
++0.008291062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.008291062s Consumed credit for VC 0, remaining: 0
++0.008291062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008291062s Returned 1 credits for VC 0, now available: 1
++0.008291062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.008291062s Consumed credit for VC 0, remaining: 0
++0.008291062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008291062s Returned 1 credits for VC 0, now available: 1
++0.008291062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.008291062s Consumed credit for VC 0, remaining: 0
++0.008291062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008291062s Returned 1 credits for VC 0, now available: 1
++0.008291062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.008291062s Consumed credit for VC 0, remaining: 0
++0.008291062s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008291062s Returned 1 credits for VC 0, now available: 1
++0.008291062s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.008291062s Consumed credit for VC 0, remaining: 0
++0.008374948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008374948s Returned 1 credits for VC 0, now available: 1
++0.008374948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.008374948s Consumed credit for VC 0, remaining: 0
++0.008374948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008374948s Returned 1 credits for VC 0, now available: 1
++0.008374948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.008374948s Consumed credit for VC 0, remaining: 0
++0.008374948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008374948s Returned 1 credits for VC 0, now available: 1
++0.008374948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.008374948s Consumed credit for VC 0, remaining: 0
++0.008374948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008374948s Returned 1 credits for VC 0, now available: 1
++0.008374948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.008374948s Consumed credit for VC 0, remaining: 0
++0.008374948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008374948s Returned 1 credits for VC 0, now available: 1
++0.008374948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.008374948s Consumed credit for VC 0, remaining: 0
++0.008374948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008374948s Returned 1 credits for VC 0, now available: 1
++0.008374948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.008374948s Consumed credit for VC 0, remaining: 0
++0.008374948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008374948s Returned 1 credits for VC 0, now available: 1
++0.008374948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.008374948s Consumed credit for VC 0, remaining: 0
++0.008374948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008374948s Returned 1 credits for VC 0, now available: 1
++0.008374948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.008374948s Consumed credit for VC 0, remaining: 0
++0.008774948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008774948s Returned 1 credits for VC 0, now available: 1
++0.008774948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.008774948s Consumed credit for VC 0, remaining: 0
++0.008774948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008774948s Returned 1 credits for VC 0, now available: 1
++0.008774948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.008774948s Consumed credit for VC 0, remaining: 0
++0.008774948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008774948s Returned 1 credits for VC 0, now available: 1
++0.008774948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.008774948s Consumed credit for VC 0, remaining: 0
++0.008774948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008774948s Returned 1 credits for VC 0, now available: 1
++0.008774948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.008774948s Consumed credit for VC 0, remaining: 0
++0.008774948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008774948s Returned 1 credits for VC 0, now available: 1
++0.008774948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.008774948s Consumed credit for VC 0, remaining: 0
++0.008774948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008774948s Returned 1 credits for VC 0, now available: 1
++0.008774948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.008774948s Consumed credit for VC 0, remaining: 0
++0.008774948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008774948s Returned 1 credits for VC 0, now available: 1
++0.008774948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.008774948s Consumed credit for VC 0, remaining: 0
++0.008774948s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008774948s Returned 1 credits for VC 0, now available: 1
++0.008774948s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.008774948s Consumed credit for VC 0, remaining: 0
++0.008858834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008858834s Returned 1 credits for VC 0, now available: 1
++0.008858834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.008858834s Consumed credit for VC 0, remaining: 0
++0.008858834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008858834s Returned 1 credits for VC 0, now available: 1
++0.008858834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.008858834s Consumed credit for VC 0, remaining: 0
++0.008858834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008858834s Returned 1 credits for VC 0, now available: 1
++0.008858834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.008858834s Consumed credit for VC 0, remaining: 0
++0.008858834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008858834s Returned 1 credits for VC 0, now available: 1
++0.008858834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.008858834s Consumed credit for VC 0, remaining: 0
++0.008858834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008858834s Returned 1 credits for VC 0, now available: 1
++0.008858834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.008858834s Consumed credit for VC 0, remaining: 0
++0.008858834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008858834s Returned 1 credits for VC 0, now available: 1
++0.008858834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.008858834s Consumed credit for VC 0, remaining: 0
++0.008858834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008858834s Returned 1 credits for VC 0, now available: 1
++0.008858834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.008858834s Consumed credit for VC 0, remaining: 0
++0.008858834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.008858834s Returned 1 credits for VC 0, now available: 1
++0.008858834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.008858834s Consumed credit for VC 0, remaining: 0
++0.009258834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009258834s Returned 1 credits for VC 0, now available: 1
++0.009258834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.009258834s Consumed credit for VC 0, remaining: 0
++0.009258834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009258834s Returned 1 credits for VC 0, now available: 1
++0.009258834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.009258834s Consumed credit for VC 0, remaining: 0
++0.009258834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009258834s Returned 1 credits for VC 0, now available: 1
++0.009258834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.009258834s Consumed credit for VC 0, remaining: 0
++0.009258834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009258834s Returned 1 credits for VC 0, now available: 1
++0.009258834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.009258834s Consumed credit for VC 0, remaining: 0
++0.009258834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009258834s Returned 1 credits for VC 0, now available: 1
++0.009258834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.009258834s Consumed credit for VC 0, remaining: 0
++0.009258834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009258834s Returned 1 credits for VC 0, now available: 1
++0.009258834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.009258834s Consumed credit for VC 0, remaining: 0
++0.009258834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009258834s Returned 1 credits for VC 0, now available: 1
++0.009258834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.009258834s Consumed credit for VC 0, remaining: 0
++0.009258834s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009258834s Returned 1 credits for VC 0, now available: 1
++0.009258834s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.009258834s Consumed credit for VC 0, remaining: 0
++0.009342720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009342720s Returned 1 credits for VC 0, now available: 1
++0.009342720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.009342720s Consumed credit for VC 0, remaining: 0
++0.009342720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009342720s Returned 1 credits for VC 0, now available: 1
++0.009342720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.009342720s Consumed credit for VC 0, remaining: 0
++0.009342720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009342720s Returned 1 credits for VC 0, now available: 1
++0.009342720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.009342720s Consumed credit for VC 0, remaining: 0
++0.009342720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009342720s Returned 1 credits for VC 0, now available: 1
++0.009342720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.009342720s Consumed credit for VC 0, remaining: 0
++0.009342720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009342720s Returned 1 credits for VC 0, now available: 1
++0.009342720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.009342720s Consumed credit for VC 0, remaining: 0
++0.009342720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009342720s Returned 1 credits for VC 0, now available: 1
++0.009342720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.009342720s Consumed credit for VC 0, remaining: 0
++0.009342720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009342720s Returned 1 credits for VC 0, now available: 1
++0.009342720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.009342720s Consumed credit for VC 0, remaining: 0
++0.009342720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009342720s Returned 1 credits for VC 0, now available: 1
++0.009342720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.009342720s Consumed credit for VC 0, remaining: 0
++0.009742720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009742720s Returned 1 credits for VC 0, now available: 1
++0.009742720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.009742720s Consumed credit for VC 0, remaining: 0
++0.009742720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009742720s Returned 1 credits for VC 0, now available: 1
++0.009742720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.009742720s Consumed credit for VC 0, remaining: 0
++0.009742720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009742720s Returned 1 credits for VC 0, now available: 1
++0.009742720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.009742720s Consumed credit for VC 0, remaining: 0
++0.009742720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009742720s Returned 1 credits for VC 0, now available: 1
++0.009742720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.009742720s Consumed credit for VC 0, remaining: 0
++0.009742720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009742720s Returned 1 credits for VC 0, now available: 1
++0.009742720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.009742720s Consumed credit for VC 0, remaining: 0
++0.009742720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009742720s Returned 1 credits for VC 0, now available: 1
++0.009742720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.009742720s Consumed credit for VC 0, remaining: 0
++0.009742720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009742720s Returned 1 credits for VC 0, now available: 1
++0.009742720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.009742720s Consumed credit for VC 0, remaining: 0
++0.009742720s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009742720s Returned 1 credits for VC 0, now available: 1
++0.009742720s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.009742720s Consumed credit for VC 0, remaining: 0
++0.009826606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009826606s Returned 1 credits for VC 0, now available: 1
++0.009826606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.009826606s Consumed credit for VC 0, remaining: 0
++0.009826606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009826606s Returned 1 credits for VC 0, now available: 1
++0.009826606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.009826606s Consumed credit for VC 0, remaining: 0
++0.009826606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009826606s Returned 1 credits for VC 0, now available: 1
++0.009826606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.009826606s Consumed credit for VC 0, remaining: 0
++0.009826606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009826606s Returned 1 credits for VC 0, now available: 1
++0.009826606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.009826606s Consumed credit for VC 0, remaining: 0
++0.009826606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009826606s Returned 1 credits for VC 0, now available: 1
++0.009826606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.009826606s Consumed credit for VC 0, remaining: 0
++0.009826606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009826606s Returned 1 credits for VC 0, now available: 1
++0.009826606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.009826606s Consumed credit for VC 0, remaining: 0
++0.009826606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009826606s Returned 1 credits for VC 0, now available: 1
++0.009826606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.009826606s Consumed credit for VC 0, remaining: 0
++0.009826606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.009826606s Returned 1 credits for VC 0, now available: 1
++0.009826606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.009826606s Consumed credit for VC 0, remaining: 0
++0.010226606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010226606s Returned 1 credits for VC 0, now available: 1
++0.010226606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.010226606s Consumed credit for VC 0, remaining: 0
++0.010226606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010226606s Returned 1 credits for VC 0, now available: 1
++0.010226606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.010226606s Consumed credit for VC 0, remaining: 0
++0.010226606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010226606s Returned 1 credits for VC 0, now available: 1
++0.010226606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.010226606s Consumed credit for VC 0, remaining: 0
++0.010226606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010226606s Returned 1 credits for VC 0, now available: 1
++0.010226606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.010226606s Consumed credit for VC 0, remaining: 0
++0.010226606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010226606s Returned 1 credits for VC 0, now available: 1
++0.010226606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.010226606s Consumed credit for VC 0, remaining: 0
++0.010226606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010226606s Returned 1 credits for VC 0, now available: 1
++0.010226606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.010226606s Consumed credit for VC 0, remaining: 0
++0.010226606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010226606s Returned 1 credits for VC 0, now available: 1
++0.010226606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.010226606s Consumed credit for VC 0, remaining: 0
++0.010226606s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010226606s Returned 1 credits for VC 0, now available: 1
++0.010226606s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.010226606s Consumed credit for VC 0, remaining: 0
++0.010310492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010310492s Returned 1 credits for VC 0, now available: 1
++0.010310492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.010310492s Consumed credit for VC 0, remaining: 0
++0.010310492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010310492s Returned 1 credits for VC 0, now available: 1
++0.010310492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.010310492s Consumed credit for VC 0, remaining: 0
++0.010310492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010310492s Returned 1 credits for VC 0, now available: 1
++0.010310492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.010310492s Consumed credit for VC 0, remaining: 0
++0.010310492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010310492s Returned 1 credits for VC 0, now available: 1
++0.010310492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.010310492s Consumed credit for VC 0, remaining: 0
++0.010310492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010310492s Returned 1 credits for VC 0, now available: 1
++0.010310492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.010310492s Consumed credit for VC 0, remaining: 0
++0.010310492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010310492s Returned 1 credits for VC 0, now available: 1
++0.010310492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.010310492s Consumed credit for VC 0, remaining: 0
++0.010310492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010310492s Returned 1 credits for VC 0, now available: 1
++0.010310492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.010310492s Consumed credit for VC 0, remaining: 0
++0.010310492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010310492s Returned 1 credits for VC 0, now available: 1
++0.010310492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.010310492s Consumed credit for VC 0, remaining: 0
++0.010710492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010710492s Returned 1 credits for VC 0, now available: 1
++0.010710492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.010710492s Consumed credit for VC 0, remaining: 0
++0.010710492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010710492s Returned 1 credits for VC 0, now available: 1
++0.010710492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.010710492s Consumed credit for VC 0, remaining: 0
++0.010710492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010710492s Returned 1 credits for VC 0, now available: 1
++0.010710492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.010710492s Consumed credit for VC 0, remaining: 0
++0.010710492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010710492s Returned 1 credits for VC 0, now available: 1
++0.010710492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.010710492s Consumed credit for VC 0, remaining: 0
++0.010710492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010710492s Returned 1 credits for VC 0, now available: 1
++0.010710492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.010710492s Consumed credit for VC 0, remaining: 0
++0.010710492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010710492s Returned 1 credits for VC 0, now available: 1
++0.010710492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.010710492s Consumed credit for VC 0, remaining: 0
++0.010710492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010710492s Returned 1 credits for VC 0, now available: 1
++0.010710492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.010710492s Consumed credit for VC 0, remaining: 0
++0.010710492s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010710492s Returned 1 credits for VC 0, now available: 1
++0.010710492s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.010710492s Consumed credit for VC 0, remaining: 0
++0.010794378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010794378s Returned 1 credits for VC 0, now available: 1
++0.010794378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.010794378s Consumed credit for VC 0, remaining: 0
++0.010794378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010794378s Returned 1 credits for VC 0, now available: 1
++0.010794378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.010794378s Consumed credit for VC 0, remaining: 0
++0.010794378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010794378s Returned 1 credits for VC 0, now available: 1
++0.010794378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.010794378s Consumed credit for VC 0, remaining: 0
++0.010794378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010794378s Returned 1 credits for VC 0, now available: 1
++0.010794378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.010794378s Consumed credit for VC 0, remaining: 0
++0.010794378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010794378s Returned 1 credits for VC 0, now available: 1
++0.010794378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.010794378s Consumed credit for VC 0, remaining: 0
++0.010794378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010794378s Returned 1 credits for VC 0, now available: 1
++0.010794378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.010794378s Consumed credit for VC 0, remaining: 0
++0.010794378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010794378s Returned 1 credits for VC 0, now available: 1
++0.010794378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.010794378s Consumed credit for VC 0, remaining: 0
++0.010794378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.010794378s Returned 1 credits for VC 0, now available: 1
++0.010794378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.010794378s Consumed credit for VC 0, remaining: 0
++0.011194378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011194378s Returned 1 credits for VC 0, now available: 1
++0.011194378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.011194378s Consumed credit for VC 0, remaining: 0
++0.011194378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011194378s Returned 1 credits for VC 0, now available: 1
++0.011194378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.011194378s Consumed credit for VC 0, remaining: 0
++0.011194378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011194378s Returned 1 credits for VC 0, now available: 1
++0.011194378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.011194378s Consumed credit for VC 0, remaining: 0
++0.011194378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011194378s Returned 1 credits for VC 0, now available: 1
++0.011194378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.011194378s Consumed credit for VC 0, remaining: 0
++0.011194378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011194378s Returned 1 credits for VC 0, now available: 1
++0.011194378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.011194378s Consumed credit for VC 0, remaining: 0
++0.011194378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011194378s Returned 1 credits for VC 0, now available: 1
++0.011194378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.011194378s Consumed credit for VC 0, remaining: 0
++0.011194378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011194378s Returned 1 credits for VC 0, now available: 1
++0.011194378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.011194378s Consumed credit for VC 0, remaining: 0
++0.011194378s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011194378s Returned 1 credits for VC 0, now available: 1
++0.011194378s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.011194378s Consumed credit for VC 0, remaining: 0
++0.011278264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011278264s Returned 1 credits for VC 0, now available: 1
++0.011278264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.011278264s Consumed credit for VC 0, remaining: 0
++0.011278264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011278264s Returned 1 credits for VC 0, now available: 1
++0.011278264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.011278264s Consumed credit for VC 0, remaining: 0
++0.011278264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011278264s Returned 1 credits for VC 0, now available: 1
++0.011278264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.011278264s Consumed credit for VC 0, remaining: 0
++0.011278264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011278264s Returned 1 credits for VC 0, now available: 1
++0.011278264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.011278264s Consumed credit for VC 0, remaining: 0
++0.011278264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011278264s Returned 1 credits for VC 0, now available: 1
++0.011278264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.011278264s Consumed credit for VC 0, remaining: 0
++0.011278264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011278264s Returned 1 credits for VC 0, now available: 1
++0.011278264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.011278264s Consumed credit for VC 0, remaining: 0
++0.011278264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011278264s Returned 1 credits for VC 0, now available: 1
++0.011278264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.011278264s Consumed credit for VC 0, remaining: 0
++0.011278264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011278264s Returned 1 credits for VC 0, now available: 1
++0.011278264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.011278264s Consumed credit for VC 0, remaining: 0
++0.011678264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011678264s Returned 1 credits for VC 0, now available: 1
++0.011678264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.011678264s Consumed credit for VC 0, remaining: 0
++0.011678264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011678264s Returned 1 credits for VC 0, now available: 1
++0.011678264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.011678264s Consumed credit for VC 0, remaining: 0
++0.011678264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011678264s Returned 1 credits for VC 0, now available: 1
++0.011678264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.011678264s Consumed credit for VC 0, remaining: 0
++0.011678264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011678264s Returned 1 credits for VC 0, now available: 1
++0.011678264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.011678264s Consumed credit for VC 0, remaining: 0
++0.011678264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011678264s Returned 1 credits for VC 0, now available: 1
++0.011678264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.011678264s Consumed credit for VC 0, remaining: 0
++0.011678264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011678264s Returned 1 credits for VC 0, now available: 1
++0.011678264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.011678264s Consumed credit for VC 0, remaining: 0
++0.011678264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011678264s Returned 1 credits for VC 0, now available: 1
++0.011678264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.011678264s Consumed credit for VC 0, remaining: 0
++0.011678264s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011678264s Returned 1 credits for VC 0, now available: 1
++0.011678264s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.011678264s Consumed credit for VC 0, remaining: 0
++0.011762150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011762150s Returned 1 credits for VC 0, now available: 1
++0.011762150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.011762150s Consumed credit for VC 0, remaining: 0
++0.011762150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011762150s Returned 1 credits for VC 0, now available: 1
++0.011762150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.011762150s Consumed credit for VC 0, remaining: 0
++0.011762150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011762150s Returned 1 credits for VC 0, now available: 1
++0.011762150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.011762150s Consumed credit for VC 0, remaining: 0
++0.011762150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011762150s Returned 1 credits for VC 0, now available: 1
++0.011762150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.011762150s Consumed credit for VC 0, remaining: 0
++0.011762150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011762150s Returned 1 credits for VC 0, now available: 1
++0.011762150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.011762150s Consumed credit for VC 0, remaining: 0
++0.011762150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011762150s Returned 1 credits for VC 0, now available: 1
++0.011762150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.011762150s Consumed credit for VC 0, remaining: 0
++0.011762150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011762150s Returned 1 credits for VC 0, now available: 1
++0.011762150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.011762150s Consumed credit for VC 0, remaining: 0
++0.011762150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.011762150s Returned 1 credits for VC 0, now available: 1
++0.011762150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.011762150s Consumed credit for VC 0, remaining: 0
++0.012162150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012162150s Returned 1 credits for VC 0, now available: 1
++0.012162150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.012162150s Consumed credit for VC 0, remaining: 0
++0.012162150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012162150s Returned 1 credits for VC 0, now available: 1
++0.012162150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.012162150s Consumed credit for VC 0, remaining: 0
++0.012162150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012162150s Returned 1 credits for VC 0, now available: 1
++0.012162150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.012162150s Consumed credit for VC 0, remaining: 0
++0.012162150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012162150s Returned 1 credits for VC 0, now available: 1
++0.012162150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.012162150s Consumed credit for VC 0, remaining: 0
++0.012162150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012162150s Returned 1 credits for VC 0, now available: 1
++0.012162150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.012162150s Consumed credit for VC 0, remaining: 0
++0.012162150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012162150s Returned 1 credits for VC 0, now available: 1
++0.012162150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.012162150s Consumed credit for VC 0, remaining: 0
++0.012162150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012162150s Returned 1 credits for VC 0, now available: 1
++0.012162150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.012162150s Consumed credit for VC 0, remaining: 0
++0.012162150s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012162150s Returned 1 credits for VC 0, now available: 1
++0.012162150s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.012162150s Consumed credit for VC 0, remaining: 0
++0.012246036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012246036s Returned 1 credits for VC 0, now available: 1
++0.012246036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.012246036s Consumed credit for VC 0, remaining: 0
++0.012246036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012246036s Returned 1 credits for VC 0, now available: 1
++0.012246036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.012246036s Consumed credit for VC 0, remaining: 0
++0.012246036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012246036s Returned 1 credits for VC 0, now available: 1
++0.012246036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.012246036s Consumed credit for VC 0, remaining: 0
++0.012246036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012246036s Returned 1 credits for VC 0, now available: 1
++0.012246036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.012246036s Consumed credit for VC 0, remaining: 0
++0.012246036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012246036s Returned 1 credits for VC 0, now available: 1
++0.012246036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.012246036s Consumed credit for VC 0, remaining: 0
++0.012246036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012246036s Returned 1 credits for VC 0, now available: 1
++0.012246036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.012246036s Consumed credit for VC 0, remaining: 0
++0.012246036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012246036s Returned 1 credits for VC 0, now available: 1
++0.012246036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.012246036s Consumed credit for VC 0, remaining: 0
++0.012246036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012246036s Returned 1 credits for VC 0, now available: 1
++0.012246036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.012246036s Consumed credit for VC 0, remaining: 0
++0.012646036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012646036s Returned 1 credits for VC 0, now available: 1
++0.012646036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.012646036s Consumed credit for VC 0, remaining: 0
++0.012646036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012646036s Returned 1 credits for VC 0, now available: 1
++0.012646036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.012646036s Consumed credit for VC 0, remaining: 0
++0.012646036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012646036s Returned 1 credits for VC 0, now available: 1
++0.012646036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.012646036s Consumed credit for VC 0, remaining: 0
++0.012646036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012646036s Returned 1 credits for VC 0, now available: 1
++0.012646036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.012646036s Consumed credit for VC 0, remaining: 0
++0.012646036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012646036s Returned 1 credits for VC 0, now available: 1
++0.012646036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.012646036s Consumed credit for VC 0, remaining: 0
++0.012646036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012646036s Returned 1 credits for VC 0, now available: 1
++0.012646036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.012646036s Consumed credit for VC 0, remaining: 0
++0.012646036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012646036s Returned 1 credits for VC 0, now available: 1
++0.012646036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.012646036s Consumed credit for VC 0, remaining: 0
++0.012646036s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012646036s Returned 1 credits for VC 0, now available: 1
++0.012646036s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 0)
++0.012646036s Consumed credit for VC 0, remaining: 0
++0.012729922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012729922s Returned 1 credits for VC 0, now available: 1
++0.012729922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.012729922s Consumed credit for VC 0, remaining: 0
++0.012729922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012729922s Returned 1 credits for VC 0, now available: 1
++0.012729922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.012729922s Consumed credit for VC 0, remaining: 0
++0.012729922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012729922s Returned 1 credits for VC 0, now available: 1
++0.012729922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.012729922s Consumed credit for VC 0, remaining: 0
++0.012729922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012729922s Returned 1 credits for VC 0, now available: 1
++0.012729922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.012729922s Consumed credit for VC 0, remaining: 0
++0.012729922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012729922s Returned 1 credits for VC 0, now available: 1
++0.012729922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.012729922s Consumed credit for VC 0, remaining: 0
++0.012729922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012729922s Returned 1 credits for VC 0, now available: 1
++0.012729922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.012729922s Consumed credit for VC 0, remaining: 0
++0.012729922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012729922s Returned 1 credits for VC 0, now available: 1
++0.012729922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.012729922s Consumed credit for VC 0, remaining: 0
++0.012729922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.012729922s Returned 1 credits for VC 0, now available: 1
++0.012729922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 1)
++0.012729922s Consumed credit for VC 0, remaining: 0
++0.013129922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013129922s Returned 1 credits for VC 0, now available: 1
++0.013129922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.013129922s Consumed credit for VC 0, remaining: 0
++0.013129922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013129922s Returned 1 credits for VC 0, now available: 1
++0.013129922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.013129922s Consumed credit for VC 0, remaining: 0
++0.013129922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013129922s Returned 1 credits for VC 0, now available: 1
++0.013129922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.013129922s Consumed credit for VC 0, remaining: 0
++0.013129922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013129922s Returned 1 credits for VC 0, now available: 1
++0.013129922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.013129922s Consumed credit for VC 0, remaining: 0
++0.013129922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013129922s Returned 1 credits for VC 0, now available: 1
++0.013129922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.013129922s Consumed credit for VC 0, remaining: 0
++0.013129922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013129922s Returned 1 credits for VC 0, now available: 1
++0.013129922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.013129922s Consumed credit for VC 0, remaining: 0
++0.013129922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013129922s Returned 1 credits for VC 0, now available: 1
++0.013129922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.013129922s Consumed credit for VC 0, remaining: 0
++0.013129922s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013129922s Returned 1 credits for VC 0, now available: 1
++0.013129922s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 2)
++0.013129922s Consumed credit for VC 0, remaining: 0
++0.013213808s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013213808s Returned 1 credits for VC 0, now available: 1
++0.013213808s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.013213808s Consumed credit for VC 0, remaining: 0
++0.013213808s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013213808s Returned 1 credits for VC 0, now available: 1
++0.013213808s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.013213808s Consumed credit for VC 0, remaining: 0
++0.013213808s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013213808s Returned 1 credits for VC 0, now available: 1
++0.013213808s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.013213808s Consumed credit for VC 0, remaining: 0
++0.013213808s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013213808s Returned 1 credits for VC 0, now available: 1
++0.013213808s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.013213808s Consumed credit for VC 0, remaining: 0
++0.013213808s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013213808s Returned 1 credits for VC 0, now available: 1
++0.013213808s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.013213808s Consumed credit for VC 0, remaining: 0
++0.013213808s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013213808s Returned 1 credits for VC 0, now available: 1
++0.013213808s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.013213808s Consumed credit for VC 0, remaining: 0
++0.013213808s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013213808s Returned 1 credits for VC 0, now available: 1
++0.013213808s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.013213808s Consumed credit for VC 0, remaining: 0
++0.013213808s CreditManager:ReturnCredits(0x7ffe20961788, 0, 1)
++0.013213808s Returned 1 credits for VC 0, now available: 1
++0.013213808s CreditManager:ConsumeCredit(0x7ffe209612f8, 0, 3)
++0.013213808s Consumed credit for VC 0, remaining: 0
+CreditManager:DoDispose(0x7ffe20961d98)
+CreditManager:~CreditManager(0x7ffe20961d88)
+CreditManager:DoDispose(0x7ffe20961d98)
+CreditManager:~CreditManager(0x7ffe20961d88)
+CreditManager:DoDispose(0x7ffe20961d98)
+CreditManager:~CreditManager(0x7ffe20961d88)
+CreditManager:DoDispose(0x7ffe20961d98)
+CreditManager:~CreditManager(0x7ffe20961d88)
+CreditManager:DoDispose(0x7ffe20961d98)
+CreditManager:~CreditManager(0x7ffe20961d88)
+CreditManager:DoDispose(0x7ffe20961d98)
+CreditManager:~CreditManager(0x7ffe20961d88)
+CreditManager:DoDispose(0x7ffe20961d98)
+CreditManager:~CreditManager(0x7ffe20961d88)
+CreditManager:DoDispose(0x7ffe20961d98)
+CreditManager:~CreditManager(0x7ffe20961d88)
