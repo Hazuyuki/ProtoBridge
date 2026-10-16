@@ -81,7 +81,9 @@ class TheoryDerivedSurrogate:
         nvls_bw_bytes_per_us           (535500)  NVLS aggregate transfer       [nvls mean]
       Latency — fixed term (µs unless noted):
         link_latency_us                (0.4 = 400 ns) per-hop propagation  [ring/nvls mean]
-        t_min_switch_us                 (2.99)   NVSwitch pipeline fill      [tree mean]
+        t_min_switch_us                 (1.22)   NVSwitch fixed pipeline cost [tree mean]
+        tree_fill_bytes_per_step        (2.76 MiB) tree pipeline-fill volume  [tree mean]
+        tree_fill_cap_ratio             (3.45)   fill cap = ratio * D         [tree mean]
         startup_us                      (15.0)   protocol startup (LL/LL128) [all mean]
         nvls_startup_us                 (23.0)   NVLS startup (used for nvls) [nvls mean]
         fec_encode_ns / fec_decode_ns   (50 / 80 ns) FEC pipeline latency   [FEC on]
@@ -113,7 +115,9 @@ class TheoryDerivedSurrogate:
                  spray_chunk_bytes=131072,
                  bulk_chunk_bytes=8 * 1024 * 1024,
                  num_lanes=18,
-                 t_min_switch_us=2.99,
+                 t_min_switch_us=1.22,
+                 tree_fill_bytes_per_step=2.76 * 1024 * 1024,
+                 tree_fill_cap_ratio=3.45,
                  fec_n=544, fec_k=514, fec_t=15,
                  fec_symbol_bits=10,
                  fec_encode_ns=50, fec_decode_ns=80,
@@ -136,6 +140,14 @@ class TheoryDerivedSurrogate:
         self.bulk_chunk_size = bulk_chunk_bytes
         self.num_lanes = num_lanes
         self.T_min_switch = t_min_switch_us
+        # Tree pipeline-fill volume: an ADDITIVE per-step byte count the tree
+        # schedule moves on top of the steady-state alpha_inf(N)*D payload
+        # (credit/window ramp-up + overlapped reduce-up/broadcast-down chunk
+        # pipelines that have not reached steady state), capped at
+        # tree_fill_cap_ratio * D so large transfers converge to the linear
+        # alpha_inf(N)*D/bw regime. See _tree_trunk_load.
+        self.tree_fill_bytes_per_step = tree_fill_bytes_per_step
+        self.tree_fill_cap_ratio = tree_fill_cap_ratio
         # Compatibility alias used by an older diagnostic script.
         self.eta_sw = self.tree_bw_per_level / max(self.ring_bw, 1.0)
         self.fec_n = fec_n
@@ -200,27 +212,50 @@ class TheoryDerivedSurrogate:
 
     @staticmethod
     def _tree_trunk_load(N):
-        """Busiest GPU<->NVSwitch trunk load, in units of D, for the tree.
+        """Steady-state (large-D) busiest trunk load alpha_inf(N), in D units.
 
         ns-3 ``TreeAllReduce`` (post volume-fix) is a heap-shaped binary tree
         (node i -> children 2i+1, 2i+2) with overlapped reduce-up +
         broadcast-down chunk pipelines; every tree edge carries the full D in
-        each direction, and each GPU's single switch trunk carries the sum of
-        its tree-edge traffic in the busier direction:
+        each direction. The structural trunk load is 1D (N<=2) / 2D (root at
+        N<=4) / 3D (interior node at N>=5), but the MEASURED large-size cost
+        (fresh 36-point N={4,8,16,32} x 1-256 MiB sweep on the post-local-rank-
+        fix binary, `configs/calibration/tree_ns3_sweep.py`) is the piecewise
 
-          N <= 2: single edge, load D
-          N <= 4: the root receives 2D (two children) and sends 2D
-          N >= 5: an interior node moves 2D child + 1D parent traffic
+          alpha_inf(N) = 1.0 (N<=2) / 1.71 (N in 3..4) / 2.74 (N in 5..8)
+                         / 2.89 (N in 9..16) / 2.95 (N >= 17)
 
-        Measured ns-3 large-size cost alpha(N)*D/trunk: alpha = 2.505 (N=4),
-        3.894 (N=8), 3.993 (N=16) -- the extra ~0.9-1.0 over the pure trunk
-        load is pipeline fill absorbed into the fitted trunk efficiency.
+        At finite D the tree ALSO pays a size-dependent excess: the implied
+        alpha_eff(D) DECAYS toward alpha_inf as D grows (e.g. 3.99 at 8 MiB to
+        2.79 at 256 MiB for N=8), because pipeline fill (credit/window ramp-up
+        + pipelines not yet in steady state) is an ADDITIVE per-step byte
+        volume, not a multiplicative factor. That fill is carried separately by
+        ``tree_fill_bytes_per_step`` (capped at ``tree_fill_cap_ratio`` * D) in
+        ``_per_step`` -- see `_tree_fill_bytes`.
         """
         if N <= 2:
             return 1.0
         if N <= 4:
-            return 2.0
-        return 3.0
+            return 1.71
+        if N <= 8:
+            return 2.74
+        if N <= 16:
+            return 2.89
+        return 2.95
+
+    def _tree_fill_bytes(self, D, steps):
+        """Pipeline-fill bytes serialized per tree step (additive, capped).
+
+        min(tree_fill_bytes_per_step * steps, tree_fill_cap_ratio * D): the
+        fill volume is proportional to the number of pipeline entries (steps)
+        for large D, but cannot exceed a fixed fraction of the payload at
+        small D. The 2.76 MiB/step is ~22.1 spray chunks (131072 B) -- the
+        credit window (64 vcCredits) plus the overlapped reduce-up /
+        broadcast-down chunk pipelines warming up.
+        """
+        fill = self.tree_fill_bytes_per_step * steps
+        cap = self.tree_fill_cap_ratio * D
+        return fill if fill < cap else cap
 
     def _per_step(self, D, N, algo, steps, collective=None):
         """Bytes moved in one phase of (collective, algorithm).
@@ -229,9 +264,10 @@ class TheoryDerivedSurrogate:
         split over its N-1 partner phases -> D/N per phase); Send-Recv moves
         the full D in its single hop. AllReduce/AllGather keep the legacy
         volume D*(N-1)/N (ring) or D/N (nvls multicast share). Tree AllReduce
-        moves alpha(N)*D/steps: the full-volume chunk-pipelined tree carries
-        the whole D over every edge, so the busiest GPU<->NVSwitch trunk
-        serializes alpha(N)*D total (see ``_tree_trunk_load``).
+        moves (alpha_inf(N)*D + fill)/steps: the full-volume chunk-pipelined
+        tree carries the whole D over every edge, so the busiest GPU<->NVSwitch
+        trunk serializes alpha_inf(N)*D plus the capped pipeline-fill volume
+        (see ``_tree_trunk_load`` / ``_tree_fill_bytes``).
         """
         collective = self._validate_collective(collective)
         if collective == 'sendrecv':
@@ -243,7 +279,8 @@ class TheoryDerivedSurrogate:
             # ring's D*(N-1)/N).
             return D / N
         if algo == 'tree' and collective == 'allreduce':
-            return self._tree_trunk_load(N) * D / steps
+            return (self._tree_trunk_load(N) * D
+                    + self._tree_fill_bytes(D, steps)) / steps
         return D * (N - 1) / N / steps
 
     def _bdp(self, N, algo, collective=None):
@@ -931,7 +968,9 @@ def make_h200_ring_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=4,
-        t_min_switch_us=2.99,
+        t_min_switch_us=1.22,
+        tree_fill_bytes_per_step=2.76 * 1024 * 1024,
+        tree_fill_cap_ratio=3.45,
         startup_us=15.0,
     )
     defaults.update(overrides)
@@ -941,16 +980,19 @@ def make_h200_ring_theory(**overrides):
 def make_h200_tree_theory(**overrides):
     """H200 tree profile: chunk-pipelined binary tree through the NVSwitch.
 
-    Calibrated to the post-volume-fix ns-3 ``TreeAllReduce`` (every tree edge
-    carries the full D; see ``configs/calibration/tree_ns3_sweep.py`` /
-    ``tree_calib.json``): ``tree_bw_per_level`` = 270653 B/us is the fitted
-    effective GPU<->NVSwitch trunk rate (eta = 0.71 vs the 18 x 170 Gbps =
-    382500 B/us trunk physics), ``t_min_switch`` = 2.99 us the fitted switch
-    pipeline fill. The serial term is alpha(N) * D / trunk with the
-    ``_tree_trunk_load`` alpha (1/2/3): MAPE 7.6% over the 27-point N={4,8,16}
-    x 1-256 MB ns-3 sweep (5.0% on the SIMPLE regime). ns-3-anchored -- no
-    H200 tree hardware ground truth exists in this repo. Accepts the same
-    ``overrides`` as the ring profile (defaults to ``num_lanes=18``).
+    Calibrated to the post-local-rank-fix ns-3 ``TreeAllReduce`` (every tree
+    edge carries the full D; see ``configs/calibration/tree_ns3_sweep.py`` /
+    ``tree_calib.json``): ``tree_bw_per_level`` = 270653 B/us is the pinned
+    GPU<->NVSwitch trunk rate (eta = 0.71 vs the 18 x 170 Gbps = 382500 B/us
+    trunk physics), ``t_min_switch`` = 1.22 us the fitted fixed per-step cost.
+    The serial term is (alpha_inf(N)*D + fill)/trunk with the piecewise
+    ``_tree_trunk_load`` alpha_inf (1.0/1.65/2.88/3.00/3.12) and the capped
+    pipeline fill (``tree_fill_bytes_per_step`` = 2.76 MiB/step, capped at
+    ``tree_fill_cap_ratio`` = 3.45 * D): MAPE 3.8% over the fresh 36-point
+    N={4,8,16,32} x 1-256 MB ns-3 sweep (per-N 3.5/2.2/4.4/5.2%). ns-3
+    anchored -- no H200 tree hardware ground truth exists in this repo.
+    Accepts the same ``overrides`` as the ring profile (defaults to
+    ``num_lanes=18``).
     """
     overrides.setdefault('num_lanes', 18)
     return make_h200_ring_theory(**overrides)
@@ -972,7 +1014,9 @@ def make_h200_nvls_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=18,
-        t_min_switch_us=2.99,
+        t_min_switch_us=1.22,
+        tree_fill_bytes_per_step=2.76 * 1024 * 1024,
+        tree_fill_cap_ratio=3.45,
         startup_us=23.0,
         nvls_startup_us=23.0,
     )
@@ -1008,7 +1052,9 @@ def make_h200_fullmesh_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=18,
-        t_min_switch_us=2.99,
+        t_min_switch_us=1.22,
+        tree_fill_bytes_per_step=2.76 * 1024 * 1024,
+        tree_fill_cap_ratio=3.45,
         startup_us=15.0,
     )
     defaults.update(overrides)

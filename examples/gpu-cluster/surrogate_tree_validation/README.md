@@ -83,6 +83,24 @@ link rate; per size the recal model already wins at 1-256 MiB (48.7% ->
    (0.12% MAPE). The paper's "0 fitted parameters" claim needs updating
    either way.
 
+## Resolution (2026-10-16, absorbed into the surrogate)
+
+The follow-up fresh 36-point sweep (`tree_sweep_current.csv`, current binary,
+profile convention with `--vcCredits=64`) exposed the structural defect
+behind finding 3's residuals: the 9/18 model's implied alpha_eff DECREASES
+with D (N=8: 3.99 at 8 MiB -> 2.79 at 256 MiB), i.e. pipeline fill is an
+ADDITIVE per-step byte volume, not a multiplicative alpha factor. Absorbed
+into `surrogate/theory/whitebox_surrogate_v2.py` as
+
+    T = S(D) + steps*1.22us + (alpha_inf(N)*D + min(2.76MiB*steps, 3.45*D)) / 270653
+    alpha_inf(N) = 1.0/1.71/2.74/2.89/2.95 (N<=2 / <=4 / <=8 / <=16 / >=17)
+
+refit on the canonical cfg-convention sweep
+(`configs/calibration/tree_sweep.csv`, 36 points incl. N=32): MAPE 3.80%
+all / 2.31% SIMPLE (old constants on the same data: 12.4%); consistency
+regression tree preset 11.22% -> 0.80%. See `configs/calibration/
+tree_ns3_sweep.py` and the rewritten tree section in `doc/CALIBRATION.md`.
+
 ## Files
 
 | file | what |
@@ -93,3 +111,4 @@ link rate; per size the recal model already wins at 1-256 MiB (48.7% ->
 | `paper_seed1_tree.json` | June parent-binary values for the same 90 cells |
 | `eval_tree_validation.py` | dual-model evaluation |
 | `tree_validation.csv` / `tree_validation_report.txt` | per-cell and summary outputs |
+| `tree_sweep_current.csv` | fresh 36-point sweep (N=4/8/16/32 x 1-256 MiB, vcCredits=64 inline convention) that exposed the fill-term defect |

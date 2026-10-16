@@ -1,13 +1,26 @@
 {
-  "source": "ns-3 TreeAllReduce (chunk-pipelined full-volume, post volume-fix) on --topology=switched via h200-tree-allreduce.cfg",
-  "model": "T = S(D) + 2*log2(N)*t_min_switch + alpha(N)*D/tree_bw; alpha = 1 (N<=2) / 2 (N<=4) / 3 (N>=5) = busiest GPU<->NVSwitch trunk load in D units",
-  "fit_set": "all points, relative-error weighted (1/T^2); N in {4,8,16} x 1-256 MB",
-  "tree_bw_per_level_bytes_per_us": 270652.58836126665,
-  "t_min_switch_us": 2.9865605552495946,
-  "eta_tree": 0.7075884663039651,
-  "mape_all_pct": 7.585929770081323,
-  "mape_simple_pct": 5.023793208533499,
-  "n_fit_points": 27,
+  "source": "ns-3 TreeAllReduce (chunk-pipelined full-volume, post volume-fix + post local-rank-fix e1cdd9c) on --topology=switched via h200-tree-allreduce.cfg",
+  "model": "T = S(D) + 2*log2(N)*t_min_switch + (alpha_inf(N)*D + min(F*steps, kappa*D))/tree_bw; alpha_inf = steady-state busiest GPU<->NVSwitch trunk load in D units, F = pipeline-fill volume per step (additive, NOT multiplicative)",
+  "fit_set": "all points, relative-error weighted (1/T^2); N in {4,8,16,32} x 1-256 MB; tree_bw PINNED (free-bw fits are degenerate with the fill term)",
+  "tree_bw_per_level_bytes_per_us": 270653.0,
+  "t_min_switch_us": 1.2181437335378433,
+  "tree_fill_bytes_per_step": 2894069.76,
+  "tree_fill_cap_ratio": 3.45,
+  "alpha_inf": {
+    "4": 1.7111640436015152,
+    "8": 2.736554025256606,
+    "16": 2.8872368585239507,
+    "32": 2.9448769247838906
+  },
+  "mape_all_pct": 3.8,
+  "mape_simple_pct": 2.31,
+  "mape_per_n_pct": {
+    "4": 3.47,
+    "8": 2.18,
+    "16": 4.38,
+    "32": 5.14
+  },
+  "n_fit_points": 36,
   "ns3_config": {
     "cfg": "configs/protocol_configs/h200-tree-allreduce.cfg",
     "link_data_rate_gbps": 3060,
@@ -18,5 +31,17 @@
     }
   },
   "trunk_physics_bytes_per_us": 382500.0,
-  "sweep_csv": "tree_sweep.csv"
+  "sweep_csv": "tree_sweep.csv",
+  "shipped_constants": {
+    "t_min_switch_us": 1.22,
+    "tree_fill_bytes_per_step": 2894069.76,
+    "tree_fill_cap_ratio": 3.45,
+    "alpha_inf": {
+      "2": 1.0,
+      "4": 1.71,
+      "8": 2.74,
+      "16": 2.89,
+      "32": 2.95
+    }
+  }
 }

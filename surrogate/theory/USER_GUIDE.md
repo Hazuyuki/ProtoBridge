@@ -117,7 +117,9 @@ The full `__init__` parameter list (21 knobs, all defaulted) is in the
 | `nvls_bw_bytes_per_us` | bytes/µs | NVLS serialization | 535500 |
 | `fullmesh_bw_bytes_per_us` | bytes/µs | full-mesh serialization (ns-3-calibrated) | 449890 |
 | `link_latency_us` | µs (400 ns = 0.4) | ring/nvls/fullmesh propagation | 0.4 |
-| `t_min_switch_us` | µs | tree fixed (NVSwitch fill) | 2.99 |
+| `t_min_switch_us` | µs | tree fixed (NVSwitch pipeline cost) | 1.22 |
+| `tree_fill_bytes_per_step` | bytes | tree pipeline-fill volume per step | 2.76 MiB |
+| `tree_fill_cap_ratio` | — | fill cap = ratio × D | 3.45 |
 | `credit_bdp_ring_packets` | packets | ring credit pressure Φ_credit | 91.5 |
 | `credit_bdp_tree_packets` | packets | tree credit pressure Φ_credit | 35.5 |
 | `startup_us` / `nvls_startup_us` | µs | protocol startup (fixed) | 15.0 / 23.0 |
@@ -173,7 +175,7 @@ mapping (full formulas in §6 of `WHITEBOX_SURROGATE.md`):
 | `collective` | `algo` | steps | per-step volume | per-GPU volume |
 |---|---|---|---|---|
 | `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
-| `allreduce` | `tree` | `2⌊log₂N⌋` | `α(N)·D / steps` (α=1/2/3 trunk load) | `α(N)·D` per trunk |
+| `allreduce` | `tree` | `2⌊log₂N⌋` | `(α∞(N)·D + fill)/steps` (α∞=1.0/1.71/2.74/2.89/2.95 steady-state trunk load; fill = min(2.76 MiB·steps, 3.45·D) pipeline fill) | `α∞(N)·D` + fill per trunk |
 | `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
 | `allreduce` | `fullmesh` | `2` | `D/N` | `D/N` per peer (N−1 concurrent) |
 | `allgather` | `fullmesh` | `1` | `D/N` | `D/N` per peer (N−1 concurrent) |

@@ -6,6 +6,35 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Changed — tree surrogate: additive pipeline-fill term + fresh 36-point refit
+
+The 9/18 tree recalibration (f984edb: `T = S + steps·2.99 + α(N)·D/270653`,
+α = 1/2/3) was fitted against a sweep that predates the 9/30 single-node
+local-rank fix (e1cdd9c — all rank pairs exchange credits), and its
+multiplicative-α shape is structurally wrong: on the fresh 36-point sweep
+(N = {4,8,16,32} × 1–256 MiB, `configs/calibration/tree_sweep.csv`) the
+implied α_eff *decreases* with D (N=8: 3.99 at 8 MiB → 2.79 at 256 MiB) —
+pipeline fill (credit-window ramp-up + overlapped reduce-up/broadcast-down
+chunk pipelines warming up) is an ADDITIVE per-step byte volume, not a
+multiplicative factor. The tree serial term is now
+
+    (α∞(N)·D + min(F·steps, κ·D)) / tree_bw
+
+with α∞(N) = 1.0/1.71/2.74/2.89/2.95 (N≤2/≤4/≤8/≤16/≥17) the steady-state
+trunk load, F = 2.76 MiB/step (~22 spray chunks) the fill volume, κ = 3.45
+the fill cap, `t_min_switch` 2.99 → 1.22 µs; `tree_bw_per_level` stays
+270653 B/µs (pinned — free-bandwidth fits are degenerate with the fill
+term). Refit (`configs/calibration/tree_ns3_sweep.py`, now sweeping N=32 and
+supporting `--refit` from the CSV): MAPE 3.80% all-36 / 2.31% SIMPLE,
+per-N 3.5/2.2/4.4/5.2% — vs 12.4% for the old constants on the same data.
+The consistency regression tree preset drops 11.22% → 0.80%
+(ratio 0.994–1.014, now the tightest of the four presets). Note the sweep's
+credit convention: the cfg path keeps the inline CLI-default credits
+(unlimited), NOT the profile's PEX `vcCredits=64` (+4.4% at N=8/256 MiB
+under 64). Docs: `doc/CALIBRATION.md` tree section rewritten; 4 tree unit
+tests (α∞ values, fill cap, ≤5% ns-3 reproduction incl. N=32, N-monotone
+shape).
+
 ### Fixed — `StartApplication`/`Initialize` clobbered exhausted credit windows
 
 `FabricEndpoint::Initialize()` and `StartApplication()` lazily re-initialize

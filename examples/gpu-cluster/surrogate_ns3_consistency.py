@@ -11,8 +11,10 @@ JSON):
 
   ring     HW back-fit (ring_bw=177000 anchored to the measured H200 8-GPU
            point) -- a lower bound vs ns-3, not an ns-3 fit.
-  tree     ns-3 back-fit (this session: tree_bw=270653, t_min_switch=2.99,
-           alpha(N) trunk model; fit MAPE 7.6% all / 5.0% SIMPLE).
+  tree     ns-3 back-fit (this session: tree_bw=270653 pinned, t_min_switch=1.22,
+           alpha_inf(N) trunk model + additive pipeline fill 2.76 MiB/step
+           capped at 3.45*D; fit MAPE 3.8% all / 2.3% SIMPLE over the fresh
+           36-point N={4,8,16,32} sweep).
   nvls     HW-multicast-derived (nvls_bw=535500 = 1.2 x B_agg), recorded
            against TWO ns-3 conventions (single-170G-link cfg default and
            the --linkDataRate=3060 full trunk) because they differ ~6x; the

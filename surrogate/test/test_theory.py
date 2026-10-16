@@ -248,7 +248,7 @@ def test_collective_explicit_reproduces_calibrated():
     assert s.predict(D, 8, "ring", credits=128, ber=0,
                      collective="allreduce") == pytest.approx(1325.49, rel=1e-3)
     assert s.predict(D, 8, "tree", credits=128, ber=0,
-                     collective="allreduce") == pytest.approx(3015.56, rel=1e-3)
+                     collective="allreduce") == pytest.approx(2810.76, rel=1e-3)
     assert s.predict(D, 8, "nvls", credits=128, ber=0,
                      collective="allgather") == pytest.approx(1018.01, rel=1e-3)
 
@@ -331,44 +331,57 @@ def test_fullmesh_wire_factory_derives_full_bundle():
 
 
 def test_tree_trunk_load_alpha():
-    """alpha(N) = busiest GPU<->NVSwitch trunk load in D units for the
-    heap-shaped binary tree: 1 (single edge), 2 (root at N<=4), 3 (interior
-    node: 2D child + 1D parent traffic at N>=5)."""
+    """alpha_inf(N) = steady-state (large-D) busiest GPU<->NVSwitch trunk
+    load in D units, fitted per band on the fresh 36-point sweep: 1.0 (single
+    edge), 1.71 (N<=4), 2.74 (N<=8), 2.89 (N<=16), 2.95 (N>=32). The old
+    structural 1/2/3 step function missed the measured N-dependence."""
     f = wb.TheoryDerivedSurrogate._tree_trunk_load
     assert f(2) == 1.0
-    assert f(3) == 2.0
-    assert f(4) == 2.0
-    assert f(5) == 3.0
-    assert f(8) == 3.0
-    assert f(16) == 3.0
+    assert f(3) == 1.71
+    assert f(4) == 1.71
+    assert f(5) == 2.74
+    assert f(8) == 2.74
+    assert f(16) == 2.89
+    assert f(32) == 2.95
+
+
+def test_tree_fill_bytes_capped():
+    """Pipeline fill is an additive per-step volume, capped at a fraction of
+    D: min(F*steps, kappa*D). Without the cap small-D predictions overshoot
+    badly (the whole point of the fill-form recalibration)."""
+    s = wb.make_h200_tree_theory()
+    F, kap = s.tree_fill_bytes_per_step, s.tree_fill_cap_ratio
+    # large D: fill = F*steps (uncapped)
+    assert s._tree_fill_bytes(256 << 20, 6) == F * 6
+    # small D: fill hits the kappa*D cap
+    assert s._tree_fill_bytes(1 << 20, 6) == kap * (1 << 20)
 
 
 def test_tree_reproduces_ns3_ground_truth():
-    """The recalibrated tree preset reproduces the post-volume-fix ns-3
-    TreeAllReduce simTimeUs (the calibration ground truth,
-    configs/calibration/tree_ns3_sweep.py) within 12% at 256 MiB (fit MAPE
-    7.6% over all 27 points, 5.0% on the SIMPLE regime). startup_us=46 is the
-    profile's SIMPLE startup (the model takes startup by D regime, like the
-    sweep's back-fit)."""
+    """The fill-form tree preset reproduces the fresh (post-local-rank-fix
+    e1cdd9c binary) ns-3 TreeAllReduce simTimeUs (the calibration ground
+    truth, configs/calibration/tree_ns3_sweep.py) within 5% at 256 MiB (fit
+    MAPE 3.8% over all 36 points, per-N 3.5/2.2/4.4/5.2%). startup_us=46 is
+    the profile's SIMPLE startup (the model takes startup by D regime, like
+    the sweep's back-fit)."""
     s = wb.make_h200_tree_theory()
     D = 256 * 1024 * 1024
-    for n, gt in ((4, 1843.5), (8, 2833.5), (16, 2915.3)):
+    for n, gt in ((4, 1806.6), (8, 2851.1), (16, 2933.9), (32, 2972.9)):
         pred = s.predict(D, n, "tree", credits=128, ber=0, startup_us=46.0,
                          collective="allreduce")
-        assert abs(pred - gt) / gt <= 0.12, (n, pred, gt)
+        assert abs(pred - gt) / gt <= 0.05, (n, pred, gt)
 
 
 def test_tree_latency_not_decreasing_in_n():
     """Shape regression for the recalibration: the OLD serial term
     D(N-1)/N/(log2N*tree_bw) DECREASED with N; ns-3 measures a
-    saturating-INCREASING trunk cost (alpha = 2.5 / 3.9 / 4.0 at N=4/8/16).
-    The alpha(N) model must preserve that ordering."""
+    saturating-INCREASING trunk cost (alpha_inf = 1.71 / 2.74 / 2.89 / 2.95 at
+    N=4/8/16/32). The alpha_inf(N) model must preserve that ordering."""
     s = wb.make_h200_tree_theory()
     D = 256 * 1024 * 1024
-    t4, t8, t16 = (s.predict(D, n, "tree", credits=128, ber=0,
-                             startup_us=46.0, collective="allreduce")
-                   for n in (4, 8, 16))
-    assert t4 < t8 <= t16
+    ts = [s.predict(D, n, "tree", credits=128, ber=0, startup_us=46.0,
+                    collective="allreduce") for n in (4, 8, 16, 32)]
+    assert ts == sorted(ts)
 
 
 def test_collective_explicit_retx_path():

@@ -23,7 +23,7 @@ recipe below carries the exact runtime values it uses.
 |-----------|-----------------|--------|-------|
 | Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive, and its vs-ns-3 ratio depends on the switched-fabric link-rate convention: ≈0.09–0.16× vs the cfg default (each GPU on ONE 170 Gbps switch link) and ≈1.07–1.17× vs the `--linkDataRate=3060` full trunk (the historical "≈0.566×" note's run conditions were unrecorded and match neither — 2026-09 drift finding, see `examples/gpu-cluster/surrogate_ns3_consistency.py`) |
 | Theory-derived full-mesh (`surrogate/theory/`) | ns-3-calibrated — `fullmesh_bw=449890 B/µs` back-fit to the ns-3 `FullMeshAllReduce`/`FullMeshAllGather` sweep (η=0.9998 vs the 18×25000 dedicated-bundle physics) | vs ns-3 | MAPE 0.10% on the SIMPLE-regime sweep points (N∈{4,8,16}, 1–256 MiB); parity within 0.3% at N=8 AR+AG {16,64,256} MiB (see the Full-mesh section below) |
-| Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — `tree_bw_per_level=270653 B/µs` (η=0.7076 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs) + `t_min_switch=2.99 µs`, back-fit to the post-volume-fix ns-3 `TreeAllReduce` on `h200-tree-allreduce.cfg` + `--linkDataRate=3060` (`configs/calibration/tree_ns3_sweep.py`); serial term = α(N)·D/trunk with α = 1/2/3 (N≤2 / N≤4 / N≥5) = busiest trunk load in D units (the old `D(N−1)/N/(log₂N·bw)` shape *decreased* with N, opposite the measured saturating increase) | vs ns-3 | MAPE 7.59% over all 27 sweep points (N∈{4,8,16} × 1–256 MiB), 5.02% on the SIMPLE regime; relative-error-weighted fit — no H200 tree HW ground truth exists in this repo |
+| Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — `tree_bw_per_level=270653 B/µs` (η=0.7076 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs) + `t_min_switch=1.22 µs` + an ADDITIVE pipeline-fill term `min(2.76 MiB·steps, 3.45·D)` on the trunk, back-fit to the post-local-rank-fix ns-3 `TreeAllReduce` on `h200-tree-allreduce.cfg` + `--linkDataRate=3060` (`configs/calibration/tree_ns3_sweep.py`); serial term = (α∞(N)·D + fill)/trunk with the piecewise α∞ = 1.0/1.71/2.74/2.89/2.95 (N≤2 / N≤4 / N≤8 / N≤16 / N≥17) — the steady-state busiest trunk load in D units (the old `D(N−1)/N/(log₂N·bw)` shape *decreased* with N, opposite the measured saturating increase; the 9/18 multiplicative α(N) fit missed the fill term and drifted 12.4% once the 9/30 local-rank fix landed) | vs ns-3 | MAPE 3.80% over all 36 fresh sweep points (N∈{4,8,16,32} × 1–256 MiB), 2.31% on the SIMPLE regime, per-N 3.5/2.2/4.4/5.2%; relative-error-weighted fit with the trunk pinned (free-bandwidth fits are degenerate with the fill term) — no H200 tree HW ground truth exists in this repo |
 
 ## Generate fresh ns-3 baselines
 
@@ -336,56 +336,73 @@ full GPU↔NVSwitch trunk (382500 B/µs); in the `switched` topology each GPU
 hangs off the NVSwitch by ONE link at this rate. **ns-3-anchored**: no H200
 tree hardware ground truth exists in this repo.
 
-### Model shape (the α(N) trunk-load term)
+### Model shape (the α∞(N) trunk-load + fill terms)
 
 The old surrogate serial term `D(N−1)/N / (log₂N · tree_bw)` *decreases*
-with N; the measured ns-3 large-size cost is α(N)·D/trunk with α = 2.505 /
-3.894 / 3.993 at N = 4/8/16 — saturating-*increasing*. A constant-only refit
-therefore cannot converge; the formula was changed to
+with N; the measured ns-3 large-size cost is α·D/trunk with α saturating-
+*increasing* in N. The 9/18 recalibration (commit f984edb) modeled this as a
+multiplicative α(N) = 1/2/3. **The 10/16 refit found that shape still
+wrong**: on the fresh sweep the implied α_eff *decreases with D* (N=8: 3.99
+at 8 MiB → 2.79 at 256 MiB) — pipeline fill (credit-window ramp-up + the
+overlapped reduce-up/broadcast-down chunk pipelines warming up) is an
+**ADDITIVE per-step byte volume, not a multiplicative factor**. The formula
+is now
 
 ```
-T = S(D) + 2⌊log₂N⌋ · t_min_switch + α(N) · D / tree_bw
-α(N) = 1 (N≤2, single edge) / 2 (N≤4, root moves 2D) / 3 (N≥5, interior
-       node moves 2D child + 1D parent traffic)
+T = S(D) + 2⌊log₂N⌋ · t_min_switch
+            + (α∞(N) · D + min(F · steps, κ · D)) / tree_bw
+α∞(N) = 1.0 (N≤2, single edge) / 1.71 (N≤4) / 2.74 (N≤8)
+        / 2.89 (N≤16) / 2.95 (N≥17)      [steady-state trunk load]
+F = 2.76 MiB/step (~22 spray chunks of 131072 B), κ = 3.45
 ```
 
-α is the busiest GPU↔NVSwitch trunk load in units of D for the heap-shaped
-binary tree (node i → children 2i+1, 2i+2) with overlapped reduce-up +
-broadcast-down chunk pipelines. The required effective trunk rate per N
-spreads only ±3%, so a single fitted constant covers all N.
+α∞ is the steady-state busiest GPU↔NVSwitch trunk load in units of D for the
+heap-shaped binary tree (node i → children 2i+1, 2i+2); F is the pipeline
+fill each step carries on the trunk, capped at κ·D so large transfers
+converge to the linear α∞·D/trunk regime.
 
 ### Sweep + fit (`configs/calibration/tree_ns3_sweep.py`)
 
-N ∈ {4,8,16} × 1–256 MiB (27 points), relative-error-weighted (1/T²) least
-squares over ALL points → `tree_bw_per_level = 270653 B/µs` (η = 0.7076 vs
-trunk physics), `t_min_switch = 2.99 µs`. MAPE 7.59% all-27 / 5.02% SIMPLE
-regime. (A SIMPLE-only unweighted fit — the full-mesh precedent — reaches
-2.1% SIMPLE but with an unphysical 9.45 µs intercept that inflates ≤4 MiB
-points by up to ~90%; the weighted fit trades that for a balanced error and
-a physical ~3 µs switch-pipeline intercept.) Raw sweep: `tree_sweep.csv`;
+N ∈ {4,8,16,32} × 1–256 MiB (36 points, fresh runs on the current binary —
+the 9/18 fit CSV predated the 9/30 single-node local-rank fix e1cdd9c,
+which made all rank pairs exchange credits and shifted tree times up to
+~8%; same-form refit on the fresh data gives 11.7%, so the constants had to
+be re-fit regardless of form). `tree_bw_per_level = 270653 B/µs` is PINNED
+(free-bandwidth fits are degenerate with the fill term: bw inverts to
+nonsense values); (t_min_switch, α∞ per N) are closed-form relative-error-
+weighted (1/T²) least squares over a 2-D (F, κ) grid. Result:
+`t_min_switch = 1.22 µs`, `F = 2.76 MiB/step`, `κ = 3.45`. MAPE 3.80%
+all-36 / 2.31% SIMPLE regime, per-N 3.5/2.2/4.4/5.2% (vs 12.4% for the
+f984edb constants on the same data). Raw sweep: `tree_sweep.csv`;
 fit record: `tree_calib.json`.
 
 ### Scope + limits
 
-- Looser than the full-mesh fit (0.10%) by design: the tree's per-size error
-  is regime-structured (LL128 points +7…+13%, mid-SIMPLE −5…−7%, 256 MiB
-  +5…+11%) — a two-constant scalar model over a 3-protocol sweep.
+- Looser than the full-mesh fit (0.10%): the tree's per-size error is
+  regime-structured (worst single point −15% at N=16/8 MiB; N≥32 is
+  extrapolation territory, per-N MAPE 5.1%) — a five-constant scalar model
+  over a 3-protocol sweep.
+- **Credit convention**: the sweep runs the `h200-tree-allreduce.cfg` path,
+  where a `collective`+`algorithm` op keeps the inline 1-VC fabric model with
+  the CLI default credits (unlimited) — NOT the profile's `vcCredits=64`
+  (a PEX-bundle value consumed only by the stencil runner). At
+  `--vcCredits=64` the same N=8/256 MiB cell runs 2978.0 µs vs 2851.1 here
+  (+4.4%); the surrogate's `credit_bdp_tree_packets=35.5` credit term is
+  untested against the new tree (Φ_credit = 1 at the sweep convention).
 - `make_surrogate_from_wire` derives the trunk as `eta_tree · B_agg` with
   `eta_tree = 0.60` vs the *physical* 25000 B/µs-per-lane aggregate
   (0.60 × 450000 = 270000, −0.24% vs the fit).
-- `credit_bdp_tree_packets = 35.5` is retained from the pre-fix calibration
-  and untested against the new tree (the sweep runs at the profile's PEX
-  credit default, where Φ_credit = 1).
 - Non-NVLink presets (`make_1024_optical_fattree_theory` 20725,
   `make_connectx7_p2p_perftest_theory` 24000) keep their historical tree
-  constants; under the new α(N) formula their tree predictions are
+  constants; under the new α∞(N) formula their tree predictions are
   uncalibrated placeholders (both presets are ring/sendrecv studies).
 
 ### Verification
 
-3 unit tests (`surrogate/test/test_theory.py`): α(N) values, ns-3
-reproduction at 256 MiB (N ∈ {4,8,16}, ≤12%), and the shape regression
-(latency non-decreasing in N at fixed D).
+4 unit tests (`surrogate/test/test_theory.py`): α∞(N) values, the fill cap
+(large-D fill = F·steps, small-D fill = κ·D), ns-3 reproduction at 256 MiB
+(N ∈ {4,8,16,32}, ≤5%), and the shape regression (latency non-decreasing
+in N at fixed D).
 
 
 ## Loss recovery under injected packet loss — SRNIC Fig. 11 (measured) vs ns-3
