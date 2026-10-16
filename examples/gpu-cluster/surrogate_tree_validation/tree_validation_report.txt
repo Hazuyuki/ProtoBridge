@@ -1,0 +1,14 @@
+Tree ground-truth revalidation: fixed ns-3 (protobridge de16a7c+) vs surrogate models
+runs: 90 complete (seed 1, stratified over the paper config space)
+
+vs FIXED ns-3:   paper fork (old eta_sw*log2N formula): MAPE 55.4%
+                 9/18 recal (alpha(N) trunk-load):       MAPE 52.1%
+
+per data size (old -> new MAPE vs fixed ns-3):
+      0.004 MiB  n=18      4.4% ->   47.3%
+      0.062 MiB  n=18     31.6% ->    6.3%
+      1.000 MiB  n=18     67.8% ->   49.7%
+     16.000 MiB  n=18     86.7% ->   78.7%
+    256.000 MiB  n=18     86.7% ->   78.4%
+
+sim drift (old parent ns-3 vs fixed protobridge ns-3, same cells): mean |delta| 49.9% over 90 matched cells
