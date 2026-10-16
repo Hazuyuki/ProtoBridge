@@ -11,17 +11,21 @@ JSON):
 
   ring     HW back-fit (ring_bw=177000 anchored to the measured H200 8-GPU
            point) -- a lower bound vs ns-3, not an ns-3 fit.
-  tree     ns-3 back-fit (this session: tree_bw=270653 pinned, t_min_switch=1.22,
+  tree     ns-3 back-fit (tree_bw=270653 pinned, t_min_switch=1.20,
            alpha_inf(N) trunk model + additive pipeline fill 2.76 MiB/step
-           capped at 3.45*D; fit MAPE 3.8% all / 2.3% SIMPLE over the fresh
-           36-point N={4,8,16,32} sweep).
+           capped at 3.45*D; fit MAPE 3.96% all / 2.30% SIMPLE over the fresh
+           36-point N={4,8,16,32} sweep at the TRUE H200 fabric:
+           --linksPerGpu=18 lanes @ 170 Gbps, spray-routed, credits
+           unconstrained).
   nvls     HW-multicast-derived (nvls_bw=535500 = 1.2 x B_agg), recorded
-           against TWO ns-3 conventions (single-170G-link cfg default and
-           the --linkDataRate=3060 full trunk) because they differ ~6x; the
-           historical "~0.57x lower-bound" note matches neither and its
-           conditions are unrecorded (drift finding, 2026-09). Sizes
-           restricted to 4-16 MiB (>=64 MiB exceeds the sim-time budget,
-           see the NVLS scaling notes).
+           against the cfg run, which (since the profile carries
+           linksPerGpu=18) builds the TRUE 18-lane spray fabric. The preset
+           lands ~1.07-1.17x ABOVE ns-3 (the eta_nvls=1.2 multicast
+           amplification exceeds the 382500 B/us trunk) -- not a lower
+           bound; the historical "~0.57x lower-bound" note's conditions are
+           unrecorded and match no current convention (drift finding,
+           2026-09). Sizes restricted to 4-16 MiB (>=64 MiB exceeds the
+           sim-time budget, see the NVLS scaling notes).
   fullmesh ns-3 back-fit (fullmesh_bw=449890, MAPE 0.10% SIMPLE regime).
 
 Run:  python3 examples/gpu-cluster/surrogate_ns3_consistency.py
@@ -106,38 +110,37 @@ def points():
 
     tree_s = wb.make_h200_tree_theory()
     for d in TREE_SIZES:
-        arg = ("gpu-cluster-sim --protocolConfig="
-               "configs/protocol_configs/h200-tree-allreduce.cfg "
-               f"--numGpus={N} --dataSize={d} --linkDataRate=3060 --RngRun=1")
+        # Tree-calibration convention = the TRUE H200 fabric: 18 separate
+        # p2p NVLink4 lanes per GPU @ 170 Gbps (aggregate 3060 Gbps trunk),
+        # spray-routed by the endpoint (128 KiB chunks round-robin across
+        # links), credits unconstrained. The retired --linkDataRate=3060
+        # convention collapsed the 18 lanes into ONE pipe (no spray).
+        arg = ("gpu-cluster-sim --topology=switched --collective=allreduce "
+               "--algorithm=tree "
+               f"--numGpus={N} --dataSize={d} "
+               "--bandwidth=170 --latency=400 --numLanes=18 "
+               "--vcCredits=104857600 --fabricType=1 "
+               "--protocolModel=ns3::NcclProtocolModel "
+               "--linksPerGpu=18 --forceProtocol=0 "
+               "--startupLL=15000 --startupLL128=25000 --startupSIMPLE=46000 "
+               "--RngRun=1")
         pred = tree_s.predict(d, N, "tree", credits=128, ber=0,
                               startup_us=STARTUP_US[proto_of(d)],
                               collective="allreduce")
-        yield "tree", d, arg, pred, "ns-3 back-fit (this recalibration)"
+        yield "tree", d, arg, pred, "ns-3 back-fit (18-link spray fabric)"
 
     nvls_s = wb.make_h200_nvls_theory()
     for d in NVLS_SIZES:
-        # Preset convention: nvls_startup_us=23. Two ns-3 conventions are
-        # recorded because they differ 6x and the historical "~0.57x
-        # lower-bound" ratio (conditions unrecorded) matches neither:
-        #  - cfg default: each GPU hangs off the NVSwitch by ONE link at
-        #    --bandwidth=170 Gbps (21250 B/us) -> ns-3 serializes the whole
-        #    allgather egress on it; the preset's 535500 B/us multicast
-        #    aggregate sits ~0.09-0.16x below.
-        #  - --linkDataRate=3060 (the full 18x170 trunk, the same switched-
-        #    fabric convention the tree calibration anchors): the preset
-        #    lands ~0.9-1.2x -- NOT a lower bound in this convention (the
-        #    preset's eta_nvls=1.2 multicast amplification exceeds the
-        #    382500 B/us trunk).
+        # Preset convention: nvls_startup_us=23. The cfg sources the
+        # profile (which carries linksPerGpu=18 + bandwidthGbps=170), so the
+        # run builds the TRUE 18-lane spray fabric -- the same convention
+        # the tree calibration anchors.
         pred = nvls_s.predict(d, N, "nvls", credits=128, ber=0,
                               collective="allgather")
         arg = ("gpu-cluster-sim --protocolConfig="
                "configs/protocol_configs/h200-nvls-allgather.cfg "
                f"--numGpus={N} --dataSize={d} --RngRun=1")
-        yield "nvls", d, arg, pred, "preset vs single-170G-link switched cfg"
-        arg_trunk = arg.replace("--RngRun=1",
-                                "--linkDataRate=3060 --RngRun=1")
-        yield "nvls_trunk3060", d, arg_trunk, pred, \
-            "preset vs full-trunk switched cfg (tree-calibration convention)"
+        yield "nvls", d, arg, pred, "preset vs 18-link spray cfg (profile)"
 
     fm_s = wb.make_h200_fullmesh_theory()
     for d in FULLMESH_SIZES:
@@ -172,7 +175,7 @@ def main():
         w.writerows(rows)
 
     summary = {}
-    for preset in ("ring", "tree", "nvls", "nvls_trunk3060", "fullmesh"):
+    for preset in ("ring", "tree", "nvls", "fullmesh"):
         pts = [r for r in rows if r["preset"] == preset
                and r["ns3SimTimeUs"] is not None]
         if not pts:

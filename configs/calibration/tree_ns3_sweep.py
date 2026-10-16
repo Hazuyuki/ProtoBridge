@@ -4,10 +4,13 @@ ns-3 tree-allreduce sweep + surrogate back-fit (ground truth = ns-3).
 
 Ground truth: the chunk-pipelined full-volume ``TreeAllReduce`` (post
 volume-fix; carries the full D over every tree edge in each direction) on
-``--topology=switched`` via ``h200-tree-allreduce.cfg`` with
-``--linkDataRate=3060`` (18 lanes x 170 Gbps effective per-lane = the full
-GPU<->NVSwitch trunk; the historical per-protocol 80/100/50 values were
-compensating the old model's volume deficit and are retired). Sweeps
+``--topology=switched`` with ``--linksPerGpu=18`` — the TRUE H200 fabric:
+18 separate NVLink4 point-to-point links per GPU at the effective per-lane
+rate (170 Gbps, the profile's ``bandwidthGbps``), with the endpoint's spray
+routing round-robining 128 KiB chunks across all 18 links (aggregate trunk
+= 18 x 170 = 3060 Gbps = 382500 B/us). The earlier single-link
+``--linkDataRate=3060`` convention collapsed the 18 lanes into ONE p2p pipe
+(no spray, no per-link queues) — retired. Sweeps
 N in {4,8,16,32} x sizes 1 MB..256 MB, parses ``simTimeUs``, writes
 ``tree_sweep.csv``, then back-fits to
 
@@ -58,8 +61,9 @@ NUM_GPUS = [4, 8, 16, 32]
 SIZES = [1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20, 32 << 20,
          64 << 20, 128 << 20, 256 << 20]
 
-LINK_DATA_RATE_GBPS = 3060    # 18 lanes x 170 Gbps effective = GPU<->NVSwitch trunk
-TRUNK_PHYSICS = LINK_DATA_RATE_GBPS * 1000 / 8   # 382500 B/us
+LINKS_PER_GPU = 18             # true H200 fabric: 18 NVLink4 lanes per GPU
+PER_LINK_GBPS = 170            # effective per-lane rate (profile bandwidthGbps)
+TRUNK_PHYSICS = LINKS_PER_GPU * PER_LINK_GBPS * 1000 / 8   # 382500 B/us
 TREE_BW = 270653.0             # PINNED trunk realization (eta = 0.7076)
 CFG = "configs/protocol_configs/h200-tree-allreduce.cfg"
 
@@ -69,10 +73,10 @@ SIMPLE_CHUNK_BYTES = 2 << 20  # chunk D/N >= 2 MB => SIMPLE wire regime
 
 # Shipped surrogate constants (surrogate/theory/whitebox_surrogate_v2.py);
 # the sweep re-derives them and asserts agreement.
-SHIPPED = dict(t_min_switch_us=1.22,
+SHIPPED = dict(t_min_switch_us=1.20,
                tree_fill_bytes_per_step=2.76 * 1024 * 1024,
                tree_fill_cap_ratio=3.45,
-               alpha_inf={2: 1.0, 4: 1.71, 8: 2.74, 16: 2.89, 32: 2.95})
+               alpha_inf={2: 1.0, 4: 1.62, 8: 2.59, 16: 2.74, 32: 2.80})
 
 
 def alpha_of(n: int) -> float:
@@ -80,12 +84,12 @@ def alpha_of(n: int) -> float:
     if n <= 2:
         return 1.0
     if n <= 4:
-        return 1.71
+        return 1.62
     if n <= 8:
-        return 2.74
+        return 2.59
     if n <= 16:
-        return 2.89
-    return 2.95
+        return 2.74
+    return 2.80
 
 
 def steps_of(n: int) -> int:
@@ -106,8 +110,14 @@ def run_ns3(n, d, timeout=600):
     start_new_session + os.killpg on timeout prevents orphan ns-3 processes
     (per the batch-runner killpg fix).
     """
-    arg = (f"gpu-cluster-sim --protocolConfig={CFG} --numGpus={n} "
-           f"--dataSize={d} --linkDataRate={LINK_DATA_RATE_GBPS} --RngRun=1")
+    arg = (f"gpu-cluster-sim --topology=switched --collective=allreduce "
+           f"--algorithm=tree --numGpus={n} --dataSize={d} "
+           f"--bandwidth={PER_LINK_GBPS} --latency=400 --numLanes=18 "
+           f"--vcCredits=104857600 --fabricType=1 "
+           f"--protocolModel=ns3::NcclProtocolModel "
+           f"--linksPerGpu={LINKS_PER_GPU} --forceProtocol=0 "
+           f"--startupLL=15000 --startupLL128=25000 --startupSIMPLE=46000 "
+           f"--RngRun=1")
     try:
         proc = subprocess.Popen(
             ["./ns3", "run", arg], cwd=REPO,
@@ -203,7 +213,7 @@ def predict(n, d, t_fixed, alpha_map, F, kap):
 
 def main(argv=None):
     import sys
-    refit_only = bool(argv and argv[1] == "--refit")
+    refit_only = bool(argv and len(argv) > 1 and argv[1] == "--refit")
     rows = []
     if refit_only:
         # Re-fit from the existing sweep CSV (no ns-3 runs); the rows keep
@@ -270,7 +280,10 @@ def main(argv=None):
     json_path.write_text(json.dumps(dict(
         source=("ns-3 TreeAllReduce (chunk-pipelined full-volume, post "
                 "volume-fix + post local-rank-fix e1cdd9c) on "
-                "--topology=switched via h200-tree-allreduce.cfg"),
+                "--topology=switched; TRUE H200 fabric: --linksPerGpu=18 "
+                "separate point-to-point NVLink4 lanes @ 170 Gbps each, "
+                "spray-routed (128 KiB chunks round-robin), aggregate trunk "
+                "3060 Gbps; credits unconstrained (--vcCredits=104857600)"),
         model=("T = S(D) + 2*log2(N)*t_min_switch + (alpha_inf(N)*D + "
                "min(F*steps, kappa*D))/tree_bw; alpha_inf = steady-state "
                "busiest GPU<->NVSwitch trunk load in D units, F = pipeline-"
@@ -287,7 +300,9 @@ def main(argv=None):
         mape_simple_pct=round(mape_of(simple_pts), 2),
         mape_per_n_pct={str(n): round(m, 2) for n, m in per_n.items()},
         n_fit_points=len(fit_rows),
-        ns3_config=dict(cfg=CFG, link_data_rate_gbps=LINK_DATA_RATE_GBPS,
+        ns3_config=dict(topology="switched", links_per_gpu=LINKS_PER_GPU,
+                        per_link_gbps=PER_LINK_GBPS,
+                        trunk_physics_gbps=LINKS_PER_GPU * PER_LINK_GBPS,
                         startup_us=STARTUP_US),
         trunk_physics_bytes_per_us=TRUNK_PHYSICS,
         sweep_csv=csv_path.name,

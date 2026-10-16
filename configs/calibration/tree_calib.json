@@ -1,29 +1,31 @@
 {
-  "source": "ns-3 TreeAllReduce (chunk-pipelined full-volume, post volume-fix + post local-rank-fix e1cdd9c) on --topology=switched via h200-tree-allreduce.cfg",
+  "source": "ns-3 TreeAllReduce (chunk-pipelined full-volume, post volume-fix + post local-rank-fix e1cdd9c) on --topology=switched; TRUE H200 fabric: --linksPerGpu=18 separate point-to-point NVLink4 lanes @ 170 Gbps each, spray-routed (128 KiB chunks round-robin), aggregate trunk 3060 Gbps; credits unconstrained (--vcCredits=104857600)",
   "model": "T = S(D) + 2*log2(N)*t_min_switch + (alpha_inf(N)*D + min(F*steps, kappa*D))/tree_bw; alpha_inf = steady-state busiest GPU<->NVSwitch trunk load in D units, F = pipeline-fill volume per step (additive, NOT multiplicative)",
   "fit_set": "all points, relative-error weighted (1/T^2); N in {4,8,16,32} x 1-256 MB; tree_bw PINNED (free-bw fits are degenerate with the fill term)",
   "tree_bw_per_level_bytes_per_us": 270653.0,
-  "t_min_switch_us": 1.2181437335378433,
+  "t_min_switch_us": 1.1987422143401394,
   "tree_fill_bytes_per_step": 2894069.76,
   "tree_fill_cap_ratio": 3.45,
   "alpha_inf": {
-    "4": 1.7111640436015152,
-    "8": 2.736554025256606,
-    "16": 2.8872368585239507,
-    "32": 2.9448769247838906
+    "4": 1.6160636029370772,
+    "8": 2.593074926293032,
+    "16": 2.739871897232647,
+    "32": 2.796288016298361
   },
-  "mape_all_pct": 3.8,
-  "mape_simple_pct": 2.31,
+  "mape_all_pct": 3.96,
+  "mape_simple_pct": 2.3,
   "mape_per_n_pct": {
-    "4": 3.47,
-    "8": 2.18,
-    "16": 4.38,
-    "32": 5.14
+    "4": 3.43,
+    "8": 2.1,
+    "16": 4.81,
+    "32": 5.5
   },
   "n_fit_points": 36,
   "ns3_config": {
-    "cfg": "configs/protocol_configs/h200-tree-allreduce.cfg",
-    "link_data_rate_gbps": 3060,
+    "topology": "switched",
+    "links_per_gpu": 18,
+    "per_link_gbps": 170,
+    "trunk_physics_gbps": 3060,
     "startup_us": {
       "LL": 15.0,
       "LL128": 25.0,
@@ -33,15 +35,15 @@
   "trunk_physics_bytes_per_us": 382500.0,
   "sweep_csv": "tree_sweep.csv",
   "shipped_constants": {
-    "t_min_switch_us": 1.22,
+    "t_min_switch_us": 1.2,
     "tree_fill_bytes_per_step": 2894069.76,
     "tree_fill_cap_ratio": 3.45,
     "alpha_inf": {
       "2": 1.0,
-      "4": 1.71,
-      "8": 2.74,
-      "16": 2.89,
-      "32": 2.95
+      "4": 1.62,
+      "8": 2.59,
+      "16": 2.74,
+      "32": 2.8
     }
   }
 }

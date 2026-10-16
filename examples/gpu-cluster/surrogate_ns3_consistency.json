@@ -11,24 +11,17 @@
     },
     "tree": {
       "points": 4,
-      "mape_pct": 0.8,
-      "ratio_min": 0.9944,
-      "ratio_max": 1.0135,
-      "note": "ns-3 back-fit (this recalibration)"
+      "mape_pct": 0.56,
+      "ratio_min": 0.9951,
+      "ratio_max": 1.0076,
+      "note": "ns-3 back-fit (18-link spray fabric)"
     },
     "nvls": {
-      "points": 3,
-      "mape_pct": 87.66,
-      "ratio_min": 0.0941,
-      "ratio_max": 0.1591,
-      "note": "preset vs single-170G-link switched cfg"
-    },
-    "nvls_trunk3060": {
       "points": 3,
       "mape_pct": 11.82,
       "ratio_min": 1.0695,
       "ratio_max": 1.1668,
-      "note": "preset vs full-trunk switched cfg (tree-calibration convention)"
+      "note": "preset vs 18-link spray cfg (profile)"
     },
     "fullmesh": {
       "points": 3,
@@ -83,101 +76,71 @@
       "preset": "tree",
       "numGpus": 8,
       "dataSizeMB": 4,
-      "ns3SimTimeUs": 147.4,
-      "surrogateUs": 149.25,
-      "ratio": 1.0125,
-      "absErrPct": 1.25,
-      "note": "ns-3 back-fit (this recalibration)"
+      "ns3SimTimeUs": 145.9,
+      "surrogateUs": 146.8,
+      "ratio": 1.0062,
+      "absErrPct": 0.62,
+      "note": "ns-3 back-fit (18-link spray fabric)"
     },
     {
       "preset": "tree",
       "numGpus": 8,
       "dataSizeMB": 16,
-      "ns3SimTimeUs": 283.5,
-      "surrogateUs": 287.32,
-      "ratio": 1.0135,
-      "absErrPct": 1.35,
-      "note": "ns-3 back-fit (this recalibration)"
+      "ns3SimTimeUs": 275.8,
+      "surrogateUs": 277.91,
+      "ratio": 1.0076,
+      "absErrPct": 0.76,
+      "note": "ns-3 back-fit (18-link spray fabric)"
     },
     {
       "preset": "tree",
       "numGpus": 8,
       "dataSizeMB": 64,
-      "ns3SimTimeUs": 797.0,
-      "surrogateUs": 796.87,
-      "ratio": 0.9998,
-      "absErrPct": 0.02,
-      "note": "ns-3 back-fit (this recalibration)"
+      "ns3SimTimeUs": 762.3,
+      "surrogateUs": 759.55,
+      "ratio": 0.9964,
+      "absErrPct": 0.36,
+      "note": "ns-3 back-fit (18-link spray fabric)"
     },
     {
       "preset": "tree",
       "numGpus": 8,
       "dataSizeMB": 256,
-      "ns3SimTimeUs": 2851.1,
-      "surrogateUs": 2835.03,
-      "ratio": 0.9944,
-      "absErrPct": 0.56,
-      "note": "ns-3 back-fit (this recalibration)"
+      "ns3SimTimeUs": 2699.4,
+      "surrogateUs": 2686.14,
+      "ratio": 0.9951,
+      "absErrPct": 0.49,
+      "note": "ns-3 back-fit (18-link spray fabric)"
     },
     {
       "preset": "nvls",
-      "numGpus": 8,
-      "dataSizeMB": 4,
-      "ns3SimTimeUs": 248.0,
-      "surrogateUs": 39.47,
-      "ratio": 0.1591,
-      "absErrPct": 84.09,
-      "note": "preset vs single-170G-link switched cfg"
-    },
-    {
-      "preset": "nvls_trunk3060",
       "numGpus": 8,
       "dataSizeMB": 4,
       "ns3SimTimeUs": 36.9,
       "surrogateUs": 39.47,
       "ratio": 1.0695,
       "absErrPct": 6.95,
-      "note": "preset vs full-trunk switched cfg (tree-calibration convention)"
+      "note": "preset vs 18-link spray cfg (profile)"
     },
     {
       "preset": "nvls",
-      "numGpus": 8,
-      "dataSizeMB": 8,
-      "ns3SimTimeUs": 471.5,
-      "surrogateUs": 55.13,
-      "ratio": 0.1169,
-      "absErrPct": 88.31,
-      "note": "preset vs single-170G-link switched cfg"
-    },
-    {
-      "preset": "nvls_trunk3060",
       "numGpus": 8,
       "dataSizeMB": 8,
       "ns3SimTimeUs": 49.3,
       "surrogateUs": 55.13,
       "ratio": 1.1183,
       "absErrPct": 11.83,
-      "note": "preset vs full-trunk switched cfg (tree-calibration convention)"
+      "note": "preset vs 18-link spray cfg (profile)"
     },
     {
       "preset": "nvls",
-      "numGpus": 8,
-      "dataSizeMB": 16,
-      "ns3SimTimeUs": 918.4,
-      "surrogateUs": 86.46,
-      "ratio": 0.0941,
-      "absErrPct": 90.59,
-      "note": "preset vs single-170G-link switched cfg"
-    },
-    {
-      "preset": "nvls_trunk3060",
       "numGpus": 8,
       "dataSizeMB": 16,
       "ns3SimTimeUs": 74.1,
       "surrogateUs": 86.46,
       "ratio": 1.1668,
       "absErrPct": 16.68,
-      "note": "preset vs full-trunk switched cfg (tree-calibration convention)"
+      "note": "preset vs 18-link spray cfg (profile)"
     },
     {
       "preset": "fullmesh",

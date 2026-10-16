@@ -29,8 +29,10 @@ and the old formula is unsalvageable (up to 9x off at 256 MiB).
 ### 1. The paper grid's tree link rate is wrong (pre-fix guidance)
 
 Every tree command in the paper grid uses `--linkDataRate=80` (the retired
-pre-fix guidance). The volume-fix commit explicitly retired 80/100/50 Gbps
-and recommends `--linkDataRate=3060` (18 × 170 Gbps full trunk). Same
+pre-fix guidance). The volume-fix commit retired 80/100/50 Gbps; the current
+fabric convention is `--linksPerGpu=18` @ 170 Gbps per lane, spray-routed
+(18 × 170 Gbps full trunk; the `--linkDataRate=3060` single-pipe form is
+also retired). Same
 cell, same fixed binary: 256 MiB @ cr=32 runs **15775 µs at 80 G vs
 704 µs at 3060 G — a 22× difference**. The tree trunk is the bottleneck
 resource, so the link-rate choice IS the experiment.
@@ -69,9 +71,9 @@ link rate; per size the recal model already wins at 1-256 MiB (48.7% ->
 
 ## Recommendation
 
-1. Regenerate the tree ground truth with the fixed binary at the
-   recommended `--linkDataRate=3060` (and revisit ring's 170/nvls' 850
-   `--bandwidth` choices for consistency), then re-fit/evaluate.
+1. Regenerate the tree ground truth with the fixed binary at the TRUE H200
+   fabric (`--linksPerGpu=18` @ 170 Gbps, spray-routed; and revisit ring's
+   170/nvls' 850 `--bandwidth` choices for consistency), then re-fit/evaluate.
 2. Absorb the recal tree model (alpha(N) trunk-load + 270653 B/µs +
    T_min_switch 2.99 µs) into the paper fork — with the fixed ground
    truth it is expected to land near its fit MAPE (~5-8% on SIMPLE).
@@ -88,17 +90,22 @@ link rate; per size the recal model already wins at 1-256 MiB (48.7% ->
 The follow-up fresh 36-point sweep (`tree_sweep_current.csv`, current binary,
 profile convention with `--vcCredits=64`) exposed the structural defect
 behind finding 3's residuals: the 9/18 model's implied alpha_eff DECREASES
-with D (N=8: 3.99 at 8 MiB -> 2.79 at 256 MiB), i.e. pipeline fill is an
+with D (N=8: 5.13 at 8 MiB -> 2.67 at 256 MiB), i.e. pipeline fill is an
 ADDITIVE per-step byte volume, not a multiplicative alpha factor. Absorbed
 into `surrogate/theory/whitebox_surrogate_v2.py` as
 
-    T = S(D) + steps*1.22us + (alpha_inf(N)*D + min(2.76MiB*steps, 3.45*D)) / 270653
-    alpha_inf(N) = 1.0/1.71/2.74/2.89/2.95 (N<=2 / <=4 / <=8 / <=16 / >=17)
+refit on the canonical sweep (`configs/calibration/tree_sweep.csv`, 36 points
+incl. N=32) at the TRUE H200 fabric — `--linksPerGpu=18` separate p2p NVLink4
+lanes @ 170 Gbps, spray-routed, credits unconstrained (the earlier
+`--linkDataRate=3060 --linksPerGpu=1` convention collapsed the 18 lanes into
+ONE pipe and is retired; same cell N=8/256 MiB: 2851.1 -> 2699.4 µs):
 
-refit on the canonical cfg-convention sweep
-(`configs/calibration/tree_sweep.csv`, 36 points incl. N=32): MAPE 3.80%
-all / 2.31% SIMPLE (old constants on the same data: 12.4%); consistency
-regression tree preset 11.22% -> 0.80%. See `configs/calibration/
+    T = S(D) + steps*1.20us + (alpha_inf(N)*D + min(2.76MiB*steps, 3.45*D)) / 270653
+    alpha_inf(N) = 1.0/1.62/2.59/2.74/2.80 (N<=2 / <=4 / <=8 / <=16 / >=17)
+
+MAPE 3.96% all / 2.30% SIMPLE (old constants on the 9/18 data: 12.4%);
+consistency regression tree preset 11.22% -> 0.56% at the 18-link fabric.
+See `configs/calibration/
 tree_ns3_sweep.py` and the rewritten tree section in `doc/CALIBRATION.md`.
 
 ## Files

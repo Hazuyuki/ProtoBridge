@@ -45,13 +45,15 @@ llrMode = gobackn                        # gobackn (cumulative) | sack (selectiv
 # PEX bundle; reserved so Build() does not forward them as protocol attrs).
 # These let a `collective =` / `algorithm =` op reproduce a calibrated fabric
 # without per-run CLI flags. Values mirror configs/hardware/h200.json.
-# bandwidthGbps is the 8-GPU effective per-link rate (375 GB/s aggregate /
-# 18 lanes ~= 166 Gbps; rounded to the empirical sweep best, reproduces ring
-# allreduce to ~4-5%).
+# bandwidthGbps is the effective PER-LANE rate (18 lanes ~= 166 Gbps each;
+# rounded to the empirical sweep best). linksPerGpu=18 builds the TRUE H200
+# fabric: 18 separate point-to-point GPU<->NVSwitch lanes at 170 Gbps each
+# (aggregate 3060 Gbps trunk), spray-routed (128 KiB chunks round-robin
+# across links).
 bandwidthGbps = 170
 latencyNs = 400
 numLanes = 18
-linksPerGpu = 1
+linksPerGpu = 18
 sprayChunkSize = 131072
 switchVoqDepth = 10000
 switchArbIntervalNs = 100
