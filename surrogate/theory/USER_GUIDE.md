@@ -60,7 +60,7 @@ fabric whose bisection bandwidth or path length differs from ideal NVSwitch.
 
 ```python
 make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
-                         eta_ring=0.40, eta_tree=0.60, eta_nvls=1.20,
+                         eta_ring=0.40, eta_tree=0.61, eta_nvls=1.20,
                          eta_fullmesh=1.0, **overrides)
 ```
 
@@ -73,7 +73,7 @@ efficiency factors. No per-bandwidth calibration needed.
 | `b_link_bytes_per_us` | single NVLink unidirectional wire rate | `25000` (25 GB/s) |
 | `num_lanes` | NVLink links per GPU | `18` |
 | `algo` | `ring` / `tree` / `nvls` / `fullmesh` (`fm`) | — |
-| `eta_ring` / `eta_tree` / `eta_nvls` / `eta_fullmesh` | efficiency factors (defaulted) | 0.40 / 0.60 / 1.20 / 1.0 |
+| `eta_ring` / `eta_tree` / `eta_nvls` / `eta_fullmesh` | efficiency factors (defaulted) | 0.40 / 0.61 / 1.20 / 1.0 |
 
 Derived bandwidths land within ~2% of the calibrated H200 values (see §11 of
 `WHITEBOX_SURROGATE.md`). This is the entry point for any new platform where
@@ -113,13 +113,11 @@ The full `__init__` parameter list (21 knobs, all defaulted) is in the
 | Parameter | Units | Affects | H200 ring |
 |-----------|-------|---------|-----------|
 | `ring_bw_bytes_per_us` | bytes/µs | ring serialization | 177000 |
-| `tree_bw_per_level_bytes_per_us` | bytes/µs | tree GPU↔NVSwitch trunk (ns-3-calibrated) | 270653 |
+| `tree_bw_per_level_bytes_per_us` | bytes/µs | tree GPU↔NVSwitch trunk (ns-3-calibrated) | 275400 |
 | `nvls_bw_bytes_per_us` | bytes/µs | NVLS serialization | 535500 |
 | `fullmesh_bw_bytes_per_us` | bytes/µs | full-mesh serialization (ns-3-calibrated) | 449890 |
 | `link_latency_us` | µs (400 ns = 0.4) | ring/nvls/fullmesh propagation | 0.4 |
-| `t_min_switch_us` | µs | tree fixed (NVSwitch pipeline cost) | 1.20 |
-| `tree_fill_bytes_per_step` | bytes | tree pipeline-fill volume per step | 2.76 MiB |
-| `tree_fill_cap_ratio` | — | fill cap = ratio × D | 3.45 |
+| `t_min_switch_us` | µs | tree fixed (NVSwitch pipeline cost) | 4.10 |
 | `credit_bdp_ring_packets` | packets | ring credit pressure Φ_credit | 91.5 |
 | `credit_bdp_tree_packets` | packets | tree credit pressure Φ_credit | 35.5 |
 | `startup_us` / `nvls_startup_us` | µs | protocol startup (fixed) | 15.0 / 23.0 |
@@ -175,7 +173,7 @@ mapping (full formulas in §6 of `WHITEBOX_SURROGATE.md`):
 | `collective` | `algo` | steps | per-step volume | per-GPU volume |
 |---|---|---|---|---|
 | `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
-| `allreduce` | `tree` | `2⌊log₂N⌋` | `(α∞(N)·D + fill)/steps` (α∞=1.0/1.62/2.59/2.74/2.80 steady-state trunk load; fill = min(2.76 MiB·steps, 3.45·D) pipeline fill) | `α∞(N)·D` + fill per trunk |
+| `allreduce` | `tree` | `2⌊log₂N⌋` | `α(N)·D/steps` (α(N)=1.0/2.0/3.0 structural trunk load: single edge / root with two children / interior node) | `α(N)·D` per trunk |
 | `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
 | `allreduce` | `fullmesh` | `2` | `D/N` | `D/N` per peer (N−1 concurrent) |
 | `allgather` | `fullmesh` | `1` | `D/N` | `D/N` per peer (N−1 concurrent) |

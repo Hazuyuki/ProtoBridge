@@ -12,35 +12,25 @@ routing round-robining 128 KiB chunks across all 18 links (aggregate trunk
 ``--linkDataRate=3060`` convention collapsed the 18 lanes into ONE p2p pipe
 (no spray, no per-link queues) — retired. Sweeps
 N in {4,8,16,32} x sizes 1 MB..256 MB, parses ``simTimeUs``, writes
-``tree_sweep.csv``, then back-fits to
+``tree_sweep.csv``, then back-fits the ORIGINAL two-parameter form
 
-    T = S(D) + steps * T_fixed
-        + (alpha_inf(N) * D + min(F * steps, kappa * D)) / tree_bw
+    T = S(D) + steps * t_min_switch + alpha(N) * D / tree_bw
 
-where steps = 2*floor(log2 N), alpha_inf(N) is the steady-state (large-D)
-busiest GPU<->trunk load in units of D, F the pipeline-fill volume per step,
-and kappa the fill cap fraction of D.
+where steps = 2*floor(log2 N) and alpha(N) is the STRUCTURAL busiest
+GPU<->NVSwitch trunk load in units of D (1 for N<=2, 2 for the root at
+N<=4, 3 for an interior node at N>=5) -- only TWO constants are fitted:
+(t_min_switch, tree_bw), by relative-error-weighted (1/T^2) least squares.
 
-WHY THE FILL TERM: the previous (9/18, commit f984edb) form was
-``T = S + steps*t_min_switch + alpha(N)*D/bw`` with the piecewise-structural
-alpha = 1/2/3. Re-fitting that shape to the FRESH sweep (the old fit CSV
-predates the 9/30 single-node local-rank fix e1cdd9c -- SetLocalRankRange(0,
-numGpus) -- which makes ALL rank pairs exchange credits and shifted tree times
-up to ~8%; constants must be re-fit regardless of form) gives 11.7% MAPE: the
-implied alpha_eff(D) DECREASES with D (N=8: 3.99 at 8 MiB -> 2.79 at 256 MiB),
-i.e. pipeline fill is an ADDITIVE per-step byte volume, not a multiplicative
-factor. The fill form separates it:
+The D-dependent pipeline-fill residual (credit-window ramp-up + chunk
+pipelines warming up: small-D ns-3 runs FASTER than the structural load,
+large-D slightly slower) is deliberately NOT modeled -- it is absorbed into
+the fitted pair. A dedicated additive fill term (commit a1fa05d) bought the
+MAPE down to 3.96% but made the formula a 5-constant curve fit; that trade
+was rejected in favor of the physical form.
 
-    alpha_inf = 1.0 (N<=2) / 1.65 (N<=4) / 2.88 (N<=8)
-                / 3.00 (N<=16) / 3.12 (N>=32)   [step function]
-    F = 2.83 MiB/step (~22.6 spray chunks of 131072 B), kappa = 3.5
-
-FIT METHOD: tree_bw is PINNED at 270653 B/us (the eta = 0.7076 trunk
-realization -- free-bandwidth fits are degenerate with the fill term: bw
-inverts to nonsense values). (T_fixed, alpha_inf per N) are closed-form
-relative-error-weighted (1/T^2) least squares; (F, kappa) is a 2-D grid.
-Fresh-sweep MAPE: 3.6% all 36 points (per-N 3.8/2.5/3.5/4.7%), vs 13.1% for
-the f984edb constants on the same data.
+FIT RESULT at this convention: t_min_switch = 4.10 us, tree_bw = 275400
+B/us (eta = 0.72 vs the 382500 B/us trunk physics), MAPE 12.65% all-36
+(per-N 10.6/11.0/14.0/15.1%).
 
 Run:  python3 configs/calibration/tree_ns3_sweep.py
 """
@@ -64,8 +54,6 @@ SIZES = [1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20, 32 << 20,
 LINKS_PER_GPU = 18             # true H200 fabric: 18 NVLink4 lanes per GPU
 PER_LINK_GBPS = 170            # effective per-lane rate (profile bandwidthGbps)
 TRUNK_PHYSICS = LINKS_PER_GPU * PER_LINK_GBPS * 1000 / 8   # 382500 B/us
-TREE_BW = 270653.0             # PINNED trunk realization (eta = 0.7076)
-CFG = "configs/protocol_configs/h200-tree-allreduce.cfg"
 
 # Profile startup delays (h200-ll128.profile), selected by total D.
 STARTUP_US = {"LL": 15.0, "LL128": 25.0, "SIMPLE": 46.0}
@@ -73,23 +61,17 @@ SIMPLE_CHUNK_BYTES = 2 << 20  # chunk D/N >= 2 MB => SIMPLE wire regime
 
 # Shipped surrogate constants (surrogate/theory/whitebox_surrogate_v2.py);
 # the sweep re-derives them and asserts agreement.
-SHIPPED = dict(t_min_switch_us=1.20,
-               tree_fill_bytes_per_step=2.76 * 1024 * 1024,
-               tree_fill_cap_ratio=3.45,
-               alpha_inf={2: 1.0, 4: 1.62, 8: 2.59, 16: 2.74, 32: 2.80})
+SHIPPED = dict(t_min_switch_us=4.10,
+               tree_bw_per_level_bytes_per_us=275400)
 
 
 def alpha_of(n: int) -> float:
-    """Steady-state alpha_inf(N) -- the shipped surrogate's step function."""
+    """Structural alpha(N) -- the busiest-trunk load, same as the surrogate."""
     if n <= 2:
         return 1.0
     if n <= 4:
-        return 1.62
-    if n <= 8:
-        return 2.59
-    if n <= 16:
-        return 2.74
-    return 2.80
+        return 2.0
+    return 3.0
 
 
 def steps_of(n: int) -> int:
@@ -170,45 +152,35 @@ def solve_linear(A, y, w):
     return x
 
 
-def fit_fill_model(rows):
-    """Grid (F, kappa) x closed-form weighted LS for (T_fixed, alpha_N).
+def fit_original_model(rows):
+    """Joint relative-error-weighted (1/T^2) LS for (t_min_switch, tree_bw).
 
-    tree_bw is pinned; unknowns are T_fixed and one alpha_inf per swept N.
-    Returns (mape, F_bytes, kappa, t_fixed, {N: alpha}).
+    Model: T = S(D) + steps*t_min_switch + alpha(N)*D/tree_bw with the
+    STRUCTURAL alpha(N) = 1/2/3 (see alpha_of). Two unknowns, one 2x2
+    normal-equation solve (columns: steps, alpha(N)*D; coefficients:
+    t_min_switch, 1/tree_bw).
+    Returns (mape, t_fixed, tree_bw).
     """
-    ns = sorted(set(n for n, _, _ in rows))
-    best = None
-    for F100 in range(100, 601):        # 1.0 .. 6.0 MiB/step
-        F = F100 / 100 * 2 ** 20
-        for kap100 in range(100, 601):  # 1.0 .. 6.0
-            kap = kap100 / 100
-            A, y, w = [], [], []
-            for n, d, t in rows:
-                s = steps_of(n)
-                fill = min(F * s, kap * d) / TREE_BW
-                A.append([float(s)] + [d / TREE_BW if nn == n else 0.0
-                                       for nn in ns])
-                y.append(t - STARTUP_US[proto_of(d)] - fill)
-                w.append(1.0 / (t * t))
-            coef = solve_linear(A, y, w)
-            if coef is None:
-                continue
-            errs = []
-            for i, (n, d, t) in enumerate(rows):
-                p = (STARTUP_US[proto_of(d)]
-                     + sum(a * c for a, c in zip(A[i], coef))
-                     + min(F * steps_of(n), kap * d) / TREE_BW)
-                errs.append(abs(p - t) / t)
-            m = 100.0 * sum(errs) / len(errs)
-            if best is None or m < best[0]:
-                best = (m, F, kap, coef[0], dict(zip(ns, coef[1:])))
-    return best
+    A = [[float(steps_of(n)), alpha_of(n) * d] for n, d, _ in rows]
+    y = [t - STARTUP_US[proto_of(d)] for _, d, t in rows]
+    w = [1.0 / (t * t) for _, _, t in rows]
+    coef = solve_linear(A, y, w)
+    if coef is None:
+        return None
+    t_fixed, inv_bw = coef
+    bw = 1.0 / inv_bw
+    errs = []
+    for (n, d, t), row in zip(rows, A):
+        p = STARTUP_US[proto_of(d)] + sum(a * c for a, c in zip(row, coef))
+        errs.append(abs(p - t) / t)
+    m = 100.0 * sum(errs) / len(errs)
+    return (m, t_fixed, bw)
 
 
-def predict(n, d, t_fixed, alpha_map, F, kap):
+def predict(n, d, t_fixed, tree_bw):
     s = steps_of(n)
     return (STARTUP_US[proto_of(d)] + s * t_fixed
-            + (alpha_map[n] * d + min(F * s, kap * d)) / TREE_BW)
+            + alpha_of(n) * d / tree_bw)
 
 
 def main(argv=None):
@@ -250,10 +222,10 @@ def main(argv=None):
 
     fit_rows = [(r["numGpus"], r["dataSize"], r["simTimeUs"])
                 for r in rows if r["simTimeUs"] is not None]
-    mape, F, kap, t_fixed, alpha_map = fit_fill_model(fit_rows)
+    mape, t_fixed, tree_bw = fit_original_model(fit_rows)
 
     def mape_of(pts):
-        errs = [abs(predict(n, d, t_fixed, alpha_map, F, kap) - t) / t
+        errs = [abs(predict(n, d, t_fixed, tree_bw) - t) / t
                 for (n, d, t) in pts]
         return 100.0 * sum(errs) / len(errs) if errs else float("nan")
 
@@ -263,13 +235,10 @@ def main(argv=None):
                   and r["wireRegime"] == "SIMPLE"]
     per_n = {n: mape_of([p for p in fit_rows if p[0] == n]) for n in NUM_GPUS}
 
-    print(f"\n=== FILL-MODEL FIT ({len(fit_rows)} pts, bw pinned "
-          f"{TREE_BW:.0f}) ===")
-    print(f"t_fixed      = {t_fixed:.3f} us")
-    print(f"fill/step F  = {F / 2**20:.2f} MiB ({F / 131072:.1f} spray chunks)"
-          f"  capped at {kap:.2f} * D")
-    print(f"alpha_inf    = " + ", ".join(f"N={n}: {a:.3f}"
-                                         for n, a in alpha_map.items()))
+    print(f"\n=== ORIGINAL 2-PARAM FIT ({len(fit_rows)} pts) ===")
+    print(f"t_min_switch = {t_fixed:.3f} us")
+    print(f"tree_bw      = {tree_bw:.0f} B/us "
+          f"(eta = {tree_bw / TRUNK_PHYSICS:.4f} vs {TRUNK_PHYSICS:.0f} trunk)")
     print(f"MAPE (all {len(fit_rows)} pts) = {mape:.2f}%")
     print(f"MAPE (SIMPLE regime, {len(simple_pts)} pts) = "
           f"{mape_of(simple_pts):.2f}%")
@@ -284,18 +253,16 @@ def main(argv=None):
                 "separate point-to-point NVLink4 lanes @ 170 Gbps each, "
                 "spray-routed (128 KiB chunks round-robin), aggregate trunk "
                 "3060 Gbps; credits unconstrained (--vcCredits=104857600)"),
-        model=("T = S(D) + 2*log2(N)*t_min_switch + (alpha_inf(N)*D + "
-               "min(F*steps, kappa*D))/tree_bw; alpha_inf = steady-state "
-               "busiest GPU<->NVSwitch trunk load in D units, F = pipeline-"
-               "fill volume per step (additive, NOT multiplicative)"),
+        model=("T = S(D) + 2*log2(N)*t_min_switch + alpha(N)*D/tree_bw; "
+               "alpha(N) = STRUCTURAL busiest GPU<->NVSwitch trunk load in D "
+               "units (1/2/3); the pipeline-fill residual is absorbed into "
+               "the fitted pair, not modeled"),
         fit_set=("all points, relative-error weighted (1/T^2); N in "
-                 "{4,8,16,32} x 1-256 MB; tree_bw PINNED (free-bw fits are "
-                 "degenerate with the fill term)"),
-        tree_bw_per_level_bytes_per_us=TREE_BW,
+                 "{4,8,16,32} x 1-256 MB; TWO free constants "
+                 "(t_min_switch, tree_bw), joint LS"),
+        tree_bw_per_level_bytes_per_us=tree_bw,
         t_min_switch_us=t_fixed,
-        tree_fill_bytes_per_step=F,
-        tree_fill_cap_ratio=kap,
-        alpha_inf={str(k): v for k, v in alpha_map.items()},
+        alpha_structural={str(n): alpha_of(n) for n in NUM_GPUS},
         mape_all_pct=round(mape, 2),
         mape_simple_pct=round(mape_of(simple_pts), 2),
         mape_per_n_pct={str(n): round(m, 2) for n, m in per_n.items()},

@@ -6,44 +6,47 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
-### Changed — tree surrogate: additive pipeline-fill term + fresh 36-point refit
+### Changed — tree surrogate: back to the original physical form, refit at the TRUE 18-link fabric
 
-The 9/18 tree recalibration (f984edb: `T = S + steps·2.99 + α(N)·D/270653`,
-α = 1/2/3) was fitted against a sweep that predates the 9/30 single-node
-local-rank fix (e1cdd9c — all rank pairs exchange credits), and its
-multiplicative-α shape is structurally wrong: on the fresh 36-point sweep
-(N = {4,8,16,32} × 1–256 MiB, `configs/calibration/tree_sweep.csv`) the
-implied α_eff *decreases* with D (N=8: 5.13 at 8 MiB → 2.67 at 256 MiB) —
-pipeline fill (credit-window ramp-up + overlapped reduce-up/broadcast-down
-chunk pipelines warming up) is an ADDITIVE per-step byte volume, not a
-multiplicative factor. The tree serial term is now
+Two corrections landed together:
 
-    (α∞(N)·D + min(F·steps, κ·D)) / tree_bw
+1. **Fabric convention**: the tree calibration now runs at the TRUE H200
+   fabric — `--linksPerGpu=18` separate point-to-point GPU↔NVSwitch NVLink4
+   lanes @ 170 Gbps each, spray-routed (128 KiB chunks round-robin, aggregate
+   3060 Gbps trunk), credits unconstrained. The retired
+   `--linkDataRate=3060 --linksPerGpu=1` convention collapsed the 18 lanes
+   into ONE p2p pipe (no spray, no per-link queues) — same cell N=8/256 MiB:
+   2851.1 → 2699.4 µs. The `h200-ll128.profile` now carries
+   `linksPerGpu = 18` and both switched `.cfg` headers document the 18-link
+   recipe.
+2. **Model form**: the fill-form experiment (a1fa05d: an ADDITIVE capped
+   pipeline-fill term `min(F·steps, κ·D)` + per-N fitted α∞, five constants)
+   reached 3.96% MAPE but was rejected as pure curve-fitting. The tree keeps
+   the ORIGINAL two-parameter form
 
-with α∞(N) = 1.0/1.62/2.59/2.74/2.80 (N≤2/≤4/≤8/≤16/≥17) the steady-state
-trunk load, F = 2.76 MiB/step (~22 spray chunks) the fill volume, κ = 3.45
-the fill cap, `t_min_switch` 2.99 → 1.20 µs; `tree_bw_per_level` stays
-270653 B/µs (pinned — free-bandwidth fits are degenerate with the fill
-term). Refit (`configs/calibration/tree_ns3_sweep.py`, now sweeping N=32 and
-supporting `--refit` from the CSV) at the TRUE H200 fabric —
-`--linksPerGpu=18` separate point-to-point NVLink4 lanes @ 170 Gbps,
-spray-routed (aggregate 3060 Gbps trunk), credits unconstrained: MAPE 3.96%
-all-36 / 2.30% SIMPLE, per-N 3.4/2.1/4.8/5.5% — vs 12.4% for the old
-constants on the 9/18 data. The earlier `--linkDataRate=3060
---linksPerGpu=1` convention (18 lanes collapsed into ONE pipe, no spray) is
-retired — same cell N=8/256 MiB: 2851.1 → 2699.4 µs; the
-`h200-ll128.profile` now carries `linksPerGpu = 18` and both switched
-`.cfg` headers recommend the 18-link fabric recipe. The consistency
-regression tree preset drops 11.22% → 0.56% at the 18-link fabric
-(ratio 0.995–1.008, the tightest of the four presets); the nvls preset is
-now recorded against the profile's 18-link cfg alone (the old duplicate
-single-link/trunk nvls presets converged once the profile changed). Note
-the sweep's credit
-convention: the inline 1-VC fabric model with CLI-default credits
-(unlimited), NOT the profile's PEX `vcCredits=64` (+24.8% at N=8/256 MiB
-under 64 on the 18-link fabric). Docs: `doc/CALIBRATION.md` tree section
-rewritten; 4 tree unit tests (α∞ values, fill cap, ≤5% ns-3 reproduction
-incl. N=32, N-monotone shape).
+       T = S(D) + steps·t_min_switch + α(N)·D / tree_bw
+       α(N) = 1 / 2 / 3   (N≤2 / N≤4 / N≥5, structural trunk load)
+
+   with BOTH constants refit on the fresh 36-point sweep
+   (N = {4,8,16,32} × 1–256 MiB, `configs/calibration/tree_sweep.csv`;
+   relative-error-weighted joint least squares): `t_min_switch = 4.10 µs`,
+   `tree_bw_per_level = 275400 B/µs` (η = 0.72 vs the 382500 B/µs trunk
+   physics; `eta_tree` 0.60 → 0.61 in `make_surrogate_from_wire`). MAPE
+   12.65% all-36 / 6.97% SIMPLE, per-N 10.6/11.0/14.0/15.1% — the accepted
+   cost of the physical form: the D-dependent pipeline-fill residual
+   (small-D ns-3 faster, large-D slightly slower) is absorbed into the
+   fitted pair and documented, not modeled.
+
+The consistency regression tree preset lands at 11.13% (ratio 0.80–1.11)
+against the 18-link ns-3 fabric; the nvls preset is recorded against the
+profile's 18-link cfg alone (the old duplicate single-link/trunk nvls
+presets converged once the profile changed — it sits 1.07–1.17× above
+ns-3, documented). Sweep credit convention: the inline 1-VC fabric model
+with CLI-default credits (unlimited), NOT the profile's PEX `vcCredits=64`
+(+24.8% at N=8/256 MiB under 64 on the 18-link fabric). Docs:
+`doc/CALIBRATION.md` tree section rewritten; 4 tree unit tests (structural
+α(N), per-step volume α(N)·D/steps, ≤16% ns-3 reproduction incl. N=32,
+N-monotone shape).
 
 ### Fixed — `StartApplication`/`Initialize` clobbered exhausted credit windows
 

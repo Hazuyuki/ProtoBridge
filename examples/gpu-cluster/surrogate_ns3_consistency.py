@@ -11,12 +11,11 @@ JSON):
 
   ring     HW back-fit (ring_bw=177000 anchored to the measured H200 8-GPU
            point) -- a lower bound vs ns-3, not an ns-3 fit.
-  tree     ns-3 back-fit (tree_bw=270653 pinned, t_min_switch=1.20,
-           alpha_inf(N) trunk model + additive pipeline fill 2.76 MiB/step
-           capped at 3.45*D; fit MAPE 3.96% all / 2.30% SIMPLE over the fresh
-           36-point N={4,8,16,32} sweep at the TRUE H200 fabric:
-           --linksPerGpu=18 lanes @ 170 Gbps, spray-routed, credits
-           unconstrained).
+  tree     ns-3 back-fit (original 2-parameter form: tree_bw=275400,
+           t_min_switch=4.10, structural alpha(N)=1/2/3 trunk load; fit
+           MAPE 12.65% all / 6.97% SIMPLE over the fresh 36-point
+           N={4,8,16,32} sweep at the TRUE H200 fabric: --linksPerGpu=18
+           lanes @ 170 Gbps, spray-routed, credits unconstrained).
   nvls     HW-multicast-derived (nvls_bw=535500 = 1.2 x B_agg), recorded
            against the cfg run, which (since the profile carries
            linksPerGpu=18) builds the TRUE 18-lane spray fabric. The preset

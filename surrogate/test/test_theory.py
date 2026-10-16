@@ -95,7 +95,7 @@ def test_surrogate_from_wire_derives_h200_bandwidths():
     s = wb.make_surrogate_from_wire(
         b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
     assert abs(s.ring_bw - 177000) / 177000 <= 0.025
-    assert abs(s.tree_bw_per_level - 270653) / 270653 <= 0.025
+    assert abs(s.tree_bw_per_level - 275400) / 275400 <= 0.025
     assert abs(s.nvls_bw - 535500) / 535500 <= 0.025
 
 
@@ -248,7 +248,7 @@ def test_collective_explicit_reproduces_calibrated():
     assert s.predict(D, 8, "ring", credits=128, ber=0,
                      collective="allreduce") == pytest.approx(1325.49, rel=1e-3)
     assert s.predict(D, 8, "tree", credits=128, ber=0,
-                     collective="allreduce") == pytest.approx(2661.50, rel=1e-3)
+                     collective="allreduce") == pytest.approx(2973.32, rel=1e-3)
     assert s.predict(D, 8, "nvls", credits=128, ber=0,
                      collective="allgather") == pytest.approx(1018.01, rel=1e-3)
 
@@ -331,54 +331,50 @@ def test_fullmesh_wire_factory_derives_full_bundle():
 
 
 def test_tree_trunk_load_alpha():
-    """alpha_inf(N) = steady-state (large-D) busiest GPU<->NVSwitch trunk
-    load in D units, fitted per band on the fresh 36-point sweep at the TRUE
-    H200 fabric (--linksPerGpu=18 x 170 Gbps spray-routed): 1.0 (single
-    edge), 1.62 (N<=4), 2.59 (N<=8), 2.74 (N<=16), 2.80 (N>=32). The old
-    structural 1/2/3 step function missed the measured N-dependence."""
+    """alpha(N) = structural busiest GPU<->NVSwitch trunk load in D units:
+    1.0 (single edge, N<=2), 2.0 (root with two children, N<=4), 3.0
+    (interior node moving 2D child + 1D parent traffic, N>=5)."""
     f = wb.TheoryDerivedSurrogate._tree_trunk_load
     assert f(2) == 1.0
-    assert f(3) == 1.62
-    assert f(4) == 1.62
-    assert f(5) == 2.59
-    assert f(8) == 2.59
-    assert f(16) == 2.74
-    assert f(32) == 2.80
+    assert f(3) == 2.0
+    assert f(4) == 2.0
+    assert f(5) == 3.0
+    assert f(8) == 3.0
+    assert f(32) == 3.0
 
 
-def test_tree_fill_bytes_capped():
-    """Pipeline fill is an additive per-step volume, capped at a fraction of
-    D: min(F*steps, kappa*D). Without the cap small-D predictions overshoot
-    badly (the whole point of the fill-form recalibration)."""
+def test_tree_per_step_is_alpha_d_over_steps():
+    """The tree per-step volume is alpha(N)*D/steps (the full-volume
+    chunk-pipelined tree serializes alpha(N)*D on the busiest trunk) -- with
+    no extra fill term."""
     s = wb.make_h200_tree_theory()
-    F, kap = s.tree_fill_bytes_per_step, s.tree_fill_cap_ratio
-    # large D: fill = F*steps (uncapped)
-    assert s._tree_fill_bytes(256 << 20, 6) == F * 6
-    # small D: fill hits the kappa*D cap
-    assert s._tree_fill_bytes(1 << 20, 6) == kap * (1 << 20)
+    D = 256 * 1024 * 1024
+    assert s._per_step(D, 8, "tree", 6, "allreduce") == 3.0 * D / 6
 
 
 def test_tree_reproduces_ns3_ground_truth():
-    """The fill-form tree preset reproduces the fresh (post-local-rank-fix
-    e1cdd9c binary) ns-3 TreeAllReduce simTimeUs at the TRUE H200 fabric
+    """The original-form tree preset (2 fitted params: tree_bw=275400,
+    t_min_switch=4.10) reproduces the fresh (post-local-rank-fix e1cdd9c
+    binary) ns-3 TreeAllReduce simTimeUs at the TRUE H200 fabric
     (--linksPerGpu=18 x 170 Gbps spray-routed; the calibration ground truth,
-    configs/calibration/tree_ns3_sweep.py) within 5% at 256 MiB (fit
-    MAPE 3.96% over all 36 points, per-N 3.4/2.1/4.8/5.5%). startup_us=46 is
-    the profile's SIMPLE startup (the model takes startup by D regime, like
-    the sweep's back-fit)."""
+    configs/calibration/tree_ns3_sweep.py) within 16% at 256 MiB (fit
+    MAPE 12.65% over all 36 points, per-N 10.6/11.0/14.0/15.1%). startup_us=46
+    is the profile's SIMPLE startup (the model takes startup by D regime,
+    like the sweep's back-fit)."""
     s = wb.make_h200_tree_theory()
     D = 256 * 1024 * 1024
     for n, gt in ((4, 1745.9), (8, 2699.4), (16, 2789.7), (32, 2816.3)):
         pred = s.predict(D, n, "tree", credits=128, ber=0, startup_us=46.0,
                          collective="allreduce")
-        assert abs(pred - gt) / gt <= 0.05, (n, pred, gt)
+        assert abs(pred - gt) / gt <= 0.16, (n, pred, gt)
 
 
 def test_tree_latency_not_decreasing_in_n():
     """Shape regression for the recalibration: the OLD serial term
     D(N-1)/N/(log2N*tree_bw) DECREASED with N; ns-3 measures a
-    saturating-INCREASING trunk cost (alpha_inf = 1.62 / 2.59 / 2.74 / 2.80 at
-    N=4/8/16/32). The alpha_inf(N) model must preserve that ordering."""
+    saturating-INCREASING trunk cost (alpha(N) = 2.0 / 3.0 / 3.0 at
+    N=4/8/16 on top of growing steps). The alpha(N) model must preserve
+    that ordering."""
     s = wb.make_h200_tree_theory()
     D = 256 * 1024 * 1024
     ts = [s.predict(D, n, "tree", credits=128, ber=0, startup_us=46.0,

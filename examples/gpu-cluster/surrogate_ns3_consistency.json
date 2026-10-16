@@ -11,9 +11,9 @@
     },
     "tree": {
       "points": 4,
-      "mape_pct": 0.56,
-      "ratio_min": 0.9951,
-      "ratio_max": 1.0076,
+      "mape_pct": 11.13,
+      "ratio_min": 0.797,
+      "ratio_max": 1.1094,
       "note": "ns-3 back-fit (18-link spray fabric)"
     },
     "nvls": {
@@ -77,9 +77,9 @@
       "numGpus": 8,
       "dataSizeMB": 4,
       "ns3SimTimeUs": 145.9,
-      "surrogateUs": 146.8,
-      "ratio": 1.0062,
-      "absErrPct": 0.62,
+      "surrogateUs": 116.29,
+      "ratio": 0.797,
+      "absErrPct": 20.3,
       "note": "ns-3 back-fit (18-link spray fabric)"
     },
     {
@@ -87,9 +87,9 @@
       "numGpus": 8,
       "dataSizeMB": 16,
       "ns3SimTimeUs": 275.8,
-      "surrogateUs": 277.91,
-      "ratio": 1.0076,
-      "absErrPct": 0.76,
+      "surrogateUs": 253.36,
+      "ratio": 0.9186,
+      "absErrPct": 8.14,
       "note": "ns-3 back-fit (18-link spray fabric)"
     },
     {
@@ -97,9 +97,9 @@
       "numGpus": 8,
       "dataSizeMB": 64,
       "ns3SimTimeUs": 762.3,
-      "surrogateUs": 759.55,
-      "ratio": 0.9964,
-      "absErrPct": 0.36,
+      "surrogateUs": 801.63,
+      "ratio": 1.0516,
+      "absErrPct": 5.16,
       "note": "ns-3 back-fit (18-link spray fabric)"
     },
     {
@@ -107,9 +107,9 @@
       "numGpus": 8,
       "dataSizeMB": 256,
       "ns3SimTimeUs": 2699.4,
-      "surrogateUs": 2686.14,
-      "ratio": 0.9951,
-      "absErrPct": 0.49,
+      "surrogateUs": 2994.73,
+      "ratio": 1.1094,
+      "absErrPct": 10.94,
       "note": "ns-3 back-fit (18-link spray fabric)"
     },
     {
