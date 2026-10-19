@@ -354,6 +354,15 @@ HierarchicalAlltoAll::Complete()
 void
 HierarchicalAlltoAll::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
 {
+    // Only DATA counts toward progress (same rule as HierarchicalAllReduce/
+    // RingAllReduce): PERMANENT_LOSS notifications carry the lost packet's
+    // byte counts but the data is gone, and unrelated P2P traffic must not
+    // advance the collective's phase counters.
+    if (header.GetPacketType() != FabricPacketType::DATA)
+    {
+        return;
+    }
+
     uint16_t destRank = header.GetDestRank();
     uint32_t effectiveDataSize = header.GetEffectiveDataSize();
     uint32_t payloadSize = header.GetPayloadSize();

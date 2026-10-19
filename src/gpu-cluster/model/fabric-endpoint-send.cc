@@ -291,6 +291,11 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
         uint64_t sizeBasedChunks =
             (wireSize + m_sprayChunkSize - 1) / m_sprayChunkSize;
         uint64_t numChunks = std::max(minChunks, sizeBasedChunks);
+        // Bound the chunk count by the wire size: the one-chunk-per-link
+        // spray can otherwise produce trailing fragments whose offset is
+        // past the wire end (wireSize - offset underflows). Same clamp as
+        // the DATA spray path.
+        numChunks = std::min(numChunks, std::max<uint64_t>(wireSize, 1));
 
         // Packet event count otherwise grows with every 128 KB spray unit. At
         // multi-GB sizes this dominates wall time. Coalesce only large
@@ -315,6 +320,10 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
         for (uint64_t i = 0; i < numChunks; i++)
         {
             uint64_t offset = i * chunkSize;
+            if (offset >= wireSize)
+            {
+                continue; // trailing lane-pad fragment past the wire end
+            }
             uint32_t thisChunkSize = static_cast<uint32_t>(
                 std::min(chunkSize, wireSize - offset));
             uint64_t effectiveBegin = i * effectiveSize / numChunks;
@@ -361,6 +370,10 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                 for (uint64_t j = i + 1; j < numChunks; j++)
                 {
                     uint64_t remOffset = j * chunkSize;
+                    if (remOffset >= wireSize)
+                    {
+                        continue; // trailing lane-pad fragment past the wire end
+                    }
                     uint32_t remChunkSize = static_cast<uint32_t>(
                         std::min(chunkSize, wireSize - remOffset));
                     uint64_t remEffectiveBegin = j * effectiveSize / numChunks;
@@ -488,6 +501,20 @@ FabricEndpoint::SendP2p(uint16_t destRank, const uint8_t* data, uint32_t size,
     header.SetPayloadSize(size);
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
+
+    // Scale-out (remote dest) P2P bypasses the per-VC credit gate — the same
+    // convention SendBulkWireTransferSize applies to So traffic. Credits are
+    // returned by the RECEIVER only for intra-node sources
+    // (OnPacketDelivered's IsLocalRank guard), so a credit-consuming remote
+    // P2P would drain the local VC pool with no return path and stall once
+    // vcCredits exhausts.
+    if (m_localRankCount > 1 && !IsLocalRank(destRank))
+    {
+        packet->AddHeader(header);
+        uint32_t deviceIndex = ResolveDeviceIndex(destRank);
+        SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(destRank));
+        return;
+    }
 
     SendQueueEntry entry;
     entry.packet = packet;
