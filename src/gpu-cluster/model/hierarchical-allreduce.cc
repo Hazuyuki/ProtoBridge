@@ -644,6 +644,23 @@ HierarchicalAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fa
 {
     NS_LOG_FUNCTION(this << srcRank << packet->GetSize());
 
+    // Only DATA counts toward progress. A PERMANENT_LOSS notification (retries
+    // exhausted) carries the original packet's byte counts so the fabric layer
+    // can propagate terminal progress, but the data is gone — counting it
+    // would let the collective report completion with missing data (same rule
+    // as RingAllReduce).
+    if (header.GetPacketType() != FabricPacketType::DATA)
+    {
+        if (header.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+        {
+            m_permanentLossCount++;
+            NS_LOG_INFO("PERMANENT_LOSS: src=" << srcRank << " -> dest="
+                         << header.GetDestRank()
+                         << " (data integrity violated, not counted as progress)");
+        }
+        return;
+    }
+
     uint16_t destRank = header.GetDestRank();
     uint32_t effectiveDataSize = header.GetEffectiveDataSize();
     uint32_t payloadSize = header.GetPayloadSize();

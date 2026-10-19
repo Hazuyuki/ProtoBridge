@@ -191,6 +191,7 @@ private:
     std::vector<uint64_t> m_gpuReceivedBytes;
     std::vector<bool> m_gpuPhaseComplete;
     uint32_t m_completedGpuCount;
+    uint32_t m_permanentLossCount = 0; // permanently lost packets (not progress)
 
     // Per-GPU tracking for which local ranks have sent their inter-node data
     std::vector<bool> m_gpuInterNodeSendDone;
