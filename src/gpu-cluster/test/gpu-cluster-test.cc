@@ -4396,16 +4396,21 @@ class DcqcnRateMachineTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ_TOL(m->GetAlpha(k), 0.5, 1e-9,
             "first CNP: Alpha = (1-0)*gInit = 0.5");
 
-        // (c) ShapingDelay at Alpha=0.5: rateFactor = 1 - 0.5/2 = 0.75; delay =
-        // base*(1/rateFactor - 1), base = chunkBytes / MaxRate (50e9 B/s).
+        // (c) ShapingDelay at Alpha=0.5: rateFactor = 1 - 0.5/2 = 0.75; the
+        // enforced rate is 0.75*MaxRate, so the pacer spaces chunks one
+        // slot = chunk/(0.75*MaxRate) apart. At simulator time 0 chunk 0 is
+        // not delayed and chunk i is held until i*slot (the pacer's
+        // next-send bookkeeping), spacing consecutive egress starts a full
+        // slot apart -- the reduced rate actually holds.
         const uint32_t chunk = 1000000;
         const double maxRate = 50.0e9;
-        const double baseNs = static_cast<double>(chunk) / maxRate * 1e9;
-        const double expectNs = baseNs * (1.0 / 0.75 - 1.0);
-        NS_TEST_ASSERT_MSG_EQ_TOL(
-            static_cast<double>(m->ShapingDelay(chunk, k).GetNanoSeconds()),
-            expectNs, 100.0,
-            "ShapingDelay must equal base*(1/rateFactor-1) at Alpha=0.5");
+        const double slotNs = static_cast<double>(chunk) / (0.75 * maxRate) * 1e9;
+        const int64_t d0 = m->ShapingDelay(chunk, k).GetNanoSeconds();
+        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d0), 0.0, 2.0,
+            "chunk 0 of a newly-paced flow is not delayed");
+        const int64_t d1 = m->ShapingDelay(chunk, k).GetNanoSeconds();
+        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d1), slotNs, 100.0,
+            "chunk 1 is held one full slot after chunk 0's egress start");
 
         // (d) Fast-recovery timer fires at tFast=50us: g *= gDecay (0.5->0.25),
         // Alpha = 0.5 - 0.5*0.25 = 0.375.
@@ -4464,30 +4469,20 @@ class PerQpCeilingPacerTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(on->ShapingDelay(chunk, kB).GetNanoSeconds(), 0,
             "a second flow's first chunk must not inherit flow A's pacing");
 
-        // (d) Ceiling + DCQCN compose: both apply, the binding (larger) delay
-        // wins (max). With Alpha=0.5 the DCQCN extra-serialization delay for a
-        // 9000 B chunk at 50e9 B/s is base*(1/0.75-1) = 60 ns; the ceiling slot
-        // is 9000/6.125e9 = 1469 ns. The first chunk's pacer delay is 0, so the
-        // DCQCN delay (60) binds at chunk 0; from chunk 1 the pacer delay
-        // (1469) exceeds the DCQCN delay, so the ceiling binds -- proving the
-        // sustained-throughput cap overrides DCQCN once a flow has history.
+        // (d) Ceiling + DCQCN compose: the effective rate is
+        // min(alpha rate, ceiling) = min(0.75*50e9, 6.125e9) = 6.125e9 B/s
+        // (the ceiling binds), so both chunks of a fresh flow pace at the
+        // ceiling slot — chunk 0 un-delayed, chunk 1 one full slot later.
         on->OnCnp(kA); // Alpha=0.5
         const DcqcnRateMachine::FlowKey kC = 111;
         on->OnCnp(kC); // Alpha=0.5 on a fresh flow (pacer state empty)
-        // chunk 0: max(DCQCN 60, pacer 0) = 60 (DCQCN binds; ceiling pacer is 0
-        // for a flow's first chunk).
         const int64_t d0 = on->ShapingDelay(chunk, kC).GetNanoSeconds();
-        const int64_t dcqcnNs =
-            static_cast<int64_t>(static_cast<double>(chunk) / 50.0e9 * 1e9 *
-                                 (1.0 / 0.75 - 1.0));
-        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d0),
-            static_cast<double>(dcqcnNs), 2.0,
-            "chunk 0: DCQCN delay binds (pacer is 0 for the first chunk)");
-        // chunk 1: max(DCQCN 60, pacer slot 1469) = 1469 (ceiling binds).
+        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d0), 0.0, 2.0,
+            "chunk 0: a fresh flow's first chunk is not delayed");
         const int64_t d1 = on->ShapingDelay(chunk, kC).GetNanoSeconds();
         NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d1),
             static_cast<double>(slotNs), 2.0,
-            "chunk 1: ceiling pacer binds over the DCQCN delay");
+            "chunk 1: composed pacer binds at the ceiling rate");
         Simulator::Destroy();
     }
 };
@@ -4681,6 +4676,10 @@ class SoOnlyPredicateTest : public TestCase
             "Su MacTx must fire at send time (zero shaping delay)");
 
         // --- So packet (remote dest, RoCE SIMPLE, eff=0.95): shaped, deferred --
+        // The DCQCN delay is a per-flow PACER: a fresh flow's chunk 0 is not
+        // delayed, chunk 1 is held one pace slot after chunk 0's egress start.
+        // The expected slot is computed from the same formula the machine
+        // uses (Alpha=0.5 -> rateFactor 0.75 of the 50e9 B/s line rate).
         Ptr<Packet> soPkt = Create<Packet>(chunk);
         FabricHeader soFh;
         soFh.SetPacketType(FabricPacketType::DATA);
@@ -4693,22 +4692,28 @@ class SoOnlyPredicateTest : public TestCase
         soFh.SetSequenceNumber(2);
         soPkt->AddHeader(soFh);
 
-        const Time expectShaping = machine->ShapingDelay(soPkt->GetSize(), soKey);
-        NS_TEST_ASSERT_MSG_EQ(expectShaping.IsStrictlyPositive(), true,
-            "charged So flow must have positive shaping delay");
+        const double slotNs = static_cast<double>(chunk) / (0.75 * 50.0e9) * 1e9;
+        // Chunk 0 of the So flow: pacer delay 0, fires synchronously.
         m_sawTx = false;
         ep->InjectSend(soPkt, 0, destMac);
+        NS_TEST_ASSERT_MSG_EQ(m_sawTx, true,
+            "So chunk 0 (fresh pacer state) sends synchronously");
+        // Chunk 1: held one pace slot after chunk 0's egress start.
+        Ptr<Packet> soPkt2 = Create<Packet>(chunk);
+        FabricHeader soFh2 = soFh;
+        soFh2.SetSequenceNumber(3);
+        soPkt2->AddHeader(soFh2);
+        m_sawTx = false;
+        ep->InjectSend(soPkt2, 0, destMac);
         NS_TEST_ASSERT_MSG_EQ(m_sawTx, false,
-            "So (eff<1.0, Alpha>0) must defer MacTx by ShapingDelay");
+            "So (eff<1.0, Alpha>0) chunk 1 must defer MacTx by the pace slot");
         Simulator::Stop(MicroSeconds(30)); // < tFast(50us): Alpha stays 0.5
         Simulator::Run();
         NS_TEST_ASSERT_MSG_EQ(m_sawTx, true,
             "deferred So MacTx must fire after the simulator advances");
-        // Both sends occurred at Now=0, so the deferred fire time == ShapingDelay.
         NS_TEST_ASSERT_MSG_EQ_TOL(
-            static_cast<double>(m_txTime.GetNanoSeconds()),
-            static_cast<double>(expectShaping.GetNanoSeconds()), 1000.0,
-            "So MacTx must fire at Now + ShapingDelay");
+            static_cast<double>(m_txTime.GetNanoSeconds()), slotNs, 1000.0,
+            "So chunk 1 MacTx must fire one pace slot after chunk 0");
         Simulator::Destroy();
     }
     void OnMacTx(Ptr<const Packet> /*p*/)

@@ -29,11 +29,14 @@ namespace ns3
  * OnCnp() grows a per-flow Alpha (the rate-backoff factor) and arms a
  * fast-recovery timer that multiplicatively shrinks Alpha; once the fast
  * cycles are spent, an additive-increase timer drives Alpha back to the
- * floor. ShapingDelay() maps Alpha onto an egress delay the send path folds
- * into its chokepoint: rateFactor = clamp(1 - alpha/2, 0.5, 1.0), and the
- * delay is the extra serialization time at the reduced rate. At Alpha = 0
- * (the default, before any CNP) ShapingDelay() is zero, so mounting the
- * machine is byte-identical to the unmounted baseline (parity-safe).
+ * floor. ShapingDelay() maps Alpha onto the enforced rate
+ * rateFactor = clamp(1 - alpha/2, 0.5, 1.0) x line rate, enforced as a TRUE
+ * per-flow pacer (per-flow `nextSendNs` bookkeeper spacing consecutive
+ * chunks) -- a constant per-chunk delay would give a whole burst the same
+ * offset and the NetDevice would then drain it at the line rate, never
+ * realizing the reduced rate. At Alpha = 0 (the default, before any CNP)
+ * ShapingDelay() is zero, so mounting the machine is byte-identical to the
+ * unmounted baseline (parity-safe).
  *
  * The flow key is FabricEndpoint::MakeSeqKey(destRank, vcId, flowId): the key
  * the sender uses on the send path matches the key the CNP carries back, so
@@ -42,13 +45,13 @@ namespace ns3
  * PerQpCeilingGbps (> 0 = on) caps the *sustained* throughput of a single
  * flow (one flowKey == one QP) at the given rate. This is a HARDWARE per-QP
  * NIC cap (e.g. the ~49 Gbps single-QP `ib_write_bw` ceiling), independent of
- * congestion. It is enforced as a TRUE per-flow rate pacer -- not a per-chunk
- * constant offset: a per-flow `nextSendNs` bookkeeper spaces consecutive
- * chunks so the aggregate rate of a single flow settles to the ceiling
- * (chunkSize / ceilingBps per chunk). A constant offset (the DCQCN alpha
- * model above) would only delay the burst start, leaving the NetDevice to
- * serialize all chunks at the link rate -- which does NOT cap sustained
- * throughput; the pacer does. Default 0.0 = off (parity-identical).
+ * congestion. It is enforced by the same per-flow pacer as the congestion
+ * backoff (a per-flow `nextSendNs` bookkeeper spaces consecutive chunks so
+ * the aggregate rate of a single flow settles to min(alpha rate, ceiling)),
+ * not a per-chunk constant offset, which would only delay the burst start
+ * and leave the NetDevice to serialize all chunks at the link rate. When both
+ * limits are active the effective pace slot is chunkSize / min(rates).
+ * Default 0.0 = off (parity-identical).
  */
 class DcqcnRateMachine : public Object
 {
