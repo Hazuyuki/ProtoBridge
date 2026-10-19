@@ -214,7 +214,6 @@ class LlrManager : public Object
     {
         Ptr<Packet> packet;
         uint16_t destRank;
-        EventId timeoutEvent;
     };
 
     struct SourceEntry
@@ -222,6 +221,12 @@ class LlrManager : public Object
         Ptr<Packet> packet;
         uint16_t destRank;
         uint32_t retryCount;
+        // The retry-timeout timer lives on the SOURCE entry, not the
+        // retry-buffer entry: the source store is the packet's lifetime
+        // (until ACK), while a retry-buffer copy can be evicted by
+        // EnforceBufferLimit or refused outright by DROP_NEWEST -- either
+        // would strand an un-ACKed packet with no timeout backstop.
+        EventId timeoutEvent;
     };
 
     /**

@@ -176,14 +176,25 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
         sourceIt->second.destRank = destRank;
     }
 
+    // (Re)arm the retry-timeout on the SOURCE entry: it must survive both a
+    // retry-buffer eviction and a DROP_NEWEST refusal -- the packet stays
+    // un-ACKed either way and needs its timeout backstop.
+    sourceIt = m_sourceStore.find(key);
+    if (!sourceIt->second.timeoutEvent.IsExpired())
+    {
+        Simulator::Cancel(sourceIt->second.timeoutEvent);
+    }
+    if (m_retryTimeout > Time(0))
+    {
+        sourceIt->second.timeoutEvent = Simulator::Schedule(
+            m_retryTimeout, &LlrManager::OnRetryTimeout,
+            this, seqNum, destRank, flowId, vcId);
+    }
+
     // Remove any existing entry with the same composite key
     auto it = m_retryBuffer.find(key);
     if (it != m_retryBuffer.end())
     {
-        if (!it->second.timeoutEvent.IsExpired())
-        {
-            Simulator::Cancel(it->second.timeoutEvent);
-        }
         m_retryBuffer.erase(it);
     }
 
@@ -192,7 +203,8 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     {
         if (m_overflowPolicy == LlrOverflowPolicy::DROP_NEWEST)
         {
-            // Refuse the fast copy; the source record remains reconstructable.
+            // Refuse only the fast copy; the source record (with its timeout)
+            // remains, so the packet is still recoverable on NACK/timeout.
             m_overflowTrace(seqNum, m_retryBuffer.size());
             m_overflowCount++;
             NS_LOG_DEBUG("Retry buffer full (DROP_NEWEST), refusing seqNum " << seqNum);
@@ -205,14 +217,6 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     RetryEntry entry;
     entry.packet = packet->Copy();
     entry.destRank = destRank;
-
-    // Schedule retry timeout
-    if (m_retryTimeout > Time(0))
-    {
-        entry.timeoutEvent = Simulator::Schedule(m_retryTimeout,
-                                                  &LlrManager::OnRetryTimeout,
-                                                  this, seqNum, destRank, flowId, vcId);
-    }
 
     m_retryBuffer[key] = entry;
     m_peakBufferSize = std::max(m_peakBufferSize,
@@ -279,12 +283,15 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
     std::vector<Retransmission> retransmissions;
 
     // Go-Back-N: retransmit all packets from seqNum onwards in sequence order
-    // Match by destRank == sourceRank AND flowId for correct flow isolation
+    // Match by destRank == sourceRank AND flowId AND vcId for correct flow
+    // isolation — the NACK names one VC's stream; a same-seq packet on a
+    // DIFFERENT VC must not be retransmitted (nor burn its retry budget).
     std::vector<RetryKey> keys;
     for (const auto& pair : m_sourceStore)
     {
         if (pair.first.flowId == flowId && pair.first.seqNum >= seqNum
-            && pair.second.destRank == sourceRank)
+            && pair.second.destRank == sourceRank
+            && pair.first.vcId == vcId)
         {
             keys.push_back(pair.first);
         }
@@ -330,22 +337,6 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
             retransmission.packet = bufferIt->second.packet->Copy();
             retransmission.readyDelay = orderingDelay;
             retransmission.sourceReload = false;
-
-            if (!bufferIt->second.timeoutEvent.IsExpired())
-            {
-                Simulator::Cancel(bufferIt->second.timeoutEvent);
-            }
-            if (m_retryTimeout > Time(0))
-            {
-                bufferIt->second.timeoutEvent = Simulator::Schedule(
-                    orderingDelay + m_retryTimeout,
-                    &LlrManager::OnRetryTimeout,
-                    this,
-                    sn,
-                    sourceRank,
-                    flowId,
-                    key.vcId);
-            }
         }
         else
         {
@@ -357,6 +348,24 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
             retransmission.readyDelay = orderingDelay;
             retransmission.sourceReload = true;
             m_retryMissCount++;
+        }
+
+        // Re-arm the SOURCE-entry timeout for the retransmission (one timer
+        // per un-ACKed packet, regardless of retry-buffer residency).
+        if (!sourceIt->second.timeoutEvent.IsExpired())
+        {
+            Simulator::Cancel(sourceIt->second.timeoutEvent);
+        }
+        if (m_retryTimeout > Time(0))
+        {
+            sourceIt->second.timeoutEvent = Simulator::Schedule(
+                orderingDelay + m_retryTimeout,
+                &LlrManager::OnRetryTimeout,
+                this,
+                sn,
+                sourceRank,
+                flowId,
+                key.vcId);
         }
 
         m_retryTrace(sn, sourceIt->second.destRank);
@@ -420,22 +429,6 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
             retransmission.packet = bufferIt->second.packet->Copy();
             retransmission.readyDelay = Seconds(0);
             retransmission.sourceReload = false;
-
-            if (!bufferIt->second.timeoutEvent.IsExpired())
-            {
-                Simulator::Cancel(bufferIt->second.timeoutEvent);
-            }
-            if (m_retryTimeout > Time(0))
-            {
-                bufferIt->second.timeoutEvent = Simulator::Schedule(
-                    m_retryTimeout,
-                    &LlrManager::OnRetryTimeout,
-                    this,
-                    seqNum,
-                    sourceRank,
-                    flowId,
-                    key.vcId);
-            }
         }
         else
         {
@@ -445,6 +438,24 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
             retransmission.readyDelay = ReserveSourceReload(storedHeader.GetPayloadSize());
             retransmission.sourceReload = true;
             m_retryMissCount++;
+        }
+
+        // Re-arm the SOURCE-entry timeout (same one-timer-per-packet rule as
+        // the GBN path).
+        if (!sourceIt->second.timeoutEvent.IsExpired())
+        {
+            Simulator::Cancel(sourceIt->second.timeoutEvent);
+        }
+        if (m_retryTimeout > Time(0))
+        {
+            sourceIt->second.timeoutEvent = Simulator::Schedule(
+                m_retryTimeout,
+                &LlrManager::OnRetryTimeout,
+                this,
+                seqNum,
+                sourceRank,
+                flowId,
+                key.vcId);
         }
 
         m_retryTrace(seqNum, sourceIt->second.destRank);
@@ -612,7 +623,7 @@ LlrManager::GetOverflowPolicy() const
 void
 LlrManager::Clear()
 {
-    for (auto& pair : m_retryBuffer)
+    for (auto& pair : m_sourceStore)
     {
         if (!pair.second.timeoutEvent.IsExpired())
         {
@@ -630,24 +641,20 @@ LlrManager::OnRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId, 
     NS_LOG_FUNCTION(this << seqNum << destRank << flowId);
 
     RetryKey key = MakeRetryKey(seqNum, destRank, flowId, vcId);
-    auto it = m_retryBuffer.find(key);
-    if (it != m_retryBuffer.end())
+    // The timer lives on the source entry, so it fires for any un-ACKed
+    // packet -- including ones whose retry-buffer copy was evicted or
+    // refused (the timeout is their only recovery path).
+    auto sourceIt = m_sourceStore.find(key);
+    if (sourceIt != m_sourceStore.end())
     {
-        auto& entry = it->second;
-        uint32_t retryCount = 0;
-        auto sourceIt = m_sourceStore.find(key);
-        if (sourceIt != m_sourceStore.end())
-        {
-            retryCount = sourceIt->second.retryCount;
-        }
         NS_LOG_DEBUG("Retry timeout for seqNum " << seqNum
                     << " destRank=" << destRank
                     << " flowId=" << flowId
-                    << " retryCount=" << retryCount);
+                    << " retryCount=" << sourceIt->second.retryCount);
 
         if (!m_timeoutCallback.IsNull())
         {
-            m_timeoutCallback(seqNum, entry.destRank, flowId, key.vcId);
+            m_timeoutCallback(seqNum, sourceIt->second.destRank, flowId, key.vcId);
         }
     }
 }
@@ -675,16 +682,16 @@ LlrManager::ReserveSourceReload(uint32_t bytes)
 void
 LlrManager::RemoveOutstandingPacket(const RetryKey& key)
 {
-    auto bufferIt = m_retryBuffer.find(key);
-    if (bufferIt != m_retryBuffer.end())
+    auto sourceIt = m_sourceStore.find(key);
+    if (sourceIt != m_sourceStore.end())
     {
-        if (!bufferIt->second.timeoutEvent.IsExpired())
+        if (!sourceIt->second.timeoutEvent.IsExpired())
         {
-            Simulator::Cancel(bufferIt->second.timeoutEvent);
+            Simulator::Cancel(sourceIt->second.timeoutEvent);
         }
-        m_retryBuffer.erase(bufferIt);
+        m_sourceStore.erase(sourceIt);
     }
-    m_sourceStore.erase(key);
+    m_retryBuffer.erase(key);
 }
 
 bool
@@ -715,18 +722,17 @@ LlrManager::EnforceBufferLimit()
             auto it = oldestIt;
             {
                 uint32_t evictedSeq = it->first.seqNum;
-                // Eviction drops the retry-buffer entry — the packet itself
-                // is already on the wire and may still arrive successfully.
+                // Eviction drops ONLY the retry-buffer fast copy — the packet
+                // itself is already on the wire and may still arrive
+                // successfully, and its SOURCE-entry timeout stays armed as
+                // the recovery backstop (canceling it here would strand an
+                // un-ACKed packet whose NACK was lost).
                 // Do NOT fire PermanentLossCallback: that would tell the
                 // receiver to skip a packet that is still in flight,
                 // corrupting the collective. If the packet IS subsequently
                 // lost and a retry request arrives, the sender reconstructs
                 // it from the backing source and pays the configured reload
                 // delay.
-                if (!it->second.timeoutEvent.IsExpired())
-                {
-                    Simulator::Cancel(it->second.timeoutEvent);
-                }
                 m_overflowTrace(evictedSeq, m_retryBuffer.size());
                 m_overflowCount++;
                 m_retryBuffer.erase(it);

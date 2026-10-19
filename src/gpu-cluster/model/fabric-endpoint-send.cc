@@ -326,8 +326,18 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             }
             uint32_t thisChunkSize = static_cast<uint32_t>(
                 std::min(chunkSize, wireSize - offset));
-            uint64_t effectiveBegin = i * effectiveSize / numChunks;
-            uint64_t effectiveEnd = (i + 1) * effectiveSize / numChunks;
+            // Partition effective bytes PROPORTIONALLY TO THE WIRE BYTES
+            // ACTUALLY SENT. The old i*effectiveSize/numChunks split
+            // reserved a share for every chunk index including the skipped
+            // trailing lane-pad fragments, so those shares were never
+            // delivered (a 32-byte-per-GPU 256B allgather on 18 links
+            // delivered only 28 bytes and the collective never completed).
+            // Anchoring the boundaries to the wire offsets makes the last
+            // sent chunk absorb whatever the skipped fragments would have
+            // carried and the shares sum to exactly effectiveSize.
+            uint64_t wireSpanEnd = std::min(offset + chunkSize, wireSize);
+            uint64_t effectiveBegin = effectiveSize * offset / std::max<uint64_t>(wireSize, 1);
+            uint64_t effectiveEnd = effectiveSize * wireSpanEnd / std::max<uint64_t>(wireSize, 1);
             uint32_t thisEffectiveSize =
                 static_cast<uint32_t>(effectiveEnd - effectiveBegin);
 
@@ -376,8 +386,13 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                     }
                     uint32_t remChunkSize = static_cast<uint32_t>(
                         std::min(chunkSize, wireSize - remOffset));
-                    uint64_t remEffectiveBegin = j * effectiveSize / numChunks;
-                    uint64_t remEffectiveEnd = (j + 1) * effectiveSize / numChunks;
+                    // Same wire-anchored proportional split as the main loop
+                    // (skipped trailing fragments must not eat a share).
+                    uint64_t remWireSpanEnd = std::min(remOffset + chunkSize, wireSize);
+                    uint64_t remEffectiveBegin =
+                        effectiveSize * remOffset / std::max<uint64_t>(wireSize, 1);
+                    uint64_t remEffectiveEnd =
+                        effectiveSize * remWireSpanEnd / std::max<uint64_t>(wireSize, 1);
                     uint32_t remEffectiveSize =
                         static_cast<uint32_t>(remEffectiveEnd - remEffectiveBegin);
                     uint64_t remSeqKey = MakeSeqKey(destRank, 0, 0);

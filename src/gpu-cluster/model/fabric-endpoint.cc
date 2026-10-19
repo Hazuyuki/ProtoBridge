@@ -1728,7 +1728,11 @@ FabricEndpoint::ProcessRetryPacket(Ptr<Packet> packet, const FabricHeader& heade
 
         if (m_llrEnabled && m_llrManager)
         {
-            m_llrManager->RemovePacketsUpTo(seqNum, sourceRank, flowId);
+            // The VC-qualified key: without it the call defaults to VC0 and a
+            // VC0/VC1 pair with matching (seq, flow) would purge the wrong
+            // VC's recovery state.
+            m_llrManager->RemovePacketsUpTo(seqNum, sourceRank, flowId,
+                                            header.GetVirtualChannel());
         }
     }
 }
@@ -1918,7 +1922,8 @@ FabricEndpoint::ProcessCreditPacket(Ptr<Packet> packet, const FabricHeader& head
         {
             m_llrManager->RemovePacket(header.GetSequenceNumber(),
                                        header.GetSourceRank(),
-                                       header.GetFlowId());
+                                       header.GetFlowId(),
+                                       header.GetVirtualChannel());
         }
         else
         {
@@ -1939,7 +1944,8 @@ FabricEndpoint::ProcessCreditPacket(Ptr<Packet> packet, const FabricHeader& head
             {
                 m_llrManager->RemovePacketsUpTo(nextAck - 1,
                                                 header.GetSourceRank(),
-                                                header.GetFlowId());
+                                                header.GetFlowId(),
+                                                header.GetVirtualChannel());
             }
         }
     }
@@ -2668,13 +2674,18 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         // Total wire bytes and path striping are unchanged. Queue and credit
         // events occur at this coarser granularity, so this API is reserved for
         // bulk-transfer timing rather than fine-grained contention tests.
-        // numChunks is bounded by wireSize: the spray (one chunk per path) and
-        // the bulk-chunk cap (no chunk above MAX_CHUNK_BYTES) both raise the
-        // count, but never above one 1-byte chunk per wire byte — otherwise
-        // trailing per-lane fragments compute sizes past the transfer end
+        // numChunks = max(one chunk per path, chunks needed to honor the
+        // bulk cap): a count below memCapChunks emits fragments above
+        // MAX_CHUNK_BYTES, which is how bulkChunkSize < sprayChunkSize broke
+        // the cap (58 KiB fragments over a 4 KiB bulk cap). With the default
+        // bulkChunkSize (8 MiB) > sprayChunkSize this is one chunk per path,
+        // the same coarsening as before. numChunks is bounded above by
+        // wireSize: one 1-byte chunk per wire byte — otherwise trailing
+        // per-lane fragments compute sizes past the transfer end
         // (wireSize - offset underflows) and emit zero/phantom data bytes.
         uint64_t memCapChunks = (wireSize + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
-        uint64_t numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
+        uint64_t numChunks = std::max(minChunks, memCapChunks);
+        (void)sizeBasedChunks;
         numChunks = std::min(numChunks, std::max<uint64_t>(wireSize, 1));
         uint64_t wireChunkSize = (wireSize + numChunks - 1) / numChunks;
         uint64_t dataChunkSize = (dataSize + numChunks - 1) / numChunks;

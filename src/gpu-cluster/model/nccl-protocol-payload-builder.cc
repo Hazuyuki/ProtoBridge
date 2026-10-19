@@ -124,10 +124,10 @@ NcclProtocolPayloadBuilder::ExtractData(Ptr<Packet> packet, NcclProtocol protoco
     switch (protocol)
     {
         case NcclProtocol::LL:
-            return ExtractLLLine(packet, outData);
+            return ExtractLLLine(packet, outData, maxDataSize);
 
         case NcclProtocol::LL128:
-            return ExtractLL128Chunk(packet, outData, nullptr);
+            return ExtractLL128Chunk(packet, outData, nullptr, maxDataSize);
 
         case NcclProtocol::SIMPLE:
         case NcclProtocol::NONE:
@@ -211,9 +211,10 @@ NcclProtocolPayloadBuilder::BuildSimpleChunk(const uint8_t* data, uint64_t dataB
 }
 
 uint64_t
-NcclProtocolPayloadBuilder::ExtractLLLine(Ptr<Packet> packet, uint8_t* outData)
+NcclProtocolPayloadBuilder::ExtractLLLine(Ptr<Packet> packet, uint8_t* outData,
+                                           uint64_t maxDataSize)
 {
-    if (packet == nullptr || outData == nullptr)
+    if (packet == nullptr || outData == nullptr || maxDataSize == 0)
     {
         return 0;
     }
@@ -221,21 +222,24 @@ NcclProtocolPayloadBuilder::ExtractLLLine(Ptr<Packet> packet, uint8_t* outData)
     uint32_t packetSize = packet->GetSize();
     if (packetSize < LL_DATA_PER_LINE)
     {
-        // Packet too small, copy what we have
-        packet->CopyData(outData, packetSize);
-        return packetSize;
+        // Packet too small, copy what we have (never more than the buffer)
+        uint64_t copySize = std::min(static_cast<uint64_t>(packetSize), maxDataSize);
+        packet->CopyData(outData, copySize);
+        return copySize;
     }
 
     // Copy data portion (first 64 bytes)
-    packet->CopyData(outData, LL_DATA_PER_LINE);
-    return LL_DATA_PER_LINE;
+    uint64_t copySize = std::min(static_cast<uint64_t>(LL_DATA_PER_LINE), maxDataSize);
+    packet->CopyData(outData, copySize);
+    return copySize;
 }
 
 uint64_t
 NcclProtocolPayloadBuilder::ExtractLL128Chunk(Ptr<Packet> packet, uint8_t* outData,
-                                               uint32_t* outChunkIndex)
+                                               uint32_t* outChunkIndex,
+                                               uint64_t maxDataSize)
 {
-    if (packet == nullptr || outData == nullptr)
+    if (packet == nullptr || outData == nullptr || maxDataSize == 0)
     {
         return 0;
     }
@@ -260,10 +264,14 @@ NcclProtocolPayloadBuilder::ExtractLL128Chunk(Ptr<Packet> packet, uint8_t* outDa
         *outChunkIndex = chunkIndex;
     }
 
-    // Validate data size
+    // Validate data size (never claim more than the caller's buffer holds)
     if (dataSize > LL128_DATA_PER_LINE)
     {
         dataSize = LL128_DATA_PER_LINE;
+    }
+    if (dataSize > maxDataSize)
+    {
+        dataSize = maxDataSize;
     }
 
     // Check if packet has enough data
