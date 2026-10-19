@@ -29,8 +29,12 @@ sweeps run tens of points.
 | `eth_gbn_loss_sweep.py` | SRNIC (NSDI'23) Fig. 11, ConnectX-6 go-back-N vs SRNIC selective repeat under injected loss | GBN arm within ~3 pts of CX-6 up to 0.5 % loss (no-RTO gap +10 pts at 1–2 %); SACK arm reproduces the flat SRNIC curve, no arm inversion |
 | `plot_measured_anchors.py` | (plots only) | regenerates `srnic_fig11_comparison`, `crusoe_nccl_busbw`, `roce_p2p_perftest_comparison` from the committed `.json` results — fast, no ns-3 runs |
 
-The H200 ring command (the one hardware-calibrated operating point,
-`vcCredits=64` packets via the profile, credit-saturated regime):
+The H200 ring command (the one hardware-calibrated operating point; note the
+collective/algorithm path runs credit-UNCONSTRAINED — the profile's
+`vcCredits` PEX value is consumed only by the stencil runner's `ApplyBundle`,
+not the collective injector (scratch `gpu-cluster-sim.cc` sourcing comment /
+doc/CALIBRATION.md "vcCredits sourcing"), so the run logs
+`vcCredits=104857600` and the calibration is at the unconstrained window):
 
 ```bash
 ./ns3 run "gpu-cluster-sim --protocolConfig=\

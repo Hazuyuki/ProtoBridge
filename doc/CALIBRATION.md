@@ -244,10 +244,15 @@ RoCE hierarchical anchor.
 See `configs/protocol_configs/p2p-eth.cfg` (single P2P) and
 `p2p-eth-incast.cfg` (2-flow incast that exercises the full NACK→LLR-retransmit
 →delivery loop; `--dataSize=196608 --voqDropThreshold=2 --llrRetryLimit=64`
-gives 149 drops → 314 retransmits → 0 permanent losses, completing in
-106.9 µs — measured with the `--bulkChunkSize=16384` cap actually enforced;
-at the previous 4 MiB size the cap fix's 256 fragments/flow drop-storm burns
-every retry budget, which is lossy-regime stress, not a recovery demo).
+gives 27 drops → 27 retransmits → 0 permanent losses, completing in
+15.5 µs — measured with the `--bulkChunkSize=16384` cap actually enforced
+and the cfg's `[stack] llrMode = sack` override active, i.e. TRUE SACK
+selective retransmit. Before that override the profile's
+`llrMode = gobackn` silently won over the CLI `--llrMode=sack` (profile values
+override CLI flags), so the previously recorded 149/314 numbers were the GBN
+blanket-retransmit regime; at the previous 4 MiB size the cap fix's 256
+fragments/flow drop-storm burns every retry budget, which is lossy-regime
+stress, not a recovery demo).
 
 ## Full-mesh AllReduce/AllGather — ns-3-calibrated
 
@@ -452,15 +457,21 @@ intentionally differs from the testbed's single-link 90–97 Gbps.
 |---|---|---|---|---|
 | ≤1e-4 | 0.976–0.995 | 1.000 | 1.000 | 1.000 |
 | 1e-3 | 0.919 | 0.933 | 0.979 | 0.990 |
-| 2e-3 | 0.861 | 0.889 | 0.978 | 0.979 |
-| 5e-3 | 0.725 | 0.744 | 0.945 | 0.907 |
-| 1e-2 | 0.580 | 0.467 | **0.823** | **0.773** |
-| 2e-2 | 0.383 | 0.278 | 0.569 | 0.619 |
+| 2e-3 | 0.861 | 0.889 | 0.977 | 0.979 |
+| 5e-3 | 0.725 | 0.744 | 0.968 | 0.907 |
+| 1e-2 | 0.580 | 0.467 | **0.814** | **0.773** |
+| 2e-2 | 0.383 | 0.278 | 0.590 | 0.619 |
+
+(The SACK column was re-swept after the SACK retry-timer fix — the source
+reload `readyDelay` is now included when re-arming the retry timer, mirroring
+the GBN path, so a reload-blocked retransmission no longer burns its retry
+budget before reaching the wire. The GBN arm is bit-identical to the
+original sweep.)
 
 What reproduces (the point of the experiment):
 
-- **The SACK arm tracks the measured SRNIC curve within ~5 points at every
-  swept loss rate** (0.823 vs 0.773 at 1%, 0.569 vs 0.619 at 2%). This is
+- **The SACK arm tracks the measured SRNIC curve within ~6 points at every
+  swept loss rate** (0.814 vs 0.773 at 1%, 0.590 vs 0.619 at 2%). This is
   the arm whose recovery semantics (per-loss selective retransmit, timer
   backstop for lost control packets) match its reference hardware.
 - **The strict-GBN arm tracks the measured CX-6 curve within ~3 points up
@@ -468,7 +479,7 @@ What reproduces (the point of the experiment):
   keeps the measured **mode ordering at every loss rate** (GBN below SACK,
   no inversion — the legacy semantics inverted the arms at 2%).
 - **Recovery-mode retransmit economy**: ns-3 SACK retransmits ≈ the actual
-  drop count (~80 packets at 1%), strict GBN retransmits ~35× more (real
+  drop count (~85 packets at 1%), strict GBN retransmits ~35× more (real
   rewind blankets) for the same delivered bytes — the defining go-back-N
   waste.
 
