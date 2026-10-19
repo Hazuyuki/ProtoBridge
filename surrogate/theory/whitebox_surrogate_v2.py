@@ -498,19 +498,30 @@ class TheoryDerivedSurrogate:
 
     # ---- Shared-resource contention (Phi_share) ----
 
-    def _shared_contention(self, algo, cr, competing_bw, D, N, collective=None):
+    def _shared_contention(self, algo, cr, competing_bw, D, N, collective=None,
+                          bisection_bw=None):
         """Residual-capacity penalty at a shared bottleneck.
 
         ``competing_bw`` is the traffic rate, in GB/s, that uses the same
         bottleneck as the modeled transfer. The expression has no fitted
         contention coefficient.
 
-        The schedule bandwidth must match the serial term it penalizes:
-        alltoall / sendrecv phases serialize over the per-link (ring) rate —
-        their ``predict`` T_serial uses ``ring_bw`` regardless of ``algo`` — so
-        the contention divisor must too, else ``algo='tree'`` undercuts the
-        penalty (rho computed against the faster tree trunk while the transfer
-        actually runs at ring rate).
+        The schedule bandwidth must match the serial term it penalizes — two
+        dimensions of that match are load-bearing:
+
+        1. The COLLECTIVE dimension: alltoall / sendrecv phases serialize over
+           the per-link (ring) rate — their ``predict`` T_serial uses
+           ``ring_bw`` regardless of ``algo`` — so the contention divisor must
+           too, else ``algo='tree'`` undercuts the penalty (rho computed against
+           the faster tree trunk while the transfer actually runs at ring
+           rate).
+        2. The TOPOLOGY dimension: when a topology caps the serial rate (a
+           bisection / egress bottleneck below the fabric's own link rate),
+           the competing traffic eats into the CAPPED rate, not the raw link
+           rate — a 25 GB/s flow sharing a link capped to 50 GB/s leaves
+           25 GB/s of residual, a 2x penalty, not 1.16x. Using the uncapped
+           rate understates the penalty exactly when the bottleneck is
+           tightest.
         """
         if competing_bw <= 0:
             return 1.0
@@ -526,6 +537,8 @@ class TheoryDerivedSurrogate:
             schedule_bw = self.fullmesh_bw
         else:
             schedule_bw = self.ring_bw
+        if bisection_bw is not None:
+            schedule_bw = min(schedule_bw, bisection_bw)
         schedule_bw_GB = schedule_bw / 1000.0
         rho = min(0.99, competing_bw / max(schedule_bw_GB, 1e-9))
         return 1.0 / (1.0 - rho)
@@ -806,7 +819,13 @@ class TheoryDerivedSurrogate:
                          if fec_enabled else ber)
         bits_per_chunk = self.chunk_size * 8
         P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk if effective_ber > 0 else 0
-        is_heavy_tail = P_chunk > 0.1
+        # The heavy-tail branch models a RETRANSMISSION cascade (expected
+        # retry delay per chunk error). With LLR disabled there are no
+        # retransmissions — a lost chunk is a permanent failure the mean
+        # already handles (strict_reliability) — so BER must not add tail
+        # here no matter how large P_chunk is. Gating on llr_enabled mirrors
+        # _step_variance's retransmission term, which has the same guard.
+        is_heavy_tail = P_chunk > 0.1 and llr_enabled
 
         if not is_heavy_tail:
             from scipy.stats import norm
@@ -924,7 +943,8 @@ class TheoryDerivedSurrogate:
             if fec_enabled and include_fec else 1.0)
         Phi_share = (
             self._shared_contention(
-                algo, credits, competing_bw, data_bytes, num_gpus, collective)
+                algo, credits, competing_bw, data_bytes, num_gpus, collective,
+                bsec)
             if include_contention else 1.0)
 
         if strict_reliability and llr_enabled and retry_limit is not None:

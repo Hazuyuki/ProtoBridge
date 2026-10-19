@@ -245,6 +245,14 @@ consumed by concurrent traffic using that bottleneck. Residual capacity is
 Phi_share = 1 / (1 - rho_shared)
 ```
 
+`BW_eff` is the capacity the serial term actually serializes over — the
+collective's schedule rate (ring rate for alltoall/sendrecv phases, tree/NVLS
+trunk otherwise) already capped by any topology bisection/egress bottleneck.
+Computing `rho_shared` against the uncapped link rate understates the penalty
+exactly when the bottleneck is tightest (25 GB/s competing on a 50 GB/s-capped
+link doubles the transfer; against the raw 177 GB/s rate it would barely
+register).
+
 Disjoint routes use `rho_shared = 0`. Source injection rate is not substituted
 for bottleneck utilization.
 
