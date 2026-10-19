@@ -22,14 +22,14 @@ Two cases, mirroring the two ``--llrRetryLimit`` regimes documented in the
   a regression in any of them stalls at the 3600s ceiling with
   retransmittedPackets == 0.
 
-* ``test_ethernet_permanent_loss_fallback`` -- ``--llrRetryLimit=8`` (low, the
-  documented ``p2p-eth-incast.cfg`` contrast): retries exhaust and the
-  permanent-loss fallback fires (``permanentLosses > 0``) yet the run still
-  COMPLETES (the graceful degraded completion, NOT a stall). This is the
-  faithful severe-congestion lossy-Ethernet degradation (the thing RoCE's PFC
-  exists to prevent) -- a safety-critical path with no other automated coverage.
-  (``--llrRetryLimit=1`` is too aggressive -- it stalls at the 3600s ceiling
-  rather than degrading gracefully -- so 8 is the documented contrast point.)
+* ``test_ethernet_permanent_loss_fallback`` -- ``--llrRetryLimit=3`` (below the
+  recovery threshold): retries exhaust and the permanent-loss fallback fires
+  (``permanentLosses > 0``) with the loss notified end-to-end -- the receiver
+  advances past the gap and the run reports the degradation (permanentLosses=1,
+  incomplete at the 3600s ceiling: the deliberate stall-not-corrupt policy,
+  protocol-config-runner.cc's PERMANENT_LOSS guard). This is the faithful
+  severe-congestion lossy-Ethernet degradation (the thing RoCE's PFC exists to
+  prevent) -- a safety-critical path with no other automated coverage.
 
  dataSize note: pinned at 192 KiB since the bulkChunkSize-cap fix (12 x 16 KiB
  bulk chunks per flow). The 1fb92ba linksPerGpu=18 re-anchor originally
@@ -40,8 +40,19 @@ Two cases, mirroring the two ``--llrRetryLimit`` regimes documented in the
  voqDropThreshold=2: ~18k VOQ drops burn EVERY retry budget (permLoss=354
  even at rlim=64, incomplete at rlim=8) -- a lossy-regime stress test, not
  the NACK->retransmit recovery demo this file gates. 192 KiB restores the
- intended regime at the true chunk size: drops=149, retx=314, permLoss=0
- at rlim=64; permLoss=9 with graceful completion at rlim=8.
+ intended regime at the true chunk size.
+
+ llrMode note: re-anchored when the cfg gained its ``[stack] llrMode = sack``
+ override. The referenced h200-ll128 profile pins ``llrMode = gobackn`` and
+ profile values override CLI flags, so the tests' ``--llrMode=sack`` silently
+ ran GBN before the override (blanket retransmits: 149 drops / 314 retx /
+ permLoss=9 at rlim=8 with a "graceful" completion that was really GBN's
+ blanket-retransmit byte accounting double-counting retransmitted fragments).
+ True SACK retransmits selectively: 27 drops / 27 retx, permLoss=0 for every
+ rlim >= 4 at 192 KiB, and a permanent loss always stalls by design (the
+ executor counts delivered effective bytes; PERMANENT_LOSS events are ignored
+ rather than credited -- stall-not-corrupt). The contrast point is therefore
+ rlim=3 (permLoss=1, incomplete), not rlim=8.
 
 Run:
     python3 -m pytest test/parity/test_ethernet_lossy_recovery.py -v
@@ -133,18 +144,21 @@ def test_ethernet_incast_recovers():
 
 
 def test_ethernet_permanent_loss_fallback():
-    # rlim=8 is the documented p2p-eth-incast.cfg contrast: retries exhaust on
-    # some packets (permanentLosses > 0) yet the run still COMPLETES -- the
-    # graceful degraded completion, not a stall. (rlim=1 is too aggressive and
-    # stalls at the 3600s Simulator::Stop ceiling, so 8 is the contrast point.)
-    fields, out = run_incast(8)
-    assert fields.get("status") == "complete", (
-        "incast rlim=8 did not complete (permanent-loss fallback should still "
-        "complete the run gracefully):\n" + out[-500:])
+    # rlim=3 is the contrast point under true SACK (see the module docstring):
+    # below the recovery threshold (rlim>=4 recovers everything at 192 KiB),
+    # retries exhaust, the permanent-loss fallback fires end-to-end
+    # (NotifyPermanentLoss -> PERMANENT_LOSS packet -> receiver MarkPermanentGap)
+    # and the run degrades to the deliberate stall-not-corrupt incomplete
+    # state (the executor's PERMANENT_LOSS guard).
+    fields, out = run_incast(3)
     assert fields.get("permanentLosses", 0) > 0, (
-        "incast rlim=8: permanentLosses={} (the permanent-loss fallback should "
+        "incast rlim=3: permanentLosses={} (the permanent-loss fallback should "
         "fire once retries exhaust -- the lossy-Ethernet degradation)"
         .format(fields.get("permanentLosses")))
+    assert fields.get("status") == "incomplete", (
+        "incast rlim=3: status={} (a permanent loss must stall the run, not "
+        "complete with missing bytes -- stall-not-corrupt)".format(
+            fields.get("status")))
 
 
 if __name__ == "__main__":

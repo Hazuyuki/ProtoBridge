@@ -16,26 +16,24 @@ Two cases on the ``p2p-eth-incast.cfg`` scenario (2 senders -> rank 3 through
 a voqDropThreshold=2 ToR switch -- the congestion RTTCC exists to sense):
 
 * ``test_rttcc_default_off_parity`` -- without ``--rttcc`` the run must be
-  BYTE-IDENTICAL to the deterministic off-baseline (simTimeNs=106890,
-  drops=149, retx=314, permLoss=0; pinned at the linksPerGpu=18 fabric
+  BYTE-IDENTICAL to the deterministic off-baseline (simTimeNs=15480,
+  drops=27, retx=27, permLoss=0; pinned at the linksPerGpu=18 fabric
   convention and 192 KiB data -- see the dataSize note at the pins): no
   machine is mounted, no probe is emitted, the new code is invisible. This
   is the parity foundation for every existing calibration.
 
-* ``test_rttcc_on_incast`` -- with ``--rttcc=1`` the full loop must light up:
-  probes sent, RTT samples collected, and at least one flow throttled well
-  below the 400G line rate (rttccMinRateGbps < 400) while the run still
-  COMPLETES. The pinned numbers (simTimeNs=54763, drops=96, retx=250,
-  minRate=190.4 Gbps) are the observed deterministic RngRun=1 values. At
-  this burst size RTTCC now WINS the incast outright: the pacer spaces the
-  initial injection so the dest-port VOQ never reaches the runaway pile-up
-  the off-run shows (drops 149 -> 96, completion 106.9 us -> 54.8 us --
-  roughly half the lossless-floor serialization of the whole incast).
-  (Pre-bulk-cap-fix pins at 4 MiB -- 1484174/86/959 off, 1481369/98/947 on
-  -- were calibrated when the 16 KiB bulkChunkSize cap was silently ignored
-  by the spray-chunk coalescing: 128 KiB fragments made every drop ~8x the
-  bytes, both runs completed mid-storm, and the pacer could only space the
-  retransmits. See the dataSize note below.)
+* ``test_rttcc_on_incast`` -- with ``--rttcc=1 --rttccTargetRttNs=3000`` the
+  full loop must light up: probes sent, RTT samples collected, and at least
+  one flow throttled below the 400G line rate (rttccMinRateGbps=244.1) while
+  the run still COMPLETES. The 3 us target is REQUIRED under true SACK (the
+  cfg's [stack] llrMode=sack override): selective retransmit recovers each
+  drop with one retransmit, so the incast's max RTT (5849 ns) never exceeds
+  the 10 us default target and the machine never throttles. Under SACK the
+  throttle costs more than it saves at this burst size (15.5 -> 16.2 us) --
+  unlike the earlier GBN regime (blanket retransmits, drops 149 / retx 314)
+  where pacing the initial burst halved completion (106.9 -> 54.8 us). The
+  gate's purpose is that the loop demonstrably engages, not that it wins at
+  this size.
 
 Run:
     python3 -m pytest test/parity/test_rttcc_ethernet.py -v
@@ -61,19 +59,32 @@ INCAST_CFG = "configs/protocol_configs/p2p-eth-incast.cfg"
 # cap: 256 fragments/flow at voqDropThreshold=2 burn every retry budget
 # (permLoss>0 even at rlim=64), which is a lossy-regime stress, not a
 # congestion-control scenario.
+# Re-pinned when the cfg gained its [stack] llrMode=sack override: the profile
+# pins llrMode=gobackn and profile values override CLI flags, so before the
+# override the tests' --llrMode=sack silently ran GBN (blanket retransmits:
+# 149 drops / 314 retx). True SACK retransmits selectively (27/27) and halves
+# completion (106.9 -> 15.5 us).
 BASELINE = {
-    "simTimeNs": 106890,
-    "switchVoqDrops": 149,
-    "retransmittedPackets": 314,
+    "simTimeNs": 15480,
+    "switchVoqDrops": 27,
+    "retransmittedPackets": 27,
     "permanentLosses": 0,
 }
 
-# Observed deterministic values with --rttcc=1 (RngRun=1).
+# Observed deterministic values with --rttcc=1 --rttccTargetRttNs=3000
+# (RngRun=1). The non-default 3us target is REQUIRED to engage the loop under
+# SACK: selective retransmit recovers each VOQ drop with one retransmit, so the
+# incast's max RTT (5849ns) never exceeds the 10us default target and the
+# controller never throttles (rttccMinRateGbps stays at line rate 400). The
+# GBN-era pins (rttcc halved completion by pacing the initial burst) do not
+# carry over: under SACK the retransmit storm is 10x smaller, so throttling
+# costs more than it saves at this size (54.8 -> 16.2us baseline vs on).
 RTTCC_ON = {
-    "simTimeNs": 54763,
-    "switchVoqDrops": 96,
-    "retransmittedPackets": 250,
+    "simTimeNs": 16184,
+    "switchVoqDrops": 30,
+    "retransmittedPackets": 30,
     "permanentLosses": 0,
+    "rttccMinRateGbps": 244.1,
 }
 
 
@@ -112,6 +123,9 @@ def run_incast(rttcc, timeout=600):
     ]
     if rttcc:
         args.append("--rttcc=1")
+        # Below the incast's observed max RTT (5849ns): the 10us default never
+        # throttles under SACK (see RTTCC_ON comment).
+        args.append("--rttccTargetRttNs=3000")
     if binary:
         cmd = [binary] + args
     else:
