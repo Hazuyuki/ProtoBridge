@@ -156,7 +156,8 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     FabricHeader hdr;
     packet->PeekHeader(hdr);
     uint16_t flowId = hdr.GetFlowId();
-    RetryKey key = MakeRetryKey(seqNum, destRank, flowId);
+    uint8_t vcId = hdr.GetVirtualChannel();
+    RetryKey key = MakeRetryKey(seqNum, destRank, flowId, vcId);
 
     // The finite retry buffer stores a fast packet copy. The source store
     // represents the original payload in GPU memory and is retained until ACK.
@@ -210,7 +211,7 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     {
         entry.timeoutEvent = Simulator::Schedule(m_retryTimeout,
                                                   &LlrManager::OnRetryTimeout,
-                                                  this, seqNum, destRank, flowId);
+                                                  this, seqNum, destRank, flowId, vcId);
     }
 
     m_retryBuffer[key] = entry;
@@ -220,11 +221,11 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
 }
 
 void
-LlrManager::RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+LlrManager::RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId)
 {
     NS_LOG_FUNCTION(this << seqNum << destRank << flowId);
 
-    RetryKey key = MakeRetryKey(seqNum, destRank, flowId);
+    RetryKey key = MakeRetryKey(seqNum, destRank, flowId, vcId);
     if (m_sourceStore.find(key) != m_sourceStore.end())
     {
         m_ackTrace(seqNum, destRank);
@@ -233,7 +234,7 @@ LlrManager::RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
 }
 
 void
-LlrManager::RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+LlrManager::RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId)
 {
     NS_LOG_FUNCTION(this << seqNum << destRank << flowId);
 
@@ -242,8 +243,10 @@ LlrManager::RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowI
     {
         uint32_t entrySeqNum = pair.first & 0xFFFFFFFF;
         uint16_t entryFlowId = (pair.first >> 32) & 0xFFFF;
-        uint16_t entryDestRank = pair.first >> 48;
-        if (entryDestRank == destRank && entryFlowId == flowId && entrySeqNum <= seqNum)
+        uint8_t entryVcId = (pair.first >> 48) & 0xFF;
+        uint16_t entryDestRank = pair.first >> 56;
+        if (entryDestRank == destRank && entryFlowId == flowId &&
+            entryVcId == vcId && entrySeqNum <= seqNum)
         {
             ackedKeys.push_back(pair.first);
         }
@@ -256,13 +259,13 @@ LlrManager::RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowI
 }
 
 void
-LlrManager::RemoveSackedPackets(const std::unordered_set<uint32_t>& ackedSeqNums, uint16_t destRank, uint16_t flowId)
+LlrManager::RemoveSackedPackets(const std::unordered_set<uint32_t>& ackedSeqNums, uint16_t destRank, uint16_t flowId, uint8_t vcId)
 {
     NS_LOG_FUNCTION(this << ackedSeqNums.size() << destRank << flowId);
 
     for (uint32_t seqNum : ackedSeqNums)
     {
-        RetryKey key = MakeRetryKey(seqNum, destRank, flowId);
+        RetryKey key = MakeRetryKey(seqNum, destRank, flowId, vcId);
         if (m_sourceStore.find(key) != m_sourceStore.end())
         {
             m_ackTrace(seqNum, destRank);
@@ -340,7 +343,8 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
                     this,
                     sn,
                     sourceRank,
-                    flowId);
+                    flowId,
+                    static_cast<uint8_t>((key >> 48) & 0xFF));
             }
         }
         else
@@ -379,8 +383,27 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
     std::sort(orderedSeqNums.begin(), orderedSeqNums.end());
     for (uint32_t seqNum : orderedSeqNums)
     {
-        RetryKey key = MakeRetryKey(seqNum, sourceRank, flowId);
-        auto sourceIt = m_sourceStore.find(key);
+        // Look up by (seq, dest, flow) with ANY vc: the NACK does not carry
+        // the original packet's vcId, and sequence numbers are per-(dest,vc,flow).
+        // Match the source entry whose key agrees on seq/dest/flow.
+        RetryKey key = 0;
+        auto sourceIt = m_sourceStore.end();
+        for (uint8_t probeVc = 0; probeVc < 255; probeVc++)
+        {
+            auto it = m_sourceStore.find(MakeRetryKey(seqNum, sourceRank, flowId, probeVc));
+            if (it != m_sourceStore.end())
+            {
+                key = MakeRetryKey(seqNum, sourceRank, flowId, probeVc);
+                sourceIt = it;
+                break;
+            }
+        }
+        if (sourceIt == m_sourceStore.end())
+        {
+            // fall back to the legacy vc-less key (vc 0)
+            key = MakeRetryKey(seqNum, sourceRank, flowId);
+            sourceIt = m_sourceStore.find(key);
+        }
         if (sourceIt == m_sourceStore.end())
         {
             m_retryMissCount++;
@@ -425,7 +448,8 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
                     this,
                     seqNum,
                     sourceRank,
-                    flowId);
+                    flowId,
+                    static_cast<uint8_t>((key >> 48) & 0xFF));
             }
         }
         else
@@ -516,9 +540,9 @@ LlrManager::GetPeakBufferSize() const
 }
 
 bool
-LlrManager::HasOutstandingPacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId) const
+LlrManager::HasOutstandingPacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId) const
 {
-    return m_sourceStore.find(MakeRetryKey(seqNum, destRank, flowId)) != m_sourceStore.end();
+    return m_sourceStore.find(MakeRetryKey(seqNum, destRank, flowId, vcId)) != m_sourceStore.end();
 }
 
 uint64_t
@@ -616,11 +640,11 @@ LlrManager::Clear()
 }
 
 void
-LlrManager::OnRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+LlrManager::OnRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId)
 {
     NS_LOG_FUNCTION(this << seqNum << destRank << flowId);
 
-    RetryKey key = MakeRetryKey(seqNum, destRank, flowId);
+    RetryKey key = MakeRetryKey(seqNum, destRank, flowId, vcId);
     auto it = m_retryBuffer.find(key);
     if (it != m_retryBuffer.end())
     {

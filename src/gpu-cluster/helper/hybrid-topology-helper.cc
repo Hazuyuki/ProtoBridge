@@ -169,13 +169,20 @@ HybridTopologyHelper::BuildFabric(FabricConfig& config)
     // Build topology based on type
     if (config.topologyType == "ring")
     {
-        // Ring topology: each node connects to two neighbors
+        // Ring topology: each node connects to two neighbors — INCLUDING the
+        // closing edge (last -> first). Without it a 3+ GPU "ring" is a chain
+        // (endpoint degrees 1,2,...,2,1) and wraparound routes don't exist.
+        // Track which device index on each endpoint leads to which neighbor:
+        // interior endpoints receive the PREVIOUS link's device first (as the
+        // far end of link i-1), so "device 0 = forward" is NOT an invariant —
+        // route by the recorded device, not by position.
+        std::vector<uint32_t> forwardDevice(config.numGpus, 0);
+        std::vector<uint32_t> backwardDevice(config.numGpus, 0);
+
         for (uint32_t i = 0; i < config.numGpus; ++i)
         {
             uint16_t rank = config.baseRank + i;
             uint32_t nextIdx = (i + 1) % config.numGpus;
-            uint32_t prevIdx = (i + config.numGpus - 1) % config.numGpus;
-            (void)prevIdx;
 
             // Set rank and fabric type
             Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(config.endpoints.Get(i));
@@ -185,31 +192,29 @@ HybridTopologyHelper::BuildFabric(FabricConfig& config)
             // Map rank to fabric
             m_rankToFabric[rank] = config.fabricId;
 
-            // Connect to next neighbor (if not already connected)
-            if (i < config.numGpus - 1 || config.numGpus == 2)
-            {
-                // Check if this connection already exists
-                uint16_t nextRank = config.baseRank + nextIdx;
+            // Connect to next neighbor (every hop, closing the ring)
+            uint16_t nextRank = config.baseRank + nextIdx;
 
-                // Connect node i to node nextIdx
-                NetDeviceContainer devices = p2p.Install(config.nodes.Get(i), config.nodes.Get(nextIdx));
+            NetDeviceContainer devices = p2p.Install(config.nodes.Get(i), config.nodes.Get(nextIdx));
 
-                ep->AddNetDevice(devices.Get(0));
-                ep->SetNeighborMac(nextRank, Mac48Address::ConvertFrom(devices.Get(1)->GetAddress()));
+            uint32_t myDeviceIdx = ep->GetNNetDevices();
+            ep->AddNetDevice(devices.Get(0));
+            ep->SetNeighborMac(nextRank, Mac48Address::ConvertFrom(devices.Get(1)->GetAddress()));
 
-                // Add reverse device to next neighbor
-                Ptr<FabricEndpoint> nextEp = DynamicCast<FabricEndpoint>(config.endpoints.Get(nextIdx));
-                nextEp->AddNetDevice(devices.Get(1));
-                nextEp->SetNeighborMac(rank, Mac48Address::ConvertFrom(devices.Get(0)->GetAddress()));
-            }
+            // Add reverse device to next neighbor
+            Ptr<FabricEndpoint> nextEp = DynamicCast<FabricEndpoint>(config.endpoints.Get(nextIdx));
+            uint32_t nextDeviceIdx = nextEp->GetNNetDevices();
+            nextEp->AddNetDevice(devices.Get(1));
+            nextEp->SetNeighborMac(rank, Mac48Address::ConvertFrom(devices.Get(0)->GetAddress()));
+
+            forwardDevice[i] = myDeviceIdx;      // ep i -> ep i+1
+            backwardDevice[nextIdx] = nextDeviceIdx; // ep i+1 -> ep i
         }
 
-        // Set up routing table for ring
+        // Set up routing table for ring (by recorded device, not position)
         for (uint32_t i = 0; i < config.numGpus; ++i)
         {
             Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(config.endpoints.Get(i));
-            uint16_t myRank = config.baseRank + i;
-            (void)myRank;
 
             for (uint32_t j = 0; j < config.numGpus; ++j)
             {
@@ -221,9 +226,8 @@ HybridTopologyHelper::BuildFabric(FabricConfig& config)
                 int32_t distForward = (j > i) ? (j - i) : (config.numGpus - i + j);
                 int32_t distBackward = (i > j) ? (i - j) : (config.numGpus - j + i);
 
-                // Use device 0 for forward (to next), device 1 for backward (to prev)
-                // But check how many devices we have
-                uint32_t deviceIdx = (distForward <= distBackward) ? 0 : 1;
+                uint32_t deviceIdx = (distForward <= distBackward)
+                                         ? forwardDevice[i] : backwardDevice[i];
                 if (ep->GetNNetDevices() > deviceIdx)
                 {
                     ep->SetRoutingEntry(destRank, deviceIdx);

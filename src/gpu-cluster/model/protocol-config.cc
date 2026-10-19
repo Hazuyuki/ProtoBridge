@@ -208,14 +208,15 @@ class EvalEngine
 };
 
 // Map a kind name to (ProtocolTransactionKind, FabricPacketType).
+// MEMORY_READ / MEMORY_WRITE / COLLECTIVE are parsed by the transaction
+// layer's own grammar but have no send path in ProtocolConfigRunner (it only
+// emits wire DATA) — accepting them here would let a config compile and then
+// abort at runtime, so reject at compile time instead.
 bool
 ParseKind(const std::string& s, ProtocolTransactionKind& kind, FabricPacketType& ptype)
 {
     if (s == "DATA" || s == "SEND_DATA") { kind = ProtocolTransactionKind::DATA_TRANSFER; ptype = FabricPacketType::DATA; return true; }
     if (s == "P2P")        { kind = ProtocolTransactionKind::P2P_TRANSFER; ptype = FabricPacketType::DATA; return true; }
-    if (s == "MEMORY_READ"){ kind = ProtocolTransactionKind::MEMORY_READ; ptype = FabricPacketType::MEMORY_READ; return true; }
-    if (s == "MEMORY_WRITE"){ kind = ProtocolTransactionKind::MEMORY_WRITE; ptype = FabricPacketType::MEMORY_WRITE; return true; }
-    if (s == "COLLECTIVE") { kind = ProtocolTransactionKind::COLLECTIVE_OFFLOAD; ptype = FabricPacketType::ALLREDUCE; return true; }
     return false;
 }
 
@@ -479,11 +480,24 @@ ProtocolConfig::Compile(ProtocolTransactionGraph& graph,
             startupNs = v;
             hasStartup = startupNs > 0;
         }
+        else
+        {
+            // A bad startup expression must fail the compile, not silently
+            // produce a zero-delay graph (misleading latency results).
+            return PROTOCOL_TRANSACTION_INVALID_NODE;
+        }
     }
     uint64_t perStepNs = 0;
     {
         uint64_t v;
-        if (Eval(m_perStepDelay, vars, v, error)) perStepNs = v;
+        if (Eval(m_perStepDelay, vars, v, error))
+        {
+            perStepNs = v;
+        }
+        else
+        {
+            return PROTOCOL_TRANSACTION_INVALID_NODE;
+        }
     }
 
     // --- 6. emit the graph -------------------------------------------------

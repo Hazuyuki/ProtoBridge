@@ -72,18 +72,10 @@ ReorderBuffer::Insert(uint32_t seqNum, Ptr<Packet> packet, const FabricHeader& h
         return false;
     }
 
-    // Check buffer capacity
-    if (m_buffer.size() >= m_maxBufferSize)
-    {
-        NS_LOG_WARN("Reorder buffer full, dropping packet seq=" << seqNum);
-        return false;
-    }
-
-    NS_ASSERT_MSG(m_buffer.size() < m_maxBufferSize,
-                  "ReorderBuffer::Insert: buffer overflow, size=" << m_buffer.size()
-                  << " max=" << m_maxBufferSize);
-
-    // Special case: packet is exactly what we expect
+    // Special case: packet is exactly what we expect — accept and deliver it
+    // even when the buffer is FULL: delivering the expected seq drains at
+    // least one entry (itself), so it never grows past capacity. Rejecting it
+    // (capacity checked first) would deadlock a full buffer at a missing seq.
     if (seqNum == m_expectedSeq)
     {
         NS_LOG_DEBUG("Received expected packet seq=" << seqNum);
@@ -101,6 +93,18 @@ ReorderBuffer::Insert(uint32_t seqNum, Ptr<Packet> packet, const FabricHeader& h
     // Packet is in the future, buffer it
     if (seqNum > m_expectedSeq)
     {
+        // Check buffer capacity (only for out-of-order parking: the expected
+        // seq above always drains immediately)
+        if (m_buffer.size() >= m_maxBufferSize)
+        {
+            NS_LOG_WARN("Reorder buffer full, dropping packet seq=" << seqNum);
+            return false;
+        }
+
+        NS_ASSERT_MSG(m_buffer.size() < m_maxBufferSize,
+                      "ReorderBuffer::Insert: buffer overflow, size=" << m_buffer.size()
+                      << " max=" << m_maxBufferSize);
+
         NS_LOG_DEBUG("Buffering out-of-order packet seq=" << seqNum
                      << " (expected=" << m_expectedSeq << ")");
         m_reorderEventCount++;

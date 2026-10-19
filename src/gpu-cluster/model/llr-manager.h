@@ -100,7 +100,7 @@ class LlrManager : public Object
      * @param destRank Destination rank of the ACKed packet
      * @param flowId Flow ID of the packet
      */
-    void RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    void RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     /**
      * @brief Remove all packets up to a sequence number (cumulative ACK)
@@ -108,7 +108,7 @@ class LlrManager : public Object
      * @param destRank Destination rank of the packets
      * @param flowId Flow ID of the packets
      */
-    void RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    void RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     /**
      * @brief Remove specifically ACKed packets (SACK block)
@@ -116,7 +116,7 @@ class LlrManager : public Object
      * @param destRank Destination rank of the packets
      * @param flowId Flow ID of the packets
      */
-    void RemoveSackedPackets(const std::unordered_set<uint32_t>& ackedSeqNums, uint16_t destRank, uint16_t flowId);
+    void RemoveSackedPackets(const std::unordered_set<uint32_t>& ackedSeqNums, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     // --- Retransmission ---
 
@@ -168,7 +168,7 @@ class LlrManager : public Object
     uint32_t GetMaxBufferSize() const;
     uint32_t GetBufferSize() const;
     uint32_t GetPeakBufferSize() const;
-    bool HasOutstandingPacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId) const;
+    bool HasOutstandingPacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0) const;
     uint64_t GetRetransmittedPackets() const;
     uint64_t GetOverflowCount() const;
     uint64_t GetPermanentLossCount() const;
@@ -222,7 +222,7 @@ class LlrManager : public Object
     /**
      * @brief Handle retry timeout for a specific packet
      */
-    void OnRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    void OnRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     /**
      * @brief Enforce buffer size limit by evicting entries
@@ -232,12 +232,16 @@ class LlrManager : public Object
     Time ReserveSourceReload(uint32_t bytes);
     void RemoveOutstandingPacket(uint64_t key);
 
-    // Retry buffer key: (destRank << 48) | (flowId << 32) | seqNum
-    // This prevents collisions between different flows/destinations that produce the same seqNum.
+    // Retry buffer key: (destRank << 56) | (vcId << 48) | (flowId << 32) | seqNum
+    // This prevents collisions between different flows/virtual channels/destinations
+    // that produce the same seqNum (sequence numbers are per (dest, vc, flow)).
     typedef uint64_t RetryKey;
-    static RetryKey MakeRetryKey(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+    static RetryKey MakeRetryKey(uint32_t seqNum, uint16_t destRank, uint16_t flowId,
+                                 uint8_t vcId = 0)
     {
-        return (static_cast<uint64_t>(destRank) << 48) | (static_cast<uint64_t>(flowId) << 32) | seqNum;
+        return (static_cast<uint64_t>(destRank) << 56) |
+               (static_cast<uint64_t>(vcId) << 48) |
+               (static_cast<uint64_t>(flowId) << 32) | seqNum;
     }
     std::unordered_map<uint64_t, RetryEntry> m_retryBuffer;
     std::unordered_map<uint64_t, SourceEntry> m_sourceStore;
