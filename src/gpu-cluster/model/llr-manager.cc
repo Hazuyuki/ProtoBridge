@@ -441,7 +441,12 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
         }
 
         // Re-arm the SOURCE-entry timeout (same one-timer-per-packet rule as
-        // the GBN path).
+        // the GBN path). Arm at readyDelay + m_retryTimeout, mirroring the
+        // GBN path's orderingDelay + m_retryTimeout: the retransmission is not
+        // on the wire until the reload completes, so a timer at bare
+        // m_retryTimeout fires repeatedly during the reload and exhausts the
+        // retry budget before the retransmission can land (GBN recovers, SACK
+        // degrades to permanent loss under the same loss pattern).
         if (!sourceIt->second.timeoutEvent.IsExpired())
         {
             Simulator::Cancel(sourceIt->second.timeoutEvent);
@@ -449,7 +454,7 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
         if (m_retryTimeout > Time(0))
         {
             sourceIt->second.timeoutEvent = Simulator::Schedule(
-                m_retryTimeout,
+                retransmission.readyDelay + m_retryTimeout,
                 &LlrManager::OnRetryTimeout,
                 this,
                 seqNum,

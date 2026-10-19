@@ -1602,17 +1602,24 @@ FabricEndpoint::DeliverBypassDataPacket(Ptr<Packet> packet, const FabricHeader& 
         NS_LOG_DEBUG("Bypass mode: skipping duplicate seq=" << header.GetSequenceNumber()
                      << " flowKey=" << flowKey);
         SendLlrAckPacket(header, false);
-        // Still return credit for the retransmitted packet
-        FabricPacketType pktType = header.GetPacketType();
-        if (pktType == FabricPacketType::DATA ||
-            pktType == FabricPacketType::P2P ||
-            header.IsCollectivePacket())
+        // Still return credit for the retransmitted packet — but only if the
+        // send consumed one. OnPacketDelivered's credit return is guarded by
+        // IsLocalRank(sourceRank) (So sends bypass the gate), so the duplicate
+        // branch must mirror it or an So retransmit duplicate would grow the
+        // sender's VC pool it never drew from.
+        if (IsLocalRank(header.GetSourceRank()))
         {
-            SendCreditPacket(header.GetSourceRank(),
-                             vcId,
-                             1,
-                             header.GetSequenceNumber(),
-                             header.GetFlowId());
+            FabricPacketType pktType = header.GetPacketType();
+            if (pktType == FabricPacketType::DATA ||
+                pktType == FabricPacketType::P2P ||
+                header.IsCollectivePacket())
+            {
+                SendCreditPacket(header.GetSourceRank(),
+                                  vcId,
+                                  1,
+                                  header.GetSequenceNumber(),
+                                  header.GetFlowId());
+            }
         }
         return true;
     }
@@ -1641,8 +1648,14 @@ FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
         ReleaseBulkTxSlot();
     }
 
-    // Return the consumed credit for the permanently lost packet (sender-side)
-    if (m_creditManager)
+    // Return the consumed credit for the permanently lost packet (sender-side).
+    // Only if the send actually consumed one: So (remote-dest) bulk packets
+    // bypass the credit gate (SendBulkWireTransferSize's IsLocalRank guard),
+    // so returning a credit for one would grow the pool it never drew from
+    // and let an unrelated local send through early. IsLocalRank(destRank) is
+    // the mirror of the send-side guard; single-node (m_localRankCount==1)
+    // keeps every dest local -> unchanged.
+    if (m_creditManager && IsLocalRank(destRank))
     {
         m_creditManager->ReturnCredits(vcId, 1);
         NS_LOG_DEBUG("Returned credit for permanently lost seqNum " << seqNum
@@ -2688,7 +2701,20 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         (void)sizeBasedChunks;
         numChunks = std::min(numChunks, std::max<uint64_t>(wireSize, 1));
         uint64_t wireChunkSize = (wireSize + numChunks - 1) / numChunks;
-        uint64_t dataChunkSize = (dataSize + numChunks - 1) / numChunks;
+        // Only the first sentChunks fragments are actually emitted (the loops
+        // below skip trailing lane-pad fragments once wireOffset >= wireSize).
+        // Split the data over the fragments that are sent, not over numChunks:
+        // splitting over numChunks can assign trailing data bytes to fragments
+        // that are never emitted (dataSize=400 over 8 GPUs -> 50 B ring
+        // chunks; LL wireSize=128 over numChunks=18 lanes sends 16 fragments
+        // but ceil(50/18)=3 B each -> 48 of 50 effective bytes delivered,
+        // stalling the receiver). dataSize <= wireSize (efficiency <= 1)
+        // keeps dataChunkSize <= wireChunkSize, so the last sent fragment
+        // still fits its wire budget, and skipped fragments get zero data.
+        // Identical to the old numChunks split whenever every fragment is
+        // sent (the regime all calibrated runs live in).
+        uint64_t sentChunks = (wireSize + wireChunkSize - 1) / wireChunkSize;
+        uint64_t dataChunkSize = (dataSize + sentChunks - 1) / sentChunks;
 
         // So TX window (perftest tx_depth analog): bound the number of
         // in-flight chunks instead of dispatching the whole message

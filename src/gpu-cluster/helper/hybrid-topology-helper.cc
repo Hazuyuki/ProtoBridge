@@ -188,6 +188,13 @@ HybridTopologyHelper::BuildFabric(FabricConfig& config)
             Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(config.endpoints.Get(i));
             ep->SetRank(rank);
             ep->SetFabricType(config.fabricType);
+            // Local rank range = this fabric's GPUs (they sit on one node, so
+            // they are "local" to each other for credit purposes). Without it
+            // the endpoint keeps the default [0,1): rank 0 is the only local
+            // rank, every P2P from another rank consumes a VC credit that
+            // OnPacketDelivered never returns (its IsLocalRank guard) and the
+            // VC stalls after 64 credits.
+            ep->SetLocalRankRange(config.baseRank, config.numGpus);
 
             // Map rank to fabric
             m_rankToFabric[rank] = config.fabricId;
@@ -244,6 +251,9 @@ HybridTopologyHelper::BuildFabric(FabricConfig& config)
             Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(config.endpoints.Get(i));
             ep->SetRank(rank);
             ep->SetFabricType(config.fabricType);
+            // See the ring branch: without the local rank range every non-zero
+            // rank drains its VC with no credit return (64-credit stall).
+            ep->SetLocalRankRange(config.baseRank, config.numGpus);
 
             m_rankToFabric[rank] = config.fabricId;
 
@@ -296,6 +306,9 @@ HybridTopologyHelper::BuildFabric(FabricConfig& config)
             Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(config.endpoints.Get(i));
             ep->SetRank(rank);
             ep->SetFabricType(config.fabricType);
+            // See the ring branch: without the local rank range every non-zero
+            // rank drains its VC with no credit return (64-credit stall).
+            ep->SetLocalRankRange(config.baseRank, config.numGpus);
             ep->AddNetDevice(devices.Get(0));
 
             m_rankToFabric[rank] = config.fabricId;
