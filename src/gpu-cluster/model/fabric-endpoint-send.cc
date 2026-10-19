@@ -105,8 +105,14 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
             header.SetSourceMac(m_address);
             header.SetDestMac(ResolveDestMac(destRank));
 
-            // Check and consume credit before sending (credit-based flow control)
-            if (m_creditManager && !m_creditManager->HasCredits(vcId))
+            // Check and consume credit before sending (credit-based flow
+            // control) — Su (local-dest) traffic only. So (remote-dest) DATA
+            // bypasses credits, mirroring SendBulkWireTransferSize /
+            // SendP2p: the receiver returns credits only for local sources
+            // (OnPacketDelivered's IsLocalRank guard), so a credit-consuming
+            // remote send would drain the VC pool with no return path and
+            // stall after vcCredits sends.
+            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
             {
                 NS_LOG_DEBUG("No credits for DATA chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -156,7 +162,7 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 TrySendQueuedPackets();
                 break;
             }
-            if (m_creditManager)
+            if (m_creditManager && IsLocalRank(destRank))
             {
                 m_creditManager->ConsumeCredit(vcId, seqNum);
             }
@@ -570,9 +576,12 @@ FabricEndpoint::SendMemoryRead(uint16_t destRank, uint64_t address, uint32_t siz
 
     // Send-gate flow control: dispatches on m_flowControlPolicy. Under the
     // default CREDIT policy this is the existing per-VC credit check + consume;
-    // WINDOW/RATE are seam-only and admit with a warning.
+    // WINDOW/RATE are seam-only and admit with a warning. Remote (So) dests
+    // bypass the credit gate — the receiver returns credits only for local
+    // sources (OnPacketDelivered's IsLocalRank guard), so a remote consume
+    // would never come back and would stall the VC.
     uint8_t vcId = 0;
-    if (!FlowControlGate(vcId, seqNum, false))
+    if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
     {
         NS_LOG_DEBUG("FlowControlGate backpressure for MEMORY_READ on VC "
                      << static_cast<int>(vcId) << ", queuing packet");
@@ -627,9 +636,12 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control: check and consume credits before sending
+    // Credit-based flow control: check and consume credits before sending.
+    // Su (local-dest) traffic only — the receiver returns credits solely for
+    // local sources (OnPacketDelivered's IsLocalRank guard), so a remote
+    // memory write would drain the VC pool with no return path.
     uint8_t vcId = 0;
-    if (m_creditManager)
+    if (m_creditManager && IsLocalRank(destRank))
     {
         if (!m_creditManager->HasCredits(vcId))
         {
@@ -678,9 +690,10 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control for MEMORY_RESP
+    // Credit-based flow control for MEMORY_RESP — Su (local-dest) traffic
+    // only (see SendMemoryWrite for the So bypass rationale).
     uint8_t vcId = 0;
-    if (m_creditManager)
+    if (m_creditManager && IsLocalRank(destRank))
     {
         if (!m_creditManager->HasCredits(vcId))
         {
@@ -764,9 +777,10 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control for memory semantic packets
+    // Credit-based flow control for memory semantic packets — Su (local-dest)
+    // traffic only (see SendMemoryWrite for the So bypass rationale).
     uint8_t vcId = 0;
-    if (m_creditManager)
+    if (m_creditManager && IsLocalRank(destRank))
     {
         if (!m_creditManager->HasCredits(vcId))
         {
@@ -851,17 +865,24 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             uint32_t wireSize = pkt->GetSize();
 
             // Compute actual data bytes carried by this sub-packet.
-            // For overhead protocols, use payload builder to extract the
-            // true data size. For SIMPLE (efficiency >= 1), each sub-packet
-            // carries min(chunkSize, remaining) data.
+            // For overhead protocols, use payload builder to extract the true
+            // data size. The extraction buffer is sized to the sub-packet, not
+            // a fixed 256 B: any vendor builder with larger units (e.g. 512 KiB
+            // RoCE segments) would advertise only 256 B per segment and the
+            // receiver would drop the rest (4096 B send delivered 256 B). The
+            // result is capped by the data still unassigned in this chunk: a
+            // fixed-width wire unit (LL line / LL128 chunk) that pads a short
+            // tail otherwise advertises the full unit (64 B for a 50 B tail)
+            // and over-counts the flow.
             uint32_t subPacketDataSize;
             if (efficiency < 1.0)
             {
-                // LL/LL128: extract actual data from the built sub-packet
-                uint8_t tmpBuf[256];
+                uint32_t dataStillNeeded = thisChunkDataSize - dataAssigned;
+                std::vector<uint8_t> tmpBuf(pkt->GetSize());
                 uint64_t extracted = m_payloadBuilder->ExtractData(
-                    pkt, protocolId, tmpBuf, sizeof(tmpBuf));
-                subPacketDataSize = static_cast<uint32_t>(extracted);
+                    pkt, protocolId, tmpBuf.data(), tmpBuf.size());
+                subPacketDataSize = static_cast<uint32_t>(
+                    std::min<uint64_t>(extracted, dataStillNeeded));
             }
             else
             {
@@ -889,8 +910,11 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             header.SetEffectiveDataSize(subPacketDataSize);
             header.SetTtl(64);
 
-            // Credit-based flow control: check and consume credits before sending
-            if (m_creditManager && !m_creditManager->HasCredits(vcId))
+            // Credit-based flow control: check and consume credits before
+            // sending — Su (local-dest) traffic only (see SendData for the
+            // So bypass rationale; the receiver's return is IsLocalRank-
+            // guarded, so a remote consume would never come back).
+            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
             {
                 NS_LOG_DEBUG("No credits for DATA_INTERNAL chunk on VC " << static_cast<int>(vcId)
                              << ", queuing packet");
@@ -905,7 +929,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                 chunkIndex++;
                 continue;
             }
-            if (m_creditManager)
+            if (m_creditManager && IsLocalRank(destRank))
             {
                 m_creditManager->ConsumeCredit(vcId, seqNum);
             }

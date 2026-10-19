@@ -589,13 +589,24 @@ FabricEndpoint::GetNeighborMac(uint16_t rank) const
 uint32_t
 FabricEndpoint::ResolveDeviceIndex(uint16_t destRank)
 {
-    // For spraying: use round-robin from routing devices table
+    // For spraying: round-robin over THIS DESTINATION's permitted devices
+    // (m_routingDevicesTable[destRank]), not over every attached device.
+    // GetNextDeviceIndex() rotates over all of m_devices — on a multi-node
+    // endpoint that set mixes the dest's links with unrelated scale-out
+    // ports, and a sprayed packet would leave on a port that never reaches
+    // the dest. No routing-devices entry (single-device dests, e.g. the
+    // inter-node NICs set up via SetRoutingEntry) falls through to the plain
+    // routing table below, so single-path dests keep exact device selection.
     if (m_sprayingEnabled)
     {
         auto devicesIt = m_routingDevicesTable.find(destRank);
-        if (devicesIt != m_routingDevicesTable.end() && devicesIt->second.size() > 0)
+        if (devicesIt != m_routingDevicesTable.end() && devicesIt->second.size() > 1)
         {
-            return GetNextDeviceIndex();
+            const std::vector<uint32_t>& devs = devicesIt->second;
+            uint32_t index = devs[m_currentDeviceIndex % devs.size()];
+            m_currentDeviceIndex =
+                (m_currentDeviceIndex + 1) % m_devices.size();
+            return index;
         }
     }
 
@@ -2283,13 +2294,20 @@ FabricEndpoint::TrySendQueuedPackets()
     {
         SendQueueEntry& entry = m_sendQueue.front();
 
-        if (!m_creditManager->HasCredits(entry.vcId))
+        // Credit gate — Su (local-dest) entries only. So (remote-dest) entries
+        // bypass credits entirely: the receiver never returns credits for a
+        // remote source (OnPacketDelivered's IsLocalRank guard), so consuming
+        // one here would strand it. Entries reach this queue from send paths
+        // whose own gates were bypassed under the same predicate, so the split
+        // here mirrors the send side exactly.
+        const bool destIsLocal = IsLocalRank(entry.header.GetDestRank());
+        if (destIsLocal && !m_creditManager->HasCredits(entry.vcId))
         {
             NS_LOG_DEBUG("No credits for VC " << static_cast<int>(entry.vcId));
             break;
         }
 
-        if (!m_creditManager->ConsumeCredit(entry.vcId, entry.seqNum))
+        if (destIsLocal && !m_creditManager->ConsumeCredit(entry.vcId, entry.seqNum))
         {
             break;
         }
@@ -2728,10 +2746,32 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         // RTT-scale instead of whole-transfer-scale.
         if (m_soTxWindow > 0 && !IsLocalRank(destRank))
         {
+            // Only fragments that still carry data bytes are emitted. The two
+            // skips below are load-bearing in opposite directions:
+            // - wireOffset >= wireSize: trailing lane-pad fragment past the
+            //   wire end (wireSize - wireOffset would underflow).
+            // - dataOffset >= dataSize: trailing wire-padding fragment. It
+            //   carries zero effective bytes, and a zero-effectiveDataSize
+            //   header is NOT inert on the receive side — receivers read
+            //   effectiveDataSize==0 as "the whole packet" (protocol-config-
+            //   runner.cc / the collective injectors), so a padding-only
+            //   fragment over-counts and can complete a transfer early. Its
+            //   wire bytes are pure protocol padding; dropping the fragment
+            //   keeps the effective-byte ledger exact and the wire smaller.
+            //   dataSize <= wireSize guarantees at least one fragment carries
+            //   data, so this never skips the whole transfer.
             for (uint64_t i = 0; i < numChunks; i++)
             {
                 uint64_t wireOffset = i * wireChunkSize;
+                if (wireOffset >= wireSize)
+                {
+                    continue; // trailing lane-pad fragment past the wire end
+                }
                 uint64_t dataOffset = i * dataChunkSize;
+                if (dataOffset >= dataSize)
+                {
+                    break; // wire-padding fragment: no data bytes left to send
+                }
                 BulkTxChunk desc;
                 desc.destRank = destRank;
                 desc.flowId = flowId;
@@ -2742,10 +2782,6 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                 desc.fragmentDataSize = static_cast<uint32_t>(
                     std::min(dataChunkSize, dataSize - dataOffset));
                 desc.chunkIndex = static_cast<uint32_t>(i);
-                if (desc.wireChunk == 0 && desc.fragmentDataSize == 0)
-                {
-                    continue; // trailing lane-pad fragment past the transfer end
-                }
                 desc.deviceIndex = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
                 desc.stamp = stampSoHeader && (desc.wireChunk > soHeaderSize);
                 m_bulkTxQueue.push_back(desc);
@@ -2756,6 +2792,10 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             return;
         }
 
+        // Same fragment skips as the windowed path above: stop at the first
+        // fragment past the data end (wire padding carries no bytes and a
+        // zero-effectiveDataSize header over-counts on the receive side), and
+        // skip fragments past the wire end.
         for (uint64_t i = 0; i < numChunks; i++)
         {
             uint64_t wireOffset = i * wireChunkSize;
@@ -2768,8 +2808,12 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
 
             // Ensure fragment effectiveDataSize sums to original dataSize
             uint64_t dataOffset = i * dataChunkSize;
+            if (dataOffset >= dataSize)
+            {
+                break; // wire-padding fragment: no data bytes left to send
+            }
             uint32_t fragmentDataSize = static_cast<uint32_t>(
-                dataOffset < dataSize ? std::min(dataChunkSize, dataSize - dataOffset) : 0);
+                std::min(dataChunkSize, dataSize - dataOffset));
 
             uint64_t seqKey = MakeSeqKey(destRank, vcId, flowId);
             uint32_t seqNum = m_nextSeqNum[seqKey]++;
@@ -2834,9 +2878,12 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     uint32_t remWireChunk = static_cast<uint32_t>(
                         std::min(wireChunkSize, wireSize - remWireOffset));
                     uint64_t remDataOffset = j * dataChunkSize;
+                    if (remDataOffset >= dataSize)
+                    {
+                        break; // wire-padding fragment: no data bytes left to send
+                    }
                     uint32_t remFragmentData = static_cast<uint32_t>(
-                        remDataOffset < dataSize
-                            ? std::min(dataChunkSize, dataSize - remDataOffset) : 0);
+                        std::min(dataChunkSize, dataSize - remDataOffset));
                     uint64_t remSeqKey = MakeSeqKey(destRank, vcId, flowId);
                     uint32_t remSeqNum = m_nextSeqNum[remSeqKey]++;
 
