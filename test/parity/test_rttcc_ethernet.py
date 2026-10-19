@@ -16,23 +16,26 @@ Two cases on the ``p2p-eth-incast.cfg`` scenario (2 senders -> rank 3 through
 a voqDropThreshold=2 ToR switch -- the congestion RTTCC exists to sense):
 
 * ``test_rttcc_default_off_parity`` -- without ``--rttcc`` the run must be
-  BYTE-IDENTICAL to the pre-RTTCC baseline (simTimeNs=1484174, drops=86,
-  retx=959, permLoss=0; pinned at the linksPerGpu=18 fabric convention and
-  4 MiB data -- see the dataSize note at the pins): no machine is mounted,
-  no probe is emitted, the new code is invisible. This is the parity
-  foundation for every existing calibration.
+  BYTE-IDENTICAL to the deterministic off-baseline (simTimeNs=106890,
+  drops=149, retx=314, permLoss=0; pinned at the linksPerGpu=18 fabric
+  convention and 192 KiB data -- see the dataSize note at the pins): no
+  machine is mounted, no probe is emitted, the new code is invisible. This
+  is the parity foundation for every existing calibration.
 
 * ``test_rttcc_on_incast`` -- with ``--rttcc=1`` the full loop must light up:
   probes sent, RTT samples collected, and at least one flow throttled well
   below the 400G line rate (rttccMinRateGbps < 400) while the run still
-  COMPLETES. The pinned numbers (simTimeNs=1481369, drops=98, retx=947,
-  minRate=1.0 Gbps) are the observed deterministic RngRun=1 values. At this
-  4 MiB burst the multiplicative decrease bites hard once probe RTT feedback
-  arrives (min rate 1.0 Gbps) but drops are NOT reduced (98 vs 86 off) --
-  the initial burst floods the VOQ before the first RTT sample returns, and
-  the pacer mostly spaces out the retransmits. RTTCC's drop reduction shows
-  only on still-longer bursts (documented, not asserted, to keep the gate
-  fast).
+  COMPLETES. The pinned numbers (simTimeNs=54763, drops=96, retx=250,
+  minRate=190.4 Gbps) are the observed deterministic RngRun=1 values. At
+  this burst size RTTCC now WINS the incast outright: the pacer spaces the
+  initial injection so the dest-port VOQ never reaches the runaway pile-up
+  the off-run shows (drops 149 -> 96, completion 106.9 us -> 54.8 us --
+  roughly half the lossless-floor serialization of the whole incast).
+  (Pre-bulk-cap-fix pins at 4 MiB -- 1484174/86/959 off, 1481369/98/947 on
+  -- were calibrated when the 16 KiB bulkChunkSize cap was silently ignored
+  by the spray-chunk coalescing: 128 KiB fragments made every drop ~8x the
+  bytes, both runs completed mid-storm, and the pacer could only space the
+  retransmits. See the dataSize note below.)
 
 Run:
     python3 -m pytest test/parity/test_rttcc_ethernet.py -v
@@ -48,24 +51,28 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 INCAST_CFG = "configs/protocol_configs/p2p-eth-incast.cfg"
 
-# Pre-RTTCC incast baseline (debug binary, RngRun=1) -- must stay pinned.
-# Pinned at the 1fb92ba linksPerGpu=18 fabric convention AND 4 MiB data: the
-# cfg's profile builds the 18-lane spray fabric, whose wider intra-node trunk
-# absorbs the old 256 KiB burst before the dest-port VOQ fills (drops 87 -> 1,
-# too little congestion for RTTCC to sense). 4 MiB restores the incast
-# pressure RTTCC exists to react to.
+# Deterministic off-baseline (debug binary, RngRun=1) -- must stay pinned.
+# Pinned at the 1fb92ba linksPerGpu=18 fabric convention AND 192 KiB data:
+# the cfg's profile builds the 18-lane spray fabric, whose wider intra-node
+# trunk absorbs a 256 KiB burst before the dest-port VOQ fills (drops 87 -> 1,
+# too little congestion for RTTCC to sense). 192 KiB (12 x 16 KiB bulk chunks
+# per flow) restores the incast pressure RTTCC exists to react to WITHOUT the
+# runaway drop-storm a 4 MiB burst produces at the (now-enforced) 16 KiB bulk
+# cap: 256 fragments/flow at voqDropThreshold=2 burn every retry budget
+# (permLoss>0 even at rlim=64), which is a lossy-regime stress, not a
+# congestion-control scenario.
 BASELINE = {
-    "simTimeNs": 1484174,
-    "switchVoqDrops": 86,
-    "retransmittedPackets": 959,
+    "simTimeNs": 106890,
+    "switchVoqDrops": 149,
+    "retransmittedPackets": 314,
     "permanentLosses": 0,
 }
 
 # Observed deterministic values with --rttcc=1 (RngRun=1).
 RTTCC_ON = {
-    "simTimeNs": 1481369,
-    "switchVoqDrops": 98,
-    "retransmittedPackets": 947,
+    "simTimeNs": 54763,
+    "switchVoqDrops": 96,
+    "retransmittedPackets": 250,
     "permanentLosses": 0,
 }
 
@@ -100,7 +107,7 @@ def run_incast(rttcc, timeout=600):
         "--ber=0",
         "--packetLossRate=0",
         "--protocolConfig=" + INCAST_CFG,
-        "--dataSize=4194304",
+        "--dataSize=196608",
         "--RngRun=1",
     ]
     if rttcc:

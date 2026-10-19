@@ -326,16 +326,19 @@ python3 -m pytest test/parity/test_config_vs_inline_parity.py -q
 # or: python3 test/parity/test_config_vs_inline_parity.py
 ```
 
-Verified cases (config `==` inline, `simTimeNs`):
+Verified cases (config `==` inline, `simTimeNs`) on the current
+`linksPerGpu=18` fabric convention (all six re-measured; the pre-1fb92ba
+`linksPerGpu=1` values 38308/1353580/33028/1163404/114794/80352 are
+obsolete):
 
 | op | size | GPUs | simTimeNs | measured |
 |----|------|------|-----------|----------|
-| ring | 1 MiB | 8 | 38308 | 37.24 µs |
-| ring | 256 MiB | 8 | 1353580 | 1347.65 µs |
-| ring | 1 MiB | 4 | 33028 | — |
-| ring | 256 MiB | 4 | 1163404 | — |
-| tree | 1 MiB | 8 | 114794 | — |
-| nvls | 1 MiB | 8 | 80352 | — |
+| ring | 1 MiB | 8 | 38782 | — |
+| ring | 256 MiB | 8 | 1496204 | — |
+| ring | 1 MiB | 4 | 33634 | — |
+| ring | 256 MiB | 4 | 1284496 | — |
+| tree | 1 MiB | 8 | 55148 | — |
+| nvls | 1 MiB | 8 | 27576 | — |
 
 If you change a sourced profile key, the C++ sourcing block
 (`scratch/gpu-cluster-sim.cc`, after `configMode = true;`), or an injector,

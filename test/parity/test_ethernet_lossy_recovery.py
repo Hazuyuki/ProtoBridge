@@ -31,12 +31,17 @@ Two cases, mirroring the two ``--llrRetryLimit`` regimes documented in the
   (``--llrRetryLimit=1`` is too aggressive -- it stalls at the 3600s ceiling
   rather than degrading gracefully -- so 8 is the documented contrast point.)
 
- dataSize note: pinned at 4 MiB since the 1fb92ba linksPerGpu=18 fabric
- re-anchor (the cfg's profile builds the 18-lane spray fabric, whose much
-wider intra-node trunk absorbs the old 256 KiB burst before the dest-port
-VOQ fills -- at 256 KiB the incast barely registers, switchVoqDrops=1, and
-no retry limit exhausts). 4 MiB restores the intended congestion pressure
-(drops=86 at rlim=64, permLoss=27 with graceful completion at rlim=8).
+ dataSize note: pinned at 192 KiB since the bulkChunkSize-cap fix (12 x 16 KiB
+ bulk chunks per flow). The 1fb92ba linksPerGpu=18 re-anchor originally
+ moved the pin from 256 KiB up to 4 MiB -- but that 4 MiB calibration ran
+ when the 16 KiB --bulkChunkSize cap was silently ignored by the spray-chunk
+ coalescing (32 x 128 KiB fragments per flow, drops=86). With the cap
+ actually enforced, a 4 MiB burst is 256 fragments/flow against
+ voqDropThreshold=2: ~18k VOQ drops burn EVERY retry budget (permLoss=354
+ even at rlim=64, incomplete at rlim=8) -- a lossy-regime stress test, not
+ the NACK->retransmit recovery demo this file gates. 192 KiB restores the
+ intended regime at the true chunk size: drops=149, retx=314, permLoss=0
+ at rlim=64; permLoss=9 with graceful completion at rlim=8.
 
 Run:
     python3 -m pytest test/parity/test_ethernet_lossy_recovery.py -v
@@ -83,7 +88,7 @@ def run_incast(llr_retry_limit, timeout=600):
         "--ber=0",
         "--packetLossRate=0",
         "--protocolConfig=" + INCAST_CFG,
-        "--dataSize=4194304",
+        "--dataSize=196608",
         "--RngRun=1",
     ]
     if binary:

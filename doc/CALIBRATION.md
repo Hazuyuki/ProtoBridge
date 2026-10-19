@@ -243,8 +243,11 @@ RoCE hierarchical anchor.
 
 See `configs/protocol_configs/p2p-eth.cfg` (single P2P) and
 `p2p-eth-incast.cfg` (2-flow incast that exercises the full NACK→LLR-retransmit
-→delivery loop; `--voqDropThreshold=2 --llrRetryLimit=64` gives 87 drops → 285
-retransmits → 0 permanent losses, completing in 68.7 µs).
+→delivery loop; `--dataSize=196608 --voqDropThreshold=2 --llrRetryLimit=64`
+gives 149 drops → 314 retransmits → 0 permanent losses, completing in
+106.9 µs — measured with the `--bulkChunkSize=16384` cap actually enforced;
+at the previous 4 MiB size the cap fix's 256 fragments/flow drop-storm burns
+every retry budget, which is lossy-regime stress, not a recovery demo).
 
 ## Full-mesh AllReduce/AllGather — ns-3-calibrated
 
