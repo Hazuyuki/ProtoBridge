@@ -19,6 +19,7 @@
 #include "ns3/callback.h"
 
 #include <vector>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <queue>
@@ -125,23 +126,27 @@ class LlrManager : public Object
      * @param seqNum Sequence number of the failed packet
      * @param sourceRank Rank that sent the retry request
      * @param flowId Flow ID of the failed packet
+     * @param vcId Virtual channel of the failed packet (from the NACK header)
      * @return Retransmissions and their source-read delays
      */
     std::vector<Retransmission> HandleRetryRequest(uint32_t seqNum,
                                                    uint16_t sourceRank,
-                                                   uint16_t flowId);
+                                                   uint16_t flowId,
+                                                   uint8_t vcId);
 
     /**
      * @brief Handle a SACK retry request from a peer
      * @param nackSeqNums Set of sequence numbers that need retransmission
      * @param sourceRank Rank that sent the SACK
      * @param flowId Flow ID of the packets
+     * @param vcId Virtual channel of the packets (from the NACK header)
      * @return Retransmissions and their source-read delays
      */
     std::vector<Retransmission> HandleSackRequest(
         const std::unordered_set<uint32_t>& nackSeqNums,
         uint16_t sourceRank,
-        uint16_t flowId);
+        uint16_t flowId,
+        uint8_t vcId);
 
     // --- Retry limit ---
 
@@ -159,7 +164,7 @@ class LlrManager : public Object
      * @brief Set callback invoked when a retry timeout fires
      * The callback receives (seqNum, destRank, flowId) and should trigger retransmission
      */
-    typedef Callback<void, uint32_t, uint16_t, uint16_t> TimeoutCallback;
+    typedef Callback<void, uint32_t, uint16_t, uint16_t, uint8_t> TimeoutCallback;
     void SetTimeoutCallback(TimeoutCallback cb);
 
     // --- Buffer size ---
@@ -230,21 +235,45 @@ class LlrManager : public Object
      */
     bool EnforceBufferLimit();
     Time ReserveSourceReload(uint32_t bytes);
-    void RemoveOutstandingPacket(uint64_t key);
 
-    // Retry buffer key: (destRank << 56) | (vcId << 48) | (flowId << 32) | seqNum
-    // This prevents collisions between different flows/virtual channels/destinations
-    // that produce the same seqNum (sequence numbers are per (dest, vc, flow)).
-    typedef uint64_t RetryKey;
+    // Retry buffer key: the FULL (destRank, vcId, flowId, seqNum) tuple.
+    // Previously packed into a uint64 as (destRank << 56) | (vc << 48) |
+    // (flow << 32) | seq — but destRank is 16 bits, so only its low 8 bits
+    // survived the shift and destinations 1 and 257 collided. The struct
+    // carries every field at full width.
+    struct RetryKey
+    {
+        uint32_t seqNum;
+        uint16_t destRank;
+        uint16_t flowId;
+        uint8_t vcId;
+        bool operator==(const RetryKey& o) const
+        {
+            return seqNum == o.seqNum && destRank == o.destRank
+                && flowId == o.flowId && vcId == o.vcId;
+        }
+    };
     static RetryKey MakeRetryKey(uint32_t seqNum, uint16_t destRank, uint16_t flowId,
                                  uint8_t vcId = 0)
     {
-        return (static_cast<uint64_t>(destRank) << 56) |
-               (static_cast<uint64_t>(vcId) << 48) |
-               (static_cast<uint64_t>(flowId) << 32) | seqNum;
+        return RetryKey{seqNum, destRank, flowId, vcId};
     }
-    std::unordered_map<uint64_t, RetryEntry> m_retryBuffer;
-    std::unordered_map<uint64_t, SourceEntry> m_sourceStore;
+    struct RetryKeyHash
+    {
+        size_t operator()(const RetryKey& k) const
+        {
+            // seqNum is the discriminating field for entries that share a
+            // (dest, vc, flow); mix it with the flow identity.
+            return std::hash<uint64_t>()(
+                (static_cast<uint64_t>(k.destRank) << 48)
+                ^ (static_cast<uint64_t>(k.vcId) << 40)
+                ^ (static_cast<uint64_t>(k.flowId) << 24)
+                ^ k.seqNum);
+        }
+    };
+    std::unordered_map<RetryKey, RetryEntry, RetryKeyHash> m_retryBuffer;
+    std::unordered_map<RetryKey, SourceEntry, RetryKeyHash> m_sourceStore;
+    void RemoveOutstandingPacket(const RetryKey& key);
     uint32_t m_retryLimit;
     Time m_retryTimeout;
     LlrMode m_llrMode;

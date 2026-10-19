@@ -1097,9 +1097,11 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
 
     // Each GPU sent dataSize bytes. The switch reduces all N contributions
     // element-wise, producing a single result of dataSize. We use one GPU's
-    // chunk sizes to create result packets of the same sizes.
+    // chunk sizes to create result packets of the same sizes. Copy the chunk
+    // sizes BEFORE clearing the buffer: gpuBuffers.clear() destroys the map
+    // values the reference would dangle into.
     auto firstGpu = gpuBuffers.begin();
-    const auto& chunkSizes = firstGpu->second;
+    const auto chunkSizes = firstGpu->second;
 
     // Clear buffer before multicast
     gpuBuffers.clear();

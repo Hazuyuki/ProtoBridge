@@ -1699,7 +1699,8 @@ FabricEndpoint::ProcessRetryPacket(Ptr<Packet> packet, const FabricHeader& heade
         {
             // Go-Back-N: retransmit all packets from seqNum onwards for this peer
             std::vector<LlrManager::Retransmission> retransmissions =
-                m_llrManager->HandleRetryRequest(seqNum, sourceRank, flowId);
+                m_llrManager->HandleRetryRequest(seqNum, sourceRank, flowId,
+                                                 header.GetVirtualChannel());
             for (const auto& retransmission : retransmissions)
             {
                 if (retransmission.readyDelay > Time(0))
@@ -1740,6 +1741,7 @@ FabricEndpoint::ProcessNackPacket(Ptr<Packet> packet, const FabricHeader& header
     uint32_t seqNum = header.GetSequenceNumber();
     uint16_t sourceRank = header.GetSourceRank();
     uint16_t flowId = header.GetFlowId();
+    uint8_t vcId = header.GetVirtualChannel();
 
     NS_LOG_INFO("Received NACK for seqNum=" << seqNum << " from rank=" << sourceRank);
 
@@ -1751,12 +1753,14 @@ FabricEndpoint::ProcessNackPacket(Ptr<Packet> packet, const FabricHeader& header
         {
             // SACK: retransmit only the NACKed packet
             std::unordered_set<uint32_t> nackSet{seqNum};
-            retransmissions = m_llrManager->HandleSackRequest(nackSet, sourceRank, flowId);
+            retransmissions = m_llrManager->HandleSackRequest(nackSet, sourceRank,
+                                                              flowId, vcId);
         }
         else
         {
             // Go-Back-N: retransmit from NACK point onward
-            retransmissions = m_llrManager->HandleRetryRequest(seqNum, sourceRank, flowId);
+            retransmissions = m_llrManager->HandleRetryRequest(seqNum, sourceRank,
+                                                               flowId, vcId);
         }
 
         DispatchRetransmissions(retransmissions);
@@ -1794,9 +1798,10 @@ FabricEndpoint::EnableLlrTimeoutRetransmit()
 }
 
 void
-FabricEndpoint::OnLlrRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+FabricEndpoint::OnLlrRetryTimeout(uint32_t seqNum, uint16_t destRank,
+                                  uint16_t flowId, uint8_t vcId)
 {
-    NS_LOG_FUNCTION(this << seqNum << destRank << flowId);
+    NS_LOG_FUNCTION(this << seqNum << destRank << flowId << static_cast<int>(vcId));
 
     if (!m_llrEnabled || !m_llrManager)
     {
@@ -1808,16 +1813,18 @@ FabricEndpoint::OnLlrRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t f
     // The Handle*Request paths re-arm the timer and enforce the retry limit,
     // so a persistently-lost packet still degrades to permanent loss instead
     // of looping forever. destRank plays the role of the NACK's sourceRank
-    // (both name the flow's remote end).
+    // (both name the flow's remote end); vcId is the timed entry's VC.
     std::vector<LlrManager::Retransmission> retransmissions;
     if (m_llrManager->GetLlrMode() == LlrMode::SACK)
     {
         std::unordered_set<uint32_t> nackSet{seqNum};
-        retransmissions = m_llrManager->HandleSackRequest(nackSet, destRank, flowId);
+        retransmissions = m_llrManager->HandleSackRequest(nackSet, destRank,
+                                                          flowId, vcId);
     }
     else
     {
-        retransmissions = m_llrManager->HandleRetryRequest(seqNum, destRank, flowId);
+        retransmissions = m_llrManager->HandleRetryRequest(seqNum, destRank,
+                                                           flowId, vcId);
     }
     DispatchRetransmissions(retransmissions);
 }
@@ -1837,7 +1844,8 @@ FabricEndpoint::SendRetransmission(LlrManager::Retransmission retransmission)
     uint16_t destRank = oldHeader.GetDestRank();
     uint16_t flowId = oldHeader.GetFlowId();
 
-    if (!m_llrManager->HasOutstandingPacket(seqNum, destRank, flowId))
+    if (!m_llrManager->HasOutstandingPacket(seqNum, destRank, flowId,
+                                            oldHeader.GetVirtualChannel()))
     {
         return;
     }
@@ -1882,10 +1890,12 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
         bool wasOutstanding = m_soTxWindow > 0 &&
             m_llrManager->HasOutstandingPacket(header.GetSequenceNumber(),
                                                header.GetSourceRank(),
-                                               header.GetFlowId());
+                                               header.GetFlowId(),
+                                               header.GetVirtualChannel());
         m_llrManager->RemovePacket(header.GetSequenceNumber(),
                                    header.GetSourceRank(),
-                                   header.GetFlowId());
+                                   header.GetFlowId(),
+                                   header.GetVirtualChannel());
         if (wasOutstanding)
         {
             ReleaseBulkTxSlot();

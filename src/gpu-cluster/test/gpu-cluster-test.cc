@@ -1805,7 +1805,7 @@ class LlrManagerTest : public TestCase
         uint16_t destRank;
         uint16_t flowId;
     };
-    void OnTimeoutCallback(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    void OnTimeoutCallback(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId);
     std::vector<TimeoutRecord> m_timeoutCallbacks;
 };
 
@@ -1813,9 +1813,10 @@ LlrManagerTest::LlrManagerTest() : TestCase("LlrManager") {}
 LlrManagerTest::~LlrManagerTest() {}
 
 void
-LlrManagerTest::OnTimeoutCallback(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+LlrManagerTest::OnTimeoutCallback(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId)
 {
     m_timeoutCallbacks.push_back({seqNum, destRank, flowId});
+    (void)vcId;
 }
 
 void
@@ -1843,7 +1844,7 @@ LlrManagerTest::TestGoBackN()
     }
 
     // Go-Back-N from seqNum=3: should retransmit 3, 4, 5
-    auto retransmits = llr->HandleRetryRequest(3, 1, 0);
+    auto retransmits = llr->HandleRetryRequest(3, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 3u, "GBN: retransmit 3 packets from seqNum=3");
 }
 
@@ -1862,7 +1863,7 @@ LlrManagerTest::TestSack()
 
     // SACK: only retransmit seqNums 2 and 4
     std::unordered_set<uint32_t> nackSet{2, 4};
-    auto retransmits = llr->HandleSackRequest(nackSet, 1, 0);
+    auto retransmits = llr->HandleSackRequest(nackSet, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 2u, "SACK: retransmit only 2 NACKed packets");
 }
 
@@ -1876,15 +1877,15 @@ LlrManagerTest::TestRetryLimit()
     llr->StorePacket(1, pkt, 1);
 
     // Retry twice (retryCount goes to 1, then 2)
-    auto r1 = llr->HandleRetryRequest(1, 1, 0);
+    auto r1 = llr->HandleRetryRequest(1, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(r1.size(), 1u, "First retry succeeds");
 
-    auto r2 = llr->HandleRetryRequest(1, 1, 0);
+    auto r2 = llr->HandleRetryRequest(1, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(r2.size(), 1u, "Second retry succeeds");
 
     // Third retry should exceed limit (retryCount=3 > limit=2)
     // Entry is erased from buffer and permanent loss callback fires
-    auto r3 = llr->HandleRetryRequest(1, 1, 0);
+    auto r3 = llr->HandleRetryRequest(1, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(r3.size(), 0u, "Third retry exceeds limit");
     NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 0u, "Buffer empty after retry exhaustion");
 }
@@ -1928,7 +1929,7 @@ LlrManagerTest::TestBufferOverflow()
                           "Evicted packet remains reconstructable from its source");
 
     std::unordered_set<uint32_t> evictedSeq{1};
-    auto reloaded = llr->HandleSackRequest(evictedSeq, 1, 0);
+    auto reloaded = llr->HandleSackRequest(evictedSeq, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(reloaded.size(), 1u, "Evicted packet is reconstructed");
     NS_TEST_EXPECT_MSG_EQ(reloaded[0].sourceReload, true,
                           "Evicted packet uses the source-reload path");
@@ -1987,14 +1988,14 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 2u, "Both entries present before retry");
 
         // Retry request for dest=1, flow=0, sourceRank=1 — should only retransmit dest 1's packet
-        auto retransmits1 = llr->HandleRetryRequest(10, 1, 0);
+        auto retransmits1 = llr->HandleRetryRequest(10, 1, 0, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits1.size(), 1u, "GBN: dest=1 retransmits 1 packet, not dest=2's");
 
         // Both entries still in buffer (HandleRetryRequest doesn't remove, only retransmits)
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 2u, "Both entries still in buffer after retry");
 
         // Retry request for dest=2, flow=0, sourceRank=2 — should only retransmit dest 2's packet
-        auto retransmits2 = llr->HandleRetryRequest(10, 2, 0);
+        auto retransmits2 = llr->HandleRetryRequest(10, 2, 0, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits2.size(), 1u, "GBN: dest=2 retransmits 1 packet, not dest=1's");
     }
 
@@ -2013,7 +2014,7 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 1u, "Only dest=2 entry remains after RemovePacketsUpTo on dest=1");
 
         // Survivor identity: the remaining entry is for dest=2, flow=0, seq=5
-        auto retransmits = llr->HandleRetryRequest(5, 2, 0);
+        auto retransmits = llr->HandleRetryRequest(5, 2, 0, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 1u, "Survivor (dest=2) retransmitted");
         if (retransmits.size() == 1)
         {
@@ -2040,7 +2041,7 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 1u, "Only dest=2 entry remains after SACK ack on dest=1");
 
         // Survivor identity: the remaining entry is for dest=2, flow=7, seq=3
-        auto retransmits = llr->HandleRetryRequest(3, 2, 7);
+        auto retransmits = llr->HandleRetryRequest(3, 2, 7, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 1u, "Survivor (dest=2, SACK) retransmitted");
         if (retransmits.size() == 1)
         {
@@ -2065,7 +2066,7 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 1u, "dest=3 entry removed, dest=4 remains");
 
         // Survivor identity: the remaining entry is for dest=4, flow=5, seq=42
-        auto retransmits = llr->HandleRetryRequest(42, 4, 5);
+        auto retransmits = llr->HandleRetryRequest(42, 4, 5, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 1u, "Survivor (dest=4) retransmitted");
         if (retransmits.size() == 1)
         {
@@ -2091,7 +2092,7 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 1u, "flow=20 entry still present after flow=10 removal");
 
         // Survivor identity: the remaining entry is for dest=1, flow=20
-        auto retransmits = llr->HandleRetryRequest(1, 1, 20);
+        auto retransmits = llr->HandleRetryRequest(1, 1, 20, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 1u, "Survivor (flow=20) retransmitted");
         if (retransmits.size() == 1)
         {

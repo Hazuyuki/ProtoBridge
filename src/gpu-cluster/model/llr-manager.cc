@@ -241,19 +241,16 @@ LlrManager::RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowI
     std::vector<RetryKey> ackedKeys;
     for (const auto& pair : m_sourceStore)
     {
-        uint32_t entrySeqNum = pair.first & 0xFFFFFFFF;
-        uint16_t entryFlowId = (pair.first >> 32) & 0xFFFF;
-        uint8_t entryVcId = (pair.first >> 48) & 0xFF;
-        uint16_t entryDestRank = pair.first >> 56;
-        if (entryDestRank == destRank && entryFlowId == flowId &&
-            entryVcId == vcId && entrySeqNum <= seqNum)
+        const RetryKey& entryKey = pair.first;
+        if (entryKey.destRank == destRank && entryKey.flowId == flowId &&
+            entryKey.vcId == vcId && entryKey.seqNum <= seqNum)
         {
-            ackedKeys.push_back(pair.first);
+            ackedKeys.push_back(entryKey);
         }
     }
     for (RetryKey key : ackedKeys)
     {
-        m_ackTrace(static_cast<uint32_t>(key), destRank);
+        m_ackTrace(key.seqNum, destRank);
         RemoveOutstandingPacket(key);
     }
 }
@@ -275,7 +272,7 @@ LlrManager::RemoveSackedPackets(const std::unordered_set<uint32_t>& ackedSeqNums
 }
 
 std::vector<LlrManager::Retransmission>
-LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t flowId)
+LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t flowId, uint8_t vcId)
 {
     NS_LOG_FUNCTION(this << seqNum << sourceRank << flowId);
 
@@ -286,14 +283,17 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
     std::vector<RetryKey> keys;
     for (const auto& pair : m_sourceStore)
     {
-        uint32_t entrySeqNum = pair.first & 0xFFFFFFFF;
-        uint16_t entryFlowId = (pair.first >> 32) & 0xFFFF;
-        if (entryFlowId == flowId && entrySeqNum >= seqNum && pair.second.destRank == sourceRank)
+        if (pair.first.flowId == flowId && pair.first.seqNum >= seqNum
+            && pair.second.destRank == sourceRank)
         {
             keys.push_back(pair.first);
         }
     }
-    std::sort(keys.begin(), keys.end());
+    // Sequence order within the flow (GBN retransmits a contiguous suffix).
+    std::sort(keys.begin(), keys.end(),
+              [](const RetryKey& a, const RetryKey& b) {
+                  return a.seqNum < b.seqNum;
+              });
 
     Time orderingDelay = Seconds(0);
     for (RetryKey key : keys)
@@ -304,7 +304,7 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
             continue;
         }
 
-        uint32_t sn = key & 0xFFFFFFFF;
+        uint32_t sn = key.seqNum;
         sourceIt->second.retryCount++;
         if (sourceIt->second.retryCount > m_retryLimit)
         {
@@ -344,7 +344,7 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
                     sn,
                     sourceRank,
                     flowId,
-                    static_cast<uint8_t>((key >> 48) & 0xFF));
+                    key.vcId);
             }
         }
         else
@@ -373,7 +373,7 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
 
 std::vector<LlrManager::Retransmission>
 LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
-                               uint16_t sourceRank, uint16_t flowId)
+                               uint16_t sourceRank, uint16_t flowId, uint8_t vcId)
 {
     NS_LOG_FUNCTION(this << nackSeqNums.size() << sourceRank << flowId);
 
@@ -383,27 +383,12 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
     std::sort(orderedSeqNums.begin(), orderedSeqNums.end());
     for (uint32_t seqNum : orderedSeqNums)
     {
-        // Look up by (seq, dest, flow) with ANY vc: the NACK does not carry
-        // the original packet's vcId, and sequence numbers are per-(dest,vc,flow).
-        // Match the source entry whose key agrees on seq/dest/flow.
-        RetryKey key = 0;
-        auto sourceIt = m_sourceStore.end();
-        for (uint8_t probeVc = 0; probeVc < 255; probeVc++)
-        {
-            auto it = m_sourceStore.find(MakeRetryKey(seqNum, sourceRank, flowId, probeVc));
-            if (it != m_sourceStore.end())
-            {
-                key = MakeRetryKey(seqNum, sourceRank, flowId, probeVc);
-                sourceIt = it;
-                break;
-            }
-        }
-        if (sourceIt == m_sourceStore.end())
-        {
-            // fall back to the legacy vc-less key (vc 0)
-            key = MakeRetryKey(seqNum, sourceRank, flowId);
-            sourceIt = m_sourceStore.find(key);
-        }
+        // The NACK header carries the original packet's VC (SendNack echoes
+        // dataHeader's fields), so look up the exact (seq, dest, flow, vc)
+        // entry directly. The any-VC probe loop this replaces could match the
+        // WRONG VC's entry when two VCs share a flow and seq.
+        RetryKey key = MakeRetryKey(seqNum, sourceRank, flowId, vcId);
+        auto sourceIt = m_sourceStore.find(key);
         if (sourceIt == m_sourceStore.end())
         {
             m_retryMissCount++;
@@ -449,7 +434,7 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
                     seqNum,
                     sourceRank,
                     flowId,
-                    static_cast<uint8_t>((key >> 48) & 0xFF));
+                    key.vcId);
             }
         }
         else
@@ -475,7 +460,7 @@ LlrManager::IsRetryLimitExceeded(uint32_t seqNum) const
 {
     for (const auto& pair : m_sourceStore)
     {
-        if ((pair.first & 0xFFFFFFFF) == seqNum)
+        if (pair.first.seqNum == seqNum)
         {
             return pair.second.retryCount > m_retryLimit;
         }
@@ -662,7 +647,7 @@ LlrManager::OnRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId, 
 
         if (!m_timeoutCallback.IsNull())
         {
-            m_timeoutCallback(seqNum, entry.destRank, flowId);
+            m_timeoutCallback(seqNum, entry.destRank, flowId, key.vcId);
         }
     }
 }
@@ -688,7 +673,7 @@ LlrManager::ReserveSourceReload(uint32_t bytes)
 }
 
 void
-LlrManager::RemoveOutstandingPacket(uint64_t key)
+LlrManager::RemoveOutstandingPacket(const RetryKey& key)
 {
     auto bufferIt = m_retryBuffer.find(key);
     if (bufferIt != m_retryBuffer.end())
@@ -714,22 +699,22 @@ LlrManager::EnforceBufferLimit()
     {
         if (m_overflowPolicy == LlrOverflowPolicy::DROP_OLDEST)
         {
-            // Find the entry with the smallest composite key
-            // (lowest destRank, then flowId, then seqNum)
-            uint64_t oldestKey = UINT64_MAX;
-            for (const auto& pair : m_retryBuffer)
+            // Evict the lowest sequence number (the oldest chunk on the wire
+            // under per-flow sequential seqNums).
+            auto oldestIt = m_retryBuffer.end();
+            for (auto it = m_retryBuffer.begin(); it != m_retryBuffer.end(); ++it)
             {
-                if (pair.first < oldestKey)
+                if (oldestIt == m_retryBuffer.end()
+                    || it->first.seqNum < oldestIt->first.seqNum)
                 {
-                    oldestKey = pair.first;
+                    oldestIt = it;
                 }
             }
-            if (oldestKey == UINT64_MAX) break;
+            if (oldestIt == m_retryBuffer.end()) break;
 
-            auto it = m_retryBuffer.find(oldestKey);
-            if (it != m_retryBuffer.end())
+            auto it = oldestIt;
             {
-                uint32_t evictedSeq = it->first & 0xFFFFFFFF;
+                uint32_t evictedSeq = it->first.seqNum;
                 // Eviction drops the retry-buffer entry — the packet itself
                 // is already on the wire and may still arrive successfully.
                 // Do NOT fire PermanentLossCallback: that would tell the
