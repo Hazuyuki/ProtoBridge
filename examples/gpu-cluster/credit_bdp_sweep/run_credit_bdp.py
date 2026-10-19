@@ -99,7 +99,8 @@ def main():
         if r["simTimeNs"]:
             t_ns = int(r["simTimeNs"])
             r["timeMs"] = f"{t_ns / 1e6:.3f}"
-            r["busBwGbps"] = f"{2 * (n - 1) / n * SIZE * 8 / t_ns / 1e9:.1f}"
+            # bits/ns == Gbps (1 bit/ns = 1e9 bit/s), so no further scaling.
+            r["busBwGbps"] = f"{2 * (n - 1) / n * SIZE * 8 / t_ns:.1f}"
     unlim = {(r["bandwidthGbps"], r["latencyNs"]): r["simTimeNs"]
              for r in rows if r["vcCredits"] == CREDITS[-1]}
     for r in rows:

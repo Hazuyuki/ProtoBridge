@@ -36,8 +36,14 @@ TIMEOUT = 3600
 def run_one(line):
     key, cmd = line.split("\t", 1)
     n, sz, ber, fec, llr, cr = key.split(",")
+    # tree_runs.txt carries the binary path it was generated with (an absolute
+    # path in this checkout). Swap in the PB_BIN resolved from THIS script's
+    # location so the rerun uses the current build, not whatever checkout
+    # happened to generate the command list.
+    args = cmd.split()
+    args[0] = PB_BIN
     try:
-        r = subprocess.run(cmd.split(), capture_output=True, text=True,
+        r = subprocess.run(args, capture_output=True, text=True,
                            timeout=TIMEOUT, cwd=PB_ROOT)
         text = r.stdout + r.stderr
     except subprocess.TimeoutExpired:

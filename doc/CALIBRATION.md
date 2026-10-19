@@ -384,8 +384,8 @@ fit record: `tree_calib.json`.
 
 - Looser than the full-mesh fit (0.10%) and looser than the rejected fill
   form (3.96%): the price of keeping two physical constants. The per-size
-  error is regime-structured (worst single point −41% at N=16/8 MiB —
-  the unmodeled pipeline-fill deficit — and +15% at N=4/256 MiB; N≥32 is
+  error is regime-structured (worst single point −36.29% at N=16/8 MiB —
+  the unmodeled pipeline-fill deficit — and +24% at N=32/1 MiB; N≥32 is
   extrapolation territory, per-N MAPE 15.1%).
 - **Credit convention**: the sweep runs the inline 1-VC fabric model with
   credits unconstrained (`--vcCredits=104857600`) — NOT the profile's
