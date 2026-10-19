@@ -22,7 +22,7 @@ Key derivations (see WHITEBOX_SURROGATE.md for the complete equations):
 
 3. Schedule transfer work:
    T_ring = D(N-1)/(N B_ring)
-   T_tree = D(N-1)/(N B_tree log2(N))
+   T_tree = alpha(N) * D / B_tree     (structural alpha(N) = 1/2/3 by N)
    T_nvls = 2D/B_nvls
 
 4. Shared-resource contention:
@@ -1702,7 +1702,19 @@ def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
     collective, not the algorithm.
     """
     su = make_h200_ring_theory()
-    so = so_factory(**so_overrides)
+    # The So hardware args must shape the So SURROGATE, not just the topology
+    # cap: the RoCE profile's bandwidth constants are the 8-NIC 400GbE
+    # aggregate (ring_bw = 160000 B/us), so a different NIC count or wire rate
+    # rescales them. Without this, 1 vs 8 NICs predicted identically as long
+    # as the topology bisection did not bind.
+    nic_scale = so_links_per_gpu / 8.0
+    wire_scale = so_per_link_gbps / 50.0
+    so_args = dict(so_overrides)
+    so_args.setdefault('num_lanes', so_links_per_gpu)
+    if (nic_scale * wire_scale) != 1.0 and 'ring_bw_bytes_per_us' not in so_args:
+        so_args['ring_bw_bytes_per_us'] = 160000 * nic_scale * wire_scale
+        so_args.setdefault('packet_bw_bytes_per_us', 160000 * nic_scale * wire_scale)
+    so = so_factory(**so_args)
     so_topo = make_topology_from_family(
         so_topology_family, num_nodes,
         links_per_gpu=so_links_per_gpu, per_link_gbps=so_per_link_gbps)

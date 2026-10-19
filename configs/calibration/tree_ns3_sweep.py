@@ -116,13 +116,23 @@ def run_ns3(n, d, timeout=600):
             pass
         proc.communicate()
         return None
+    # Ground truth must be a COMPLETED run: a hung collective reports
+    # status=incomplete with simTimeUs = the 3600 s Simulator::Stop ceiling --
+    # accepting that as a latency would poison the fit.
+    status = None
+    sim_time = None
     for line in out.splitlines():
-        if line.strip().startswith("simTimeUs"):
+        stripped = line.strip()
+        if stripped.startswith("status="):
+            status = stripped.split("=", 1)[1].strip()
+        elif stripped.startswith("simTimeUs"):
             try:
-                return float(line.split("=", 1)[1].strip())
+                sim_time = float(stripped.split("=", 1)[1].strip())
             except (ValueError, IndexError):
                 return None
-    return None
+    if status != "complete" or sim_time is None:
+        return None
+    return sim_time
 
 
 def solve_linear(A, y, w):

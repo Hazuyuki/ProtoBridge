@@ -16,13 +16,22 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Repo root = three levels up from this script (examples/gpu-cluster/<this dir>)
+PB_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 
 # --- load both surrogate forks ---
-sys.path.insert(0, "/share_data/zhuyu/ns-3.47/doc/paper/experiments")
+# The paper fork (parent repo, read-only) provides the OLD tree formula for
+# contrast; its location comes from PB_PAPER_FORK (default: the sibling of
+# PB_ROOT in this workspace). A standalone checkout without the paper fork
+# should set PB_PAPER_FORK or drop the paper-model columns.
+PAPER_FORK = os.environ.get(
+    "PB_PAPER_FORK",
+    os.path.join(os.path.dirname(PB_ROOT), "doc/paper/experiments"))
+sys.path.insert(0, PAPER_FORK)
 import whitebox_surrogate_v2 as paper_v2          # old tree formula (eta_sw)
 
 spec = importlib.util.spec_from_file_location(
-    "pb_v2", "/share_data/zhuyu/ns-3.47/protobridge/surrogate/theory/whitebox_surrogate_v2.py")
+    "pb_v2", os.path.join(PB_ROOT, "surrogate/theory/whitebox_surrogate_v2.py"))
 pb_v2 = importlib.util.module_from_spec(spec)
 sys.modules["pb_v2"] = pb_v2
 spec.loader.exec_module(pb_v2)                    # recalibrated tree (9/18)

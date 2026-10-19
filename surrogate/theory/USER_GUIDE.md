@@ -14,10 +14,11 @@ step model:
 pass `collective=` to `predict()` (`'allreduce'` / `'allgather'` /
 `'alltoall'` / `'sendrecv'`). It is a **required** argument — not inferred from
 the algorithm, so the caller must name the operation explicitly. It is a
-first-principles physical derivation, so for ring/tree/NVLS it is a **lower
-bound** on ns-3 — the full-mesh algorithm is the ns-3-calibrated exception
-(within ~0.1%; see §7 recipe M). Use it for **ordering and trend analysis
-across a design space**, not for absolute single-point prediction.
+first-principles physical derivation fitted to ns-3, not a one-sided bound:
+ring sits below ns-3 in the calibrated range, while tree can sit ABOVE it
+(e.g. +15% at N=4/D=256 MiB — see [CALIBRATION.md](../../doc/CALIBRATION.md)).
+Use it for **ordering and trend analysis across a design space**, not for
+absolute single-point prediction.
 
 ---
 
@@ -520,10 +521,11 @@ h.predict(D, "ring", 128, collective="allreduce")     # ~701.85 us
 The full-mesh algorithm ships its own preset, `make_h200_fullmesh_theory()`,
 whose `fullmesh_bw=449890` is back-fit to the ns-3 `FullMeshAllReduce` /
 `FullMeshAllGather` sweep (η=0.9998 vs the `18×25000` dedicated-bundle
-physics, MAPE 0.10%). Unlike ring/tree/NVLS (wire-rate derivations, which are
-one-sided lower bounds on ns-3), this one is **ground-truth-calibrated to
-ns-3** — a least-squares back-fit that straddles ns-3 within ~0.1% (above at
-some points, below at others), not a one-sided bound. It still omits
+physics, MAPE 0.10%). Unlike ring/tree/NVLS (wire-rate derivations with
+fitted constants — ring runs below ns-3 in the calibrated range, tree can
+run above it), this one is **ground-truth-calibrated to ns-3** — a
+least-squares back-fit that straddles ns-3 within ~0.1% (above at some
+points, below at others). It still omits
 per-packet credit flow, VOQ arbitration and the inter-phase barrier ns-3
 models; the residual is the ~0.1% gap in either direction.
 
@@ -592,8 +594,9 @@ in [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Plain Ethernet”
   topology (`(N-1)/N` ring steps, `log2(N)` tree levels, NVLS N-cancellation).
 
 **Does not (by design):**
-- Model firmware / arbiter / VOQ drain overhead → it is a **lower bound**
-  (a lower bound on ns-3; the theory/ns-3 ratio is credit-sensitive — see
+- Model firmware / arbiter / VOQ drain overhead → the fitted constants absorb
+  them on average, so per-point error is two-sided (ring mostly below ns-3,
+  tree can be above; the theory/ns-3 ratio is credit-sensitive — see
   [CALIBRATION.md](../../doc/CALIBRATION.md)). Use it for ordering/trends, not
   absolutes.
 - The `ber > 0` retransmission path keeps the **construction** bandwidth

@@ -22,7 +22,10 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PB_BIN = "/share_data/zhuyu/ns-3.47/protobridge/build/scratch/ns3.47-gpu-cluster-sim-debug"
+# Repo root = three levels up from this script (examples/gpu-cluster/<this dir>)
+# so the runner works from any checkout location, not just this one.
+PB_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+PB_BIN = os.path.join(PB_ROOT, "build/scratch/ns3.47-gpu-cluster-sim-debug")
 RUNS = os.path.join(HERE, "tree_runs.txt")
 OUT = os.path.join(HERE, "results_tree_rerun.csv")
 
@@ -35,7 +38,7 @@ def run_one(line):
     n, sz, ber, fec, llr, cr = key.split(",")
     try:
         r = subprocess.run(cmd.split(), capture_output=True, text=True,
-                           timeout=TIMEOUT, cwd="/share_data/zhuyu/ns-3.47/protobridge")
+                           timeout=TIMEOUT, cwd=PB_ROOT)
         text = r.stdout + r.stderr
     except subprocess.TimeoutExpired:
         return key, None, "timeout"
