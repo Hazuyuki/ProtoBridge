@@ -498,17 +498,27 @@ class TheoryDerivedSurrogate:
 
     # ---- Shared-resource contention (Phi_share) ----
 
-    def _shared_contention(self, algo, cr, competing_bw, D, N):
+    def _shared_contention(self, algo, cr, competing_bw, D, N, collective=None):
         """Residual-capacity penalty at a shared bottleneck.
 
         ``competing_bw`` is the traffic rate, in GB/s, that uses the same
         bottleneck as the modeled transfer. The expression has no fitted
         contention coefficient.
+
+        The schedule bandwidth must match the serial term it penalizes:
+        alltoall / sendrecv phases serialize over the per-link (ring) rate —
+        their ``predict`` T_serial uses ``ring_bw`` regardless of ``algo`` — so
+        the contention divisor must too, else ``algo='tree'`` undercuts the
+        penalty (rho computed against the faster tree trunk while the transfer
+        actually runs at ring rate).
         """
         if competing_bw <= 0:
             return 1.0
 
-        if algo == 'tree':
+        collective = self._validate_collective(collective)
+        if collective in ('alltoall', 'sendrecv'):
+            schedule_bw = self.ring_bw
+        elif algo == 'tree':
             schedule_bw = self.tree_bw_per_level
         elif algo == 'nvls':
             schedule_bw = self.nvls_bw
@@ -807,7 +817,16 @@ class TheoryDerivedSurrogate:
             bdp = self._bdp(num_gpus, algo, collective)
             window = min(credits, bdp) if bdp != float('inf') else credits
             delay_per_error = window * self.chunk_size / self.BW_link
-            lam = P_chunk / (1 - P_chunk) / delay_per_error if P_chunk < 1 else 1e6
+            # Exponential tail approximating the geometric retry cascade: the
+            # expected extra delay is (P/(1-P)) * delay_per_error (retries per
+            # success), so the exponential rate is its reciprocal:
+            # lam = (1-P)/P / delay_per_error. The old P/(1-P) form inverted
+            # the dependence -- a HIGHER loss probability produced a SHORTER
+            # tail (p99 shrank 19680 -> 382 us as BER rose 1.1e-7 -> 2e-6).
+            if P_chunk < 1:
+                lam = (1.0 - P_chunk) / P_chunk / delay_per_error
+            else:
+                lam = 1e-6  # every chunk fails: tail diverges
             p_target = (percentile / 100) ** (1 / steps)
             step_tail = -math.log(1 - p_target) / lam
             return mean + steps * step_tail
@@ -905,7 +924,7 @@ class TheoryDerivedSurrogate:
             if fec_enabled and include_fec else 1.0)
         Phi_share = (
             self._shared_contention(
-                algo, credits, competing_bw, data_bytes, num_gpus)
+                algo, credits, competing_bw, data_bytes, num_gpus, collective)
             if include_contention else 1.0)
 
         if strict_reliability and llr_enabled and retry_limit is not None:
@@ -1123,8 +1142,14 @@ def make_h200_roce_theory(**overrides):
         tree_bw_per_level_bytes_per_us=275400,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=1.0,
-        credit_bdp_ring_packets=91.5,
-        credit_bdp_tree_packets=35.5,
+        # Credit-UNCONSTRAINED: the ns-3 So (inter-node) path bypasses the
+        # per-VC credit gate (SendBulkWireTransferSize's IsLocalRank guard --
+        # scale-out traffic is governed by ECN/DCQCN or VOQ tail-drop + LLR,
+        # not credits), so the So stage must not inherit the NVLink credit
+        # BDP. float('inf') disables _credit_pressure on the ring path (the
+        # tree BDP below is unused: the So schedule is the inter-node ring).
+        credit_bdp_ring_packets=float('inf'),
+        credit_bdp_tree_packets=float('inf'),
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=8,
@@ -1172,8 +1197,11 @@ def make_h200_ethernet_theory(**overrides):
         tree_bw_per_level_bytes_per_us=275400,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=3.0,
-        credit_bdp_ring_packets=91.5,
-        credit_bdp_tree_packets=35.5,
+        # Credit-UNCONSTRAINED -- same reason as the RoCE profile (the ns-3 So
+        # path bypasses VC credits; plain Ethernet So is governed by VOQ
+        # tail-drop + LLR retransmit).
+        credit_bdp_ring_packets=float('inf'),
+        credit_bdp_tree_packets=float('inf'),
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=8,

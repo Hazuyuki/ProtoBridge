@@ -178,7 +178,11 @@ Phi_credit = max(1, C_bdp / C)
 The ratio `C / C_bdp` is the fraction of path bandwidth sustainable by the
 credit window. The current H200 profile uses 91.5 packets for ring and 35.5
 packets for tree. NVLS does not apply the endpoint credit factor in the
-evaluated profile.
+evaluated profile. The scale-out (So) presets (`make_h200_roce_theory`,
+`make_h200_ethernet_theory`) pin both BDPs to infinity: the ns-3 So
+(inter-node) path bypasses the per-VC credit gate — scale-out traffic is
+governed by ECN/DCQCN or VOQ tail-drop + LLR, not credits — so the So stage
+must not inherit the NVLink credit window.
 
 ## 5. FEC
 
