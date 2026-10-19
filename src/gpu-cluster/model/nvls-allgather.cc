@@ -61,10 +61,17 @@ NvlsAllGather::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
+    // Per-GPU chunk: dataSize / numGpus, but the N chunks must sum to exactly
+    // dataSize — floor() alone loses dataSize % numGpus bytes when it doesn't
+    // divide evenly (N=3, D=100 sent 33 bytes per GPU = 99 total, and
+    // completion waits for all 100). Give the first (dataSize % numGpus) GPUs
+    // one extra byte so the chunks sum to dataSize.
     m_chunkSize = dataSize / numGpus;
+    m_remainder = dataSize % numGpus;
     if (m_chunkSize == 0)
     {
         m_chunkSize = 1; // minimum chunk size
+        m_remainder = 0; // chunk already >= dataSize/N; no extra bytes to add
     }
 
     m_gpuBroadcastReceivedBytes.resize(numGpus, 0);
@@ -136,11 +143,14 @@ NvlsAllGather::TriggerSendPhase()
             continue;
         }
 
-        std::vector<uint8_t> data(m_chunkSize, 0xAB);
+        // First (dataSize % numGpus) GPUs carry one extra byte so the chunks
+        // sum to exactly dataSize (see Initialize).
+        uint64_t chunk = m_chunkSize + (gpu < m_remainder ? 1 : 0);
+        std::vector<uint8_t> data(chunk, 0xAB);
         m_endpoints[gpu]->SendCollective(FabricPacketType::ALLGATHER, 0,
-                                          data.data(), m_chunkSize);
+                                          data.data(), chunk);
 
-        NS_LOG_DEBUG("GPU " << gpu << " sent " << m_chunkSize
+        NS_LOG_DEBUG("GPU " << gpu << " sent " << chunk
                      << " bytes to switch for NVLS AllGather");
     }
 }

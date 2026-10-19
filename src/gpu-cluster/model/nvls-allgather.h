@@ -63,6 +63,7 @@ class NvlsAllGather : public CollectiveInjector
     uint16_t m_numGpus;
     uint64_t m_dataSize;
     uint64_t m_chunkSize;  // dataSize / numGpus
+    uint64_t m_remainder;  // dataSize % numGpus: first m_remainder GPUs send 1 extra byte so chunks sum to dataSize
     uint16_t m_flowId;
 
     NvlsAllGatherState m_state;
