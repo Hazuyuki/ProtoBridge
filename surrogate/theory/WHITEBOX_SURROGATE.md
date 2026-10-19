@@ -28,10 +28,10 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduc
 | `b_link_bytes_per_us` | single NVLink unidirectional wire rate | 25000 |
 | `num_lanes` | NVLink links per GPU | 18 |
 | `algo` | ring / tree / nvls / fullmesh | — |
-| `eta_ring`, `eta_tree`, `eta_nvls`, `eta_fullmesh` (optional, defaulted) | efficiency factors | 0.40 / 1.05 / 1.20 / 1.0 |
+| `eta_ring`, `eta_tree`, `eta_nvls`, `eta_fullmesh` (optional, defaulted) | efficiency factors | 0.40 / 0.61 / 1.20 / 1.0 |
 
 Derived bandwidths: `ring_bw = packet_bw = eta_ring * B_agg`,
-`tree_bw = (B_agg / num_lanes) * eta_tree`, `nvls_bw = eta_nvls * B_agg`
+`tree_bw = eta_tree * B_agg`, `nvls_bw = eta_nvls * B_agg`
 (all within 2% of the calibrated H200 values; the efficiency factors are
 N-independent — N enters only the collective topology in `predict()`, see
 Section 3 and Section 11).
@@ -116,7 +116,7 @@ The current H200 profile uses:
 | Schedule | Effective transfer quantity |
 |---|---:|
 | Ring | 177,000 bytes/us |
-| Tree | 26,250 bytes/us per active level |
+| Tree | 275,400 bytes/us per active level (ns-3-calibrated trunk; 0.61 × B_agg) |
 | NVLS | 535,500 bytes/us aggregate work bandwidth |
 
 Ring uses link propagation for `T_fixed`. Tree uses the switched-path pipeline
@@ -138,14 +138,18 @@ explicitly (omitting it raises `TypeError`; an invalid name raises `ValueError`)
 | `collective` | `algorithm` | `steps` | `B_step` (bytes/step) | per-GPU volume |
 |---|---|---:|---|---|
 | `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
-| `allreduce` | `tree` | `2⌊log₂N⌋` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allreduce` | `tree` | `2⌊log₂N⌋` | `α(N)·D / steps` | `α(N)·D` |
 | `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
 | `alltoall` | `ring` / `collnetdirect` | `N-1` | `D/N` | `D(N-1)/N` |
 | `alltoall` | `tree` | `⌈log₂N⌉` | `D(N-1)/N / steps` | `D(N-1)/N` |
 | `sendrecv` | any | `1` | `D` | `D` (single hop) |
 
 AllReduce scatters `D(N-1)/N` per GPU over its `2(N-1)` ring steps
-(reduce-scatter + all-gather); AllGather via NVLS multicast moves `D/N` per
+(reduce-scatter + all-gather); the tree's per-step volume is `α(N)·D/steps`
+with the STRUCTURAL trunk-load `α(N)` = 1/2/3 (N≤2 single edge / N≤4 root
+with two children / N≥5 interior node — the busiest GPU↔switch trunk of the
+heap-shaped chunk-pipelined tree; zero free parameters, the tree analogue of
+ring's (N-1)/N); AllGather via NVLS multicast moves `D/N` per
 step over 2 steps; AlltoAll permutes `D(N-1)/N` per GPU — the volume
 correction the DSE analytical model (`bw_model_predict`) describes in comments
 but does not apply. The AlltoAll step count is `N-1` permutation phases
@@ -313,13 +317,14 @@ efficiency factors, with no per-bandwidth calibration:
 ```text
 B_agg = num_lanes * b_link                       (per-GPU NVLink aggregate)
 ring_bw = packet_bw = eta_ring * B_agg           ~0.40 (AllReduce algorithm bw)
-tree_bw = (B_agg / num_lanes) * eta_tree         ~1.05 (one link + NCCL/FEC, ~= n/k)
+tree_bw = eta_tree * B_agg                       ~0.61 (ns-3 back-fit 275,400 = 0.61 x B_agg)
 nvls_bw = eta_nvls * B_agg                       ~1.20 (NVSwitch multicast gain)
 ```
 
 For H200 (b_link = 25,000 B/us, num_lanes = 18, B_agg = 450,000), the
-defaults eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20 yield ring/packet =
-180,000 (calibrated 177,000, +1.7%), tree = 26,250 (exact), nvls = 540,000
+defaults eta_ring=0.40, eta_tree=0.61, eta_nvls=1.20 yield ring/packet =
+180,000 (calibrated 177,000, +1.7%), tree = 274,500 (ns-3-calibrated
+275,400, -0.3%), nvls = 540,000
 (calibrated 535,500, +0.8%) -- all within 2%. The ring-bus bandwidth
 2(N-1)/N * alBw = 0.69 * B_agg falls in NCCL's typical 60-80% utilization
 band, anchoring eta_ring in physics rather than as a fit coefficient. The

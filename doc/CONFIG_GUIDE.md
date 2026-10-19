@@ -274,7 +274,9 @@ per-run flags):
 bandwidthGbps           = 170     # 8-GPU effective per-link (375 GB/s / 18 lanes)
 latencyNs               = 400
 numLanes                = 18
-linksPerGpu             = 1
+linksPerGpu             = 18      # TRUE H200 fabric: separate p2p GPU<->NVSwitch
+                                 # NVLink4 lanes @ 170 Gbps, spray-routed (the
+                                 # retired linksPerGpu=1 collapsed them into one pipe)
 sprayChunkSize          = 131072
 switchVoqDepth          = 10000
 switchArbIntervalNs     = 100
