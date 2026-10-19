@@ -702,11 +702,13 @@ class TheoryDerivedSurrogate:
     def _step_variance(self, T_step, D, N, algo, cr, ber, competing_bw, llr_enabled,
                        fec_enabled=False, fec_n=None, fec_k=None, fec_t=None,
                        retry_mode='gobackn', retry_buffer_entries=None,
-                       collective=None):
+                       optical_fraction=1.0, collective=None):
         """Per-step delay variance from retransmission + queuing.
 
         Uses post-FEC BER when FEC is enabled (variance from corrected errors
         is near-zero; only uncorrectable errors trigger retransmission).
+        BER is scaled by optical_fraction to mirror predict()'s retransmission
+        arm: only the optical (error-bearing) fraction of traffic retries.
 
         Pipeline absorption factor: the Binomial variance K*p*(1-p)*Δ²
         computes the FULL retransmission delay variance, but only a fraction
@@ -725,6 +727,7 @@ class TheoryDerivedSurrogate:
         collective = self._validate_collective(collective)
         effective_ber = (self._post_fec_ber(ber, fec_n, fec_k, fec_t)
                          if fec_enabled else ber)
+        effective_ber *= min(1.0, max(0.0, optical_fraction))
         if effective_ber <= 0 and competing_bw <= 0:
             return 0.0
 
@@ -810,13 +813,18 @@ class TheoryDerivedSurrogate:
                                         credits, ber, competing_bw, llr_enabled,
                                         fec_enabled, fec_n, fec_k, fec_t,
                                         retry_mode, retry_buffer_entries,
-                                        collective=collective)
+                                        optical_fraction, collective)
 
         if var_step <= 0:
             return mean
 
+        # Scale BER by the optical (error-bearing) fraction, mirroring
+        # predict()'s retransmission arm (line ~962): with optical_fraction=0
+        # there are no error-bearing hops, so the tail must collapse to the
+        # BER-zero value, not inherit the full-BER retry cascade.
         effective_ber = (self._post_fec_ber(ber, fec_n, fec_k, fec_t)
                          if fec_enabled else ber)
+        effective_ber *= min(1.0, max(0.0, optical_fraction))
         bits_per_chunk = self.chunk_size * 8
         P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk if effective_ber > 0 else 0
         # The heavy-tail branch models a RETRANSMISSION cascade (expected
@@ -947,9 +955,16 @@ class TheoryDerivedSurrogate:
                 bsec)
             if include_contention else 1.0)
 
-        if strict_reliability and llr_enabled and retry_limit is not None:
+        if strict_reliability and retry_limit is not None:
+            # With LLR disabled there is no retransmission machinery: every
+            # lost packet is permanent on its first attempt, whatever
+            # retry_limit says (the effective attempt count is 1). The old
+            # `and llr_enabled` gate skipped this check entirely for LLR-off
+            # fabrics, letting a run with dozens of expected permanent losses
+            # report a finite completion time.
+            eff_retry_limit = retry_limit if llr_enabled else 0
             expected_losses = self.expected_permanent_losses(
-                data_bytes, num_gpus, algo, ber, retry_limit,
+                data_bytes, num_gpus, algo, ber, eff_retry_limit,
                 fec_enabled and include_fec, fec_n, fec_k, fec_t,
                 optical_fraction, optical_hops, collective)
             if expected_losses >= 0.5:
