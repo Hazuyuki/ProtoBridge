@@ -82,10 +82,8 @@ MultiNodeTopologyHelper::CreateInterNodeSwitch(Ptr<Node>& switchNode)
     NS_ASSERT(sw);
     sw->SetVoqDepth(m_switchVoqDepth);
     sw->SetArbitrationInterval(m_switchArbIntervalNs);
-    if (m_switchCutThroughDelayNs > 0)
-    {
-        sw->SetCutThroughDelay(m_switchCutThroughDelayNs);
-    }
+    // 0 is the store-and-forward selector, not "keep default": always apply.
+    sw->SetCutThroughDelay(m_switchCutThroughDelayNs);
     if (m_arbiter)
     {
         sw->SetArbiter(m_arbiter);
@@ -376,10 +374,7 @@ MultiNodeTopologyHelper::BuildIntraNodeSwitched(uint32_t nodeId, NodeInfo& info)
 
     info.nvSwitch->SetVoqDepth(m_switchVoqDepth);
     info.nvSwitch->SetArbitrationInterval(m_switchArbIntervalNs);
-    if (m_switchCutThroughDelayNs > 0)
-    {
-        info.nvSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
-    }
+    info.nvSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
     if (m_arbiter)
     {
         info.nvSwitch->SetArbiter(m_arbiter);
@@ -570,10 +565,7 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
             NS_ASSERT(hostSwitch);
             hostSwitch->SetVoqDepth(m_switchVoqDepth);
             hostSwitch->SetArbitrationInterval(m_switchArbIntervalNs);
-            if (m_switchCutThroughDelayNs > 0)
-            {
-                hostSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
-            }
+            hostSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
             if (m_arbiter)
             {
                 hostSwitch->SetArbiter(m_arbiter);
@@ -664,10 +656,7 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
         NS_ASSERT(leafSwitch);
         leafSwitch->SetVoqDepth(m_switchVoqDepth);
         leafSwitch->SetArbitrationInterval(m_switchArbIntervalNs);
-        if (m_switchCutThroughDelayNs > 0)
-        {
-            leafSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
-        }
+        leafSwitch->SetCutThroughDelay(m_switchCutThroughDelayNs);
         if (m_arbiter)
         {
             leafSwitch->SetArbiter(m_arbiter);

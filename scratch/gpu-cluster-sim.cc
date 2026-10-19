@@ -1079,7 +1079,9 @@ main(int argc, char* argv[])
         multiTopo.SetVcCredits(effectiveVcCredits);
         multiTopo.SetSwitchVoqDepth(switchVoqDepth);
         multiTopo.SetSwitchArbInterval(switchArbIntervalNs);
-        if (switchCutThroughDelayNs > 0) { multiTopo.SetSwitchCutThroughDelay(switchCutThroughDelayNs); }
+        // Always forward the value: 0 is the documented store-and-forward
+        // selector (NvSwitch falls back to Send()), not "leave default".
+        multiTopo.SetSwitchCutThroughDelay(switchCutThroughDelayNs);
         // Select the crossbar arbitration strategy (default roundrobin is the
         // NvSwitch's built-in default, so only override for a non-default type).
         if (arbiterType != "roundrobin" && !arbiterType.empty())
