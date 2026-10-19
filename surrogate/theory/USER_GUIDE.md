@@ -376,7 +376,7 @@ how the Su and So stages compose:
 | `collective` | Decomposition | So-stage volume |
 |---|---|---|
 | `allreduce` | Su(rs) + So(rs) + So(ag) + Su(ag) — 4 phases | `D/n_su` (per-node reduced chunk) |
-| `allgather` | Su(ag) + So(ag) — 2 phases (ns-3 `Complete()` fires at end of inter-node AG; no third local broadcast) | full `D` (each GPU exchanges the gathered node buffer `D/n_su` with its `n_so−1` peers: `D·(n_so−1)/n_so` per GPU) |
+| `allgather` | Su(ag) + So(ag) — 2 phases (ns-3 `Complete()` fires at end of inter-node AG; no third local broadcast) | full `D` (each GPU exchanges the gathered node buffer `D/n_so` with its `n_so−1` peers: `D·(n_so−1)/n_so` per GPU) |
 | `alltoall` | Su + So — 2 phases | full `D` (each GPU sends its `D/(n_su·n_so)` chunk to every GPU on the other nodes: `D·(n_so−1)/n_so` per GPU; the Su stage moves `D/n_so` total — the local-peer share `D·(n_su−1)/(n_su·n_so)` per GPU) |
 | `sendrecv` | So only — 1 phase | no Su stage (single inter-node hop) |
 

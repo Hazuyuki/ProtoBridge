@@ -200,7 +200,9 @@ Both ride the same 400GbE L2 wire; the difference is the congestion contract:
   `ChunkSize=9KiB` (jumbo MTU, smaller than RoCE's bulk path).
 - **`VoqDropThreshold < VoqDepth` invariant**: the lossy-NACK path must fire
   before the base `NvSwitch` hard-cap drop (else the loss is silent). The sim
-  wires `VoqDepth=1024` with `VoqDropThreshold=8` (default) for the ETH path.
+  wires `VoqDepth=10000` (the `--switchVoqDepth` default; the helper
+  applies it to every So switch, superseding the construction-time fallback)
+  with `VoqDropThreshold=8` (default) for the ETH path.
 - **LLR is required** (a fabric precondition, like RoCE's ECN/PFC infra):
   `--interNodeFabricType=ETH` forces `llrEnabled=1` on **both** the endpoint
   sender (so `StorePacket` populates the retry buffer and `ProcessNackPacket`
