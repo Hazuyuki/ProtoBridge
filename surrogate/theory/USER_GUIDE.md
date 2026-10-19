@@ -376,8 +376,8 @@ how the Su and So stages compose:
 | `collective` | Decomposition | So-stage volume |
 |---|---|---|
 | `allreduce` | Su(rs) + So(rs) + So(ag) + Su(ag) — 4 phases | `D/n_su` (per-node reduced chunk) |
-| `allgather` | Su(ag) + So(ag) — 2 phases (ns-3 `Complete()` fires at end of inter-node AG; no third local broadcast) | `D/n_su` (per-node gathered buffer) |
-| `alltoall` | Su + So — 2 phases | full `D` |
+| `allgather` | Su(ag) + So(ag) — 2 phases (ns-3 `Complete()` fires at end of inter-node AG; no third local broadcast) | full `D` (each GPU exchanges the gathered node buffer `D/n_su` with its `n_so−1` peers: `D·(n_so−1)/n_so` per GPU) |
+| `alltoall` | Su + So — 2 phases | full `D` (each GPU sends its `D/(n_su·n_so)` chunk to every GPU on the other nodes: `D·(n_so−1)/n_so` per GPU; the Su stage moves `D/n_so` total — the local-peer share `D·(n_su−1)/(n_su·n_so)` per GPU) |
 | `sendrecv` | So only — 1 phase | no Su stage (single inter-node hop) |
 
 Worked examples (non-H200) are recipes J/K/L below.
@@ -497,7 +497,7 @@ so = TheoryDerivedSurrogate(packet_bw_bytes_per_us=40000, ring_bw_bytes_per_us=4
 so_topo = make_topology_from_family("so_fullmesh", N=4, links_per_gpu=4, per_link_gbps=25.0)
 h = HierarchicalSurrogate(su, so, gpus_per_node=6, num_nodes=4, so_topology=so_topo)
 h.predict(D, "ring", 128, collective="allreduce")     # ~450.39 us
-h.predict(D, "ring", 128, collective="allgather")     # ~165.41 us
+h.predict(D, "ring", 128, collective="allgather")     # ~413.76 us
 ```
 
 ### L. Hierarchical — reuse a non-H200 preset as the Su stage

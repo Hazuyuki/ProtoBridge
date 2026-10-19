@@ -881,11 +881,16 @@ class TheoryDerivedSurrogate:
             T_serial_step = per_step / min(self.ring_bw, bsec)
         # AlltoAll partner phases and Send-Recv single hops are ONE-HOP
         # transfers: each phase ships its bytes over one link at that link's
-        # serial rate. The tree/NVLS bandwidth forms above describe their own
-        # collective structures (per-level trunk / N-fold multicast
+        # serial rate and pays the single-hop fixed latency (lat + extra hops),
+        # exactly as _one_hop_step_time (used by predict_tail) models them.
+        # The tree/NVLS forms above describe their own collective structures
+        # (the tree's per-level T_min_switch pipeline, NVLS's N-fold multicast
         # amplification) and must NOT apply — with algo='nvls' a sendrecv
-        # would otherwise scale its single-hop latency by N.
+        # would otherwise scale its single-hop latency by N, and with
+        # algo='tree' it would inherit the multi-level switch pipeline's fixed
+        # cost.
         if resolved in ('alltoall', 'sendrecv'):
+            T_fixed_step = self.lat + (hop - 1.0) * self.lat
             T_serial_step = per_step / min(self.ring_bw, bsec)
         # RoCEv2 (and any L3 fabric) pays per-transfer header overhead: the
         # sender serializes data/wire_efficiency wire bytes (ceil(data/0.95) in
@@ -1627,11 +1632,16 @@ class HierarchicalSurrogate:
     per-node reduced chunk ``D/n_su`` (after intra-node reduce-scatter each
     node holds ``D/n_su``, matching ``ns-3 hierarchical-allreduce.cc``); the
     allgather first intra-node stage gathers the per-node share ``D/n_so``
-    (each GPU starts with ``D/N``) and its inter-node stage then exchanges the
-    full node buffers ``D/n_so`` across nodes so every GPU ends with the full
-    ``D`` — two phases, matching ``ns-3 hierarchical-allgather.cc`` whose
-    ``Complete()`` fires at the end of ``INTER_ALLGATHER`` (no third local
-    broadcast); alltoall ships the full ``D`` on both
+    (each GPU starts with ``D/N``) while its inter-node stage allgathers the
+    FULL ``D`` across the n_so same-local-rank groups (each GPU exchanges the
+    node buffer D/n_so with each of its n_so-1 peers: per-GPU So volume
+    D*(n_so-1)/n_so) — two phases, matching ``ns-3 hierarchical-allgather.cc``
+    whose ``Complete()`` fires at the end of ``INTER_ALLGATHER`` (no third
+    local broadcast); alltoall ships ``D*(n_su-1)/n_su`` on the Su stage and
+    ``D*(n_so-1)/n_so`` on the So stage (the hierarchical shuffle routes each
+    GPU's (N-1)/N share through its node: the local share to local peers, the
+    remote share via the node's exit GPU), matching
+    ``ns-3 hierarchical-alltoall.cc``.
     stages. Each stage's bus-factor volume ``D_phase*(N-1)/N`` then comes from
     the ring per-step model. ``collective`` is a REQUIRED keyword-only argument
     to ``predict`` (never inferred from ``algo``), consistent with
@@ -1671,9 +1681,17 @@ class HierarchicalSurrogate:
                 data_bytes, self.n_so, algo, credits, collective='sendrecv',
                 topology=self.so_topology, **kw)
         if collective == 'alltoall':
-            # 2-phase: local shuffle across n_su GPUs, then inter-node
-            # permutation across n_so nodes (each a full alltoall).
-            return (self.su.predict(data_bytes, self.n_su, algo, credits,
+            # 2-phase, matching ns-3 hierarchical-alltoall.cc: every GPU
+            # starts with the per-GPU chunk D/(n_su*n_so) (dataSize/numGpus).
+            # Su phase: each GPU sends its chunk to its n_su-1 local peers —
+            # per-GPU volume D*(n_su-1)/(n_su*n_so), which is what an alltoall
+            # of data D/n_so over n_su GPUs models. So phase: each GPU sends
+            # its chunk to ALL GPUs on the other nodes (n_so-1 nodes x n_su
+            # GPUs) — per-GPU volume D*(n_so-1)/n_so, i.e. a full alltoall of
+            # the FULL D across n_so "super-participants" (each GPU's egress
+            # is its node's exit trunk).
+            su_chunk = data_bytes // self.n_so
+            return (self.su.predict(su_chunk, self.n_su, algo, credits,
                                    collective='alltoall', **kw)
                     + self.so.predict(data_bytes, self.n_so, algo, credits,
                                       collective='alltoall',
@@ -1695,15 +1713,18 @@ class HierarchicalSurrogate:
         # allgather (2-phase): local AG -> inter-node AG, matching
         # ns-3 hierarchical-allgather.cc (Complete() fires at the end of
         # INTER_ALLGATHER). Phase 1 gathers the per-node share D/n_so
-        # intra-node (each GPU starts with D/N) so each GPU holds its node's
-        # full buffer D/n_so; phase 2 has every GPU exchange that node buffer
-        # with its same-local-rank peers on the other nodes
-        # (D/n_so from each of the n_so-1 peers), so every GPU ends with the
-        # full D — no third local-broadcast phase.
+        # intra-node (each GPU starts with D/N; the ring model's D for that
+        # stage is the gathered node buffer D/n_so). Phase 2 is an allgather
+        # across the n_so same-local-rank groups where the gathered buffer is
+        # the FULL D: each GPU exchanges the node buffer D/n_so with each of
+        # its n_so-1 remote peers, per-GPU So volume D*(n_so-1)/n_so — the
+        # ring model must get the FULL data_bytes here, not the node share
+        # (passing node_share would divide by n_so twice). No third
+        # local-broadcast phase.
         node_share = data_bytes // self.n_so
         return (self._phase(node_share, self.n_su, self.su, algo, 'ag',
                             credits, None, 'allgather', **kw)
-                + self._phase(node_share, self.n_so, self.so, algo, 'ag',
+                + self._phase(data_bytes, self.n_so, self.so, algo, 'ag',
                               credits, self.so_topology, 'allgather', **kw))
 
 
