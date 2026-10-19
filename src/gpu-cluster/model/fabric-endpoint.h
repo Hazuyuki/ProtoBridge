@@ -463,6 +463,17 @@ class FabricEndpoint : public Application
     void ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header);
 
     /**
+     * @brief In bypass mode, run strict-GBN acceptance / duplicate suppression
+     *        on a DATA packet and deliver it if it passes.
+     *
+     * Shared by ProcessDataPacket and ProcessProtocolDataPacket (the latter
+     * after payload extraction) so protocol-aware packets get the same
+     * duplicate/GBN guards as raw ones. Returns true if the packet was
+     * handled here (delivered, discarded as a duplicate, or NAKed).
+     */
+    bool DeliverBypassDataPacket(Ptr<Packet> packet, const FabricHeader& header);
+
+    /**
      * @brief Process a credit packet
      * @param packet The packet
      * @param header The fabric header
@@ -530,7 +541,8 @@ class FabricEndpoint : public Application
      * @param flowId Flow ID
      * @return Pointer to the reorder buffer
      */
-    Ptr<ReorderBuffer> GetOrCreateReorderBuffer(uint8_t vcId, uint16_t flowId);
+    Ptr<ReorderBuffer> GetOrCreateReorderBuffer(uint8_t vcId, uint16_t flowId,
+                                                uint16_t sourceRank = 0);
 
     private:
     bool ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packet,
@@ -618,7 +630,7 @@ class FabricEndpoint : public Application
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
     Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
     Ptr<RttccRateMachine> m_rttccRate{nullptr}; ///< RTTCC rate machine (So-only; null=dormant)
-    std::unordered_map<uint32_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(VC,flowId) reorder buffers, key=(vcId<<16)|flowId
+    std::unordered_map<uint64_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(sourceRank,VC,flowId) reorder buffers, key=(srcRank<<32)|(vcId<<16)|flowId
 
     // Send queue
     std::queue<SendQueueEntry> m_sendQueue;         ///< Pending send queue

@@ -1070,9 +1070,14 @@ FabricEndpoint::GetAsyncMemLatencyNs() const
 }
 
 Ptr<ReorderBuffer>
-FabricEndpoint::GetOrCreateReorderBuffer(uint8_t vcId, uint16_t flowId)
+FabricEndpoint::GetOrCreateReorderBuffer(uint8_t vcId, uint16_t flowId, uint16_t sourceRank)
 {
-    uint32_t key = (static_cast<uint32_t>(vcId) << 16) | (flowId & 0xFFFF);
+    // Key includes the SOURCE rank: sequence numbers are per-sender, so two
+    // senders hitting the same (vc, flow) on one receiver would otherwise
+    // share a reorder buffer and each discard the other's seq 0 as a
+    // duplicate.
+    uint64_t key = (static_cast<uint64_t>(sourceRank) << 32) |
+                   (static_cast<uint32_t>(vcId) << 16) | (flowId & 0xFFFF);
     auto it = m_reorderBuffers.find(key);
     if (it != m_reorderBuffers.end())
     {
@@ -1339,7 +1344,8 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         uint8_t vcId = header.GetVirtualChannel();
         uint16_t flowId = header.GetFlowId();
         uint32_t lostSeqNum = header.GetSequenceNumber();
-        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
+        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                         header.GetSourceRank());
         rb->MarkPermanentGap(lostSeqNum, header);
         rb->DeliverReadyPackets();
     }
@@ -1451,7 +1457,8 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
         }
         else
         {
-            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
+            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                             header.GetSourceRank());
             rb->MarkPermanentGap(lostSeqNum, header);
             rb->DeliverReadyPackets();
         }
@@ -1508,102 +1515,112 @@ FabricEndpoint::ProcessDataPacket(Ptr<Packet> packet, const FabricHeader& header
     // Bypass reorder buffer for direct links (no multi-path reordering needed)
     if (m_bypassReorderBuffer)
     {
-        uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
-                           (static_cast<uint64_t>(flowId) << 32) |
-                           header.GetSourceRank();
-
-        // Strict So go-back-N: in-order-only acceptance, like a real IB
-        // responder in GBN mode. Exactly one NAK per gap; everything after
-        // the gap is discarded (no delivery, no ACK, no state), so blanket
-        // retransmits are real work, not cheap duplicates. Lost NAKs are
-        // covered by the sender's retry-timer backstop.
-        if (IsStrictGbnFlow(header))
-        {
-            uint32_t seq = header.GetSequenceNumber();
-            uint32_t& expected = m_strictNextExpected[flowKey];
-            if (seq == expected)
-            {
-                expected++;
-                // Consume any permanently-lost seqs immediately following
-                auto pl = m_strictPermLost.find(flowKey);
-                if (pl != m_strictPermLost.end())
-                {
-                    while (pl->second.erase(expected) > 0)
-                    {
-                        expected++;
-                    }
-                    if (pl->second.empty())
-                    {
-                        m_strictPermLost.erase(pl);
-                    }
-                }
-                m_strictNakPending.erase(flowKey);
-                OnPacketDelivered(packet, seq, header);
-            }
-            else if (seq < expected)
-            {
-                // Duplicate of an already-delivered seq: its ACK may have
-                // been lost, so re-ACK (So flows owe no credit, task #29).
-                SendLlrAckPacket(header, false);
-            }
-            else
-            {
-                // Gap: discard, and NAK the missing seq once per gap.
-                m_bypassReorderEvents++;
-                auto nak = m_strictNakPending.find(flowKey);
-                if (nak == m_strictNakPending.end() || nak->second != expected)
-                {
-                    m_strictNakPending[flowKey] = expected;
-                    SendStrictGbnNak(header, expected);
-                }
-            }
-            return;
-        }
-
-        // Track out-of-order arrivals even in bypass mode
-        auto it = m_bypassNextExpectedSeq.find(flowKey);
-        if (it != m_bypassNextExpectedSeq.end())
-        {
-            if (header.GetSequenceNumber() != it->second)
-            {
-                m_bypassReorderEvents++;
-            }
-        }
-        m_bypassNextExpectedSeq[flowKey] = header.GetSequenceNumber() + 1;
-
-        // Skip duplicate delivery from GBN retransmission
-        auto deliveredKey = std::make_pair(flowKey, header.GetSequenceNumber());
-        if (m_bypassDelivered.count(deliveredKey))
-        {
-            NS_LOG_DEBUG("Bypass mode: skipping duplicate seq=" << header.GetSequenceNumber()
-                         << " flowKey=" << flowKey);
-            SendLlrAckPacket(header, false);
-            // Still return credit for the retransmitted packet
-            FabricPacketType pktType = header.GetPacketType();
-            if (pktType == FabricPacketType::DATA ||
-                pktType == FabricPacketType::P2P ||
-                header.IsCollectivePacket())
-            {
-                SendCreditPacket(header.GetSourceRank(),
-                                 vcId,
-                                 1,
-                                 header.GetSequenceNumber(),
-                                 header.GetFlowId());
-            }
-            return;
-        }
-        m_bypassDelivered.insert(deliveredKey);
-
-        // Deliver packet directly to callback
-        OnPacketDelivered(packet, header.GetSequenceNumber(), header);
+        DeliverBypassDataPacket(packet, header);
     }
     else
     {
-        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
+        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                         header.GetSourceRank());
         rb->Insert(header.GetSequenceNumber(), packet, header);
         rb->DeliverReadyPackets();
     }
 
+}
+
+bool
+FabricEndpoint::DeliverBypassDataPacket(Ptr<Packet> packet, const FabricHeader& header)
+{
+    uint8_t vcId = header.GetVirtualChannel();
+    uint16_t flowId = header.GetFlowId();
+    uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
+                       (static_cast<uint64_t>(flowId) << 32) |
+                       header.GetSourceRank();
+
+    // Strict So go-back-N: in-order-only acceptance, like a real IB
+    // responder in GBN mode. Exactly one NAK per gap; everything after
+    // the gap is discarded (no delivery, no ACK, no state), so blanket
+    // retransmits are real work, not cheap duplicates. Lost NAKs are
+    // covered by the sender's retry-timer backstop.
+    if (IsStrictGbnFlow(header))
+    {
+        uint32_t seq = header.GetSequenceNumber();
+        uint32_t& expected = m_strictNextExpected[flowKey];
+        if (seq == expected)
+        {
+            expected++;
+            // Consume any permanently-lost seqs immediately following
+            auto pl = m_strictPermLost.find(flowKey);
+            if (pl != m_strictPermLost.end())
+            {
+                while (pl->second.erase(expected) > 0)
+                {
+                    expected++;
+                }
+                if (pl->second.empty())
+                {
+                    m_strictPermLost.erase(pl);
+                }
+            }
+            m_strictNakPending.erase(flowKey);
+            OnPacketDelivered(packet, seq, header);
+        }
+        else if (seq < expected)
+        {
+            // Duplicate of an already-delivered seq: its ACK may have
+            // been lost, so re-ACK (So flows owe no credit, task #29).
+            SendLlrAckPacket(header, false);
+        }
+        else
+        {
+            // Gap: discard, and NAK the missing seq once per gap.
+            m_bypassReorderEvents++;
+            auto nak = m_strictNakPending.find(flowKey);
+            if (nak == m_strictNakPending.end() || nak->second != expected)
+            {
+                m_strictNakPending[flowKey] = expected;
+                SendStrictGbnNak(header, expected);
+            }
+        }
+        return true;
+    }
+
+    // Track out-of-order arrivals even in bypass mode
+    auto it = m_bypassNextExpectedSeq.find(flowKey);
+    if (it != m_bypassNextExpectedSeq.end())
+    {
+        if (header.GetSequenceNumber() != it->second)
+        {
+            m_bypassReorderEvents++;
+        }
+    }
+    m_bypassNextExpectedSeq[flowKey] = header.GetSequenceNumber() + 1;
+
+    // Skip duplicate delivery from GBN retransmission
+    auto deliveredKey = std::make_pair(flowKey, header.GetSequenceNumber());
+    if (m_bypassDelivered.count(deliveredKey))
+    {
+        NS_LOG_DEBUG("Bypass mode: skipping duplicate seq=" << header.GetSequenceNumber()
+                     << " flowKey=" << flowKey);
+        SendLlrAckPacket(header, false);
+        // Still return credit for the retransmitted packet
+        FabricPacketType pktType = header.GetPacketType();
+        if (pktType == FabricPacketType::DATA ||
+            pktType == FabricPacketType::P2P ||
+            header.IsCollectivePacket())
+        {
+            SendCreditPacket(header.GetSourceRank(),
+                             vcId,
+                             1,
+                             header.GetSequenceNumber(),
+                             header.GetFlowId());
+        }
+        return true;
+    }
+    m_bypassDelivered.insert(deliveredKey);
+
+    // Deliver packet directly to callback
+    OnPacketDelivered(packet, header.GetSequenceNumber(), header);
+    return true;
 }
 
 void
@@ -2637,13 +2654,18 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
 
         uint64_t minChunks = sendDevices.size();
         uint64_t sizeBasedChunks = (wireSize + m_sprayChunkSize - 1) / m_sprayChunkSize;
-        uint64_t numChunks = std::max(minChunks, sizeBasedChunks);
         // Coalesce bulk transfers while retaining at least one chunk per path.
         // Total wire bytes and path striping are unchanged. Queue and credit
         // events occur at this coarser granularity, so this API is reserved for
         // bulk-transfer timing rather than fine-grained contention tests.
+        // numChunks is bounded by wireSize: the spray (one chunk per path) and
+        // the bulk-chunk cap (no chunk above MAX_CHUNK_BYTES) both raise the
+        // count, but never above one 1-byte chunk per wire byte — otherwise
+        // trailing per-lane fragments compute sizes past the transfer end
+        // (wireSize - offset underflows) and emit zero/phantom data bytes.
         uint64_t memCapChunks = (wireSize + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
-        numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
+        uint64_t numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
+        numChunks = std::min(numChunks, std::max<uint64_t>(wireSize, 1));
         uint64_t wireChunkSize = (wireSize + numChunks - 1) / numChunks;
         uint64_t dataChunkSize = (dataSize + numChunks - 1) / numChunks;
 
@@ -2673,6 +2695,10 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                 desc.fragmentDataSize = static_cast<uint32_t>(
                     std::min(dataChunkSize, dataSize - dataOffset));
                 desc.chunkIndex = static_cast<uint32_t>(i);
+                if (desc.wireChunk == 0 && desc.fragmentDataSize == 0)
+                {
+                    continue; // trailing lane-pad fragment past the transfer end
+                }
                 desc.deviceIndex = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
                 desc.stamp = stampSoHeader && (desc.wireChunk > soHeaderSize);
                 m_bulkTxQueue.push_back(desc);
@@ -2686,13 +2712,17 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         for (uint64_t i = 0; i < numChunks; i++)
         {
             uint64_t wireOffset = i * wireChunkSize;
+            if (wireOffset >= wireSize)
+            {
+                continue; // trailing lane-pad fragment past the transfer end
+            }
             uint32_t thisWireChunk = static_cast<uint32_t>(
                 std::min(wireChunkSize, wireSize - wireOffset));
 
             // Ensure fragment effectiveDataSize sums to original dataSize
             uint64_t dataOffset = i * dataChunkSize;
             uint32_t fragmentDataSize = static_cast<uint32_t>(
-                std::min(dataChunkSize, dataSize - dataOffset));
+                dataOffset < dataSize ? std::min(dataChunkSize, dataSize - dataOffset) : 0);
 
             uint64_t seqKey = MakeSeqKey(destRank, vcId, flowId);
             uint32_t seqNum = m_nextSeqNum[seqKey]++;
@@ -2750,11 +2780,16 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                 for (uint64_t j = i + 1; j < numChunks; j++)
                 {
                     uint64_t remWireOffset = j * wireChunkSize;
+                    if (remWireOffset >= wireSize)
+                    {
+                        continue; // trailing lane-pad fragment past the transfer end
+                    }
                     uint32_t remWireChunk = static_cast<uint32_t>(
                         std::min(wireChunkSize, wireSize - remWireOffset));
                     uint64_t remDataOffset = j * dataChunkSize;
                     uint32_t remFragmentData = static_cast<uint32_t>(
-                        std::min(dataChunkSize, dataSize - remDataOffset));
+                        remDataOffset < dataSize
+                            ? std::min(dataChunkSize, dataSize - remDataOffset) : 0);
                     uint64_t remSeqKey = MakeSeqKey(destRank, vcId, flowId);
                     uint32_t remSeqNum = m_nextSeqNum[remSeqKey]++;
 
@@ -2951,13 +2986,16 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
 
         if (m_bypassReorderBuffer)
         {
-            // Deliver directly
-            OnPacketDelivered(dataPacket, header.GetSequenceNumber(), header);
+            // Same bypass pipeline as raw DATA packets: strict-GBN acceptance
+            // and duplicate suppression (a retransmitted So segment must not
+            // deliver twice).
+            DeliverBypassDataPacket(dataPacket, header);
         }
         else
         {
             // Use reorder buffer
-            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
+            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                             header.GetSourceRank());
             rb->Insert(header.GetSequenceNumber(), dataPacket, header);
             rb->DeliverReadyPackets();
         }

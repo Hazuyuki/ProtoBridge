@@ -66,6 +66,11 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         {
             numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
         }
+        // Bound the chunk count by the transfer size: the one-chunk-per-link
+        // spray can otherwise produce trailing fragments whose offset is past
+        // the buffer end (size - offset underflows; Create<Packet> would read
+        // out of bounds). Never more than one 1-byte chunk per data byte.
+        numChunks = std::min(numChunks, std::max<uint32_t>(size, 1));
         uint32_t chunkSize = (size + numChunks - 1) / numChunks;
 
         NS_LOG_INFO("Fragmenting " << size << " bytes to dest " << destRank
@@ -75,6 +80,10 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         for (uint32_t i = 0; i < numChunks; i++)
         {
             uint32_t offset = i * chunkSize;
+            if (offset >= size)
+            {
+                continue; // trailing lane-pad fragment past the buffer end
+            }
             uint32_t thisChunkSize = std::min(chunkSize, size - offset);
 
             // Generate sequence number for each chunk
@@ -114,6 +123,10 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 for (uint32_t j = i + 1; j < numChunks; j++)
                 {
                     uint32_t remOffset = j * chunkSize;
+                    if (remOffset >= size)
+                    {
+                        continue; // trailing lane-pad fragment past the buffer end
+                    }
                     uint32_t remChunkSize = std::min(chunkSize, size - remOffset);
                     uint64_t remSeqKey = MakeSeqKey(destRank, vcId, flowId);
                     uint32_t remSeqNum = m_nextSeqNum[remSeqKey]++;
