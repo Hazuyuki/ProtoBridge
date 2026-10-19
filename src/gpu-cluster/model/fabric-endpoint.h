@@ -511,6 +511,17 @@ class FabricEndpoint : public Application
      * @param header The fabric header
      */
     void ProcessNackPacket(Ptr<Packet> packet, const FabricHeader& header);
+    /**
+     * @brief Handle a PERMANENT_LOSS notice from the sender.
+     *
+     * The retransmit budget for header.GetSequenceNumber() is exhausted; the
+     * sender already returned the credit in NotifyPermanentLoss. Strict GBN
+     * flows advance their expected counter past the lost seq (parking
+     * out-of-order notices); reorder-buffer flows mark a permanent gap and
+     * release everything parked below it. Shared by the FEC and non-FEC
+     * receive paths.
+     */
+    void ProcessPermanentLossNotice(const FabricHeader& header);
     void OnLlrRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId);
     void DispatchRetransmissions(const std::vector<LlrManager::Retransmission>& retransmissions);
     void ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header);

@@ -1349,16 +1349,7 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         // PERMANENT_LOSS from sender: mark seqNum as permanently lost.
         // Sender already returned the credit in NotifyPermanentLoss, so
         // we do NOT call ProcessCreditPacket here (no credit to return).
-        // Pass the PERMANENT_LOSS header (which carries original metadata:
-        // effectiveDataSize, flowId, etc.) to the reorder buffer so the
-        // permanent-gap callback can propagate terminal progress.
-        uint8_t vcId = header.GetVirtualChannel();
-        uint16_t flowId = header.GetFlowId();
-        uint32_t lostSeqNum = header.GetSequenceNumber();
-        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
-                                                         header.GetSourceRank());
-        rb->MarkPermanentGap(lostSeqNum, header);
-        rb->DeliverReadyPackets();
+        ProcessPermanentLossNotice(header);
     }
     else if (header.GetPacketType() == FabricPacketType::CNP)
     {
@@ -1392,6 +1383,61 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
     }
 
     return true;
+}
+
+void
+FabricEndpoint::ProcessPermanentLossNotice(const FabricHeader& header)
+{
+    // PERMANENT_LOSS from sender: the retransmit budget for this sequence
+    // number is exhausted and the sender has already returned the credit in
+    // NotifyPermanentLoss, so there is no credit to hand back here. Advance
+    // terminal progress so the receiver does not stall waiting for a seq that
+    // will never arrive.
+    uint8_t vcId = header.GetVirtualChannel();
+    uint16_t flowId = header.GetFlowId();
+    uint32_t lostSeqNum = header.GetSequenceNumber();
+    if (IsStrictGbnFlow(header))
+    {
+        // Strict So GBN keeps its own per-flow expected counter instead of a
+        // reorder buffer: advance past the lost seq (or park it for
+        // consumption when expected catches up).
+        uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
+                           (static_cast<uint64_t>(flowId) << 32) |
+                           header.GetSourceRank();
+        uint32_t& expected = m_strictNextExpected[flowKey];
+        if (lostSeqNum == expected)
+        {
+            expected++;
+            auto pl = m_strictPermLost.find(flowKey);
+            if (pl != m_strictPermLost.end())
+            {
+                while (pl->second.erase(expected) > 0)
+                {
+                    expected++;
+                }
+                if (pl->second.empty())
+                {
+                    m_strictPermLost.erase(pl);
+                }
+            }
+            m_strictNakPending.erase(flowKey);
+        }
+        else if (lostSeqNum > expected)
+        {
+            m_strictPermLost[flowKey].insert(lostSeqNum);
+        }
+    }
+    else
+    {
+        // Reorder-buffer flows: mark the gap and release everything below it
+        // that is still parked. The header carries the original data packet's
+        // metadata (effectiveDataSize, flowId, ...) so the permanent-gap
+        // callback can propagate terminal progress.
+        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                         header.GetSourceRank());
+        rb->MarkPermanentGap(lostSeqNum, header);
+        rb->DeliverReadyPackets();
+    }
 }
 
 void
@@ -1429,50 +1475,10 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
     }
     else if (header.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
     {
-        // Sender already returned the credit in NotifyPermanentLoss.
-        // Pass the PERMANENT_LOSS header with original metadata for
-        // terminal progress propagation.
-        uint8_t vcId = header.GetVirtualChannel();
-        uint16_t flowId = header.GetFlowId();
-        uint32_t lostSeqNum = header.GetSequenceNumber();
-        if (IsStrictGbnFlow(header))
-        {
-            // Strict So GBN keeps its own per-flow expected counter instead
-            // of a reorder buffer: advance past the lost seq (or park it for
-            // consumption when expected catches up).
-            uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
-                               (static_cast<uint64_t>(flowId) << 32) |
-                               header.GetSourceRank();
-            uint32_t& expected = m_strictNextExpected[flowKey];
-            if (lostSeqNum == expected)
-            {
-                expected++;
-                auto pl = m_strictPermLost.find(flowKey);
-                if (pl != m_strictPermLost.end())
-                {
-                    while (pl->second.erase(expected) > 0)
-                    {
-                        expected++;
-                    }
-                    if (pl->second.empty())
-                    {
-                        m_strictPermLost.erase(pl);
-                    }
-                }
-                m_strictNakPending.erase(flowKey);
-            }
-            else if (lostSeqNum > expected)
-            {
-                m_strictPermLost[flowKey].insert(lostSeqNum);
-            }
-        }
-        else
-        {
-            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
-                                                             header.GetSourceRank());
-            rb->MarkPermanentGap(lostSeqNum, header);
-            rb->DeliverReadyPackets();
-        }
+        // Sender already returned the credit in NotifyPermanentLoss. Shared
+        // with the non-FEC receive path: strict GBN advances its expected
+        // counter, reorder-buffer flows mark a permanent gap.
+        ProcessPermanentLossNotice(header);
     }
     else if (header.GetPacketType() == FabricPacketType::CNP)
     {
@@ -1914,8 +1920,17 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
         // Release a TX-window slot exactly once per chunk: only when this ACK
         // actually purges an outstanding store entry (duplicate ACKs from GBN
         // blanket retransmits find the store already purged and don't
-        // over-release).
-        bool wasOutstanding = m_soTxWindow > 0 &&
+        // over-release) AND the ACKed send actually occupied a window slot.
+        // The bulk TX window gates only remote (So) fragments — the ACK's
+        // source rank is the destination the data was sent to — so an ACK for
+        // a local (Su) send must NOT release a window slot: with
+        // soTxWindow=1 and local DATA flowing beside remote bulk, a local
+        // ACK would dispatch the next remote fragment while the previous one
+        // is still in flight (two outstanding under a one-fragment limit).
+        // The IsLocalRank(sourceRank) predicate mirrors the windowing gate
+        // in SendBulkWireTransferSize (m_soTxWindow > 0 && !IsLocalRank).
+        const bool ackIsForRemoteSend = !IsLocalRank(header.GetSourceRank());
+        bool wasOutstanding = m_soTxWindow > 0 && ackIsForRemoteSend &&
             m_llrManager->HasOutstandingPacket(header.GetSequenceNumber(),
                                                header.GetSourceRank(),
                                                header.GetFlowId(),
@@ -2059,18 +2074,27 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
         }
     }
 
-    // Return credits for MEMORY_READ, MEMORY_WRITE, and MEMORY_RESP.
-    // All three consume fabric bandwidth and credits on the send side.
+    // Return credits for MEMORY_READ, MEMORY_WRITE, and MEMORY_RESP — only
+    // when the sender actually consumed one. Local (Su) sources consume a
+    // credit on send; remote (So) memory packets bypass the credit gate
+    // (SendMemoryWrite/SendMemoryResponse's IsLocalRank guard), so returning
+    // a credit for one would grow the remote sender's pool it never drew
+    // from — and an over-returned credit releases an unrelated queued local
+    // packet early. IsLocalRank(sourceRank) is the mirror of the send-side
+    // guards; single-node endpoints keep every source local -> unchanged.
     if (type == FabricPacketType::MEMORY_READ ||
         type == FabricPacketType::MEMORY_WRITE ||
         type == FabricPacketType::MEMORY_RESP)
     {
-        uint8_t vcId = header.GetVirtualChannel();
-        SendCreditPacket(header.GetSourceRank(),
-                         vcId,
-                         1,
-                         header.GetSequenceNumber(),
-                         header.GetFlowId());
+        if (IsLocalRank(header.GetSourceRank()))
+        {
+            uint8_t vcId = header.GetVirtualChannel();
+            SendCreditPacket(header.GetSourceRank(),
+                             vcId,
+                             1,
+                             header.GetSequenceNumber(),
+                             header.GetFlowId());
+        }
     }
 }
 
@@ -3038,11 +3062,30 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
                  << " wireSize=" << packet->GetSize()
                  << " effectiveSize=" << effectiveSize);
 
-    // Check if this protocol has no overhead
+    // Check if this protocol has no overhead. Deliver directly through the
+    // receive pipeline (reorder buffer / bypass delivery) — do NOT recurse
+    // through ProcessDataPacket: it re-reads the protocol byte and, whenever
+    // the vendor id overlaps a non-trivial NcclProtocol value (MCCL's SIMPLE
+    // is 1 == NcclProtocol::LL), dispatches straight back here, recursing
+    // until the stack overflows. protocolId 0 (NONE) never reaches this
+    // function (ProcessDataPacket passes only LL/LL128 ids through), so this
+    // arm handles exactly the vendor-SIMPLE ids.
     double efficiency = GetProtocolModelForDest(header.GetSourceRank())->GetEfficiency(protocolId);
     if (efficiency >= 1.0)
     {
-        ProcessDataPacket(packet, header);
+        uint8_t vcId = header.GetVirtualChannel();
+        uint16_t flowId = header.GetFlowId();
+        if (m_bypassReorderBuffer)
+        {
+            DeliverBypassDataPacket(packet, header);
+        }
+        else
+        {
+            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                             header.GetSourceRank());
+            rb->Insert(header.GetSequenceNumber(), packet, header);
+            rb->DeliverReadyPackets();
+        }
         return;
     }
 
