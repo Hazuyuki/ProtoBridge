@@ -738,7 +738,8 @@ def test_hierarchical_decomposition_additive():
 
 
 def test_hierarchical_allgather_cheaper_than_allreduce():
-    """Allgather is 3-phase (one fewer So pass) so it is cheaper than the
+    """Allgather is 2-phase (Su ag + So ag, no final local broadcast — ns-3
+    Complete() fires at the end of INTER_ALLGATHER) so it is cheaper than the
     4-phase allreduce on the same fabric."""
     D = 1 << 24
     h = wb.make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=4)

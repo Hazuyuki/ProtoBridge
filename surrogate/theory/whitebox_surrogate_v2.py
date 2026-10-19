@@ -292,6 +292,20 @@ class TheoryDerivedSurrogate:
         else:
             return extra_lat + self.lat + per_step / min(self.ring_bw, bsec)
 
+    def _one_hop_step_time(self, per_step, N, algo, topology=None, collective=None):
+        """Per-step time for AlltoAll partner phases and Send-Recv single hops.
+
+        Each phase ships its bytes over one link at the per-link serial rate
+        (the ring-schedule bandwidth), regardless of ``algo``: the tree/NVLS
+        bandwidth forms describe their own collective structures (per-level
+        trunk / N-fold multicast amplification) and must NOT apply to a
+        one-hop transfer.
+        """
+        bsec = (topology.bisection_bw_bytes_per_us
+                if topology is not None else float('inf'))
+        hop = topology.hop_count if topology is not None else 1.0
+        return (hop - 1.0) * self.lat + self.lat + per_step / min(self.ring_bw, bsec)
+
     # ---- Credit pressure (Phi_credit) ----
 
     def _credit_pressure(self, D, N, algo, cr, collective=None):
@@ -403,10 +417,22 @@ class TheoryDerivedSurrogate:
         )
 
     def _retry_buffer_capacity_entries(self, retry_buffer_entries=None,
-                                       retry_buffer_bytes=None):
+                                       retry_buffer_bytes=None,
+                                       fragment_bytes=None):
+        """Entry capacity of a byte-capped retry buffer.
+
+        ``retry_buffer_bytes`` limits how many RETAINED FRAGMENTS the buffer
+        holds, so the conversion divides by the fragment size the transfer
+        actually uses (``fragment_bytes``, defaulting to the spray chunk
+        size) — not by the 128 KiB spray size unconditionally. Retained
+        fragments can be as large as the 8 MiB coalesced chunks (or the
+        whole transfer when it fits one fragment), and dividing by the wrong
+        size over- or under-counts the reload penalty.
+        """
         if retry_buffer_bytes is None:
             return retry_buffer_entries
-        byte_limited_entries = max(0, int(retry_buffer_bytes // self.chunk_size))
+        frag = self.chunk_size if fragment_bytes is None else fragment_bytes
+        byte_limited_entries = max(0, int(retry_buffer_bytes // frag))
         if retry_buffer_entries is None:
             return byte_limited_entries
         return min(retry_buffer_entries, byte_limited_entries)
@@ -735,7 +761,9 @@ class TheoryDerivedSurrogate:
         if competing_bw is None:
             competing_bw = mem_bw
         retry_buffer_entries = self._retry_buffer_capacity_entries(
-            retry_buffer_entries, retry_buffer_bytes)
+            retry_buffer_entries, retry_buffer_bytes,
+            self._packet_bytes_per_transfer(
+                data_bytes, num_gpus, algo, collective))
         mean = self.predict(
             data_bytes, num_gpus, algo, credits, ber=ber, mem_bw=mem_bw,
             startup_us=startup_us, fec_enabled=fec_enabled,
@@ -748,9 +776,13 @@ class TheoryDerivedSurrogate:
         if not math.isfinite(mean):
             return mean
         steps = self._steps(num_gpus, algo, collective)
-        T_step = self._step_time(
+        T_step = self._one_hop_step_time(
             self._per_step(data_bytes, num_gpus, algo, steps, collective),
-            num_gpus, algo, topology, collective)
+            num_gpus, algo, topology, collective) \
+            if self._validate_collective(collective) in ('alltoall', 'sendrecv') \
+            else self._step_time(
+                self._per_step(data_bytes, num_gpus, algo, steps, collective),
+                num_gpus, algo, topology, collective)
         var_step = self._step_variance(T_step, data_bytes, num_gpus, algo,
                                         credits, ber, competing_bw, llr_enabled,
                                         fec_enabled, fec_n, fec_k, fec_t,
@@ -818,7 +850,9 @@ class TheoryDerivedSurrogate:
         if competing_bw is None:
             competing_bw = mem_bw
         retry_buffer_entries = self._retry_buffer_capacity_entries(
-            retry_buffer_entries, retry_buffer_bytes)
+            retry_buffer_entries, retry_buffer_bytes,
+            self._packet_bytes_per_transfer(
+                data_bytes, num_gpus, algo, collective))
         optical_fraction = min(1.0, max(0.0, optical_fraction))
         resolved = self._validate_collective(collective)
         S = startup_us if startup_us is not None else (
@@ -844,6 +878,14 @@ class TheoryDerivedSurrogate:
             T_serial_step = per_step / min(self.fullmesh_bw, bsec)
         else:
             T_fixed_step = self.lat + (hop - 1.0) * self.lat
+            T_serial_step = per_step / min(self.ring_bw, bsec)
+        # AlltoAll partner phases and Send-Recv single hops are ONE-HOP
+        # transfers: each phase ships its bytes over one link at that link's
+        # serial rate. The tree/NVLS bandwidth forms above describe their own
+        # collective structures (per-level trunk / N-fold multicast
+        # amplification) and must NOT apply — with algo='nvls' a sendrecv
+        # would otherwise scale its single-hop latency by N.
+        if resolved in ('alltoall', 'sendrecv'):
             T_serial_step = per_step / min(self.ring_bw, bsec)
         # RoCEv2 (and any L3 fabric) pays per-transfer header overhead: the
         # sender serializes data/wire_efficiency wire bytes (ceil(data/0.95) in
@@ -1576,7 +1618,7 @@ class HierarchicalSurrogate:
     of a single pass):
 
       allreduce (4-phase): L = L_su(rs) + L_so(rs) + L_so(ag) + L_su(ag)
-      allgather (3-phase): L = L_su(ag) + L_so(ag) + L_su(ag)
+      allgather (2-phase): L = L_su(ag) + L_so(ag)
       alltoall  (2-phase): L = L_su(alltoall) + L_so(alltoall)
       sendrecv          : L = L_so(sendrecv)  (single inter-node hop, no Su stage)
 
@@ -1585,8 +1627,11 @@ class HierarchicalSurrogate:
     per-node reduced chunk ``D/n_su`` (after intra-node reduce-scatter each
     node holds ``D/n_su``, matching ``ns-3 hierarchical-allreduce.cc``); the
     allgather first intra-node stage gathers the per-node share ``D/n_so``
-    (each GPU starts with ``D/N``) while its inter-node stage and final
-    broadcast move the full ``D``; alltoall ships the full ``D`` on both
+    (each GPU starts with ``D/N``) and its inter-node stage then exchanges the
+    full node buffers ``D/n_so`` across nodes so every GPU ends with the full
+    ``D`` — two phases, matching ``ns-3 hierarchical-allgather.cc`` whose
+    ``Complete()`` fires at the end of ``INTER_ALLGATHER`` (no third local
+    broadcast); alltoall ships the full ``D`` on both
     stages. Each stage's bus-factor volume ``D_phase*(N-1)/N`` then comes from
     the ring per-step model. ``collective`` is a REQUIRED keyword-only argument
     to ``predict`` (never inferred from ``algo``), consistent with
@@ -1647,17 +1692,19 @@ class HierarchicalSurrogate:
                                   credits, self.so_topology, 'allreduce', **kw)
                     + self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
                                   credits, None, 'allreduce', **kw))
-        # allgather (3-phase): local AG -> inter-node AG -> local AG.
-        # Phase 1 gathers the per-node share D/n_so intra-node (each GPU
-        # starts with D/N); phase 2 gathers the full D across nodes; phase 3
-        # broadcasts the full D within the node.
+        # allgather (2-phase): local AG -> inter-node AG, matching
+        # ns-3 hierarchical-allgather.cc (Complete() fires at the end of
+        # INTER_ALLGATHER). Phase 1 gathers the per-node share D/n_so
+        # intra-node (each GPU starts with D/N) so each GPU holds its node's
+        # full buffer D/n_so; phase 2 has every GPU exchange that node buffer
+        # with its same-local-rank peers on the other nodes
+        # (D/n_so from each of the n_so-1 peers), so every GPU ends with the
+        # full D — no third local-broadcast phase.
         node_share = data_bytes // self.n_so
         return (self._phase(node_share, self.n_su, self.su, algo, 'ag',
                             credits, None, 'allgather', **kw)
-                + self._phase(data_bytes, self.n_so, self.so, algo, 'ag',
-                              credits, self.so_topology, 'allgather', **kw)
-                + self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
-                              credits, None, 'allgather', **kw))
+                + self._phase(node_share, self.n_so, self.so, algo, 'ag',
+                              credits, self.so_topology, 'allgather', **kw))
 
 
 def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,

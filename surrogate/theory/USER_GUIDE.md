@@ -376,7 +376,7 @@ how the Su and So stages compose:
 | `collective` | Decomposition | So-stage volume |
 |---|---|---|
 | `allreduce` | Su(rs) + So(rs) + So(ag) + Su(ag) — 4 phases | `D/n_su` (per-node reduced chunk) |
-| `allgather` | Su(ag) + So(ag) + Su(ag) — 3 phases | `D` (full) on inter-node + final |
+| `allgather` | Su(ag) + So(ag) — 2 phases (ns-3 `Complete()` fires at end of inter-node AG; no third local broadcast) | `D/n_su` (per-node gathered buffer) |
 | `alltoall` | Su + So — 2 phases | full `D` |
 | `sendrecv` | So only — 1 phase | no Su stage (single inter-node hop) |
 
@@ -497,7 +497,7 @@ so = TheoryDerivedSurrogate(packet_bw_bytes_per_us=40000, ring_bw_bytes_per_us=4
 so_topo = make_topology_from_family("so_fullmesh", N=4, links_per_gpu=4, per_link_gbps=25.0)
 h = HierarchicalSurrogate(su, so, gpus_per_node=6, num_nodes=4, so_topology=so_topo)
 h.predict(D, "ring", 128, collective="allreduce")     # ~450.39 us
-h.predict(D, "ring", 128, collective="allgather")     # ~540.76 us
+h.predict(D, "ring", 128, collective="allgather")     # ~165.41 us
 ```
 
 ### L. Hierarchical — reuse a non-H200 preset as the Su stage
