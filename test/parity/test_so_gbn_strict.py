@@ -11,20 +11,30 @@ Su (NVLink) traffic is never affected — the gate requires a remote source
 rank.
 
 Three pinned cases on the SRNIC Fig. 11 sweep scenario (RoCE tor 100G,
-16 MiB, 4 KB chunks, seed 1):
+16 MiB, 4 KB chunks, seed 1). Baselines are pinned at the TRUE H200 fabric
+convention (h200-ll128.profile linksPerGpu=18, the 1fb92ba re-anchor): the
+cfg sources the profile, so the 18-lane spray intra-node fabric is under
+these pins even though the transfer itself is inter-node (the So path
+crosses node-0's NVSwitch, where spray reordering changes which arrivals
+count as out-of-order):
 
 * ``test_default_off_legacy_pin`` — without the flag, the lossy GBN run is
-  byte-identical to the pre-strict behavior (w=16, plr=1e-2:
-  simTimeNs=3185174, retx=918). A regression here means the strict branch
-  leaks into the default path.
-* ``test_strict_lossless_baseline`` — strict ON at plr=0 matches the legacy
-  lossless baseline (2521509 ns, retx=0): with no loss every packet arrives
-  in order, so strict acceptance is inert.
+  byte-identical to the pre-strict behavior at this fabric (w=16, plr=1e-2:
+  simTimeNs=2602110, retx=108; spray reordering makes blanket retransmits
+  near-free duplicates, so the legacy count is LOWER than strict's). A
+  regression here means the strict branch leaks into the default path.
+* ``test_strict_lossless_baseline`` — strict ON at plr=0 (retx=165 > 0):
+  spray reordering alone produces out-of-order arrivals on the 18-lane
+  NVSwitch path even with zero loss, so strict acceptance legitimately
+  discards and retransmits some packets in-order. The pin is the
+  deterministic RngRun=1 value; a change means the acceptance semantics
+  shifted.
 * ``test_strict_lossy_pin`` — strict ON at plr=1e-2 (w=64 = the calibrated
   rewind span): completes with permLoss=0, real retransmission work
-  (retx=3029 > legacy's cheap 918 at the same loss), and the pinned
-  simTimeNs=4276850 — the degradation that brings the GBN arm near the
-  measured CX-6 curve (norm 0.580 vs 0.467 at 1%).
+  (retx=478 -- in-order-only acceptance discards spray-reordered arrivals
+  rather than keeping them as cheap duplicates, and the lossless reordering
+  tail adds to the 1% loss volume), and the pinned simTimeNs=5156136 --
+  the degradation that brings the GBN arm near the measured CX-6 curve.
 
 Run:
     python3 -m pytest test/parity/test_so_gbn_strict.py -v
@@ -94,34 +104,35 @@ def run_gbn(tx_window, plr, strict, timeout=600):
 def test_default_off_legacy_pin():
     fields, out = run_gbn(tx_window=16, plr="1e-2", strict=False)
     assert fields.get("status") == "complete", out[-500:]
-    assert fields.get("simTimeNs") == 3185174, (
-        "default-off GBN lossy run changed: simTimeNs={} != 3185174 "
-        "(strict branch leaking into the default path?)".format(
-            fields.get("simTimeNs")))
-    assert fields.get("retransmittedPackets") == 918, fields
+    assert fields.get("simTimeNs") == 2602110, (
+        "default-off GBN lossy run changed: simTimeNs={} != 2602110 "
+        "(strict branch leaking into the default path, or the fabric "
+        "convention moved under the pin?)".format(fields.get("simTimeNs")))
+    assert fields.get("retransmittedPackets") == 108, fields
     assert fields.get("permanentLosses") == 0, fields
 
 
 def test_strict_lossless_baseline():
     fields, out = run_gbn(tx_window=64, plr="0", strict=True)
     assert fields.get("status") == "complete", out[-500:]
-    assert fields.get("simTimeNs") == 2521509, (
-        "strict-on lossless baseline changed: simTimeNs={} != 2521509 "
-        "(strict acceptance must be inert with in-order arrivals)".format(
-            fields.get("simTimeNs")))
-    assert fields.get("retransmittedPackets") == 0, fields
+    assert fields.get("simTimeNs") == 2263080, (
+        "strict-on lossless baseline changed: simTimeNs={} != 2263080 "
+        "(strict acceptance semantics shifted)".format(fields.get("simTimeNs")))
+    # Spray reordering on the 18-lane NVSwitch path produces out-of-order
+    # arrivals even at plr=0, so strict GBN legitimately retransmits here.
+    assert fields.get("retransmittedPackets") == 165, fields
 
 
 def test_strict_lossy_pin():
     fields, out = run_gbn(tx_window=64, plr="1e-2", strict=True)
     assert fields.get("status") == "complete", out[-500:]
     assert fields.get("permanentLosses") == 0, fields
-    assert fields.get("retransmittedPackets") == 3029, (
-        "strict-on retransmission volume changed: retx={} != 3029 "
+    assert fields.get("retransmittedPackets") == 478, (
+        "strict-on retransmission volume changed: retx={} != 478 "
         "(discard/NAK-per-gap semantics regressed?)".format(
             fields.get("retransmittedPackets")))
-    assert fields.get("simTimeNs") == 4276850, (
-        "strict-on lossy pin changed: simTimeNs={} != 4276850".format(
+    assert fields.get("simTimeNs") == 5156136, (
+        "strict-on lossy pin changed: simTimeNs={} != 5156136".format(
             fields.get("simTimeNs")))
 
 

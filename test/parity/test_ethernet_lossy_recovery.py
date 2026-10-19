@@ -31,6 +31,13 @@ Two cases, mirroring the two ``--llrRetryLimit`` regimes documented in the
   (``--llrRetryLimit=1`` is too aggressive -- it stalls at the 3600s ceiling
   rather than degrading gracefully -- so 8 is the documented contrast point.)
 
+ dataSize note: pinned at 4 MiB since the 1fb92ba linksPerGpu=18 fabric
+ re-anchor (the cfg's profile builds the 18-lane spray fabric, whose much
+wider intra-node trunk absorbs the old 256 KiB burst before the dest-port
+VOQ fills -- at 256 KiB the incast barely registers, switchVoqDrops=1, and
+no retry limit exhausts). 4 MiB restores the intended congestion pressure
+(drops=86 at rlim=64, permLoss=27 with graceful completion at rlim=8).
+
 Run:
     python3 -m pytest test/parity/test_ethernet_lossy_recovery.py -v
     python3 test/parity/test_ethernet_lossy_recovery.py
@@ -76,7 +83,7 @@ def run_incast(llr_retry_limit, timeout=600):
         "--ber=0",
         "--packetLossRate=0",
         "--protocolConfig=" + INCAST_CFG,
-        "--dataSize=262144",
+        "--dataSize=4194304",
         "--RngRun=1",
     ]
     if binary:

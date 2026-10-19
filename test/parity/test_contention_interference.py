@@ -27,11 +27,17 @@ Pinned values (deterministic, ``--RngRun=1``; re-pin on an intentional model
 change, the way ``test_so_hierarchical_regression.py`` pins its parity triple):
 
 * multi-node, 2-node RoCE hierarchical allreduce 16 MiB:
-  baseline 1248928; cross-node bg (rank 0->4) 1353663 (+8.4%) -- the WFQ term
-  is OFF the critical path here (weights=1.0 gives the identical 1353663: the
-  bg flow, paced at the 800G intra-node rate onto a 400G link, is limited by
-  NIC link sharing), so the WFQ discriminator uses an intra-node bg (rank
-  0->1): default 1311031 vs weights=1.0 1295971.
+  baseline 1248928; cross-node bg (rank 0->4) 2776201 (+122%) -- the WFQ term
+  is OFF the critical path here (the bg flow, paced at the 800G intra-node
+  rate onto a 400G link, is limited by NIC link sharing), so the WFQ
+  discriminator uses an intra-node bg (rank 0->1): default 1330831 vs
+  weights=1.0 1315771. NOTE: the multi-node bg pins were re-anchored by the
+  HierarchicalAllReduce PERMANENT_LOSS/P2P-progress fix (only FabricPacketType
+  ::DATA advances collective phases). The pre-fix values (1353663/1311031)
+  were corrupted by phantom progress: the bg flow's P2P packets incremented
+  the same phase counters the collective uses, so the run "completed" early
+  on missing collective bytes. The fixed runs wait for real data, so bg
+  interference now shows its true (much larger) cost.
 * single-node, Su ring allreduce 16 MiB: baseline 319658; intra-node bg
   (rank 0->2) default 450982 vs weights=1.0 468378 (+41% is link sharing; the
   WFQ penalty on the P2P class is a -3.7% correction).
@@ -123,8 +129,8 @@ SINGLE_BASE = [
 SINGLE_BG = SINGLE_BASE + BG_COMMON + ["--bgP2pDst=2"]
 
 PINNED = {
-    "multi-base": 1248928, "multi-bg-cross": 1353663,
-    "multi-bg-intra": 1311031, "multi-bg-intra-w1": 1295971,
+    "multi-base": 1248928, "multi-bg-cross": 2776201,
+    "multi-bg-intra": 1330831, "multi-bg-intra-w1": 1315771,
     "single-base": 319658, "single-bg": 450982, "single-bg-w1": 468378,
 }
 
