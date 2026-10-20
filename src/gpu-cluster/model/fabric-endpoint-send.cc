@@ -552,7 +552,7 @@ FabricEndpoint::SendMemoryRead(uint16_t destRank, uint64_t address, uint32_t siz
 {
     NS_LOG_FUNCTION(this << destRank << address << size);
 
-    uint64_t seqKey = MakeSeqKey(destRank, 0, 0);
+    uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
     // Pack address and size into payload for memory read request
@@ -613,7 +613,7 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
 {
     NS_LOG_FUNCTION(this << destRank << address << size);
 
-    uint64_t seqKey = MakeSeqKey(destRank, 0, 0);
+    uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
     // Pack address prefix + data into payload
@@ -676,15 +676,16 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
 {
     NS_LOG_FUNCTION(this << destRank << size);
 
-    // Sequence responses from this endpoint's per-dest counter (same key
-    // space as SendMemoryRead/SendMemoryWrite). A hard-coded 0 gave every
-    // MEMORY_RESP the same LLR retry key: with two reads in flight the
-    // second response's store entry overwrote the first's packet copy, and
-    // its ACK purged the shared entry — a lost first response was never
-    // retransmitted with its own payload (its data vanished silently).
-    // Distinct sequence numbers also let the receiver's CREDIT advance the
-    // GBN cumulative-ack window past 1.
-    uint64_t seqKey = MakeSeqKey(destRank, 0, 0);
+    // Sequence responses from this endpoint's per-dest memory counter (the
+    // isolated MakeMemorySeqKey namespace shared with SendMemoryRead/Write —
+    // disjoint from DATA's counters, whose reorder tracking never sees
+    // memory seqs). A hard-coded 0 gave every MEMORY_RESP the same LLR
+    // retry key: with two reads in flight the second response's store entry
+    // overwrote the first's packet copy, and its ACK purged the shared
+    // entry — a lost first response was never retransmitted with its own
+    // payload (its data vanished silently). Distinct sequence numbers also
+    // let the receiver's CREDIT advance the GBN cumulative-ack window past 1.
+    uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
     Ptr<Packet> packet = Create<Packet>(data, size);
@@ -760,14 +761,23 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
                              ? m_syncMemLatencyNs
                              : m_asyncMemLatencyNs;
 
-    // Send the memory request packet with the access type in the header
-    uint64_t seqKey = MakeSeqKey(destRank, 0, 0);
+    // Send the memory request packet with the access type in the header.
+    // data == nullptr is a READ (the API documents it so): build a
+    // MEMORY_READ carrying address+size, not a MEMORY_WRITE padded with
+    // zeros — the receiving MEMORY endpoint applies MEMORY_WRITE payloads
+    // verbatim, so a zero-padded "read" would overwrite the target with 0s.
+    const bool isRead = (data == nullptr);
+    uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
-    uint32_t payloadSize = 8 + size; // address + data
+    uint32_t payloadSize = isRead ? 12 : 8 + size; // read: address + size
     std::vector<uint8_t> payload(payloadSize, 0);
     std::memcpy(payload.data(), &address, 8);
-    if (data != nullptr && size > 0)
+    if (isRead)
+    {
+        std::memcpy(payload.data() + 8, &size, 4);
+    }
+    else if (size > 0)
     {
         std::memcpy(payload.data() + 8, data, size);
     }
@@ -775,7 +785,8 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     Ptr<Packet> packet = Create<Packet>(payload.data(), payloadSize);
 
     FabricHeader header;
-    header.SetPacketType(FabricPacketType::MEMORY_WRITE);
+    header.SetPacketType(isRead ? FabricPacketType::MEMORY_READ
+                                 : FabricPacketType::MEMORY_WRITE);
     header.SetFabricType(GetFabricTypeForDest(destRank));
     header.SetFlowId(0);
     header.SetSequenceNumber(seqNum);

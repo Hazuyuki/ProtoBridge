@@ -399,6 +399,24 @@ class FabricEndpoint : public Application
         return (static_cast<uint64_t>(destRank) << 24) | (static_cast<uint64_t>(vcId) << 16) | (static_cast<uint64_t>(flowId) & 0xFFFF);
     }
 
+    /**
+     * @brief Sequence counter key for MEMORY_* packets (read/write/response/
+     * semantic requests)
+     *
+     * Memory packets ride their own counter namespace, disjoint from the
+     * DATA/collective counter space MakeSeqKey(dest, vc, flow) covers: the
+     * receiver's reorder/bypass per-flow sequence tracking only sees
+     * ProcessDataPacket traffic, so a memory seq drawn from the shared
+     * (dest, vc=0, flow=0) counter leaves a permanent gap in the DATA flow
+     * (DATA seq N+1 waits forever for the seq N a MEMORY_RESP consumed).
+     * Bit 63 is never set by MakeSeqKey (dest occupies bits 24-39), so the
+     * namespaces cannot collide.
+     */
+    static uint64_t MakeMemorySeqKey(uint16_t destRank)
+    {
+        return MakeSeqKey(destRank, 0, 0) | (1ULL << 63);
+    }
+
   protected:
     void DoDispose() override;
     void StartApplication() override;
