@@ -607,12 +607,21 @@ class TheoryDerivedSurrogate:
                 # NVLS/SHARP: every rank uploads once and the switch
                 # multicasts once -- N uploads + N result deliveries.
                 transfer_count = 2 * num_gpus
+            elif algo == 'tree':
+                # Tree allreduce: the tree has N-1 edges and each carries the
+                # FULL D per direction (D up during reduce, D down during
+                # broadcast — see _wire_bytes_per_transfer's tree branch,
+                # which also counts full-D fragments per edge). The transfer
+                # count is therefore 2(N-1), NOT 2N(N-1): the old multiplier
+                # overcounted tree losses by N (at N=8/D=16 MiB/BER 6e-7/
+                # retry 3 it reported 0.80997 expected losses instead of
+                # 0.10125, and strict_reliability wrongly returned infinity).
+                transfer_count = 2 * (num_gpus - 1)
             else:
-                # Ring/tree/fullmesh allreduce = reduce-scatter + all-gather.
+                # Ring/fullmesh allreduce = reduce-scatter + all-gather.
                 # Ring: every rank does 2(N-1) chunk steps -> 2N(N-1);
                 # fullmesh: every rank sends D/N to N-1 peers per phase
-                # -> 2N(N-1); the tree walks the same volume across its
-                # edges per phase.
+                # -> 2N(N-1).
                 transfer_count = 2 * num_gpus * (num_gpus - 1)
         elif collective == 'allgather':
             if algo == 'ring':

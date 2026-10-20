@@ -6,6 +6,20 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — tree expected losses count edges, not ranks
+
+The whole-collective reliability estimate's allreduce multiplier applied
+`2N(N−1)` uniformly, but the tree is edge-based: it has N−1 edges and each
+edge carries the full D per direction (`_wire_bytes_per_transfer`'s tree
+branch already counts full-D fragments per edge), so the transfer count is
+`2(N−1)`. The old multiplier overcounted tree losses by a factor of N — at
+N=8/D=16 MiB/BER 6e-7/retry 3 it reported 0.80997 expected losses instead
+of 0.10125, and `strict_reliability` wrongly returned infinity for a
+completable config (codex round 11, finding 5). Ring/fullmesh keep
+`2N(N−1)` (every rank really does 2(N−1) chunk steps). Regression tests
+pin the corrected tree value (±2e-3), the now-finite strict prediction, and
+that ring losses are unchanged.
+
 ### Fixed — multicast result sequence numbers are per-destination
 
 The three multicast-result sites stamped every packet from one global

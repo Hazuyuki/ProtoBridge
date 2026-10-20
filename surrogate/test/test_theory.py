@@ -756,3 +756,34 @@ def test_hierarchical_sendrecv_is_so_only():
     direct = h.so.predict(D, h.n_so, "ring", 32, collective="sendrecv",
                           topology=h.so_topology)
     assert abs(h.predict(D, "ring", 32, collective="sendrecv") - direct) < 1e-6
+
+
+def test_tree_expected_losses_count_edges_not_ranks():
+    """Tree allreduce transfers: the tree has N-1 edges and each edge carries
+    the FULL D per direction (see _wire_bytes_per_transfer's tree branch),
+    so the whole-collective transfer count is 2(N-1). The pre-fix multiplier
+    2N(N-1) overcounted tree losses by N: at N=8/D=16 MiB/BER 6e-7/retry 3
+    it reported 0.80997 expected losses instead of 0.10125, and
+    strict_reliability wrongly returned infinity for a completable config."""
+    tree = wb.make_h200_tree_theory()
+    losses = tree.expected_permanent_losses(
+        16 * 1024 * 1024, 8, "tree", 6e-7, 3,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce")
+    assert abs(losses - 0.10125) < 2e-3
+    # The strict gate must now stay finite for this completable config.
+    t = tree.predict(16 * 1024 * 1024, 8, "tree", 1024, ber=6e-7,
+                     retry_limit=3, strict_reliability=True,
+                     collective="allreduce", llr_enabled=True)
+    assert math.isfinite(t)
+
+
+def test_ring_expected_losses_unchanged_2N():
+    """Ring/fullmesh allreduce transfer counts keep the whole-collective
+    2N(N-1) form (every rank does 2(N-1) chunk steps): the tree fix must not
+    touch them."""
+    ring = wb.make_h200_ring_theory()
+    losses = ring.expected_permanent_losses(
+        16 * 1024 * 1024, 8, "ring", 6e-7, 3,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce")
+    # 2N(N-1) = 112 transfers at the ring's per-transfer packetization.
+    assert losses > 0.8  # the pre-fix tree value (0.80997) is the ring scale
