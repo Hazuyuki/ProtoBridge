@@ -611,7 +611,7 @@ in [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Plain Ethernet”
 ## 9. Tests
 
 ```bash
-python3 -m pytest surrogate/test/ -q          # 61 passed
+python3 -m pytest surrogate/test/ -q          # 72 passed
 python3 test/parity/test_surrogate_vs_ns3_fullmesh.py   # fullmesh vs ns-3 (6 pts)
 ```
 
