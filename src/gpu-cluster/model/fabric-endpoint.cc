@@ -925,7 +925,7 @@ FabricEndpoint::PumpBulkTxWindow()
         // permanent-loss handling sees LLR store entries from ALL send
         // paths (small unfragmented remote sends, local Su packets), which
         // must not free a bulk window slot they never consumed.
-        m_bulkTxWindowSeqs.emplace(desc.destRank, seqNum);
+        m_bulkTxWindowSeqs.emplace(desc.destRank, desc.vcId, desc.flowId, seqNum);
         SendPacketOnDevice(chunkPacket, desc.deviceIndex, ResolveDestMac(desc.destRank));
 
         m_txTrace(chunkPacket->GetSize(), seqNum);
@@ -1673,7 +1673,9 @@ FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
     // would dispatch an extra bulk fragment while one is still in flight.
     // The store entry is already purged by the LlrManager before this
     // callback fires, so a late ACK can't double-release.
-    if (m_soTxWindow > 0 && m_bulkTxWindowSeqs.erase({destRank, seqNum}) > 0)
+    if (m_soTxWindow > 0 &&
+        m_bulkTxWindowSeqs.erase({destRank, vcId,
+                                  originalHeader.GetFlowId(), seqNum}) > 0)
     {
         ReleaseBulkTxSlot();
     }
@@ -1937,10 +1939,16 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
         // unfragmented remote sends (they share the LLR store but never
         // held a window slot), releasing a slot that belonged to an
         // in-flight bulk fragment — with soTxWindow=1 the next fragment
-        // dispatched while the previous one was still outstanding.
+        // dispatched while the previous one was still outstanding. The key
+        // carries the full (dest, vc, flow) identity because seq counters
+        // are allocated per (dest, vc, flow): an ACK from an unwindowed
+        // flow sharing only (dest, seq) must not release another flow's
+        // bulk slot.
         const bool heldWindowSlot =
             m_soTxWindow > 0 &&
             m_bulkTxWindowSeqs.erase({header.GetSourceRank(),
+                                      header.GetVirtualChannel(),
+                                      header.GetFlowId(),
                                       header.GetSequenceNumber()}) > 0;
         m_llrManager->RemovePacket(header.GetSequenceNumber(),
                                    header.GetSourceRank(),

@@ -34,6 +34,7 @@
 #include <vector>
 #include <queue>
 #include <deque>
+#include <tuple>
 #include <unordered_map>
 
 namespace ns3
@@ -691,7 +692,13 @@ class FabricEndpoint : public Application
     /// release: only a packet that OCCUPIED a slot (PumpBulkTxWindow
     /// dispatch) may free one — small unfragmented remote sends and local
     /// (Su) packets share the LLR store but never touch the window.
-    std::set<std::pair<uint16_t, uint32_t>> m_bulkTxWindowSeqs;
+    /// (destRank, vcId, flowId, seqNum) of window-dispatched bulk chunks, for
+    /// exact slot release: only a packet that OCCUPIED a slot (PumpBulkTxWindow
+    /// dispatch) may free one. The key must carry the full flow identity —
+    /// seq allocation is per (dest, vc, flow), so two flows to one dest run
+    /// independent seq counters and collide on bare (dest, seq): an ACK from
+    /// an unwindowed flow would release another flow's bulk slot.
+    std::set<std::tuple<uint16_t, uint8_t, uint16_t, uint32_t>> m_bulkTxWindowSeqs;
     void PumpBulkTxWindow();                        ///< Dispatch queued chunks while window has room
     void ReleaseBulkTxSlot();                       ///< Free one window slot and pump
 
