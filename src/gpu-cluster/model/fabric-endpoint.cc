@@ -3202,8 +3202,21 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
         {
             Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
                                                              header.GetSourceRank());
-            rb->Insert(header.GetSequenceNumber(), packet, header);
+            bool inserted = rb->Insert(header.GetSequenceNumber(), packet, header);
             rb->DeliverReadyPackets();
+            if (!inserted && rb->IsDuplicate(header.GetSequenceNumber()))
+            {
+                // A rejected DUPLICATE (a retransmission of an
+                // already-delivered seq, or of one still parked in the
+                // reorder buffer): the original delivery's ACK may have been
+                // lost, and without this re-ACK the sender's LLR store entry
+                // is never purged — the retry-timer backstop retransmits
+                // forever and the entry degrades into a false permanent loss
+                // for data the receiver already holds. Same gate as the raw
+                // DATA reorder path: a capacity-rejected FUTURE seq is not a
+                // duplicate and rides the sender's retry timer instead.
+                SendLlrAckPacket(header, false);
+            }
         }
         return;
     }
@@ -3252,8 +3265,19 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
             // Use reorder buffer
             Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
                                                              header.GetSourceRank());
-            rb->Insert(header.GetSequenceNumber(), dataPacket, header);
+            bool inserted = rb->Insert(header.GetSequenceNumber(), dataPacket, header);
             rb->DeliverReadyPackets();
+            if (!inserted && rb->IsDuplicate(header.GetSequenceNumber()))
+            {
+                // Re-ACK a rejected duplicate exactly like the raw DATA
+                // reorder path (above) and ProcessDataPacket: a retransmitted
+                // LL/LL128 segment whose original delivery's ACK was lost
+                // must still purge the sender's LLR store entry, or the retry
+                // timer runs out and records a false permanent loss for data
+                // the receiver already delivered. A capacity-rejected future
+                // seq is not a duplicate and is not ACKed.
+                SendLlrAckPacket(header, false);
+            }
         }
 
     }
