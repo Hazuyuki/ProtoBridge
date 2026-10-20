@@ -588,12 +588,43 @@ class TheoryDerivedSurrogate:
         packets_per_transfer = self._packets_per_transfer(
             data_bytes, num_gpus, algo, collective)
         collective = self._validate_collective(collective)
+        # Whole-COLLECTIVE transfer counts: the expected-loss estimate
+        # aggregates the risk of EVERY transfer the collective issues, not
+        # just the ones one rank participates in. The old per-rank counts
+        # (ring: 2(N-1) steps, alltoall: N-1 partners) covered only the
+        # local rank's slice, understating expected permanent losses by
+        # ~N x -- at N=8/D=16 MiB/BER 2e-7/retry 3 the ring model reported
+        # 0.2108 losses against 1.6865 when all ranks were counted, so
+        # ``strict_reliability`` wrongly returned a finite latency for a
+        # config that cannot complete.
         if collective == 'sendrecv':
             transfer_count = 1
         elif collective == 'alltoall':
-            transfer_count = max(1, num_gpus - 1)
-        elif algo in ('tree', 'ring'):
-            transfer_count = 2 * (num_gpus - 1)
+            # Every rank exchanges with every other rank: N(N-1) transfers.
+            transfer_count = num_gpus * (num_gpus - 1)
+        elif collective == 'allreduce':
+            if algo == 'nvls':
+                # NVLS/SHARP: every rank uploads once and the switch
+                # multicasts once -- N uploads + N result deliveries.
+                transfer_count = 2 * num_gpus
+            else:
+                # Ring/tree/fullmesh allreduce = reduce-scatter + all-gather.
+                # Ring: every rank does 2(N-1) chunk steps -> 2N(N-1);
+                # fullmesh: every rank sends D/N to N-1 peers per phase
+                # -> 2N(N-1); the tree walks the same volume across its
+                # edges per phase.
+                transfer_count = 2 * num_gpus * (num_gpus - 1)
+        elif collective == 'allgather':
+            if algo == 'ring':
+                # Ring allgather: every rank passes D/N around the ring
+                # through N-1 peers -> N(N-1) transfers.
+                transfer_count = num_gpus * (num_gpus - 1)
+            elif algo == 'nvls':
+                # NVLS allgather: N uploads + N multicast deliveries.
+                transfer_count = 2 * num_gpus
+            else:
+                # Fullmesh allgather: every rank sends D/N to all N-1 peers.
+                transfer_count = num_gpus * (num_gpus - 1)
         else:
             transfer_count = num_gpus
         attempts = retry_limit + 1
