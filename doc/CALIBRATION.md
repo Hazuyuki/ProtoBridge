@@ -142,15 +142,18 @@ scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
   directly comparable to `ib_write_lat`.
 - The inter-node `RoceProtocolModel` **is** wired (scratch/gpu-cluster-sim.cc
   attaches it on every endpoint when `--interNodeFabricType=RoCE`;
-  `FabricEndpoint::GetProtocolModelForDest`, fabric-endpoint.cc:716-726, selects
-  it for non-local dests under the `m_localRankCount > 1` guard). A RoCE P2P run
+  `FabricEndpoint::GetProtocolModelForDest`, fabric-endpoint.cc, selects it for
+  non-local dests — `IsLocalRank` alone decides, so one GPU per node still
+  routes remote traffic on the So model). A RoCE P2P run
   works **today** via `p2p-roce.cfg` + `--interNodeTopology=tor`
   + `--interNodeBandwidth=400 --interNodeLatency=100`, reproducing `ib_write_lat`
   at **MAPE 5.26 %** (sweep best fit; see the sweep JSON). A dedicated
   `h200-roce.profile` PEX bundle is **not** required — `[stack] = h200-ll128`
   governs only the Su model; the RoCE model is wired out-of-band.
-- `--collective=p2p` inline CLI remains a no-op (P2P is reachable via the `.cfg`
-  stencil path). The opt-in per-QP ceiling (`PerQpCeilingGbps` ≈ 49 G) for
+- `--collective=p2p` inline CLI performs a real delivery-gated transfer (NOT a
+  no-op — `--collective=p2p --topology=fullmesh --numGpus=8 --dataSize=1048576
+  --bandwidth=400 --latency=400` completes in ~22.8 µs; the `.cfg` stencil path
+  remains the fuller-featured route). The opt-in per-QP ceiling (`PerQpCeilingGbps` ≈ 49 G) for
   **ib_write_bw** sustained-throughput parity is **DONE**:
   `--perQpCeilingGbps=49` mounts `DcqcnRateMachine`'s true per-flow pacer;
   [`examples/gpu-cluster/roce_p2p_bw_sweep.py`](../examples/gpu-cluster/roce_p2p_bw_sweep.py)
