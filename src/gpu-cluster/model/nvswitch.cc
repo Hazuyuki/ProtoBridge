@@ -904,7 +904,15 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
     // models the full packet traversal including per-port contention.
     // Cut-through: header starts after pipeline delay, tail finishes after
     // serialization. Completion time (for credit/dependency) uses full duration.
-    if (p2pOut && m_cutThroughDelayNs > 0)
+    // The scheduled path must also run for FEC-active egress when cut-through
+    // is disabled: outDevice->Send() serializes the RAW packet, discarding the
+    // FEC wire expansion (wireSize) and codec latency computed above. With
+    // m_cutThroughDelayNs == 0 the pipeline term is zero, so the scheduled
+    // arrival is startTime + serialization(encoded) + codec + propagation —
+    // store-and-forward timing with FEC applied. Non-FEC ports keep the
+    // Send() fallback below unchanged.
+    const bool fecActiveEgress = p2pOut && m_fecOpticalOnly && PortUsesFec(outPort);
+    if (p2pOut && (m_cutThroughDelayNs > 0 || fecActiveEgress))
     {
         Ptr<Channel> rawChannel = p2pOut->GetChannel();
         Ptr<PointToPointChannel> channel = DynamicCast<PointToPointChannel>(rawChannel);
