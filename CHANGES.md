@@ -6,6 +6,21 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NVLS expected losses count upload and result sides separately
+
+The whole-collective reliability estimate treated NVLS like the ring
+(`2N(N−1)` same-size sides), but the two directions differ: every rank
+uploads the full D (or D/N for allgather) once, while the switch
+re-multicasts every received chunk to each of the N destinations — at
+N=8/D=16 MiB the C++ truth is 1,296 result fragments vs 144 upload
+fragments for allgather (9×), and 1,024 uploads vs 1,152 results for
+allreduce. The generic multiplier overreported allgather losses by ~4.5×
+(0.2683 vs the measured 1.2074 at BER 6e-7/retry 3; codex round 11,
+finding 6). `expected_permanent_losses` now has an NVLS branch that counts
+each side with its own fragment count (`N·frag(D/N)` results per dest × N
+dests). Regression tests pin the allgather value and the allreduce/upload
+ratio.
+
 ### Fixed — CONFIG_GUIDE advertises the registered per-step knob names
 
 The NCCL-ring section of `doc/CONFIG_GUIDE.md` listed the per-step software
