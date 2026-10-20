@@ -141,9 +141,10 @@ overlap (max-of-bottleneck instead of the hierarchical sum-of-phases).
 Wins ≥2× at large sizes on switched topologies (741 vs 362 Gbps busbw at
 256 MiB, 16 n × 8 g RoCE 400G); loses below ~16 MiB where the 2(N−1)-step
 latency dominates — the same regime where real NCCL switches to tree.
-Honors the shared per-step knobs (`--perStepSwOverheadNs`,
-`--swOverheadPerByteNs`, `--computeBase*Ns`, `--llThreshold` /
-`--ll128Threshold`, `--startupDelayNs`). AllReduce only; gate
+Honors the shared per-step knobs (`--perStepSwOverhead`,
+`--swOverheadPerByte`, `--computeBaseLL` / `--computeBaseLL128` /
+`--computeBaseSIMPLE`, `--llThreshold` /
+`--ll128Threshold`, `--startupDelay`). AllReduce only; gate
 `test/parity/test_ncclring.py`.
 
 **So topologies (`--interNodeTopology` + shape knobs).** Eight inter-node

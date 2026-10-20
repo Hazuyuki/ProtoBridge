@@ -6,6 +6,19 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — CONFIG_GUIDE advertises the registered per-step knob names
+
+The NCCL-ring section of `doc/CONFIG_GUIDE.md` listed the per-step software
+and compute knobs with `Ns`-suffixed names (`--perStepSwOverheadNs`,
+`--swOverheadPerByteNs`, `--computeBase*Ns`, `--startupDelayNs`) that the
+executable never registered — `gpu-cluster-sim` rejects them with "Invalid
+command-line argument" (codex round 11, finding 7). The registered names
+omit the suffix: `--perStepSwOverhead`, `--swOverheadPerByte`,
+`--computeBaseLL` / `--computeBaseLL128` / `--computeBaseSIMPLE`,
+`--startupDelay`. The guide now uses those; `--llThreshold` and
+`--ll128Threshold` were already correct as documented. Doc-only change:
+verified `--perStepSwOverhead=100` is accepted and the run completes.
+
 ### Fixed — tree expected losses count edges, not ranks
 
 The whole-collective reliability estimate's allreduce multiplier applied
