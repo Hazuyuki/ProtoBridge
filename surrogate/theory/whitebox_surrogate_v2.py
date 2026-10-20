@@ -368,6 +368,30 @@ class TheoryDerivedSurrogate:
         optical_fraction = min(1.0, max(0.0, optical_fraction))
         return 1.0 + optical_fraction * (n_symbols / k_symbols - 1.0)
 
+    def _nccl_protocol_for(self, payload_bytes):
+        """NCCL wire protocol the C++ side picks for ``payload_bytes``.
+
+        Mirrors ``NcclProtocolModel::GetProtocolForSize`` (thresholds 8 KiB
+        and 2 MiB): LL below 8 KiB, LL128 below 2 MiB, SIMPLE above.
+        """
+        if payload_bytes < 8192:
+            return 'LL'
+        if payload_bytes < 2 * 1024 * 1024:
+            return 'LL128'
+        return 'SIMPLE'
+
+    def _nccl_wire_bytes(self, payload_bytes, protocol):
+        """Wire bytes ``NcclProtocolModel::GetWireSize`` emits for a payload.
+
+        LL: 64 data + 64 flag bytes per 128 B line; LL128: 120 data + 8
+        header per 128 B line; SIMPLE: payload as-is (efficiency 1.0).
+        """
+        if protocol == 'LL':
+            return math.ceil(payload_bytes / 64) * 128
+        if protocol == 'LL128':
+            return math.ceil(payload_bytes / 120) * 128
+        return payload_bytes
+
     def _wire_bytes_per_transfer(self, data_bytes, num_gpus, algo,
                                  collective=None):
         """Wire bytes in one protocol transfer before FEC encoding.
@@ -378,26 +402,100 @@ class TheoryDerivedSurrogate:
         edge (see ``_per_step`` / ``_tree_trunk_load``): its per-transfer
         volume is D, not D/N — reliability must count the bytes actually on
         the wire, or it underestimates expected losses by ~alpha(N).
+
+        The tree also picks its wire protocol from the per-rank chunk D/N
+        (``TreeAllReduce`` selects once by m_chunkSize = D/N), not from the
+        full per-edge D: e.g. at N=8/D=32 KiB the wire protocol is LL
+        (4 KiB per-rank < 8 KiB), so each edge carries ceil(D/64)*128 = 64 KiB
+        of LL line framing — LL128 selected by total D would count 35,072 B.
         """
         collective = self._validate_collective(collective)
         if algo == 'tree' and collective == 'allreduce':
-            transfer_bytes = data_bytes
-        else:
-            transfer_bytes = (data_bytes if collective == 'sendrecv'
-                              else data_bytes / max(1, num_gpus))
+            per_rank = max(1, data_bytes // max(1, num_gpus))
+            if data_bytes < num_gpus:
+                per_rank = data_bytes
+            protocol = self._nccl_protocol_for(per_rank)
+            return self._nccl_wire_bytes(data_bytes, protocol)
+        transfer_bytes = (data_bytes if collective == 'sendrecv'
+                          else data_bytes / max(1, num_gpus))
         if algo == 'nvls':
             return transfer_bytes
-        if transfer_bytes < 8192:
-            return math.ceil(transfer_bytes / 64) * 128
-        if transfer_bytes < 2 * 1024 * 1024:
-            return math.ceil(transfer_bytes / 120) * 128
-        return transfer_bytes
+        protocol = self._nccl_protocol_for(transfer_bytes)
+        return self._nccl_wire_bytes(transfer_bytes, protocol)
+
+    def _tree_pipe_chunk(self, data_bytes, num_gpus):
+        """``TreeAllReduce`` m_pipeChunkSize: clamp(D/(32*depth), 64 KiB, 8 MiB).
+
+        depth = ceil(log2(N)) (heap-shaped binary tree). The tree quantizes
+        each edge's full-D forwarding into ceil(D/pipe) pipe chunks, each
+        sprayed across the lanes as one bulk transfer.
+        """
+        depth = max(1, math.ceil(math.log2(max(2, num_gpus))))
+        pipe = data_bytes // (32 * depth)
+        return min(max(pipe, 64 * 1024), 8 * 1024 * 1024)
+
+    def _bulk_fragment_count(self, wire_bytes, data_bytes):
+        """Fragments ``SendBulkWireTransferSize`` emits for one transfer.
+
+        Mirrors the C++ fragment loops exactly: numChunks =
+        max(lanes, ceil(wire/bulk_chunk)); wireChunkSize = ceil(wire/numChunks);
+        a fragment is emitted only when BOTH its wire offset is inside the
+        wire span AND its data offset is inside the data span (trailing
+        lane-pad and wire-padding fragments are skipped). At
+        wire == data (SIMPLE, efficiency 1.0) the two filters coincide; under
+        LL/LL128 framing (wire > data) the data filter can drop extra trailing
+        fragments.
+        """
+        if wire_bytes <= 0:
+            return 1
+        num_chunks = max(self.num_lanes,
+                         math.ceil(wire_bytes / self.bulk_chunk_size))
+        wire_chunk = math.ceil(wire_bytes / num_chunks)
+        sent_chunks = math.ceil(wire_bytes / wire_chunk)
+        data_chunk = math.ceil(data_bytes / max(1, sent_chunks))
+        emitted = 0
+        for i in range(num_chunks):
+            if i * wire_chunk >= wire_bytes:
+                continue  # trailing lane-pad fragment past the wire end
+            if i * data_chunk >= data_bytes:
+                break  # wire-padding fragment: no data bytes left to send
+            emitted += 1
+        return max(1, emitted)
 
     def _packets_per_transfer(self, data_bytes, num_gpus, algo, collective=None):
+        """Fragments the C++ fabric actually emits for one transfer.
+
+        Non-tree algorithms spray the transfer's wire bytes across the lanes
+        in bulk-chunk-sized fragments (at least one per lane). The tree is
+        different: each edge's full-D volume moves as ceil(D/pipe) pipe
+        chunks, EACH of which is its own sprayed bulk transfer — at
+        N=8/D=16 MiB that is 97 chunks x 18 fragments + a 16-fragment tail =
+        1744 fragments per edge (ns-3 counts exactly 1744), not 18. Counting
+        fragments at the whole-transfer granularity understates expected
+        permanent losses by the same ~alpha(N) factor (19.2 vs 8.7e-5 at
+        BER 1e-7 / retry 3).
+        """
+        collective = self._validate_collective(collective)
+        if algo == 'tree' and collective == 'allreduce':
+            pipe = self._tree_pipe_chunk(data_bytes, num_gpus)
+            per_rank = max(1, data_bytes // max(1, num_gpus))
+            if data_bytes < num_gpus:
+                per_rank = data_bytes
+            protocol = self._nccl_protocol_for(per_rank)
+            fragments = 0
+            remaining = data_bytes
+            while remaining > 0:
+                chunk = min(pipe, remaining)
+                chunk_wire = self._nccl_wire_bytes(chunk, protocol)
+                fragments += self._bulk_fragment_count(chunk_wire, chunk)
+                remaining -= chunk
+            return fragments
         wire_bytes = self._wire_bytes_per_transfer(
             data_bytes, num_gpus, algo, collective)
-        size_limited = math.ceil(wire_bytes / self.bulk_chunk_size)
-        return max(1, self.num_lanes, size_limited)
+        return self._bulk_fragment_count(
+            wire_bytes,
+            data_bytes if collective == 'sendrecv'
+            else data_bytes / max(1, num_gpus))
 
     def _packet_bytes_per_transfer(self, data_bytes, num_gpus, algo,
                                    collective=None):
