@@ -451,8 +451,18 @@ NvSwitch::InjectResultNack(uint16_t requestingRank, uint32_t seqNum)
 size_t
 NvSwitch::GetSharpResultStoreSize(uint16_t destRank) const
 {
-    auto it = m_sharpResultStore.find(destRank);
-    return it == m_sharpResultStore.end() ? 0 : it->second.size();
+    // Sum every flow's window for the dest (in practice at most one flow's
+    // entries are live — a new flow replaces the old one's, see
+    // StoreMulticastResult).
+    size_t total = 0;
+    for (const auto& kv : m_sharpResultStore)
+    {
+        if ((kv.first >> 16) == destRank)
+        {
+            total += kv.second.size();
+        }
+    }
+    return total;
 }
 
 bool
@@ -1240,7 +1250,7 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
 
             // Spray chunks across this GPU's ports
             uint32_t portIdx = ports[chunkIdx % ports.size()];
-            StoreMulticastResult(destRank, portIdx,
+            StoreMulticastResult(destRank, flowId, portIdx,
                                  resultHeader.GetSequenceNumber(), pkt);
             m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
         }
@@ -1330,7 +1340,7 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
             pkt->AddHeader(resultHeader);
 
             uint32_t portIdx = ports[chunkIdx % ports.size()];
-            StoreMulticastResult(destRank, portIdx,
+            StoreMulticastResult(destRank, flowId, portIdx,
                                  resultHeader.GetSequenceNumber(), pkt);
             m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
         }
@@ -1645,7 +1655,7 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
             pkt->AddHeader(resultHeader);
 
             uint32_t portIdx = ports[chunkIdx % ports.size()];
-            StoreMulticastResult(destRank, portIdx,
+            StoreMulticastResult(destRank, flowId, portIdx,
                                  resultHeader.GetSequenceNumber(), pkt);
             m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
         }
@@ -1692,8 +1702,8 @@ NvSwitch::SendSharpLlrAck(const FabricHeader& uploadHeader, uint32_t inPort)
 }
 
 void
-NvSwitch::StoreMulticastResult(uint16_t destRank, uint32_t portIdx,
-                               uint32_t seqNum, Ptr<Packet> pkt)
+NvSwitch::StoreMulticastResult(uint16_t destRank, uint16_t flowId,
+                               uint32_t portIdx, uint32_t seqNum, Ptr<Packet> pkt)
 {
     // Only needed for NACK-driven retransmit; skip when LLR is off (results
     // are best-effort in that regime, matching legacy behavior).
@@ -1711,7 +1721,25 @@ NvSwitch::StoreMulticastResult(uint16_t destRank, uint32_t portIdx,
     {
         return;
     }
-    auto& window = m_sharpResultStore[destRank];
+    // Entries belong to a FLOW. A new flow's first result replaces the old
+    // flow's entries wholesale: they are stale (that collective already
+    // completed) and result seqs are per-(dest, flow), so a fixed per-dest
+    // window would otherwise evict THIS flow's early fragments mid-generation
+    // once two flows' fragments interleaved (codex round 12: an 8-GPU 2-GiB
+    // allgather — 16,384 fragments/dest — lost its first half to the 8,192
+    // window before any of them could be NACKed).
+    uint64_t key = (static_cast<uint64_t>(destRank) << 16) | flowId;
+    auto& window = m_sharpResultStore[key];
+    if (window.empty())
+    {
+        auto flowIt = m_lastResultFlow.find(destRank);
+        if (flowIt != m_lastResultFlow.end() && flowIt->second != flowId)
+        {
+            m_sharpResultStore.erase(
+                (static_cast<uint64_t>(destRank) << 16) | flowIt->second);
+        }
+        m_lastResultFlow[destRank] = flowId;
+    }
     window.push_back({seqNum, portIdx, 0, header});
     while (window.size() > SHARP_RESULT_WINDOW)
     {
@@ -1726,7 +1754,22 @@ NvSwitch::HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort)
     uint16_t requestingRank = nackHeader.GetSourceRank();
     uint32_t seqNum = nackHeader.GetSequenceNumber();
 
-    auto destIt = m_sharpResultStore.find(requestingRank);
+    // The store is keyed per (dest, flow) — the NACK names the flow it lost
+    // a fragment of; fall back to the dest's last stored flow when the NACK
+    // carries none (the test seam).
+    uint16_t flowId = nackHeader.GetFlowId();
+    if (m_sharpResultStore.find((static_cast<uint64_t>(requestingRank) << 16) | flowId) ==
+        m_sharpResultStore.end())
+    {
+        auto flowIt = m_lastResultFlow.find(requestingRank);
+        if (flowIt == m_lastResultFlow.end())
+        {
+            return false;
+        }
+        flowId = flowIt->second;
+    }
+    auto destIt = m_sharpResultStore.find(
+        (static_cast<uint64_t>(requestingRank) << 16) | flowId);
     if (destIt == m_sharpResultStore.end())
     {
         return false;

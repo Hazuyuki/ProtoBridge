@@ -554,10 +554,12 @@ class NvSwitch : public FabricSwitch
      * receiver's NACK for a lost one is addressed DestRank 0xFFFF and
      * arrives on the losing GPU's port. HandleSwitchNack looks the packet
      * up here and retransmits it on the stored port. Bounded FIFO per
-     * destination rank (m_sharpResultWindow) so memory stays flat.
+     * (destination, flow) — a new flow's results REPLACE the old flow's
+     * entries wholesale (stale: its collective completed), so the window
+     * only ever bounds one flow's fragments.
      */
-    void StoreMulticastResult(uint16_t destRank, uint32_t portIdx,
-                              uint32_t seqNum, Ptr<Packet> pkt);
+    void StoreMulticastResult(uint16_t destRank, uint16_t flowId,
+                              uint32_t portIdx, uint32_t seqNum, Ptr<Packet> pkt);
 
     /**
      * @brief Retransmit a multicast result on a receiver NACK (DestRank 0xFFFF).
@@ -601,10 +603,10 @@ class NvSwitch : public FabricSwitch
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, uint64_t>> m_allGatherReceivedBytes;
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, std::vector<uint32_t>>> m_allGatherBuffer;
 
-    // Switch-side LLR for multicast results: destRank -> FIFO of (seq,
-    // portIdx, retransmitCount, header). Only the stamped header is kept —
-    // the packet BODY is dummy bytes (only sizes matter for timing), so a
-    // retransmit rebuilds a body of the header's payload size instead of
+    // Switch-side LLR for multicast results: (destRank<<16|flowId) -> FIFO of
+    // (seq, portIdx, retransmitCount, header). Only the stamped header is
+    // kept — the packet BODY is dummy bytes (only sizes matter for timing),
+    // so a retransmit rebuilds a body of the header's payload size instead of
     // holding a full copy per fragment. Entries live until evicted by the
     // window bound; a NACK re-sends a rebuilt packet (bounded retries).
     struct SharpResultEntry
@@ -614,18 +616,19 @@ class NvSwitch : public FabricSwitch
         uint32_t retransmits;   ///< NACK-driven retransmits issued so far
         FabricHeader header;    ///< Header of the multicast result packet
     };
-    std::unordered_map<uint16_t, std::deque<SharpResultEntry>> m_sharpResultStore;
-    // Result-fragment retention. The eviction harness pinned the true scale:
-    // an 8-GPU 128-MiB allgather on the 18-lane fabric yields 1,024 fragments
-    // per dest, and 1024 fragments x 144 B header-only entries is ~144 KB —
-    // full packet copies were what made the old 512-entry window necessary.
-    // 8192 entries per dest bounds memory at ~1.2 MB/dest while covering the
-    // eviction-repro geometry (8192 fragments to one dest) with headroom;
-    // fragments beyond the window are still repairable via the endpoint's
-    // retry-timeout retransmit path. Cross-flow aliasing is impossible:
-    // result seqs come from the globally monotonic m_multicastSeqNum, so a
-    // stale entry can never match a new flow's seq.
-    static constexpr size_t SHARP_RESULT_WINDOW = 8192; ///< Max stored results per dest
+    std::unordered_map<uint64_t, std::deque<SharpResultEntry>> m_sharpResultStore;
+    std::unordered_map<uint16_t, uint16_t> m_lastResultFlow; ///< destRank -> flow of stored entries
+    // Result-fragment retention. Result entries belong to a FLOW: when a dest
+    // sees a new flow's results, the old flow's entries are stale (its
+    // collective already completed and its seq stream is per-(dest,flow)) and
+    // are dropped wholesale, so the window only ever bounds ONE flow's
+    // fragments. The eviction harnesses pinned the true scale: 1,024
+    // fragments/dest for an 8-GPU 128-MiB allgather, 16,384 for 2 GiB — and
+    // header-only entries are ~144 B, so 65,536 entries per (dest, flow)
+    // bounds memory at ~9.4 MB while covering an 8-GPU 8-GiB allgather with
+    // headroom. The window is a safety valve for absurd geometries; the
+    // observed scales fit well inside it.
+    static constexpr size_t SHARP_RESULT_WINDOW = 65536; ///< Max stored results per (dest, flow)
     static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
 
     // Upload dedup: (flowId, srcRank) -> seen upload sequence numbers. A
