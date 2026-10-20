@@ -374,10 +374,17 @@ class TheoryDerivedSurrogate:
 
         AllReduce/AllGather ring-tree step and AlltoAll partner exchange each
         carry data/num_gpus (D/N) per transfer; Send-Recv carries the full D.
+        The tree's chunk-pipelined schedule carries the FULL D over every
+        edge (see ``_per_step`` / ``_tree_trunk_load``): its per-transfer
+        volume is D, not D/N — reliability must count the bytes actually on
+        the wire, or it underestimates expected losses by ~alpha(N).
         """
         collective = self._validate_collective(collective)
-        transfer_bytes = (data_bytes if collective == 'sendrecv'
-                           else data_bytes / max(1, num_gpus))
+        if algo == 'tree' and collective == 'allreduce':
+            transfer_bytes = data_bytes
+        else:
+            transfer_bytes = (data_bytes if collective == 'sendrecv'
+                              else data_bytes / max(1, num_gpus))
         if algo == 'nvls':
             return transfer_bytes
         if transfer_bytes < 8192:
@@ -1109,8 +1116,10 @@ def make_h200_fullmesh_theory(**overrides):
     (no ``*N`` factor). ``fullmesh_bw`` is back-fit to the ns-3 sweep
     (``configs/calibration/fullmesh_ns3_sweep.py``); the model omits
     per-packet credit flow, VOQ arbitration and the inter-phase barrier that
-    ns-3 models, so it sits at or just below ns-3 (a lower-bound back-fit,
-    like the ring preset). Scoped to the SIMPLE wire regime (chunk D/N >= 2
+    ns-3 models, so the least-squares fit STRADDLES ns-3 (slightly above at
+    some fit points, below at others — a calibrated back-fit, not a bound;
+    see CALIBRATION.md's "straddles ns-3" note). Scoped to the SIMPLE wire
+    regime (chunk D/N >= 2
     MB); the LL/LL128 small-message regime is out of scope (same scope as the
     ring preset). Accepts the same ``overrides`` as the ring profile.
     """
