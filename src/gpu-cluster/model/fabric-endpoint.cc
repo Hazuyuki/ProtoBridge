@@ -410,7 +410,12 @@ FabricEndpoint::GetTreeRightChild() const
 FabricType
 FabricEndpoint::GetFabricTypeForDest(uint16_t destRank) const
 {
-    if (!IsLocalRank(destRank) && m_localRankCount > 1)
+    // IsLocalRank alone decides Su vs So — no m_localRankCount > 1 gate:
+    // with one GPU per node the only local rank is this endpoint itself, and
+    // the old count gate would wrongly push remote traffic onto the Su
+    // fabric. Single-node setups set a range covering every rank, so
+    // IsLocalRank is always true there and behavior is unchanged.
+    if (!IsLocalRank(destRank))
     {
         return static_cast<FabricType>(m_interNodeFabricType);
     }
@@ -728,10 +733,13 @@ FabricEndpoint::SetInterNodeProtocolModel(Ptr<ProtocolModel> model)
 Ptr<ProtocolModel>
 FabricEndpoint::GetProtocolModelForDest(uint16_t destRank) const
 {
-    // Use the inter-node (So) protocol model only for remote destinations on a
-    // multi-node fabric; otherwise fall back to the scale-up (Su) model so
-    // single-node and no-So-model behavior is byte-identical (parity-safe).
-    if (m_interNodeProtocolModel && !IsLocalRank(destRank) && m_localRankCount > 1)
+    // Use the inter-node (So) protocol model for remote destinations; otherwise
+    // fall back to the scale-up (Su) model. IsLocalRank alone decides — no
+    // m_localRankCount > 1 gate: with one GPU per node the only local rank is
+    // this endpoint itself, and the old count gate would wrongly run remote
+    // traffic on the Su model. Single-node setups cover every rank with the
+    // local range, so behavior there is unchanged.
+    if (m_interNodeProtocolModel && !IsLocalRank(destRank))
     {
         return m_interNodeProtocolModel;
     }
@@ -761,7 +769,9 @@ FabricEndpoint::GetPayloadBuilderForRank(uint16_t rank) const
 {
     // Mirrors GetProtocolModelForDest's Su/So split: the So builder (when
     // mounted) frames inter-node traffic; Su traffic keeps the vendor builder.
-    if (m_soPayloadBuilder && !IsLocalRank(rank) && m_localRankCount > 1)
+    // IsLocalRank alone decides (see GetProtocolModelForDest — one GPU per
+    // node still has remote ranks).
+    if (m_soPayloadBuilder && !IsLocalRank(rank))
     {
         return m_soPayloadBuilder;
     }

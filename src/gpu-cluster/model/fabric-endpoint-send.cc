@@ -529,7 +529,9 @@ FabricEndpoint::SendP2p(uint16_t destRank, const uint8_t* data, uint32_t size,
     // (OnPacketDelivered's IsLocalRank guard), so a credit-consuming remote
     // P2P would drain the local VC pool with no return path and stall once
     // vcCredits exhausts.
-    if (m_localRankCount > 1 && !IsLocalRank(destRank))
+    // IsLocalRank alone decides (no m_localRankCount > 1 gate — one GPU per
+    // node still has remote ranks; see GetProtocolModelForDest).
+    if (!IsLocalRank(destRank))
     {
         packet->AddHeader(header);
         uint32_t deviceIndex = ResolveDeviceIndex(destRank);
