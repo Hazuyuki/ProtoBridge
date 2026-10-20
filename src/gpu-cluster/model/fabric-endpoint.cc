@@ -1727,9 +1727,29 @@ FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
     // keeps every dest local -> unchanged.
     if (m_creditManager && IsLocalRank(destRank))
     {
-        m_creditManager->ReturnCredits(vcId, 1);
-        NS_LOG_DEBUG("Returned credit for permanently lost seqNum " << seqNum
-                     << " on VC " << static_cast<int>(vcId));
+        // Credit-bypass types (NVLS/SHARP uploads) consumed no credit on
+        // send — none is owed back here (mirror of the ProcessAckPacket gate).
+        bool creditBypass = originalHeader.GetPacketType() == FabricPacketType::ALLREDUCE ||
+                            originalHeader.GetPacketType() == FabricPacketType::ALLGATHER;
+        if (!creditBypass)
+        {
+            // Record the return in the shared CREDIT/ACK ledger (same key space
+            // as the ProcessAckPacket recovery): the receiver still emits a
+            // CREDIT for this sequence number if the packet arrives late (after
+            // the retry limit declared it permanently lost), and without a
+            // ledger entry that late CREDIT would return a second credit for a
+            // slot that was already freed here — growing the pool beyond total.
+            // insert().second false means this seq was already accounted (e.g.
+            // the ACK raced ahead of the permanent-loss declaration).
+            uint64_t ackKey = MakeSeqKey(originalHeader.GetDestRank(), vcId,
+                                         originalHeader.GetFlowId());
+            if (m_creditsReturned.insert({ackKey, seqNum}).second)
+            {
+                m_creditManager->ReturnCredits(vcId, 1);
+                NS_LOG_DEBUG("Returned credit for permanently lost seqNum " << seqNum
+                             << " on VC " << static_cast<int>(vcId));
+            }
+        }
     }
 
     // Notify the receiver to advance its reorder buffer past the lost sequence number.
