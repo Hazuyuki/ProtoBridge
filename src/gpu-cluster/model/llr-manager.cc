@@ -176,15 +176,30 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
         sourceIt->second.destRank = destRank;
     }
 
-    // (Re)arm the retry-timeout on the SOURCE entry: it must survive both a
-    // retry-buffer eviction and a DROP_NEWEST refusal -- the packet stays
-    // un-ACKed either way and needs its timeout backstop.
+    // A FIRST store (fresh send) does NOT arm the timeout here: the packet
+    // has not reached the wire yet, and the DCQCN/RTTCC pacer, WFQ service
+    // time, or FEC encode latency can hold it past a short timeout — the
+    // retry budget would expire for a packet that was never lost (codex
+    // round 12, finding 4). The wire egress arms it instead
+    // (ArmRetryTimeoutAtTransmission via FabricEndpoint::ArmRetryTimeoutOnWire).
+    // A RE-store of an already-timed-out packet (the sourceReload refresh in
+    // SendRetransmission) keeps its timer: that packet already lost its
+    // first copy, so the backstop must stay armed.
     sourceIt = m_sourceStore.find(key);
-    if (!sourceIt->second.timeoutEvent.IsExpired())
+    if (sourceIt->second.timeoutEvent.IsPending())
     {
-        Simulator::Cancel(sourceIt->second.timeoutEvent);
+        // Existing (pending) timer: leave its deadline alone — it was armed
+        // relative to an earlier wire event and may already be shorter than
+        // this re-store implies.
     }
-    if (m_retryTimeout > Time(0))
+    else if (!sourceIt->second.wireArmed)
+    {
+        // Fresh send awaiting its first transmission: no timer yet.
+    }
+    // A re-store after a timeout fired (event expired, wireArmed true) is a
+    // reload refresh: re-arm the plain timeout so the un-ACKed reload keeps
+    // its backstop.
+    else if (m_retryTimeout > Time(0))
     {
         sourceIt->second.timeoutEvent = Simulator::Schedule(
             m_retryTimeout, &LlrManager::OnRetryTimeout,
@@ -222,6 +237,42 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     m_peakBufferSize = std::max(m_peakBufferSize,
                                 static_cast<uint32_t>(m_retryBuffer.size()));
     return true;
+}
+
+void
+LlrManager::ArmRetryTimeoutAtTransmission(uint32_t seqNum, uint16_t destRank,
+                                          uint16_t flowId, uint8_t vcId)
+{
+    NS_LOG_FUNCTION(this << seqNum << destRank << flowId << static_cast<int>(vcId));
+    if (m_retryTimeout <= Time(0))
+    {
+        return;
+    }
+    RetryKey key = MakeRetryKey(seqNum, destRank, flowId, vcId);
+    auto sourceIt = m_sourceStore.find(key);
+    if (sourceIt == m_sourceStore.end())
+    {
+        return; // already ACKed (or never stored): no timer to re-arm
+    }
+    // Only EXTEND, never shorten: a timer legitimately armed for an earlier
+    // NACK-driven retransmission (readyDelay + timeout) keeps its deadline
+    // when the wire send happens to land after it. Compare against the
+    // pending event's deadline when one is armed.
+    Time deadline = Simulator::Now() + m_retryTimeout;
+    if (!sourceIt->second.timeoutEvent.IsExpired())
+    {
+        Time pending = Simulator::GetDelayLeft(sourceIt->second.timeoutEvent);
+        if (pending + Simulator::Now() >= deadline)
+        {
+            sourceIt->second.wireArmed = true;
+            return;
+        }
+        Simulator::Cancel(sourceIt->second.timeoutEvent);
+    }
+    sourceIt->second.wireArmed = true;
+    sourceIt->second.timeoutEvent = Simulator::Schedule(
+        m_retryTimeout, &LlrManager::OnRetryTimeout,
+        this, seqNum, destRank, flowId, vcId);
 }
 
 bool
@@ -373,7 +424,10 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
         }
 
         // Re-arm the SOURCE-entry timeout for the retransmission (one timer
-        // per un-ACKed packet, regardless of retry-buffer residency).
+        // per un-ACKed packet, regardless of retry-buffer residency). A
+        // retransmission is by definition wire-visible (its timer fired or a
+        // NACK referenced it), so the entry counts as wire-armed from here on.
+        sourceIt->second.wireArmed = true;
         if (!sourceIt->second.timeoutEvent.IsExpired())
         {
             Simulator::Cancel(sourceIt->second.timeoutEvent);
@@ -468,7 +522,10 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
         // on the wire until the reload completes, so a timer at bare
         // m_retryTimeout fires repeatedly during the reload and exhausts the
         // retry budget before the retransmission can land (GBN recovers, SACK
-        // degrades to permanent loss under the same loss pattern).
+        // degrades to permanent loss under the same loss pattern). A
+        // retransmission is wire-visible by definition, so the entry counts as
+        // wire-armed from here on.
+        sourceIt->second.wireArmed = true;
         if (!sourceIt->second.timeoutEvent.IsExpired())
         {
             Simulator::Cancel(sourceIt->second.timeoutEvent);

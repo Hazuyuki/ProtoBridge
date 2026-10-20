@@ -444,6 +444,13 @@ class FabricEndpoint : public Application
      */
     void SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                             const Address& dest);
+    /**
+     * \brief Re-arm the LLR retry timer at first wire transmission. The
+     *        timer otherwise starts at StorePacket (enqueue) and can expire
+     *        while a pacer/contention/FEC hold still gates the send — a
+     *        loss-free link would then produce permanent losses.
+     */
+    void ArmRetryTimeoutOnWire(Ptr<Packet> packet);
     bool LinkUsesFec() const;
 
     /**

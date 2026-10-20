@@ -2154,9 +2154,14 @@ LlrManagerTest::TestTimeoutCallbackIsolation()
     llr->SetRetryTimeout(NanoSeconds(1));
     llr->SetTimeoutCallback(MakeCallback(&LlrManagerTest::OnTimeoutCallback, this));
 
-    // Store two packets with same seqNum/flowId but different destRanks
+    // Store two packets with same seqNum/flowId but different destRanks, then
+    // simulate each hitting the wire (a bare manager has no endpoint pacing
+    // the egress, so the wire-arming call is made explicitly — the timeout
+    // countdown starts at first transmission, not at enqueue).
     llr->StorePacket(100, makePacket(1, 5), 1);  // seq=100, flow=5, dest=1
     llr->StorePacket(100, makePacket(2, 5), 2);  // seq=100, flow=5, dest=2
+    llr->ArmRetryTimeoutAtTransmission(100, 1, 5);
+    llr->ArmRetryTimeoutAtTransmission(100, 2, 5);
 
     NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 2u, "Both entries stored before Run");
 
@@ -2188,6 +2193,8 @@ LlrManagerTest::TestTimeoutCallbackIsolation()
 
         llr2->StorePacket(200, makePacket(3, 7), 3);  // seq=200, flow=7, dest=3
         llr2->StorePacket(200, makePacket(4, 7), 4);  // seq=200, flow=7, dest=4
+        llr2->ArmRetryTimeoutAtTransmission(200, 3, 7);
+        llr2->ArmRetryTimeoutAtTransmission(200, 4, 7);
 
         NS_TEST_EXPECT_MSG_EQ(llr2->GetBufferSize(), 2u, "Both entries stored before cancellation");
 
@@ -4719,6 +4726,106 @@ class DcqcnDisposeCancelsTimersTest : public TestCase
     }
 };
 
+// (1b-3) LLR retry timers must not start while the pacer still holds the
+// packet. Codex round 12, finding 4: StorePacket armed the timeout at
+// ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
+// by pace slots; with a retry timeout shorter than a slot, retries exhausted
+// entirely before any transmission and a loss-free link produced permanent
+// losses. Regression: pace both flows at a sub-slot retry timeout and assert
+// every byte arrives with zero permanent losses and zero retransmissions.
+class LlrTimeoutStartsAtWireTest : public TestCase
+{
+  public:
+    LlrTimeoutStartsAtWireTest()
+        : TestCase("LLR retry timeout starts at wire transmission, not enqueue") {}
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1); // dest 1 is remote (So path, shaped)
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(false);
+
+        static uint64_t rxBytes = 0;
+        static uint64_t gapBytes = 0;
+        rxBytes = 0;
+        gapBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader h) {
+            if (h.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+            {
+                gapBytes += h.GetEffectiveDataSize();
+            }
+            else
+            {
+                rxBytes += h.GetEffectiveDataSize();
+            }
+        });
+
+        // LLR with a retry timeout SHORTER than the pacer slot: 1us vs ~13.4us
+        // for 1000B at the 0.1 Gbps per-QP ceiling. Pre-fix this exhausted the
+        // retry budget during the first pace slot (all loss fabricated).
+        // LLR is enabled on BOTH endpoints: the receiver's manager is what
+        // turns deliveries into ACKs (SendLlrAckPacket is a no-op without
+        // it), matching the protocol-config wiring where lossy fabrics
+        // enable LLR on every endpoint.
+        Ptr<LlrManager> llr = tx->GetLlrManager();
+        llr->SetRetryTimeout(NanoSeconds(1000));
+        llr->SetRetryLimit(1);
+        llr->SetLlrMode(LlrMode::SACK);
+        tx->SetLlrEnabled(true);
+        tx->EnableLlrTimeoutRetransmit();
+        rx->SetLlrEnabled(true);
+
+        Ptr<LinkDegradationModel> degr = CreateObject<LinkDegradationModel>();
+        degr->SetAttribute("Ber", DoubleValue(0.0)); // loss-free link
+        tx->SetLinkDegradationModel(degr);
+        rx->SetLinkDegradationModel(degr);
+
+        Ptr<DcqcnRateMachine> dcqcn = CreateObject<DcqcnRateMachine>();
+        dcqcn->SetAttribute("PerQpCeilingGbps", DoubleValue(0.1));
+        tx->SetDcqcnRateMachine(dcqcn);
+
+        tx->Initialize();
+        rx->Initialize();
+
+        // Two flows, one 1000B packet each (each flow's pacer holds its chunk
+        // until a full slot after the flow's previous egress).
+        std::vector<uint8_t> buf(1000, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 1000, NcclProtocol::LL, 1, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 1000, NcclProtocol::LL, 2, 0);
+
+        Simulator::Stop(MicroSeconds(3000));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(rxBytes, 2000u,
+            "both paced packets must be delivered in full on a loss-free link");
+        NS_TEST_ASSERT_MSG_EQ(gapBytes, 0u,
+            "no PERMANENT_LOSS gap bytes: pacing must not fabricate loss");
+        NS_TEST_ASSERT_MSG_EQ(llr->GetPermanentLossCount(), 0u,
+            "zero permanent losses while the pacer holds packets");
+        NS_TEST_ASSERT_MSG_EQ(llr->GetRetransmittedPackets(), 0u,
+            "zero retransmissions on a loss-free link");
+        Simulator::Destroy();
+    }
+};
+
 // (1c) RTTCC rate machine: probe cadence, Swift-style MD/AI math, per-flow
 // pacer, and the parity foundation (unknown flow / at-line-rate flow shape
 // nothing). Probe/response timing is driven by scheduled events so the RTT
@@ -6353,6 +6460,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnDisposeCancelsTimersTest, TestCase::Duration::QUICK);
+    AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SoOnlyPredicateTest, TestCase::Duration::QUICK);

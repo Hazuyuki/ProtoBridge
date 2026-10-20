@@ -96,6 +96,22 @@ class LlrManager : public Object
     bool StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank);
 
     /**
+     * @brief (Re)arm the retry-timeout on a stored source entry for a packet
+     *        that is only NOW reaching the wire.
+     *
+     * StorePacket arms the timer at enqueue time, but several gates can hold
+     * a packet after StorePacket and before its first transmission: the
+     * DCQCN/RTTCC per-flow pacer (shapingDelay schedules the NetDevice send
+     * into the future), WFQ contention service time, and FEC encode latency.
+     * A timeout shorter than that hold makes the retry budget expire for a
+     * packet that was never lost — it degrades to permanent loss on a
+     * loss-free link (codex round 12, finding 4). The egress sites call
+     * this at the moment the packet actually leaves.
+     */
+    void ArmRetryTimeoutAtTransmission(uint32_t seqNum, uint16_t destRank,
+                                       uint16_t flowId, uint8_t vcId = 0);
+
+    /**
      * @brief Remove a packet from the retry buffer (individual ACK received)
      * @param seqNum Sequence number of the ACKed packet
      * @param destRank Destination rank of the ACKed packet
@@ -244,6 +260,12 @@ class LlrManager : public Object
         Ptr<Packet> packet;
         uint16_t destRank;
         uint32_t retryCount;
+        // True once the packet's retry-timeout countdown has started (first
+        // wire transmission, or a NACK/timeout retransmission). A fresh send
+        // held by the egress pacer/contention/FEC gates has NOT started its
+        // countdown — starting it at enqueue time expiring the retry budget
+        // for a packet that was never lost (codex round 12, finding 4).
+        bool wireArmed{false};
         // The retry-timeout timer lives on the SOURCE entry, not the
         // retry-buffer entry: the source store is the packet's lifetime
         // (until ACK), while a retry-buffer copy can be evicted by

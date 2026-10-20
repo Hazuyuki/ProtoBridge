@@ -24,15 +24,20 @@ unchanged, so the pins come home to them:
 
 * ``test_default_off_legacy_pin`` — without the flag, the lossy GBN run is
   byte-identical to the pre-strict behavior at this fabric (w=16, plr=1e-2:
-  simTimeNs=3116759, retx=696; spray reordering makes blanket retransmits
+  simTimeNs=3116865, retx=696; spray reordering makes blanket retransmits
   near-free duplicates, so the legacy count is LOWER than strict's). A
   regression here means the strict branch leaks into the default path. The
-  pin was re-anchored once (3185174/918 -> 3116759/696) by the 8701736
-  duplicate-branch credit mirror: a retransmitted So duplicate used to emit a
-  phantom credit packet the remote sender never consumed (its sends bypass
-  credits), and suppressing it removes those reverse-direction events from
-  this RoCE wire. The regime itself is unchanged — the strict-ON pins below
-  never had the phantom (strict dedup ACKs instead of re-crediting).
+  pin was re-anchored twice, both without touching the regime: first
+  (3185174/918 -> 3116759/696) by the 8701736 duplicate-branch credit
+  mirror: a retransmitted So duplicate used to emit a phantom credit packet
+  the remote sender never consumed (its sends bypass credits), and
+  suppressing it removes those reverse-direction events from this RoCE wire;
+  then (3116759 -> 3116865, counts unchanged) by the round-12 LLR
+  wire-arm fix: retry timeout deadlines now start at first wire
+  transmission instead of at enqueue, so each of the 696 retransmit
+  deadlines lands one FEC-encode hold (~1.1us compounded) later. The
+  strict-ON pins below never had the phantom (strict dedup ACKs instead of
+  re-crediting) and their lossy timeline already tracked wire egress.
 * ``test_strict_lossless_baseline`` — strict ON at plr=0 (retx=0): with
   the 4 KB cap enforced the TX window (w=64 chunks) bounds in-flight below
   the reorder depth, so arrivals are in-order and strict acceptance is
@@ -115,8 +120,8 @@ def run_gbn(tx_window, plr, strict, timeout=600):
 def test_default_off_legacy_pin():
     fields, out = run_gbn(tx_window=16, plr="1e-2", strict=False)
     assert fields.get("status") == "complete", out[-500:]
-    assert fields.get("simTimeNs") == 3116759, (
-        "default-off GBN lossy run changed: simTimeNs={} != 3116759 "
+    assert fields.get("simTimeNs") == 3116865, (
+        "default-off GBN lossy run changed: simTimeNs={} != 3116865 "
         "(strict branch leaking into the default path, or the fabric "
         "convention moved under the pin?)".format(fields.get("simTimeNs")))
     assert fields.get("retransmittedPackets") == 696, fields

@@ -2697,6 +2697,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                              << " encodeLatency=" << encodeLatency.GetNanoSeconds() << "ns");
                 Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, tc]() {
                     Ptr<NetDevice> dev = m_devices[deviceIndex];
+                    ArmRetryTimeoutOnWire(packet);
                     dev->Send(packet, dest, 0x0800);
                 });
                 // Decrement backlog after packet finishes transmission (serialization)
@@ -2718,6 +2719,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         {
             Simulator::Schedule(delay, [this, packet, deviceIndex, dest]() {
                 Ptr<NetDevice> device = m_devices[deviceIndex];
+                ArmRetryTimeoutOnWire(packet);
                 device->Send(packet, dest, 0x0800);
             });
             // Decrement backlog after serialization
@@ -2739,12 +2741,14 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     {
         Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest]() {
             Ptr<NetDevice> dev = m_devices[deviceIndex];
+            ArmRetryTimeoutOnWire(packet);
             dev->Send(packet, dest, 0x0800);
         });
     }
     else
     {
         Ptr<NetDevice> dev = m_devices[deviceIndex];
+        ArmRetryTimeoutOnWire(packet);
         dev->Send(packet, dest, 0x0800);
     }
     if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
@@ -2754,6 +2758,34 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             m_contentionModel->DecrementBacklog(tc);
         });
     }
+}
+
+void
+FabricEndpoint::ArmRetryTimeoutOnWire(Ptr<Packet> packet)
+{
+    NS_LOG_FUNCTION(this << packet);
+    // The packet is only now leaving the endpoint. Any LLR retry timer armed
+    // at StorePacket (enqueue) time measured the pacing/contention/FEC hold,
+    // not the network — re-arm so the timeout window starts at first wire
+    // transmission (see ArmRetryTimeoutAtTransmission). No-op for control
+    // packets (never stored) and for entries already ACKed.
+    if (!m_llrEnabled || !m_llrManager)
+    {
+        return;
+    }
+    FabricHeader hdr;
+    if (!packet->PeekHeader(hdr) || hdr.IsControlPacket() || hdr.IsRetryPacket())
+    {
+        return;
+    }
+    if (hdr.GetSourceRank() != m_rank)
+    {
+        return;
+    }
+    m_llrManager->ArmRetryTimeoutAtTransmission(hdr.GetSequenceNumber(),
+                                                hdr.GetDestRank(),
+                                                hdr.GetFlowId(),
+                                                hdr.GetVirtualChannel());
 }
 
 uint32_t

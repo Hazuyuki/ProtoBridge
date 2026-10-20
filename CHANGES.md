@@ -6,6 +6,29 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — LLR retry timers start at first wire transmission, not enqueue
+
+`LlrManager::StorePacket` armed the retry timeout at enqueue, but the
+endpoint's egress path can hold a stored packet before any wire
+transmission — DCQCN per-QP shaping, WFQ contention service, and FEC
+encode latency all defer `dev->Send`. The timeout window therefore
+measured the pacing hold, not the network: with a retry timeout shorter
+than the pace slot (1 µs vs ~13 µs for 1000 B at a 0.1 Gbps per-QP
+ceiling) the retry budget exhausted while the first transmission was
+still queued, fabricating permanent loss on a loss-free link (codex
+round 12, finding 4). First stores no longer arm a timer;
+`FabricEndpoint::ArmRetryTimeoutOnWire`, called immediately before
+`dev->Send` in all four egress branches (so the FabricHeader is read
+before the device mutates the packet front), forwards to the new
+`LlrManager::ArmRetryTimeoutAtTransmission`, which arms only-extend —
+an earlier NACK-driven deadline is never pushed out. Re-stores after a
+timeout re-arm as before, and GBN/SACK retransmits still arm at
+`delay + retryTimeout`. The 2-node lossy GBN parity pins re-anchor by
++1106 ns with every event count identical (each of the 696 retransmit
+deadlines now starts one FEC hold later); regression test
+`LlrTimeoutStartsAtWireTest` pins loss-free delivery under a sub-slot
+retry timeout.
+
 ### Fixed — NVLS expected losses count upload and result sides separately
 
 The whole-collective reliability estimate treated NVLS like the ring
