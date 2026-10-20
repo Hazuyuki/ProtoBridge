@@ -1260,8 +1260,11 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
             }
             else
             {
-                // No FEC: use link degradation's per-packet BER sampling
-                if (!m_linkDegradationModel->ProcessPacket(pkt))
+                // No FEC: use link degradation's per-packet BER sampling.
+                // ProcessPacketBerOnly (not ProcessPacket): the loss-rate
+                // draw already happened above — ProcessPacket would draw the
+                // loss rate a second time, compounding the effective loss.
+                if (!m_linkDegradationModel->ProcessPacketBerOnly(pkt))
                 {
                     packetCorrupted = true;
                     packetSurvived = false;

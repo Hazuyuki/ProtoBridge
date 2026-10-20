@@ -475,7 +475,10 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
         }
         else
         {
-            failed = !linkModel->ProcessPacket(pkt);
+            // ProcessPacketBerOnly (not ProcessPacket): the loss-rate draw
+            // already happened above — ProcessPacket would draw the loss
+            // rate a second time, compounding the effective loss.
+            failed = !linkModel->ProcessPacketBerOnly(pkt);
         }
 
         if (failed)

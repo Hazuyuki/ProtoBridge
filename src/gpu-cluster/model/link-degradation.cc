@@ -440,6 +440,30 @@ LinkDegradationModel::ProcessPacket(Ptr<Packet> packet)
         }
     }
 
+    return ProcessPacketBerOnly(packet);
+}
+
+bool
+LinkDegradationModel::ProcessPacketBerOnly(Ptr<Packet> packet)
+{
+    NS_LOG_FUNCTION(this << packet);
+
+    // Check bit errors only. Callers that have already sampled the packet
+    // loss rate (and link state) themselves must use this entry point:
+    // calling ProcessPacket would draw the loss-rate sample a SECOND time,
+    // doubling the effective loss probability (10% configured -> 19% actual)
+    // and perturbing every subsequent draw.
+    if (m_linkState == LinkState::DOWN)
+    {
+        m_droppedPackets++;
+        m_packetDropTrace(packet->GetSize(), m_currentTrigger);
+        if (!m_packetDropCallback.IsNull())
+        {
+            m_packetDropCallback(packet, m_currentTrigger);
+        }
+        return false;
+    }
+
     // Check bit errors
     if (m_ber > 0)
     {
