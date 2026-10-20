@@ -224,17 +224,19 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     return true;
 }
 
-void
+bool
 LlrManager::RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId)
 {
     NS_LOG_FUNCTION(this << seqNum << destRank << flowId);
 
     RetryKey key = MakeRetryKey(seqNum, destRank, flowId, vcId);
-    if (m_sourceStore.find(key) != m_sourceStore.end())
+    const bool hadEntry = m_sourceStore.find(key) != m_sourceStore.end();
+    if (hadEntry)
     {
         m_ackTrace(seqNum, destRank);
     }
     RemoveOutstandingPacket(key);
+    return hadEntry;
 }
 
 void

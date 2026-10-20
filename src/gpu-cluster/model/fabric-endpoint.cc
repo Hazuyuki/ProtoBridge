@@ -1964,13 +1964,43 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
                                       header.GetVirtualChannel(),
                                       header.GetFlowId(),
                                       header.GetSequenceNumber()}) > 0;
-        m_llrManager->RemovePacket(header.GetSequenceNumber(),
-                                   header.GetSourceRank(),
-                                   header.GetFlowId(),
-                                   header.GetVirtualChannel());
+        const bool removed =
+            m_llrManager->RemovePacket(header.GetSequenceNumber(),
+                                       header.GetSourceRank(),
+                                       header.GetFlowId(),
+                                       header.GetVirtualChannel());
         if (heldWindowSlot)
         {
             ReleaseBulkTxSlot();
+        }
+        if (removed)
+        {
+            // R9#2: the ACK proves the receiver got the packet, so the send's
+            // consumed credit is owed back even if the receiver's CREDIT
+            // packet was lost in flight (CREDIT is BER-exempt but still drawn
+            // against the loss rate). Without this backstop the ACK purges
+            // the retry entry — nothing ever re-sends that CREDIT — and the
+            // VC permanently loses the credit (the next send on the VC
+            // queues forever). The insert shares m_creditsReturned with
+            // ProcessCreditPacket so the credit is returned EXACTLY once per
+            // seq whichever arrives first: ACK first marks the seq credited
+            // and the receiver's genuine CREDIT lands in the phantom bucket;
+            // CREDIT first returns it and the ACK-side insert fails. A
+            // duplicate ACK (removed=false) never reaches here. So
+            // (remote-dest) sends never consumed a credit, so only local
+            // dests are owed one — mirror of every send-side guard.
+            uint64_t ackKey = MakeSeqKey(header.GetSourceRank(),
+                                         header.GetVirtualChannel(),
+                                         header.GetFlowId());
+            if (IsLocalRank(header.GetSourceRank()) &&
+                m_creditsReturned.insert({ackKey,
+                                          header.GetSequenceNumber()}).second)
+            {
+                m_creditManager->ReturnCredits(header.GetVirtualChannel(), 1);
+                NS_LOG_DEBUG("ACK-side credit recovery for seq "
+                             << header.GetSequenceNumber() << " vc="
+                             << static_cast<int>(header.GetVirtualChannel()));
+            }
         }
     }
 }

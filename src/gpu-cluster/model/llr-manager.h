@@ -100,8 +100,10 @@ class LlrManager : public Object
      * @param seqNum Sequence number of the ACKed packet
      * @param destRank Destination rank of the ACKed packet
      * @param flowId Flow ID of the packet
+     * @return true if an entry was actually removed (the ACK retired a live
+     *         retry entry); false for a duplicate ACK whose entry is gone
      */
-    void RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
+    bool RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     /**
      * @brief Remove all packets up to a sequence number (cumulative ACK)
