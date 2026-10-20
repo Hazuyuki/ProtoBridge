@@ -574,13 +574,13 @@ class NvSwitch : public FabricSwitch
     uint32_t m_allReduceNumPartitions;              ///< Number of partitions for pipelined multicast (0=single)
     // FlowID -> count of completed partitions (for pipelined multicast)
     std::unordered_map<uint16_t, uint32_t> m_allReduceCompletedPartitions;
-    // Multicast result seqnums are PER DESTINATION: endpoint reorder buffers
-    // (the module default, SetBypassReorderBuffer(false)) key on
-    // (vc, flow, source) and expect each stream to start at 0 — one global
-    // counter advancing across destinations left every dest after the first
-    // buffering its seqs forever awaiting a 0 that never comes. Per-dest
-    // counters start at 0 for each destination rank.
-    std::unordered_map<uint16_t, uint32_t> m_multicastSeqNums; ///< destRank -> next seq
+    // Multicast result seqnums are PER (DESTINATION, FLOW): endpoint reorder
+    // buffers (the module default, SetBypassReorderBuffer(false)) key on
+    // (vc, flow, source) and expect each stream to start at 0 — a counter
+    // spanning destinations OR flows leaves every stream after the first
+    // buffering its seqs forever awaiting a 0 that never comes. Counters
+    // start at 0 for each (destination, flow) pair.
+    std::unordered_map<uint64_t, uint32_t> m_multicastSeqNums; ///< (destRank<<16|flowId) -> next seq
     uint32_t m_multicastSeqNum = 0; ///< Total result packets emitted (stats/tests)
     // FlowID -> (sourceRank -> chunk sizes) — track per-GPU contribution sizes only.
     // Full Packet objects are NOT stored to avoid memory explosion (256MB × N GPUs

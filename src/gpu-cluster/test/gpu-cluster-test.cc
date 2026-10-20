@@ -5653,14 +5653,16 @@ class SharpResultRetentionTest : public TestCase
 // (vc, flow, source) and expect each stream to start at seq 0. Codex repro
 // (round 11, finding 4): one global counter advanced across destinations, so
 // with two GPUs the first dest received seqs 0-1 (delivered) while the
-// second buffered seqs 2-3 forever awaiting 0 — 128 B / 0 B delivered. The
-// main executable's forced bypass masked this module-API failure. The fix
-// numbers each destination's stream independently from 0.
+// second buffered seqs 2-3 forever awaiting 0 — 128 B / 0 B delivered. Codex
+// round 12, finding 1: the per-dest fix still spanned FLOWS — a second
+// collective on the same switch continued the dest's counter at seq 2, so
+// flow 2's reorder stream buffered forever (0 B delivered). The fix numbers
+// each (destination, flow) stream independently from 0.
 class MulticastSeqPerDestTest : public TestCase
 {
   public:
     MulticastSeqPerDestTest()
-        : TestCase("Multicast result seqs are per-destination (reorder buffers)")
+        : TestCase("Multicast result seqs are per-destination and per-flow (reorder buffers)")
     {
     }
     void DoRun() override
@@ -5681,6 +5683,8 @@ class MulticastSeqPerDestTest : public TestCase
 
         uint64_t rxA = 0;
         uint64_t rxB = 0;
+        uint64_t rx2A = 0; // flow 2 (second collective) per-dest deliveries
+        uint64_t rx2B = 0;
         Ptr<FabricEndpoint> epA = CreateObject<FabricEndpoint>();
         Ptr<FabricEndpoint> epB = CreateObject<FabricEndpoint>();
         epA->SetRank(0);
@@ -5694,9 +5698,27 @@ class MulticastSeqPerDestTest : public TestCase
         epA->SetBypassReorderBuffer(false);
         epB->SetBypassReorderBuffer(false);
         epA->SetReceiveCallback(
-            [&rxA](uint16_t, Ptr<Packet>, FabricHeader h) { rxA += h.GetEffectiveDataSize(); });
+            [&rxA, &rx2A](uint16_t, Ptr<Packet>, FabricHeader h) {
+                if (h.GetFlowId() == 1)
+                {
+                    rxA += h.GetEffectiveDataSize();
+                }
+                else if (h.GetFlowId() == 2)
+                {
+                    rx2A += h.GetEffectiveDataSize();
+                }
+            });
         epB->SetReceiveCallback(
-            [&rxB](uint16_t, Ptr<Packet>, FabricHeader h) { rxB += h.GetEffectiveDataSize(); });
+            [&rxB, &rx2B](uint16_t, Ptr<Packet>, FabricHeader h) {
+                if (h.GetFlowId() == 1)
+                {
+                    rxB += h.GetEffectiveDataSize();
+                }
+                else if (h.GetFlowId() == 2)
+                {
+                    rx2B += h.GetEffectiveDataSize();
+                }
+            });
         epA->Initialize();
         epB->Initialize();
 
@@ -5709,21 +5731,27 @@ class MulticastSeqPerDestTest : public TestCase
         sw->SetAllGatherDataSize(128);
 
         // Each rank uploads 64 B on its own port (a real wire send so the
-        // switch learns both port->rank mappings).
-        for (int r = 0; r < 2; ++r)
+        // switch learns both port->rank mappings), for flow 1 and then again
+        // for flow 2 — two collectives on the same switch (codex round 12:
+        // the per-dest-only counter continued flow 2's stream at seq 2, so
+        // its reorder buffer waited forever for seq 0).
+        for (int f = 1; f <= 2; ++f)
         {
-            FabricHeader fh;
-            fh.SetPacketType(FabricPacketType::ALLGATHER);
-            fh.SetFlowId(1);
-            fh.SetSourceRank(r);
-            fh.SetDestRank(0xFFFF);
-            fh.SetSequenceNumber(r);
-            fh.SetPayloadSize(64);
-            fh.SetEffectiveDataSize(64);
-            Ptr<Packet> pkt = Create<Packet>(64);
-            pkt->AddHeader(fh);
-            (r == 0 ? d0.Get(0) : d1.Get(0))
-                ->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            for (int r = 0; r < 2; ++r)
+            {
+                FabricHeader fh;
+                fh.SetPacketType(FabricPacketType::ALLGATHER);
+                fh.SetFlowId(f);
+                fh.SetSourceRank(r);
+                fh.SetDestRank(0xFFFF);
+                fh.SetSequenceNumber(r);
+                fh.SetPayloadSize(64);
+                fh.SetEffectiveDataSize(64);
+                Ptr<Packet> pkt = Create<Packet>(64);
+                pkt->AddHeader(fh);
+                (r == 0 ? d0.Get(0) : d1.Get(0))
+                    ->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            }
         }
         Simulator::Stop(MicroSeconds(500));
         Simulator::Run();
@@ -5737,6 +5765,16 @@ class MulticastSeqPerDestTest : public TestCase
             "Dest 1 must receive the full result — a per-dest seq stream "
             "starting at 0, not a global counter's continuation (pre-fix: "
             "seqs 2-3 buffered forever, 0 B delivered)");
+        // Flow 2 must ALSO deliver fully to both dests: its reorder stream
+        // keys on (vc, flow 2, source) and starts at 0. Pre-fix (round 12,
+        // finding 1): the per-dest counter continued at seq 2, so flow 2's
+        // seqs 2-3 parked forever — 0 B / 0 B delivered.
+        NS_TEST_ASSERT_MSG_EQ(rx2A, 128,
+            "Dest 0 must receive flow 2's full result — per-flow seq streams "
+            "restart at 0, not a per-dest counter's continuation");
+        NS_TEST_ASSERT_MSG_EQ(rx2B, 128,
+            "Dest 1 must receive flow 2's full result (pre-fix: 0 B — flow "
+            "2's result seqs continued the dest's counter)");
         Simulator::Destroy();
     }
 };

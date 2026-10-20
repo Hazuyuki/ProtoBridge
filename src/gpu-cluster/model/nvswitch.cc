@@ -1228,9 +1228,11 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisEffectiveSize);
-            // Per-dest seq: reorder buffers expect each (vc,flow,source)
-            // stream to start at 0 (see m_multicastSeqNums' note).
-            resultHeader.SetSequenceNumber(m_multicastSeqNums[destRank]++);
+            // Per-(dest,flow) seq: reorder buffers expect each
+            // (vc,flow,source) stream to start at 0 (see m_multicastSeqNums'
+            // note).
+            resultHeader.SetSequenceNumber(
+                m_multicastSeqNums[(uint64_t{destRank} << 16) | flowId]++);
             m_multicastSeqNum++;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
@@ -1318,9 +1320,11 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisEffectiveSize);
-            // Per-dest seq: reorder buffers expect each (vc,flow,source)
-            // stream to start at 0 (see m_multicastSeqNums' note).
-            resultHeader.SetSequenceNumber(m_multicastSeqNums[destRank]++);
+            // Per-(dest,flow) seq: reorder buffers expect each
+            // (vc,flow,source) stream to start at 0 (see m_multicastSeqNums'
+            // note).
+            resultHeader.SetSequenceNumber(
+                m_multicastSeqNums[(uint64_t{destRank} << 16) | flowId]++);
             m_multicastSeqNum++;
 
             pkt->AddHeader(resultHeader);
@@ -1630,9 +1634,11 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisChunkSize);
-            // Per-dest seq: reorder buffers expect each (vc,flow,source)
-            // stream to start at 0 (see m_multicastSeqNums' note).
-            resultHeader.SetSequenceNumber(m_multicastSeqNums[destRank]++);
+            // Per-(dest,flow) seq: reorder buffers expect each
+            // (vc,flow,source) stream to start at 0 (see m_multicastSeqNums'
+            // note).
+            resultHeader.SetSequenceNumber(
+                m_multicastSeqNums[(uint64_t{destRank} << 16) | flowId]++);
             m_multicastSeqNum++;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
