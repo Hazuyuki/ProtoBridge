@@ -1174,7 +1174,7 @@ def make_h200_roce_theory(**overrides):
     Spec-derived, UNCALIBRATED lower bound (anchored to ns-3, not real HW):
     400GbE per-link unidirectional wire rate (50 GB/s = 50000 B/us), 8 NICs
     per node, ~1 us per-hop propagation (vs NVLink 0.4), ~1.5 us Ethernet
-    switch pipeline (vs NVSwitch 1.1), ~40 us RDMA startup (vs NCCL 15), and
+    switch pipeline (vs NVSwitch 4.10), ~40 us RDMA startup (vs NCCL 15), and
     0.95 wire efficiency (Eth+IP+UDP+IB header overhead -- mirrors the ns-3
     RoceProtocolModel's GetWireSize = data/0.95). The schedule bandwidths
     derive from the Ethernet wire rate the same way NVLink does (ring_bw =
