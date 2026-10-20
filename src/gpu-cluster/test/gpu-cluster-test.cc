@@ -5648,6 +5648,99 @@ class SharpResultRetentionTest : public TestCase
     }
 };
 
+// Multicast result sequence numbering must be per-destination: endpoint
+// reorder buffers (the module default, SetBypassReorderBuffer(false)) key on
+// (vc, flow, source) and expect each stream to start at seq 0. Codex repro
+// (round 11, finding 4): one global counter advanced across destinations, so
+// with two GPUs the first dest received seqs 0-1 (delivered) while the
+// second buffered seqs 2-3 forever awaiting 0 — 128 B / 0 B delivered. The
+// main executable's forced bypass masked this module-API failure. The fix
+// numbers each destination's stream independently from 0.
+class MulticastSeqPerDestTest : public TestCase
+{
+  public:
+    MulticastSeqPerDestTest()
+        : TestCase("Multicast result seqs are per-destination (reorder buffers)")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // Two endpoints, each with its own p2p link to the switch; both run
+        // with the reorder buffer ENABLED (module default).
+        NodeContainer epNodes;
+        epNodes.Add(CreateObject<Node>());
+        epNodes.Add(CreateObject<Node>());
+        NodeContainer swNode;
+        swNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer d0 = p2p.Install(epNodes.Get(0), swNode.Get(0));
+        NetDeviceContainer d1 = p2p.Install(epNodes.Get(1), swNode.Get(0));
+
+        uint64_t rxA = 0;
+        uint64_t rxB = 0;
+        Ptr<FabricEndpoint> epA = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> epB = CreateObject<FabricEndpoint>();
+        epA->SetRank(0);
+        epB->SetRank(1);
+        epA->SetLocalRankRange(0, 8);
+        epB->SetLocalRankRange(0, 8);
+        epA->AddNetDevice(d0.Get(0));
+        epB->AddNetDevice(d1.Get(0));
+        // Default is already false (reorder on); set it explicitly so the
+        // test's intent survives any future default change.
+        epA->SetBypassReorderBuffer(false);
+        epB->SetBypassReorderBuffer(false);
+        epA->SetReceiveCallback(
+            [&rxA](uint16_t, Ptr<Packet>, FabricHeader h) { rxA += h.GetEffectiveDataSize(); });
+        epB->SetReceiveCallback(
+            [&rxB](uint16_t, Ptr<Packet>, FabricHeader h) { rxB += h.GetEffectiveDataSize(); });
+        epA->Initialize();
+        epB->Initialize();
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->AddPort(d0.Get(1));
+        sw->AddPort(d1.Get(1));
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(2);
+        sw->SetAllGatherChunkSize(64);
+        sw->SetAllGatherDataSize(128);
+
+        // Each rank uploads 64 B on its own port (a real wire send so the
+        // switch learns both port->rank mappings).
+        for (int r = 0; r < 2; ++r)
+        {
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::ALLGATHER);
+            fh.SetFlowId(1);
+            fh.SetSourceRank(r);
+            fh.SetDestRank(0xFFFF);
+            fh.SetSequenceNumber(r);
+            fh.SetPayloadSize(64);
+            fh.SetEffectiveDataSize(64);
+            Ptr<Packet> pkt = Create<Packet>(64);
+            pkt->AddHeader(fh);
+            (r == 0 ? d0.Get(0) : d1.Get(0))
+                ->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+        }
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+
+        // Both dests must receive the full 128 B multicast result through
+        // their reorder buffers. Pre-fix: rxA=128, rxB=0 (seqs 2-3 parked
+        // forever awaiting seq 0).
+        NS_TEST_ASSERT_MSG_EQ(rxA, 128,
+            "Dest 0 must receive the full result (its seq stream starts at 0)");
+        NS_TEST_ASSERT_MSG_EQ(rxB, 128,
+            "Dest 1 must receive the full result — a per-dest seq stream "
+            "starting at 0, not a global counter's continuation (pre-fix: "
+            "seqs 2-3 buffered forever, 0 B delivered)");
+        Simulator::Destroy();
+    }
+};
+
 
 // Forwarding + no-spurious-TTL-drop: a 4-GPU switched fabric forwards GPU0's
 // DATA to GPU1, the switch counts rx/tx, and GetTtlDrops()==0 (TTL is hardcoded
@@ -6202,6 +6295,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new NvlsAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new SharpUploadDedupTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
+    AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
 
     // P1: NvSwitch microarchitecture.

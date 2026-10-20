@@ -1228,7 +1228,10 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisEffectiveSize);
-            resultHeader.SetSequenceNumber(m_multicastSeqNum++);
+            // Per-dest seq: reorder buffers expect each (vc,flow,source)
+            // stream to start at 0 (see m_multicastSeqNums' note).
+            resultHeader.SetSequenceNumber(m_multicastSeqNums[destRank]++);
+            m_multicastSeqNum++;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
             pkt->AddHeader(resultHeader);
@@ -1315,7 +1318,10 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisEffectiveSize);
-            resultHeader.SetSequenceNumber(m_multicastSeqNum++);
+            // Per-dest seq: reorder buffers expect each (vc,flow,source)
+            // stream to start at 0 (see m_multicastSeqNums' note).
+            resultHeader.SetSequenceNumber(m_multicastSeqNums[destRank]++);
+            m_multicastSeqNum++;
 
             pkt->AddHeader(resultHeader);
 
@@ -1624,7 +1630,10 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisChunkSize);
-            resultHeader.SetSequenceNumber(m_multicastSeqNum++);
+            // Per-dest seq: reorder buffers expect each (vc,flow,source)
+            // stream to start at 0 (see m_multicastSeqNums' note).
+            resultHeader.SetSequenceNumber(m_multicastSeqNums[destRank]++);
+            m_multicastSeqNum++;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
             pkt->AddHeader(resultHeader);

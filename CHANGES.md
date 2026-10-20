@@ -6,6 +6,23 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — multicast result sequence numbers are per-destination
+
+The three multicast-result sites stamped every packet from one global
+`m_multicastSeqNum` that advanced across destinations, but endpoint reorder
+buffers (the module default, `SetBypassReorderBuffer(false)`) key on
+(vc, flow, source) and expect each stream to start at seq 0. With two GPUs,
+64-byte uploads, no loss, the first destination received seqs 0–1 (delivered)
+while the second buffered seqs 2–3 forever awaiting a 0 that never came —
+codex reproduced 128 B / 0 B delivered (round 11, finding 4). The main
+executable's forced bypass masked this module-API failure.
+
+Each destination now has its own counter starting at 0 (`m_multicastSeqNums`,
+destRank-keyed); the old counter survives as a total-emitted statistic.
+Regression test `MulticastSeqPerDestTest` builds two reorder-enabled
+endpoints on real switch ports and asserts both receive the full 128-byte
+result.
+
 ### Fixed — the switch-side result cache can no longer evict a fragment before its first delivery
 
 The multicast-result LLR store kept a full `Ptr<Packet>` copy per result
