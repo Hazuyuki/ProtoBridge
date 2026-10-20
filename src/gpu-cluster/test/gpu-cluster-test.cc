@@ -146,6 +146,22 @@ FabricHeaderTest::TestHeaderSerialization()
     // Verify MAC addresses
     NS_TEST_EXPECT_MSG_EQ(receivedHeader.GetSourceMac(), Mac48Address("00:11:22:33:44:55"), "Source MAC mismatch");
     NS_TEST_EXPECT_MSG_EQ(receivedHeader.GetDestMac(), Mac48Address("66:77:88:99:AA:BB"), "Dest MAC mismatch");
+
+    // The protocol-framed flag rides bit 7 of the virtualLane byte and must
+    // survive serialization; the low bits (the lane itself) are untouched.
+    header.SetProtocolFramed(true);
+    NS_TEST_EXPECT_MSG_EQ(header.GetSerializedSize(), 39,
+                          "Framed flag must not change the 39-byte wire layout");
+    Ptr<Packet> framedPacket = Create<Packet>();
+    framedPacket->AddHeader(header);
+    FabricHeader framedHeader;
+    framedPacket->RemoveHeader(framedHeader);
+    NS_TEST_EXPECT_MSG_EQ(framedHeader.IsProtocolFramed(), true,
+                          "Framed flag must survive serialization");
+    framedHeader.SetProtocolFramed(false);
+    NS_TEST_EXPECT_MSG_EQ(framedHeader.IsProtocolFramed(), false,
+                          "Framed flag must clear cleanly");
+    NS_TEST_EXPECT_MSG_EQ(header.GetVirtualChannel(), 3, "VC unchanged by framed flag");
 }
 
 void
@@ -261,6 +277,17 @@ FabricHeaderTest::TestPacketTypeClassification()
     NS_TEST_EXPECT_MSG_EQ(header.GetVirtualLane(), 0, "Default virtual lane is 0");
     header.SetVirtualLane(3);
     NS_TEST_EXPECT_MSG_EQ(header.GetVirtualLane(), 3, "Virtual lane set to 3");
+
+    // The protocol-framed flag (bit 7 of the lane byte) coexists with the
+    // low lane bits and defaults to false.
+    header.SetVirtualLane(0);
+    NS_TEST_EXPECT_MSG_EQ(header.IsProtocolFramed(), false, "Framed flag defaults false");
+    header.SetProtocolFramed(true);
+    NS_TEST_EXPECT_MSG_EQ(header.GetVirtualLane(), 0,
+                          "Framed flag must not disturb the lane value");
+    header.SetVirtualLane(3);
+    NS_TEST_EXPECT_MSG_EQ(header.IsProtocolFramed(), true,
+                          "Lane set must not disturb the framed flag");
 }
 
 /**
@@ -4184,6 +4211,170 @@ class CnpTestEndpoint : public FabricEndpoint
 
 NS_OBJECT_ENSURE_REGISTERED(CnpTestEndpoint);
 
+// Receive dispatch routes by the wire-level protocol-framed flag, not by the
+// handling model's efficiency. Two codex-reproduced regressions the efficiency
+// gate caused (round 11, finding 1):
+//   (a) RoCE, dataSize=8: SendBulkWireTransferSize's stamp guard requires
+//       wireChunk > 10 (the SoHeader size); ceil(8/0.95)=9 stays raw. The
+//       efficiency-gated receiver still peeled a SoHeader off 9 bytes and
+//       NS_ASSERT-aborted in Buffer::Iterator.
+//   (b) UB model mounted: public SendData sends raw (no builder framing);
+//       the efficiency-gated receiver stripped a 16-byte UB transaction
+//       header that was never stamped -- 64 payload bytes delivered as 48.
+// The flag makes send/receive gates provably match: it is set exactly where
+// a builder header is stamped, and nowhere else.
+class ProtocolFramedDispatchTest : public TestCase
+{
+  public:
+    ProtocolFramedDispatchTest()
+        : TestCase("Receive dispatch keys on the protocol-framed wire flag")
+    {
+    }
+    void DoRun() override
+    {
+        // ---- (a) Raw RoCE packet under an efficiency-1.0... no: 0.95 model ----
+        // A raw (unframed) DATA packet from a remote RoCE source must take the
+        // raw delivery path: full payload delivered, no SoHeader peel.
+        {
+            Ptr<CnpTestEndpoint> ep = MakeUbLikeEndpoint(
+                CreateObject<RoceProtocolModel>(), CreateObject<RocePayloadBuilder>());
+            ClearDelivered(); // delivery observed via the static capture buffer
+            ep->SetReceiveCallback(MakeCallback(&ProtocolFramedDispatchTest::CaptureDelivered));
+
+
+            const uint32_t rawSize = 9; // the dataSize=8 wire chunk (ceil(8/0.95))
+            Ptr<Packet> raw = Create<Packet>(rawSize);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ROCE);
+            fh.SetSourceRank(kRemoteRank);
+            fh.SetDestRank(0);
+            fh.SetProtocol(0); // raw bulk chunk: no SoHeader stamped
+            fh.SetVirtualChannel(0);
+            fh.SetFlowId(1);
+            fh.SetSequenceNumber(1);
+            fh.SetPayloadSize(rawSize);
+            fh.SetEffectiveDataSize(rawSize);
+            ep->InjectDataPacket(raw, fh);
+
+            NS_TEST_ASSERT_MSG_EQ(m_lastDelivered.size(), rawSize,
+                "Raw RoCE chunk (sub-header-size bulk fragment) must deliver its "
+                "full payload, not abort on a SoHeader deserialize");
+            Simulator::Destroy();
+        }
+
+        // ---- (b) Raw UB packet: efficiency 0.98, but never framed ----
+        // Public SendData emits raw packets even when the UB model/builder are
+        // mounted; the receiver must deliver all 64 bytes (was: 48 after the
+        // spurious 16-byte transaction-header strip).
+        {
+            Ptr<CnpTestEndpoint> ep = MakeUbLikeEndpoint(
+                CreateObject<UbProtocolModel>(), CreateObject<UbPayloadBuilder>());
+            ClearDelivered(); // delivery observed via the static capture buffer
+            ep->SetReceiveCallback(MakeCallback(&ProtocolFramedDispatchTest::CaptureDelivered));
+
+
+            const uint32_t rawSize = 64;
+            Ptr<Packet> raw = Create<Packet>(rawSize);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::UB); // vendor fabric; value only feeds logging
+            fh.SetSourceRank(kRemoteRank);
+            fh.SetDestRank(0);
+            fh.SetProtocol(static_cast<uint8_t>(UbTransaction::MEM_SYNC));
+            fh.SetVirtualChannel(0);
+            fh.SetFlowId(1);
+            fh.SetSequenceNumber(1);
+            fh.SetPayloadSize(rawSize);
+            fh.SetEffectiveDataSize(rawSize);
+            ep->InjectDataPacket(raw, fh);
+
+            NS_TEST_ASSERT_MSG_EQ(m_lastDelivered.size(), rawSize,
+                "Raw UB SendData payload must deliver byte-for-byte (was 48/64 "
+                "under the efficiency gate)");
+            Simulator::Destroy();
+        }
+
+        // ---- (c) Framed UB packet: the flag routes to ExtractData ----
+        // A packet the payload builder actually framed (16-byte transaction
+        // header) carries the flag and must arrive header-stripped.
+        {
+            Ptr<CnpTestEndpoint> ep = MakeUbLikeEndpoint(
+                CreateObject<UbProtocolModel>(), CreateObject<UbPayloadBuilder>());
+            ClearDelivered(); // delivery observed via the static capture buffer
+            ep->SetReceiveCallback(MakeCallback(&ProtocolFramedDispatchTest::CaptureDelivered));
+
+
+            const uint32_t dataSize = 64;
+            const uint8_t proto = static_cast<uint8_t>(UbTransaction::MEM_SYNC);
+            std::vector<uint8_t> data(dataSize, 0xAB);
+            auto chunks = ep->GetProtocolPayloadBuilder()->BuildChunks(
+                data.data(), dataSize, proto, 4096);
+            NS_TEST_ASSERT_MSG_EQ(chunks.size(), 1, "64 B MEM_SYNC builds one chunk");
+
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::UB);
+            fh.SetSourceRank(kRemoteRank);
+            fh.SetDestRank(0);
+            fh.SetProtocol(proto);
+            fh.SetVirtualChannel(0);
+            fh.SetFlowId(1);
+            fh.SetSequenceNumber(1);
+            fh.SetPayloadSize(chunks[0]->GetSize());
+            fh.SetEffectiveDataSize(dataSize);
+            fh.SetProtocolFramed(true); // what SendDataInternal now stamps
+            ep->InjectDataPacket(chunks[0], fh);
+
+            NS_TEST_ASSERT_MSG_EQ(m_lastDelivered.size(), dataSize,
+                "Framed UB chunk must deliver its data payload (16-byte header stripped)");
+            for (uint32_t i = 0; i < dataSize; ++i)
+            {
+                NS_TEST_ASSERT_MSG_EQ(m_lastDelivered[i], 0xAB,
+                    "Framed UB extracted content must match input");
+            }
+            Simulator::Destroy();
+        }
+    }
+
+  private:
+    static constexpr uint16_t kRemoteRank = 8;
+
+    // Bypass delivery so the receive callback sees the bytes directly (the
+    // reorder-buffer path would need a full simulator run to drain).
+    static Ptr<CnpTestEndpoint>
+    MakeUbLikeEndpoint(Ptr<ProtocolModel> model, Ptr<ProtocolPayloadBuilder> builder)
+    {
+        Ptr<CnpTestEndpoint> ep = CreateObject<CnpTestEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 8); // ranks 0-7 local; 8 remote
+        ep->SetProtocolModel(CreateObject<NcclProtocolModel>());
+        ep->SetInterNodeProtocolModel(model);
+        ep->SetProtocolPayloadBuilder(builder);
+        ep->SetBypassReorderBuffer(true);
+        return ep;
+    }
+
+    // The ReceiveCallback type has no user-data slot, so route the captured
+    // bytes through a static buffer.
+    static void
+    CaptureDelivered(uint16_t, Ptr<Packet> pkt, FabricHeader)
+    {
+        Ptr<Packet> p = pkt->Copy();
+        m_lastDelivered.assign(p->GetSize(), 0);
+        p->CopyData(m_lastDelivered.data(), p->GetSize());
+    }
+
+    static void
+    ClearDelivered()
+    {
+        m_lastDelivered.clear();
+    }
+
+    static std::vector<uint8_t> m_lastDelivered;
+};
+std::vector<uint8_t> ProtocolFramedDispatchTest::m_lastDelivered;
+
 // CNP-reaction: an ECN-marked RoCE segment reaching a receiver's protocol
 // dispatch must trigger a Congestion Notification Packet back to the source.
 // This exercises the WU-SoH3 receive-side link (ProcessProtocolDataPacket ->
@@ -4204,8 +4395,9 @@ class CnpReactionTest : public TestCase
     void DoRun() override
     {
         // Receiver: rank 0 on a node with 8 local GPUs, so a remote source rank
-        // (8) selects the RoCE model (efficiency 0.95 < 1.0 — no efficiency>=1.0
-        // short-circuit) and the So fabric type.
+        // (8) selects the RoCE model and the So fabric type. The injected
+        // segment carries the protocol-framed flag (as a real So sender
+        // stamps), so the dispatch routes it to the protocol-aware path.
         Ptr<CnpTestEndpoint> ep = CreateObject<CnpTestEndpoint>();
         ep->SetRank(0);
         ep->SetLocalRankRange(0, 8);
@@ -4266,6 +4458,7 @@ class CnpReactionTest : public TestCase
         fh.SetSourceRank(8); // remote So source
         fh.SetDestRank(0);   // ep is rank 0
         fh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        fh.SetProtocolFramed(true); // the SoHeader above is the framing
         fh.SetVirtualChannel(0);
         fh.SetFlowId(1);
         fh.SetSequenceNumber(seq);
@@ -5800,6 +5993,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new EthernetSwitchEcnTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchDropTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpReactionTest, TestCase::Duration::QUICK);
+    AddTestCase(new ProtocolFramedDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

@@ -925,6 +925,7 @@ FabricEndpoint::PumpBulkTxWindow()
         header.SetSourceMac(m_address);
         header.SetDestMac(ResolveDestMac(desc.destRank));
         header.SetProtocol(stamp ? desc.protocolId : 0);
+        header.SetProtocolFramed(stamp);
         header.SetEffectiveDataSize(desc.fragmentDataSize);
         header.SetTtl(64);
         chunkPacket->AddHeader(header);
@@ -1536,23 +1537,22 @@ FabricEndpoint::ProcessDataPacket(Ptr<Packet> packet, const FabricHeader& header
 {
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
 
-    // Check if this is a protocol-aware packet. The gate is the HANDLING
-    // MODEL's wire efficiency for the packet's protocol byte — NOT an
-    // NcclProtocol enum interpretation of that byte. Vendor protocol ids are
-    // not NCCL ids: UB's MEM_SYNC is 0 (NCCL NONE) and MAINTENANCE is 3
-    // (NCCL SIMPLE), yet both frame a 16-byte transaction header the receiver
-    // must strip — under the enum gate a UB small message took the raw path
-    // and reached the application with its transaction header intact (64
-    // payload bytes delivered as 80, first byte 0). Efficiency < 1.0 is
-    // exactly the set of protocols whose payloads were built by a payload
-    // builder on send (SendDataInternal's same gate), so the receive side
-    // must run the matching extraction. Protocol byte 0 on an efficiency-1.0
-    // model (NCCL NONE, MCCL with default efficiency) still takes the raw
-    // path unchanged.
-    uint8_t protoByte = header.GetProtocol();
-    double protoEfficiency =
-        GetProtocolModelForDest(header.GetSourceRank())->GetEfficiency(protoByte);
-    if (protoEfficiency < 1.0)
+    // Check if this is a protocol-aware packet. The gate is the WIRE-level
+    // protocol-framed flag the sender stamped when it framed the payload
+    // through a vendor payload builder (SendDataInternal's BuildChunks, the
+    // SoHeader stamp in SendBulkWireTransferSize) — NOT an inference from
+    // the handling model's efficiency and NOT an NcclProtocol enum
+    // interpretation of the protocol byte. Both inferences misfire:
+    // (a) efficiency < 1.0 does NOT guarantee the sender framed a header —
+    // public SendData, SendP2p, collective uploads, switch multicast results
+    // and sub-header-size bulk chunks all send raw under an efficiency<1.0
+    // model, and the receiver would strip (RoCE: a 10 B SoHeader deserialize
+    // off a 9 B payload aborts; UB: a 16 B strip delivers 64 B as 48 B);
+    // (b) vendor protocol ids are not NCCL ids — UB's MEM_SYNC is 0 (NCCL
+    // NONE) yet frames a 16-byte transaction header. The flag is set exactly
+    // where a builder header is stamped, so send and receive gates provably
+    // match; unframed packets keep the raw path regardless of model.
+    if (header.IsProtocolFramed())
     {
         // Delegate to protocol-aware processing
         ProcessProtocolDataPacket(packet, header);
@@ -1975,6 +1975,7 @@ FabricEndpoint::SendRetransmission(LlrManager::Retransmission retransmission)
     retryHeader.SetPayloadSize(oldHeader.GetPayloadSize());
     retryHeader.SetEffectiveDataSize(oldHeader.GetEffectiveDataSize());
     retryHeader.SetProtocol(oldHeader.GetProtocol());
+    retryHeader.SetProtocolFramed(oldHeader.IsProtocolFramed());
     retryHeader.SetTtl(64);
     packet->AddHeader(retryHeader);
 
@@ -2899,9 +2900,13 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
     // EthernetSwitch::MarkEcnIfCongested (guard GetProtocol()==SIMPLE),
     // SoHeader::PeekEcn, and SendCnpPacket on real So bulk traffic.
     // NOTE: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1) on the
-    // receive dispatch; the efficiency<1.0 gate in ProcessProtocolDataPacket
-    // keeps Su NVLink LL packets out of this path, so the two byte-1
-    // populations never cross-fire.
+    // receive dispatch; the protocol-framed wire flag stamped only when a
+    // SoHeader is actually present keeps Su NVLink LL packets (framed by the
+    // Su builder but byte-1) out of the So extraction path, so the two
+    // byte-1 populations never cross-fire. Chunks too small to hold the
+    // 10-byte header (wireChunk <= soHeaderSize) stay raw + unframed — the
+    // receiver delivers them through the raw path instead of aborting on a
+    // header deserialize that cannot fit.
     const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
     const bool stampSoHeader = (efficiency < 1.0) && payloadBuilder &&
         (payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
@@ -3064,6 +3069,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             header.SetSourceMac(m_address);
             header.SetDestMac(ResolveDestMac(destRank));
             header.SetProtocol(stamp ? protocolId : 0);
+            header.SetProtocolFramed(stamp);
             header.SetEffectiveDataSize(fragmentDataSize);
             header.SetTtl(64);
 
@@ -3123,6 +3129,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     remHeader.SetSourceMac(m_address);
                     remHeader.SetDestMac(ResolveDestMac(destRank));
                     remHeader.SetProtocol(remStamp ? protocolId : 0);
+                    remHeader.SetProtocolFramed(remStamp);
                     remHeader.SetEffectiveDataSize(remFragmentData);
                     remHeader.SetTtl(64);
 
@@ -3198,6 +3205,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         header.SetSourceMac(m_address);
         header.SetDestMac(ResolveDestMac(destRank));
         header.SetProtocol(stamp ? protocolId : 0);
+        header.SetProtocolFramed(stamp);
         header.SetEffectiveDataSize(static_cast<uint32_t>(dataSize));
         header.SetTtl(64);
 
@@ -3258,16 +3266,16 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
                  << " wireSize=" << packet->GetSize()
                  << " effectiveSize=" << effectiveSize);
 
-    // Check if this protocol has no overhead. Deliver directly through the
-    // receive pipeline (reorder buffer / bypass delivery) — do NOT recurse
-    // through ProcessDataPacket: it re-reads the protocol byte and, whenever
-    // the vendor id overlaps a non-trivial NcclProtocol value (MCCL's SIMPLE
-    // is 1 == NcclProtocol::LL), dispatches straight back here, recursing
-    // until the stack overflows. protocolId 0 (NONE) never reaches this
-    // function (ProcessDataPacket passes only LL/LL128 ids through), so this
-    // arm handles exactly the vendor-SIMPLE ids.
-    double efficiency = GetProtocolModelForDest(header.GetSourceRank())->GetEfficiency(protocolId);
-    if (efficiency >= 1.0)
+    // Check if this packet actually carries a framed payload. Deliver
+    // directly through the receive pipeline (reorder buffer / bypass
+    // delivery) when it does not — do NOT recurse through ProcessDataPacket:
+    // it dispatches on the same wire flag and would route straight back
+    // here, recursing until the stack overflows. The efficiency re-check the
+    // flag replaced had exactly this shape: a framed-marked packet from an
+    // efficiency-1.0 model (MCCL SIMPLE with WireEfficiency=1.0, raw NCCL
+    // NONE) takes this direct-delivery arm; framed packets (efficiency<1.0
+    // models, a stamped builder header) fall through to ExtractData.
+    if (!header.IsProtocolFramed())
     {
         uint8_t vcId = header.GetVirtualChannel();
         uint16_t flowId = header.GetFlowId();
@@ -3304,9 +3312,9 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
     // outermost and PeekEcn reads it directly. Peek (non-mutating) so the
     // SoHeader is still present for ExtractData below. The fabric-type gate is
     // load-bearing: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1),
-    // and Su LL/LL128 packets (efficiency<1.0, no SoHeader) would otherwise
-    // reach here and PeekEcn would read 10 B of NCCL payload as a SoHeader
-    // (spurious CNP). Only RoCE-fabric (So) packets carry a SoHeader.
+    // and Su LL/LL128 packets (framed, but not SoHeader-framed) would
+    // otherwise reach here and PeekEcn would read 10 B of NCCL payload as a
+    // SoHeader (spurious CNP). Only RoCE-fabric (So) packets carry a SoHeader.
     if (header.GetFabricType() == FabricType::ROCE &&
         protocolId == static_cast<uint8_t>(RoceProtocol::SIMPLE) &&
         SoHeader::PeekEcn(packet))

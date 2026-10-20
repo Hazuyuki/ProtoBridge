@@ -74,8 +74,10 @@ EthernetProtocolModel::GetProtocolId(uint64_t dataSize) const
     (void)dataSize;
     // 0 (NONE): the non-bulk SendDataAutoProtocol path stamps
     // SetProtocol(protocolId) unconditionally, so any non-zero id would
-    // collide with NcclProtocol::LL=1 and misroute Ethernet DATA into the
-    // NCCL-LL receiver. The bulk path forces protocol 0 when stamp=false
+    // collide with NcclProtocol::LL=1 and look like NCCL framing on the wire.
+    // The receive dispatch now routes on the protocol-framed flag (not the
+    // protocol byte), but keeping 0 preserves the byte as a plain-Ethernet
+    // discriminator. The bulk path forces protocol 0 when stamp=false
     // (efficiency=1.0) anyway. Plain Ethernet has no line-protocol tiers.
     return 0;
 }

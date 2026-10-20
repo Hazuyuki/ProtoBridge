@@ -434,16 +434,43 @@ FabricHeader::SetMemoryAccessType(MemoryAccessType type)
     m_memoryAccessType = static_cast<uint8_t>(type);
 }
 
+// The protocol-framed flag rides bit 7 of the virtualLane byte (virtual lanes
+// only use the low bits for nD deadlock-free routing; 0x80 is reserved here).
+static constexpr uint8_t PROTOCOL_FRAMED_FLAG = 0x80;
+
 uint8_t
 FabricHeader::GetVirtualLane() const
 {
-    return m_virtualLane;
+    // Mask off bit 7 (the protocol-framed flag) so callers see only the lane.
+    return static_cast<uint8_t>(m_virtualLane & ~PROTOCOL_FRAMED_FLAG);
 }
 
 void
 FabricHeader::SetVirtualLane(uint8_t lane)
 {
-    m_virtualLane = lane;
+    // Mask to the low 7 bits: bit 7 carries the protocol-framed flag, and a
+    // plain lane assignment must never clobber it.
+    m_virtualLane = static_cast<uint8_t>((lane & ~PROTOCOL_FRAMED_FLAG) |
+                                         (m_virtualLane & PROTOCOL_FRAMED_FLAG));
+}
+
+bool
+FabricHeader::IsProtocolFramed() const
+{
+    return (m_virtualLane & PROTOCOL_FRAMED_FLAG) != 0;
+}
+
+void
+FabricHeader::SetProtocolFramed(bool framed)
+{
+    if (framed)
+    {
+        m_virtualLane |= PROTOCOL_FRAMED_FLAG;
+    }
+    else
+    {
+        m_virtualLane &= static_cast<uint8_t>(~PROTOCOL_FRAMED_FLAG);
+    }
 }
 
 } // namespace ns3

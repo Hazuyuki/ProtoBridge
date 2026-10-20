@@ -143,6 +143,20 @@ class FabricHeader : public Header
     uint8_t GetVirtualLane() const;
     void SetVirtualLane(uint8_t lane);
 
+    // Protocol-framed flag: the sender stamped a vendor payload-builder
+    // header (SoHeader / UB transaction header / NCCL LL line) inside the
+    // packet body, so the receiver must run ExtractData before delivery.
+    // This is a WIRE property (did the sender frame?), not a model property
+    // (is the model's efficiency < 1.0?): several send paths legitimately
+    // emit raw packets under an efficiency<1.0 model (public SendData,
+    // SendP2p, collective uploads, switch multicast results, and
+    // SendBulkWireTransferSize chunks too small to hold a header), and
+    // inferring framing from efficiency wrongly strips a header that was
+    // never stamped. Packed into bit 7 of the virtualLane byte, so the
+    // 39-byte wire layout is unchanged.
+    bool IsProtocolFramed() const;
+    void SetProtocolFramed(bool framed);
+
   private:
     // Header fields (total: 39 bytes)
     uint8_t m_packetType;

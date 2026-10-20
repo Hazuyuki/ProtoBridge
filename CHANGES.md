@@ -6,6 +6,32 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — protocol framing is a wire flag, not a model-efficiency inference
+
+`ProcessDataPacket` routed packets to the protocol-aware extraction path by
+the handling model's wire efficiency (< 1.0 ⇒ "framed"). That inferred a wire
+property from a model property, and several send paths legitimately emit RAW
+packets under an efficiency<1.0 model: public `SendData`/`SendP2p`, collective
+uploads, switch multicast results, and `SendBulkWireTransferSize` chunks too
+small to hold the header (`wireChunk <= soHeaderSize`). Two codex-reproduced
+failures: `p2p-roce.cfg --dataSize=8` (wireSize 9 < 10 B SoHeader → receiver
+deserialized a header off 9 bytes → NS_ASSERT abort in `Buffer::Iterator`),
+and public `SendData` under the UB model (receiver stripped a 16-byte
+transaction header that was never stamped → 64 payload bytes delivered as 48).
+The switch multicast results were a third latent instance — an So builder at
+the receiver silently dropped them (SoHeader dataSize read off dummy bytes).
+
+`FabricHeader` now carries an explicit protocol-framed bit (bit 7 of the
+virtualLane byte — 39-byte wire layout unchanged; `SetVirtualLane` masks to
+the low 7 bits so it can never clobber the flag). Every send path that
+actually stamps a builder header sets it (`SendDataInternal`'s BuildChunks
+loop, the four `stampSoHeader` sites in `SendBulkWireTransferSize` /
+`PumpBulkTxWindow`), `SendRetransmission` propagates it, and the receiver
+dispatches on the flag instead of efficiency — send/receive gates provably
+match because the flag is set exactly where a header is stamped. Regression
+test `ProtocolFramedDispatchTest` covers the raw-RoCE, raw-UB, and framed-UB
+receive cases.
+
 ### Changed — tree surrogate: back to the original physical form, refit at the TRUE 18-link fabric
 
 Two corrections landed together:

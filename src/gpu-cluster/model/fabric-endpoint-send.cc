@@ -938,6 +938,10 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             header.SetProtocol(protocolId);
             header.SetEffectiveDataSize(subPacketDataSize);
             header.SetTtl(64);
+            // These chunks came from the payload builder (BuildChunks framed
+            // a vendor header inside the body) — stamp the wire flag the
+            // receiver's ProcessDataPacket dispatch reads.
+            header.SetProtocolFramed(true);
 
             // Credit-based flow control: check and consume credits before
             // sending — Su (local-dest) traffic only (see SendData for the
