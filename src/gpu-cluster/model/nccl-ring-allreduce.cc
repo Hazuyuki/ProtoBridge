@@ -38,6 +38,7 @@ NcclRingAllReduce::NcclRingAllReduce()
       m_numChannels(1),
       m_numChannelsCfg(0),
       m_chunkSize(0),
+      m_chunkRemainder(0),
       m_totalSteps(0),
       m_flowIdBase(1),
       m_protocolId(static_cast<uint8_t>(NcclProtocol::SIMPLE)),
@@ -53,6 +54,7 @@ NcclRingAllReduce::NcclRingAllReduce()
       m_ll128Threshold(2 * 1024 * 1024),
       m_gpuDoneCount(0),
       m_permanentLossCount(0),
+      m_sentDataBytes(0),
       m_startTimeNs(0),
       m_endTimeNs(0)
 {
@@ -137,10 +139,29 @@ NcclRingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
         m_numChannels = m_gpusPerNode; // one crossing per rail at most
     }
     m_totalSteps = 2 * (numGpus - 1);
-    m_chunkSize = dataSize / (static_cast<uint64_t>(m_numChannels) * numGpus);
+    // The C*N chunk grid must COVER dataSize, not truncate it: plain integer
+    // division drops dataSize % (C*N) bytes (2 nodes x 2 GPUs, 2 channels,
+    // dataSize=15 -> chunkSize=1 -> only 8 of 15 tensor bytes represented,
+    // yet the ring completes and reports the collective done — codex round
+    // 12, finding 8). The tensor splits into C*N chunks in (channel, index)
+    // row-major order; chunk i carries dataSize/chunkGrid bytes plus one
+    // extra for the first dataSize % chunkGrid chunks, so the grid sums to
+    // exactly dataSize. In the ring, rank r's step-s send moves chunk
+    // (r - s) mod N of its channel (every step, all N chunks of the channel
+    // advance one hop), so each chunk's size rides the wire 2(N-1) times and
+    // total traffic is exactly 2(N-1) * dataSize — 90 B, not 48 B, at the
+    // repro point. See ChunkSizeOf / ExpectedRecvBytes.
+    const uint64_t chunkGrid = static_cast<uint64_t>(m_numChannels) * numGpus;
+    m_chunkSize = dataSize / chunkGrid;
+    m_chunkRemainder = dataSize % chunkGrid;
     if (m_chunkSize == 0)
     {
+        // D < C*N: the grid has more slots than bytes. Keep the legacy floor
+        // (1-byte chunks, no remainder) — a degenerate config where NCCL
+        // itself would collapse channels; over-covering mirrors the old
+        // behavior while still completing.
         m_chunkSize = 1;
+        m_chunkRemainder = 0;
     }
 
     BuildRings();
@@ -239,6 +260,35 @@ NcclRingAllReduce::TriggerInitialSends()
     }
 }
 
+uint64_t
+NcclRingAllReduce::ChunkSizeOf(uint32_t channel, uint16_t rank, uint32_t step) const
+{
+    // Row-major (channel, index) grid: channel c owns indices c*N .. c*N+N-1.
+    // Rank r's step-s send moves chunk (r - s) mod N of the channel.
+    uint32_t n = m_numGpus;
+    uint32_t idx = (rank + n - (step % n)) % n;
+    uint64_t chunkIndex = static_cast<uint64_t>(channel) * n + idx;
+    uint64_t size = m_chunkSize + (chunkIndex < m_chunkRemainder ? 1 : 0);
+    return size;
+}
+
+uint64_t
+NcclRingAllReduce::ExpectedRecvBytes(uint16_t destRank, uint32_t channel,
+                                      uint32_t step) const
+{
+    // dest's ring predecessor for this channel is the rank whose ringNext is
+    // destRank. Find it by scanning the channel's successor table (N <= a
+    // few thousand; this runs once per completed step per (rank, channel)).
+    for (uint16_t r = 0; r < m_numGpus; ++r)
+    {
+        if (m_ringNext[channel][r] == destRank)
+        {
+            return ChunkSizeOf(channel, r, step);
+        }
+    }
+    return m_chunkSize; // unreachable: every rank has a successor
+}
+
 void
 NcclRingAllReduce::SendStepData(uint16_t gpu, uint32_t channel, uint32_t step)
 {
@@ -250,9 +300,11 @@ NcclRingAllReduce::SendStepData(uint16_t gpu, uint32_t channel, uint32_t step)
     // Unique flowId per (channel, step) keeps sequence tracking per transfer
     // distinct (same reason RingAllReduce uses one flowId per step).
     uint16_t flowId = static_cast<uint16_t>(m_flowIdBase + channel * m_totalSteps + step);
-    m_endpoints[gpu]->SendBulkWireTransferSize(target, m_chunkSize, m_protocolId, flowId, 0);
+    uint64_t chunk = ChunkSizeOf(channel, gpu, step);
+    m_sentDataBytes += chunk;
+    m_endpoints[gpu]->SendBulkWireTransferSize(target, chunk, m_protocolId, flowId, 0);
     NS_LOG_DEBUG("GPU " << gpu << " ch " << channel << " step " << step
-                 << " -> GPU " << target << " (" << m_chunkSize << "B)");
+                 << " -> GPU " << target << " (" << chunk << "B)");
 }
 
 void
@@ -295,9 +347,13 @@ NcclRingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fabric
 
     // Chunks of consecutive steps can interleave on the wire; subtracting one
     // chunk per completed step (instead of resetting) keeps the carry-over.
-    while (m_completedStep[idx] < m_totalSteps && m_recvBytes[idx] >= m_chunkSize)
+    // The expected size is the SENDER's step chunk (dest receives what its
+    // ring predecessor sent for that step), tracked in m_expectedBytes
+    // alongside m_completedStep.
+    while (m_completedStep[idx] < m_totalSteps &&
+           m_recvBytes[idx] >= ExpectedRecvBytes(destRank, channel, m_completedStep[idx]))
     {
-        m_recvBytes[idx] -= m_chunkSize;
+        m_recvBytes[idx] -= ExpectedRecvBytes(destRank, channel, m_completedStep[idx]);
         uint32_t step = m_completedStep[idx]++;
         OnStepReceiveComplete(destRank, channel, step);
     }

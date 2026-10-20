@@ -47,6 +47,7 @@
 #include "ns3/protocol-model.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/ring-allreduce.h"
+#include "ns3/nccl-ring-allreduce.h"
 #include "ns3/ring-allgather.h"
 #include "ns3/ring-reducescatter.h"
 #include "ns3/ring-broadcast.h"
@@ -5841,6 +5842,100 @@ class MulticastResultFecExpansionTest : public TestCase
     }
 };
 
+// NcclRingAllReduce chunk sizing must COVER dataSize: the channels*numGpus
+// chunk grid carries dataSize/(C*N) bytes per chunk plus one extra byte for
+// the first dataSize%(C*N) chunks, so the ring's total effective traffic is
+// exactly 2(N-1)*dataSize. The old floor division dropped the remainder
+// (2 nodes x 2 GPUs, 2 channels, dataSize=15 -> chunkSize=1 -> 8 of 15
+// tensor bytes represented, 48 B of traffic where 90 B is required, yet the
+// collective reported complete — codex round 12, finding 8).
+class NcclRingChunkCoverageTest : public TestCase
+{
+  public:
+    NcclRingChunkCoverageTest()
+        : TestCase("NcclRing chunk grid covers the full data size")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        // 2 nodes x 2 GPUs on a switched p2p fabric: every rank can reach
+        // every other rank (ring successor may be cross-node).
+        const uint16_t numGpus = 4;
+        NodeContainer nodes;
+        for (int i = 0; i < numGpus; ++i)
+        {
+            nodes.Add(CreateObject<Node>());
+        }
+        NodeContainer switchNode;
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r)
+                {
+                    ep->SetRoutingEntry(d, 0);
+                }
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        // Static routes + neighbor MACs so the switch forwards and endpoints
+        // unicast (Initialize below overwrites the receive callback with the
+        // injector's, so coverage is probed via GetSentDataBytes).
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r)
+                {
+                    eps[r]->SetNeighborMac(d, macs[d]);
+                }
+            }
+        }
+        for (auto& ep : eps)
+        {
+            ep->Initialize();
+        }
+
+        Ptr<NcclRingAllReduce> ar = CreateObject<NcclRingAllReduce>();
+        ar->SetNumNodes(2);
+        ar->SetGpusPerNode(2);
+        ar->SetNumChannels(2);
+        ar->Initialize(numGpus, /*dataSize=*/15, eps);
+        ar->Start();
+
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        // 2(N-1)*D = 90 effective bytes on the wire; the old floor division
+        // sent 48 (chunkSize=1 everywhere -> 8 of 15 tensor bytes covered).
+        NS_TEST_ASSERT_MSG_EQ(ar->IsCompleted(), true,
+            "the 15-B ring must complete");
+        NS_TEST_ASSERT_MSG_EQ(ar->GetSentDataBytes(), 90u,
+            "total effective traffic must cover the full data size: "
+            "2(N-1)*D = 90 B, not 48 B");
+        Simulator::Destroy();
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -6623,6 +6718,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SharpUploadDedupTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpUploadDedupSurvivesResultTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastResultFecExpansionTest, TestCase::Duration::QUICK);
+    AddTestCase(new NcclRingChunkCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);

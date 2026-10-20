@@ -64,6 +64,14 @@ public:
     void SetLlThreshold(uint64_t threshold);
     void SetLl128Threshold(uint64_t threshold);
 
+    /**
+     * @brief Effective data bytes the ring has put on the wire so far.
+     *
+     * Coverage probe for tests: the chunk grid must carry the FULL data
+     * size (total traffic 2(N-1)*D), not the truncated floor.
+     */
+    uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
+
 private:
     void DoDispose() override;
     void BuildRings();
@@ -81,7 +89,27 @@ private:
     uint32_t m_numChannels;     // resolved channel count (>=1)
     uint32_t m_numChannelsCfg;  // configured value (0 = auto)
     uint64_t m_chunkSize;       // dataSize / (channels * numGpus), >= 1
+    uint64_t m_chunkRemainder;  // dataSize % (channels * numGpus) — first chunks carry one extra byte
     uint32_t m_totalSteps;      // 2 * (numGpus - 1)
+
+    /**
+     * @brief Size of the chunk rank `rank` sends on `channel` at `step`.
+     *
+     * The tensor splits into channels*numGpus chunks in (channel, index)
+     * row-major order; the first m_chunkRemainder chunks carry one extra
+     * byte so the grid sums to exactly dataSize (no truncation). Rank r's
+     * step-s send moves chunk (r - s) mod numGpus of the channel.
+     */
+    uint64_t ChunkSizeOf(uint32_t channel, uint16_t rank, uint32_t step) const;
+
+    /**
+     * @brief Bytes destRank expects to receive on `channel` for `step`.
+     *
+     * The ring predecessor's ChunkSizeOf for the same step — the receive
+     * ledger advances one step per expected chunk.
+     */
+    uint64_t ExpectedRecvBytes(uint16_t destRank, uint32_t channel,
+                               uint32_t step) const;
     uint16_t m_flowIdBase;
     uint8_t m_protocolId;
 
@@ -104,6 +132,7 @@ private:
     std::vector<uint32_t> m_doneChannels; // per rank
     uint32_t m_gpuDoneCount;
     uint32_t m_permanentLossCount;
+    uint64_t m_sentDataBytes;      ///< cumulative effective bytes sent (coverage probe)
 
     uint64_t m_startTimeNs;
     uint64_t m_endTimeNs;

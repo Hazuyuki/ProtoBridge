@@ -6,6 +6,23 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NcclRing chunk grid covers the full data size
+
+`NcclRingAllReduce` split the tensor into `channels × numGpus` chunks with
+plain integer division, silently dropping `dataSize % (C·N)` bytes: at
+2 nodes × 2 GPUs, 2 channels, `dataSize=15` the chunk size floored to 1,
+representing only 8 of 15 tensor bytes (48 B of ring traffic where
+2(N−1)·D = 90 B is required) — yet the ring completed and reported the
+collective done (codex round 12, finding 8). The chunk grid is now
+row-major over (channel, index) with the first `dataSize % (C·N)` chunks
+carrying one extra byte, so the grid sums to exactly `dataSize`; rank r's
+step-s send moves chunk `(r−s) mod N` of its channel
+(`ChunkSizeOf`), and the receive ledger advances per step against the
+predecessor's expected chunk size (`ExpectedRecvBytes`). The 16 MiB
+parity pin is unchanged (its grid divides exactly). Regression test
+`NcclRingChunkCoverageTest` pins 90 B of traffic and completion at the
+repro point.
+
 ### Fixed — multicast result sends honor FEC wire expansion
 
 The NVLS/SHARP multicast result paths (AllReduce single and partitioned,
