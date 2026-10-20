@@ -1659,13 +1659,19 @@ def make_topology_from_family(family, N, links_per_gpu=None,
             f"expected one of {_TOPO_FAMILIES}")
     if N < 2:
         return make_topology()                         # degenerate: no fabric
-    if per_link_gbps is None:
-        if family in _NONBLOCKING_FAMILIES:
-            return make_topology(bisection_gbps=None, hop_count=1.0)
+    if per_link_gbps is None and family not in _NONBLOCKING_FAMILIES:
         raise ValueError(
             f"per_link_gbps is required for {family!r} "
             "(per-link unidirectional GB/s, e.g. 25 for H200 NVLink4 "
             "= b_link_bytes_per_us / 1000)")
+    if family in _NONBLOCKING_FAMILIES:
+        # A non-blocking NVSwitch fabric's bisection never caps the schedule
+        # rate (both guides promise this), so per_link_gbps — supplied or
+        # omitted — never enters the result. The old code fell through to
+        # _bisection_bw_gbps when the rate was supplied, which routed
+        # multiplane to the leaf-tier oversubscription formula (N*lpg*rate/8)
+        # and capped a fabric that is documented as uncapped.
+        return make_topology(bisection_gbps=None, hop_count=1.0)
     lpg = links_per_gpu or _default_links_per_gpu(family, N, **params)
     bisection_gbps = _bisection_bw_gbps(family, N, lpg, per_link_gbps, **params)
     hop = _hop_count(family, N, **params)
