@@ -1547,8 +1547,22 @@ FabricEndpoint::ProcessDataPacket(Ptr<Packet> packet, const FabricHeader& header
     {
         Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
                                                          header.GetSourceRank());
-        rb->Insert(header.GetSequenceNumber(), packet, header);
+        bool inserted = rb->Insert(header.GetSequenceNumber(), packet, header);
         rb->DeliverReadyPackets();
+        if (!inserted && rb->IsDuplicate(header.GetSequenceNumber()))
+        {
+            // A rejected DUPLICATE (retransmission of an already-delivered
+            // seq, or of one still parked in the buffer): the original
+            // delivery's ACK may have been lost, and without this re-ACK
+            // the sender's LLR store entry is never purged — the
+            // retry-timer backstop retransmits forever and the entry turns
+            // into a false permanent loss for data the receiver already
+            // holds. Mirrors the bypass path's duplicate branch. A
+            // capacity-rejected FUTURE seq is not a duplicate: it rides
+            // the sender's retry timer instead (ACKing it would purge the
+            // store entry for data the receiver never got).
+            SendLlrAckPacket(header, false);
+        }
     }
 
 }
