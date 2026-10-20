@@ -716,6 +716,14 @@ class FabricEndpoint : public Application
     bool m_isRetransmitting;                        ///< True during retransmission, prevents StorePacket reset
     std::unordered_map<uint64_t, uint32_t> m_gbnNextAckSeq;
     std::unordered_map<uint64_t, std::set<uint32_t>> m_gbnPendingAcks;
+    /// (ackKey, seqNum) credits already received from a peer. The receiver
+    /// re-credits a duplicate delivery in case the original CREDIT was lost
+    /// (CREDIT is BER-exempt but still subject to the loss-rate draw). When
+    /// the original CREDIT also arrives, the second one is phantom — the
+    /// send consumed exactly one credit and the first CREDIT already
+    /// returned it — so counting both grows the VC pool beyond its budget
+    /// and dispatches queued packets early.
+    std::set<std::pair<uint64_t, uint32_t>> m_creditsReturned;
 
     // FEC model
     Ptr<FecModel> m_fecModel;                       ///< Forward error correction model

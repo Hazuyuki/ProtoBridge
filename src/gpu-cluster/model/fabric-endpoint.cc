@@ -1954,7 +1954,31 @@ FabricEndpoint::ProcessCreditPacket(Ptr<Packet> packet, const FabricHeader& head
     uint8_t vcId = header.GetVirtualChannel();
     uint16_t credits = header.GetCreditCount();
 
-    m_creditManager->ReturnCredits(vcId, credits);
+    // Dedup per seq: the receiver re-credits a duplicate delivery (the
+    // duplicate branch of DeliverBypassDataPacket / the MEMORY_* path) in
+    // case the original CREDIT was lost — CREDIT is BER-exempt but still
+    // drawn against the loss rate. When the original CREDIT also arrives,
+    // the duplicate's credit is phantom: the send consumed exactly one
+    // credit and the first CREDIT already returned it. Counting both grows
+    // the VC pool beyond its budget and releases queued packets early.
+    // The first CREDIT for a seq wins; a genuinely lost CREDIT never
+    // enters the set, so its late twin is still accepted.
+    uint64_t ackKey = MakeSeqKey(header.GetSourceRank(),
+                                 header.GetVirtualChannel(),
+                                 header.GetFlowId());
+    bool phantomCredit = false;
+    if (!m_creditsReturned.insert({ackKey, header.GetSequenceNumber()}).second)
+    {
+        phantomCredit = true;
+        NS_LOG_DEBUG("Ignoring duplicate credit for seq="
+                     << header.GetSequenceNumber() << " vc="
+                     << static_cast<int>(vcId));
+    }
+
+    if (!phantomCredit)
+    {
+        m_creditManager->ReturnCredits(vcId, credits);
+    }
     if (m_llrEnabled && m_llrManager)
     {
         if (m_llrManager->GetLlrMode() == LlrMode::SACK)
