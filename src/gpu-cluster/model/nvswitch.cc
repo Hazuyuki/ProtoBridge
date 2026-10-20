@@ -134,6 +134,7 @@ NvSwitch::DoDispose()
     m_portRankMap.clear();
     m_allGatherBuffer.clear();
     m_allGatherReceivedBytes.clear();
+    m_seenUploadSeqs.clear();
     Simulator::Cancel(m_arbitrationEvent);
     NetDevice::DoDispose();
 }
@@ -1260,9 +1261,14 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
                 << " result packets for flowId=" << flowId
                 << " to " << rankPorts.size() << " GPUs");
 
-    // Flow complete: retire the upload dedup ledger with the buffers.
+    // Flow complete: retire the byte ledgers. The upload dedup ledger
+    // (m_seenUploadSeqs) deliberately SURVIVES the result: a retransmitted
+    // upload whose LLR ack raced the multicast must still be rejected, or
+    // the replay re-accumulates the ledgers and the switch multicasts a
+    // second full result from bytes it already holds (codex round 12,
+    // finding 5). It is one uint32 per accepted upload, cleared in
+    // DoDispose with the other per-flow state.
     m_allReduceReceivedBytes.erase(flowId);
-    m_seenUploadSeqs.erase(flowId);
 }
 
 void
@@ -1346,13 +1352,14 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
         }
     }
 
-    // Clean up buffer after last partition is multicast
+    // Clean up buffer after last partition is multicast. m_seenUploadSeqs
+    // survives (see the non-partitioned path): late replays of the flow's
+    // upload seqs must stay rejected after the result, not re-counted.
     if (partitionIdx == numPartitions - 1)
     {
         m_allReduceBuffer.erase(flowId);
         m_allReduceReceivedBytes.erase(flowId);
         m_allReduceCompletedPartitions.erase(flowId);
-        m_seenUploadSeqs.erase(flowId);
     }
 
     NS_LOG_INFO("SHARP AllReduce: multicast partition " << partitionIdx
@@ -1665,9 +1672,11 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
                 << " result chunks for flowId=" << flowId
                 << " to " << rankPorts.size() << " GPUs");
 
-    // Flow complete: retire the upload dedup ledger with the buffers.
+    // Flow complete: retire the byte ledger. m_seenUploadSeqs deliberately
+    // survives the result multicast (see the AllReduce path's note): a late
+    // replay of an accepted (flow, src, seq) must stay a rejected duplicate,
+    // not re-accumulate the ledger into a second result.
     m_allGatherReceivedBytes.erase(flowId);
-    m_seenUploadSeqs.erase(flowId);
 }
 
 void

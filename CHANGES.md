@@ -6,6 +6,20 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — upload dedup survives the NVLS/SHARP result multicast
+
+The switch erased its upload dedup ledger (`m_seenUploadSeqs`) when a
+flow completed and multicasted its result, so replaying the same
+(flow, src, seq) uploads after the result re-registered as new
+contributions: the byte ledgers re-accumulated, the flow "completed" a
+second time, and the switch multicasted a second full result — 256 B of
+result traffic where 128 B is correct, with zero duplicates reported
+(codex round 12, finding 5). The ledger now survives the result (one
+uint32 per accepted upload, cleared in `DoDispose`); late replays stay
+rejected duplicates exactly like pre-result retransmissions.
+Regression test `SharpUploadDedupSurvivesResultTest` pins one result
+set and two counted duplicates.
+
 ### Fixed — LLR retry timers start at first wire transmission, not enqueue
 
 `LlrManager::StorePacket` armed the retry timeout at enqueue, but the

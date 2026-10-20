@@ -5700,6 +5700,76 @@ class SharpUploadDedupTest : public TestCase
     }
 };
 
+// NVLS/SHARP upload dedup must SURVIVE the result multicast. The dedup
+// ledger (m_seenUploadSeqs) used to be erased when the flow completed and
+// multicasted its result, so replaying the SAME (flow, src, seq) uploads
+// after the result re-registered as new contributions: the ledgers
+// re-accumulated, the flow "completed" a second time, and the switch
+// multicasted a second full result — 256 B of result traffic where 128 B
+// is correct, with zero duplicates reported (codex round 12, finding 5).
+class SharpUploadDedupSurvivesResultTest : public TestCase
+{
+  public:
+    SharpUploadDedupSurvivesResultTest()
+        : TestCase("Upload dedup survives the result multicast")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+        uint32_t resultCount = 0;
+        uint64_t resultBytes = 0;
+        devs.Get(1)->SetReceiveCallback(
+            [&resultCount, &resultBytes](Ptr<NetDevice>, Ptr<const Packet> p, uint16_t, const Address&) {
+                FabricHeader h;
+                Ptr<Packet> c = p->Copy();
+                if (c->PeekHeader(h))
+                {
+                    resultCount++;
+                    resultBytes += h.GetEffectiveDataSize();
+                }
+                return true;
+            });
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(0));
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(2);
+        sw->SetAllGatherChunkSize(64);
+        sw->SetAllGatherDataSize(128);
+
+        // Complete the flow: 2 GPUs x 64 B.
+        sw->InjectAggregateUpload(1, 0, 100, 64, true);
+        sw->InjectAggregateUpload(1, 1, 200, 64, true);
+
+        // After the result multicast has fired (the aggregation delay is
+        // scheduled), replay both uploads with the SAME seqs — a late
+        // retransmission whose LLR ack raced the multicast.
+        Simulator::Schedule(MicroSeconds(30), [&sw]() {
+            sw->InjectAggregateUpload(1, 0, 100, 64, true);
+            sw->InjectAggregateUpload(1, 1, 200, 64, true);
+        });
+
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpDuplicateUploads(), 2,
+            "Both post-result replays must be rejected as duplicates");
+        NS_TEST_ASSERT_MSG_EQ(resultCount, 2,
+            "Exactly one result set (2 chunks x 64 B) may be multicast; "
+            "the replay must not re-complete the flow");
+        NS_TEST_ASSERT_MSG_EQ(resultBytes, 128,
+            "Result traffic is 128 B, not a second 128 B result");
+        Simulator::Destroy();
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -6480,6 +6550,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SharpAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new NvlsAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new SharpUploadDedupTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpUploadDedupSurvivesResultTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
