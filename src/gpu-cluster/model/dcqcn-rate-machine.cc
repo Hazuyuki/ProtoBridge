@@ -111,6 +111,32 @@ DcqcnRateMachine::GetOrCreate(FlowKey flowKey)
 }
 
 void
+DcqcnRateMachine::DoDispose()
+{
+    NS_LOG_FUNCTION(this);
+    // Recovery timers capture raw `this` (FastRecovery/AdditiveIncrease).
+    // Unless every armed timer is cancelled here, dropping the last
+    // reference lets the simulator fire into freed memory (codex round 12,
+    // finding 3: OnCnp -> Dispose -> release -> Run crashed ASAN inside
+    // FastRecovery).
+    for (auto& kv : m_flows)
+    {
+        FlowState& s = kv.second;
+        if (s.fastArmed)
+        {
+            Simulator::Cancel(s.fastTimer);
+            s.fastArmed = false;
+        }
+        if (s.aiArmed)
+        {
+            Simulator::Cancel(s.aiTimer);
+            s.aiArmed = false;
+        }
+    }
+    Object::DoDispose();
+}
+
+void
 DcqcnRateMachine::OnCnp(FlowKey flowKey)
 {
     NS_LOG_FUNCTION(this << flowKey);

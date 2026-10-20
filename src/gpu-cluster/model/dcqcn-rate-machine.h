@@ -71,6 +71,13 @@ class DcqcnRateMachine : public Object
     void OnCnp(FlowKey flowKey);
 
     /**
+     * \brief Cancel every armed recovery timer. The timers capture raw
+     *        `this`; leaving one armed past the last reference is a
+     *        use-after-free once the simulator fires it.
+     */
+    void DoDispose() override;
+
+    /**
      * \brief Extra egress delay (ns) to shape a chunk of chunkBytes for this
      *        flow. Returns 0 when Alpha is at/below the floor AND no per-QP
      *        ceiling is set (no congestion, no ceiling => no shaping), so the

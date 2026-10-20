@@ -219,6 +219,12 @@ FabricEndpoint::DoDispose()
     m_linkDegradationModel = nullptr;
     m_fecModel = nullptr;
     m_latencyStatistics = nullptr;
+    // The DCQCN machine owns armed recovery timers that capture its raw
+    // `this` (FastRecovery/AdditiveIncrease). Drop the reference so the
+    // machine is destroyed here, while its timers can still be cancelled
+    // by its own DoDispose — a surviving ref would fire into freed memory
+    // once the endpoint is gone.
+    SetDcqcnRateMachine(nullptr);
     m_sendQueue = std::queue<SendQueueEntry>();
     m_routingTable.clear();
     m_neighborMacTable.clear();

@@ -4680,6 +4680,45 @@ class PerQpCeilingPacerTest : public TestCase
     }
 };
 
+// (1b-2) Dispose must cancel armed recovery timers. The timers capture raw
+// `this` (FastRecovery/AdditiveIncrease); codex round 12, finding 3: OnCnp
+// then Dispose then dropping the last reference left the timer armed, and
+// running the simulator fired into freed memory (ASAN heap-use-after-free
+// inside FastRecovery). The regression: arm two flows' timers, Dispose,
+// release, and run — no crash AND the timer never fired (Alpha stays at its
+// post-CNP value instead of decaying through a fast cycle).
+class DcqcnDisposeCancelsTimersTest : public TestCase
+{
+  public:
+    DcqcnDisposeCancelsTimersTest()
+        : TestCase("DCQCN Dispose cancels armed recovery timers") {}
+    void DoRun() override
+    {
+        Ptr<DcqcnRateMachine> m = CreateObject<DcqcnRateMachine>();
+        m->SetAttribute("TFast", TimeValue(NanoSeconds(1000)));
+        const DcqcnRateMachine::FlowKey k = 7;
+        m->OnCnp(k); // arms the fast-recovery timer (Alpha = 0.5)
+        m->Dispose();
+        m = nullptr; // drop the last reference: destructor runs now
+        // No crash: the armed timer must not fire into freed memory.
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        Simulator::Destroy();
+        // Re-mount the scenario with a live machine to pin the semantic
+        // half: Dispose cancels the timer, so Alpha no longer decays.
+        Ptr<DcqcnRateMachine> live = CreateObject<DcqcnRateMachine>();
+        live->SetAttribute("TFast", TimeValue(NanoSeconds(1000)));
+        live->OnCnp(k);
+        live->Dispose();
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ_TOL(live->GetAlpha(k), 0.5, 1e-9,
+            "Dispose must cancel the fast-recovery timer (Alpha stays at its "
+            "post-CNP value instead of decaying through a fast cycle)");
+        Simulator::Destroy();
+    }
+};
+
 // (1c) RTTCC rate machine: probe cadence, Swift-style MD/AI math, per-flow
 // pacer, and the parity foundation (unknown flow / at-line-rate flow shape
 // nothing). Probe/response timing is driven by scheduled events so the RTT
@@ -6313,6 +6352,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ProtocolFramedDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
+    AddTestCase(new DcqcnDisposeCancelsTimersTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SoOnlyPredicateTest, TestCase::Duration::QUICK);
