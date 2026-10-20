@@ -787,3 +787,25 @@ def test_ring_expected_losses_unchanged_2N():
         optical_fraction=1.0, optical_hops=1, collective="allreduce")
     # 2N(N-1) = 112 transfers at the ring's per-transfer packetization.
     assert losses > 0.8  # the pre-fix tree value (0.80997) is the ring scale
+
+
+def test_nvls_expected_losses_count_result_sides():
+    """NVLS/SHARP reliability must count upload and result deliveries
+    separately: each rank's upload carries D/N (allgather) or D (allreduce),
+    while each multicast result delivers the FULL D to every destination —
+    the switch re-multicasts every received upload chunk, so a dest's result
+    stream has N * frag(D/N) packets. The pre-fix model counted 2N transfers
+    at the upload's packetization: at N=8/D=16 MiB it counted 288 packets
+    where the C++ fabric emits 1,296 (144 upload + 1,152 result), giving
+    0.2683 expected losses at BER 1e-9/0 retries instead of ~1.2074."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 16 * 1024 * 1024, 8
+    losses = nvls.expected_permanent_losses(
+        D, N, "nvls", 1e-9, 0,
+        optical_fraction=1.0, optical_hops=1, collective="allgather")
+    assert abs(losses - 1.2074) < 2e-3
+    # The allreduce branch carries the same per-side structure.
+    losses_ar = nvls.expected_permanent_losses(
+        D, N, "nvls", 1e-9, 0,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce")
+    assert losses_ar > 4 * losses / 5  # both sides counted, not 2N*frag

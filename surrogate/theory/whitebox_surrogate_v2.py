@@ -636,6 +636,31 @@ class TheoryDerivedSurrogate:
                 transfer_count = num_gpus * (num_gpus - 1)
         else:
             transfer_count = num_gpus
+        # NVLS/SHARP needs per-SIDE packet counts: uploads and result
+        # deliveries fragment differently. Each rank's upload carries D/N
+        # (allgather) or D (allreduce); each multicast result delivers the
+        # FULL D to every destination, re-fragmented at the upload chunks'
+        # granularity — the switch multicasts each received upload chunk, so
+        # a dest's result stream has N * frag(D/N) packets. Counting both
+        # sides at the upload's packetization understates the result risk:
+        # at N=8/D=16 MiB the surrogate counted 288 packets where the C++
+        # fabric emits 1,296 (144 upload + 1,152 result), so BER 1e-9/0
+        # retries gave 0.2683 expected losses instead of ~1.2074 and
+        # strict_reliability stayed finite for a config that cannot complete.
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            upload_per_rank = self._packets_per_transfer(
+                data_bytes / max(1, num_gpus) if collective == 'allgather'
+                else data_bytes,
+                num_gpus, algo, collective)
+            result_per_dest = num_gpus * self._packets_per_transfer(
+                data_bytes / max(1, num_gpus), num_gpus, algo, collective)
+            upload_count = num_gpus
+            result_count = num_gpus
+            attempts = retry_limit + 1
+            return ((upload_count * upload_per_rank
+                     + result_count * result_per_dest)
+                    * min(1.0, max(0.0, optical_fraction))
+                    * p_path ** attempts)
         attempts = retry_limit + 1
         return (transfer_count * packets_per_transfer
                 * min(1.0, max(0.0, optical_fraction))
