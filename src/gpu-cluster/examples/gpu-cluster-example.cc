@@ -181,13 +181,18 @@ main(int argc, char* argv[])
     generator->SetStartTime(Seconds(1.0));
     generator->SetStopTime(Seconds(5.0));
 
-    // Also install generator on GPU 2 to send to GPU 3
-    Ptr<GpuTrafficGenerator> generator2 = CreateObject<GpuTrafficGenerator>();
-    Ptr<FabricEndpoint> endpoint2 = DynamicCast<FabricEndpoint>(endpoints.Get(2));
-    generator2->Setup(endpoint2, 3, packetSize, numPackets, MicroSeconds(100));
-    gpuNodes.Get(2)->AddApplication(generator2);
-    generator2->SetStartTime(Seconds(1.5));
-    generator2->SetStopTime(Seconds(5.0));
+    // Also install generator on GPU 2 to send to GPU 3 — only when the
+    // topology actually has a rank 2 and 3 (this is the configurable example:
+    // --numGpus=2 must run, not abort fetching an out-of-range endpoint).
+    if (numGpus > 3)
+    {
+        Ptr<GpuTrafficGenerator> generator2 = CreateObject<GpuTrafficGenerator>();
+        Ptr<FabricEndpoint> endpoint2 = DynamicCast<FabricEndpoint>(endpoints.Get(2));
+        generator2->Setup(endpoint2, 3, packetSize, numPackets, MicroSeconds(100));
+        gpuNodes.Get(2)->AddApplication(generator2);
+        generator2->SetStartTime(Seconds(1.5));
+        generator2->SetStopTime(Seconds(5.0));
+    }
 
     NS_LOG_INFO("Running simulation...");
 
