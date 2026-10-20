@@ -2155,8 +2155,12 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
         {
             uint32_t writeSize = pktSize - 8;
 
-            // Direct write to backing store
-            if (!m_memoryData.empty() && address + writeSize <= m_memoryData.size())
+            // Direct write to backing store. The bounds check must not form
+            // address + writeSize: at address = UINT64_MAX-7 with a 16-byte
+            // write the sum wraps to 8, passes the check, and memcpy writes
+            // eight bytes BEFORE the allocation (ASan heap-buffer-overflow).
+            if (!m_memoryData.empty() && address <= m_memoryData.size() &&
+                writeSize <= m_memoryData.size() - address)
             {
                 std::vector<uint8_t> writeData(pktSize);
                 packet->CopyData(writeData.data(), pktSize);
