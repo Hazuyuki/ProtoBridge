@@ -385,11 +385,16 @@ match the bandwidth parameters.
 
 Omitting `topology` (or passing `Topology()` with defaults) is byte-identical
 to the ideal-fabric model, so the calibrated H200 numbers in Section 11 are
-unchanged. The bisection cap applies to the mean serialization term
-(`T_serial`); the `ber > 0` retransmission path keeps the construction
-bandwidth, so for the common `ber = 0` (calibration) regime the mean path is
-fully topology-aware. The two physical numbers can be supplied by hand, or —
-preferred — computed from a topology name via Section 13.
+unchanged. The bisection cap applies to the serialization rate itself, and
+every term built on that rate follows it: the mean serialization term
+(`T_serial`) **and** the `ber > 0` retransmission overhead, whose
+retransmitted fragments re-serialize at the same capped rate
+(`_retry_overhead` receives the topology-capped `T_serial_step`). At
+16 MiB / 8-GPU ring / BER 1e-7 / retry limit 3 / LLR-SACK, adding a
+50-GB/s bisection cap moves the prediction from ~223 µs to ~737 µs — the
+retransmissions serialize at the capped rate. The two physical numbers can
+be supplied by hand, or — preferred — computed from a topology name via
+Section 13.
 
 ## 13. Topology from a Name
 

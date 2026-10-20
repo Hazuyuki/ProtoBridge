@@ -6,6 +6,19 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Docs — retransmission path is topology-capped (like the mean path)
+
+`WHITEBOX_SURROGATE.md` §12 and `USER_GUIDE.md` §8 claimed the `ber > 0`
+retransmission path "keeps the construction bandwidth", implying only the
+`ber = 0` mean path was topology-aware (codex round 12, finding 9). The
+implementation caps the serialization rate itself —
+`T_serial_step = per_step / min(ring_bw, bisection)` — and `_retry_overhead`
+consumes that capped value, so SACK/GBN retransmissions serialize at the
+bisection-capped rate exactly like the mean term (verified numerically:
+16 MiB / 8-GPU ring / BER 1e-7 / retry 3 / SACK goes 222.98 µs → 737.04 µs
+under a 50 GB/s bisection cap). Both documents now state this, with the
+measured numbers; the code was already correct and is unchanged.
+
 ### Fixed — NcclRing chunk grid covers the full data size
 
 `NcclRingAllReduce` split the tensor into `channels × numGpus` chunks with

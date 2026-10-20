@@ -589,7 +589,11 @@ in [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Plain Ethernet”
 - Real-fabric bisection cap + hop propagation (when `topology=` is given).
 - Credit pressure, FEC coding overhead, GBN/SACK retransmission, contention,
   optical link protection, LLR buffer reload — each enabled by setting the
-  corresponding optional input.
+  corresponding optional input. With `topology=` given, retransmissions
+  serialize at the bisection-capped rate just like the mean path
+  (`_retry_overhead` receives the topology-capped `T_serial_step`; a
+  50-GB/s cap moves a 16 MiB / 8-GPU / BER 1e-7 / SACK prediction from
+  ~223 µs to ~737 µs — see §12 of `WHITEBOX_SURROGATE.md`).
 - N-independent efficiency factors; N enters through the explicit collective
   topology (`(N-1)/N` ring steps, `log2(N)` tree levels, NVLS N-cancellation).
 
@@ -599,9 +603,6 @@ in [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Plain Ethernet”
   tree can be above; the theory/ns-3 ratio is credit-sensitive — see
   [CALIBRATION.md](../../doc/CALIBRATION.md)). Use it for ordering/trends, not
   absolutes.
-- The `ber > 0` retransmission path keeps the **construction** bandwidth
-  (topology's effect on retransmission is second-order); only the `ber = 0`
-  mean path is fully topology-aware. See §12 of `WHITEBOX_SURROGATE.md`.
 - Replace packet simulation near a design frontier — surrogate winners are
   re-verified in ns-3.
 
