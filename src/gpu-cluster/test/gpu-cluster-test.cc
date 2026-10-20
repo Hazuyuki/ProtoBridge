@@ -5451,8 +5451,10 @@ class NvSwitchAggHarness : public NvSwitch
         return tid;
     }
     NvSwitchAggHarness() = default;
-    // Expose the protected test seam at public scope for this harness.
+    // Expose the protected test seams at public scope for this harness.
     using NvSwitch::InjectAggregateUpload;
+    using NvSwitch::InjectResultNack;
+    using NvSwitch::GetSharpResultStoreSize;
 };
 
 NS_OBJECT_ENSURE_REGISTERED(NvSwitchAggHarness);
@@ -5579,6 +5581,73 @@ class HierarchicalAllReduceCorrectnessTest : public TestCase
 // ---------------------------------------------------------------------------
 // P1: NvSwitch microarchitecture.
 // ---------------------------------------------------------------------------
+
+// Multicast-result retention: the switch-side LLR store must not evict a
+// result fragment before its first delivery. Codex repro (round 11, finding
+// 3): an 8-GPU 128-MiB allgather on the 18-lane fabric yields 1,024 result
+// fragments per dest; the old store kept full packet copies under a 512-entry
+// per-dest window, so the first half was evicted at generation time and any
+// loss of an evicted fragment was unrepairable (SACK, retry 64, plr 0.001:
+// collective incomplete at the sim limit). The store now keeps the stamped
+// header only (bodies are dummy bytes) under a 4096-entry window. The test
+// reproduces the eviction geometry — 8 ranks x 1024 fragments to one dest =
+// 8192 result chunks — and asserts both an early (seq 5) and a late (seq
+// 8150) NACK are serviceable, plus the store's per-dest bound.
+class SharpResultRetentionTest : public TestCase
+{
+  public:
+    SharpResultRetentionTest()
+        : TestCase("Multicast result store retains fragments for NACK repair")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(0));
+        sw->SetLlrEnabled(true);
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(8);
+        sw->SetAllGatherChunkSize(16777216); // 16 MiB per rank
+        sw->SetAllGatherDataSize(134217728); // 8 x 16 MiB
+
+        // 8 ranks x 1024 fragments of 16 KiB each: the codex-repro geometry.
+        for (uint16_t r = 0; r < 8; ++r)
+        {
+            for (uint32_t s = 0; s < 1024; ++s)
+            {
+                sw->InjectAggregateUpload(1, r, 1000 + s, 16384, true);
+            }
+        }
+        // Let the aggregation-delay event run the multicast.
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+
+        // 8192 result chunks emitted; the early ones must still be repairable
+        // (the old 512-entry window evicted all but the last 512 — seq 5 was
+        // gone before its first delivery).
+        NS_TEST_ASSERT_MSG_EQ(sw->GetMulticastSeqNum(), 8192,
+            "8 ranks x 1024 fragments must produce 8192 result chunks");
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpResultStoreSize(7), 8192,
+            "The per-dest store must retain every result fragment of the "
+            "flow (8192 here; the old 512-entry window evicted 94% at "
+            "generation time)");
+        NS_TEST_ASSERT_MSG_EQ(sw->InjectResultNack(7, 5), true,
+            "An early fragment (seq 5) must be NACK-repairable");
+        NS_TEST_ASSERT_MSG_EQ(sw->InjectResultNack(7, 8150), true,
+            "A late fragment (seq 8150) must be NACK-repairable");
+        Simulator::Destroy();
+    }
+};
+
 
 // Forwarding + no-spurious-TTL-drop: a 4-GPU switched fabric forwards GPU0's
 // DATA to GPU1, the switch counts rx/tx, and GetTtlDrops()==0 (TTL is hardcoded
@@ -6132,6 +6201,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SharpAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new NvlsAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new SharpUploadDedupTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
 
     // P1: NvSwitch microarchitecture.

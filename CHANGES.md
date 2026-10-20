@@ -6,6 +6,28 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — the switch-side result cache can no longer evict a fragment before its first delivery
+
+The multicast-result LLR store kept a full `Ptr<Packet>` copy per result
+fragment under a 512-entry per-dest window. Result generation queues every
+fragment synchronously, so a flow producing more than 512 fragments per
+destination — an 8-GPU 128-MiB allgather on the 18-lane fabric generates
+1,024 per dest — evicted the first half at generation time, before any of
+them could be lost and NACKed. Loss of an evicted fragment was unrepairable:
+the codex repro (SACK, retry limit 64, packet loss 0.001, `RngRun=1`) left
+the collective incomplete at the simulation limit while the loss-free run
+completed (codex round 11, finding 3).
+
+The store now retains the stamped header only — result bodies are dummy
+bytes whose size is all that matters for timing, so `HandleSwitchNack`
+rebuilds a body from the header's payload size instead of holding a copy —
+and the window rises to 8,192 entries per dest (~1.2 MB/dest bound, covering
+the eviction-repro geometry with headroom). The codex repro now completes
+(111 µs) with its 3 link-error drops repaired; at loss 0.01 the same run
+completes with 6 retransmissions. Regression test `SharpResultRetentionTest`
+reproduces the eviction geometry (8 ranks × 1024 fragments to one dest) and
+asserts both an early and a late NACK are serviceable.
+
 ### Fixed — NVLS/SHARP retransmitted uploads no longer double-count toward completion
 
 The switch's aggregation paths (`ProcessAllReduce`/`ProcessAllGather`) counted

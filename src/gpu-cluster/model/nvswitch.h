@@ -353,6 +353,22 @@ class NvSwitch : public FabricSwitch
                                uint32_t effectiveSize, bool allGather);
 
     /**
+     * @brief Test seam: drive the multicast-result retransmit path directly
+     * with a receiver NACK (DestRank 0xFFFF), bypassing the p2p loopback.
+     *
+     * Returns HandleSwitchNack's verdict: true when a stored result matched
+     * and was retransmitted. Used by the result-cache eviction regression
+     * test.
+     */
+    bool InjectResultNack(uint16_t requestingRank, uint32_t seqNum);
+
+    /**
+     * @brief Test seam: number of result copies currently retained for a
+     * destination rank in the switch-side LLR store.
+     */
+    size_t GetSharpResultStoreSize(uint16_t destRank) const;
+
+    /**
      * @brief Congestion hook called when a packet is enqueued to a VOQ.
      *
      * Returns false to DROP the packet (the caller skips the push and counts
@@ -579,17 +595,30 @@ class NvSwitch : public FabricSwitch
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, std::vector<uint32_t>>> m_allGatherBuffer;
 
     // Switch-side LLR for multicast results: destRank -> FIFO of (seq,
-    // portIdx, retransmitCount, packet). Entries live until evicted by the
-    // window bound; a NACK re-sends the stored copy (bounded retries).
+    // portIdx, retransmitCount, header). Only the stamped header is kept —
+    // the packet BODY is dummy bytes (only sizes matter for timing), so a
+    // retransmit rebuilds a body of the header's payload size instead of
+    // holding a full copy per fragment. Entries live until evicted by the
+    // window bound; a NACK re-sends a rebuilt packet (bounded retries).
     struct SharpResultEntry
     {
         uint32_t seqNum;        ///< FabricHeader sequence number of the result
         uint32_t portIdx;       ///< Port the result was multicast on
         uint32_t retransmits;   ///< NACK-driven retransmits issued so far
-        Ptr<Packet> packet;     ///< Copy of the multicast result packet
+        FabricHeader header;    ///< Header of the multicast result packet
     };
     std::unordered_map<uint16_t, std::deque<SharpResultEntry>> m_sharpResultStore;
-    static constexpr size_t SHARP_RESULT_WINDOW = 512; ///< Max stored results per dest
+    // Result-fragment retention. The eviction harness pinned the true scale:
+    // an 8-GPU 128-MiB allgather on the 18-lane fabric yields 1,024 fragments
+    // per dest, and 1024 fragments x 144 B header-only entries is ~144 KB —
+    // full packet copies were what made the old 512-entry window necessary.
+    // 8192 entries per dest bounds memory at ~1.2 MB/dest while covering the
+    // eviction-repro geometry (8192 fragments to one dest) with headroom;
+    // fragments beyond the window are still repairable via the endpoint's
+    // retry-timeout retransmit path. Cross-flow aliasing is impossible:
+    // result seqs come from the globally monotonic m_multicastSeqNum, so a
+    // stale entry can never match a new flow's seq.
+    static constexpr size_t SHARP_RESULT_WINDOW = 8192; ///< Max stored results per dest
     static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
 
     // Upload dedup: (flowId, srcRank) -> seen upload sequence numbers. A

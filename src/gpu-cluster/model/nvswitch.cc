@@ -437,6 +437,25 @@ NvSwitch::InjectAggregateUpload(uint16_t flowId, uint16_t srcRank, uint32_t seqN
 }
 
 bool
+NvSwitch::InjectResultNack(uint16_t requestingRank, uint32_t seqNum)
+{
+    FabricHeader nh;
+    nh.SetPacketType(FabricPacketType::NACK);
+    nh.SetFlowId(1);
+    nh.SetSourceRank(requestingRank);
+    nh.SetDestRank(0xFFFF);
+    nh.SetSequenceNumber(seqNum);
+    return HandleSwitchNack(nh, 0);
+}
+
+size_t
+NvSwitch::GetSharpResultStoreSize(uint16_t destRank) const
+{
+    auto it = m_sharpResultStore.find(destRank);
+    return it == m_sharpResultStore.end() ? 0 : it->second.size();
+}
+
+bool
 NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
                            uint16_t protocol, const Address& source,
                            const Address& destination, NetDevice::PacketType packetType)
@@ -1667,8 +1686,18 @@ NvSwitch::StoreMulticastResult(uint16_t destRank, uint32_t portIdx,
     {
         return;
     }
+    // Keep the stamped header only — the body is dummy bytes (only sizes
+    // matter for timing), so a retransmit rebuilds it from the header's
+    // payload size. A full copy per fragment forced the old 512-entry window,
+    // which evicted fragments before their first delivery at real scales
+    // (1,024 fragments/dest on an 8-GPU 128-MiB allgather).
+    FabricHeader header;
+    if (!pkt->PeekHeader(header))
+    {
+        return;
+    }
     auto& window = m_sharpResultStore[destRank];
-    window.push_back({seqNum, portIdx, 0, pkt->Copy()});
+    window.push_back({seqNum, portIdx, 0, header});
     while (window.size() > SHARP_RESULT_WINDOW)
     {
         window.pop_front();
@@ -1705,8 +1734,11 @@ NvSwitch::HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort)
             return false;
         }
         entry.retransmits++;
-        m_ports[entry.portIdx]->Send(entry.packet->Copy(),
-                                     Mac48Address::GetBroadcast(), 0x0800);
+        // Rebuild the body (dummy bytes — only the size matters) and stamp
+        // the stored header so the retransmit is wire-identical in shape.
+        Ptr<Packet> pkt = Create<Packet>(entry.header.GetPayloadSize());
+        pkt->AddHeader(entry.header);
+        m_ports[entry.portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
         NS_LOG_DEBUG("Switch retransmit multicast result seq " << seqNum
                      << " to rank " << requestingRank);
         return true;
