@@ -382,6 +382,21 @@ HierarchicalAllReduce::StartLocalReduceScatter()
             }
         }
     }
+
+    // One GPU per node: the local phase has no peers (the ring's successor
+    // is the GPU itself; fullmesh has nobody to send to), so no receive
+    // callback will ever fire to advance the phase. Every GPU is trivially
+    // complete — schedule the inter-node phase directly instead of stalling
+    // until the 3600s ceiling.
+    if (m_gpusPerNode <= 1)
+    {
+        NS_LOG_INFO("Phase1 (local reduce-scatter) trivially complete (one GPU per node)");
+        uint64_t computeDelay = GetLocalComputeDelayNs(m_segmentSize);
+        uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
+        uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
+        Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                            &HierarchicalAllReduce::StartInterNodeReduceScatter, this);
+    }
 }
 
 void
@@ -592,6 +607,15 @@ HierarchicalAllReduce::StartLocalAllGather()
                                                         m_protocolId, m_flowId + 3, 0);
             }
         }
+    }
+
+    // One GPU per node: Phase4 has no local peers, so no receive callback
+    // will ever fire to complete the collective — every GPU is trivially
+    // done. (Phase1's gpusPerNode<=1 note applies here too.)
+    if (m_gpusPerNode <= 1)
+    {
+        NS_LOG_INFO("Phase4 (local all-gather) trivially complete (one GPU per node)");
+        Complete();
     }
 }
 

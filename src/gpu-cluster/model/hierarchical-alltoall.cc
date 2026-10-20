@@ -248,6 +248,18 @@ HierarchicalAlltoAll::StartLocalAlltoAll()
             }
         }
     }
+
+    // One GPU per node: the local phase has no peers, so no receive callback
+    // will ever fire to advance the phase. Every GPU is trivially complete —
+    // schedule the inter-node phase directly instead of stalling until the
+    // 3600s ceiling.
+    if (m_gpusPerNode <= 1)
+    {
+        NS_LOG_INFO("Phase1 (local alltoall) trivially complete (one GPU per node)");
+        uint64_t interStartup = GetInterNodeStartupDelayNs(m_chunkSize);
+        Simulator::Schedule(NanoSeconds(interStartup),
+                            &HierarchicalAlltoAll::StartInterNodeAlltoAll, this);
+    }
 }
 
 void

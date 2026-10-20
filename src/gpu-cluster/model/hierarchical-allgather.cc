@@ -258,6 +258,19 @@ HierarchicalAllGather::StartLocalAllGather()
             }
         }
     }
+
+    // One GPU per node: the local phase has no peers to gather from, so no
+    // receive callback will ever fire to advance the phase. Every GPU is
+    // trivially complete — mark them and schedule the inter-node phase
+    // directly instead of stalling until the 3600s ceiling.
+    if (m_gpusPerNode <= 1)
+    {
+        NS_LOG_INFO("Phase1 (local all-gather) trivially complete (one GPU per node)");
+        uint64_t interStartup = GetInterNodeStartupDelayNs(m_nodeChunkSize);
+        uint64_t rampDelay = GetInterNodeRampDelayNs(m_nodeChunkSize);
+        Simulator::Schedule(NanoSeconds(interStartup + rampDelay),
+                            &HierarchicalAllGather::StartInterNodeAllGather, this);
+    }
 }
 
 void
