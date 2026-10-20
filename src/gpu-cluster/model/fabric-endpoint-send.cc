@@ -565,7 +565,7 @@ FabricEndpoint::SendMemoryRead(uint16_t destRank, uint64_t address, uint32_t siz
     FabricHeader header;
     header.SetPacketType(FabricPacketType::MEMORY_READ);
     header.SetFabricType(GetFabricTypeForDest(destRank));
-    header.SetFlowId(0);
+    header.SetFlowId(MEMORY_FLOW_ID);
     header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetSourceRank(m_rank);
@@ -627,7 +627,7 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
     FabricHeader header;
     header.SetPacketType(FabricPacketType::MEMORY_WRITE);
     header.SetFabricType(GetFabricTypeForDest(destRank));
-    header.SetFlowId(0);
+    header.SetFlowId(MEMORY_FLOW_ID);
     header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetSourceRank(m_rank);
@@ -693,7 +693,7 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
     FabricHeader header;
     header.SetPacketType(FabricPacketType::MEMORY_RESP);
     header.SetFabricType(GetFabricTypeForDest(destRank));
-    header.SetFlowId(0);
+    header.SetFlowId(MEMORY_FLOW_ID);
     header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetSourceRank(m_rank);
@@ -788,7 +788,7 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     header.SetPacketType(isRead ? FabricPacketType::MEMORY_READ
                                  : FabricPacketType::MEMORY_WRITE);
     header.SetFabricType(GetFabricTypeForDest(destRank));
-    header.SetFlowId(0);
+    header.SetFlowId(MEMORY_FLOW_ID);
     header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetVirtualLane(0);

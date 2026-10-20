@@ -418,6 +418,19 @@ class FabricEndpoint : public Application
         return MakeSeqKey(destRank, 0, 0) | (1ULL << 63);
     }
 
+    /// Wire flow id stamped on every MEMORY_* packet. Memory senders stamp
+    /// flow 0 on the wire, the same flow id DATA/collective traffic uses, so
+    /// every identity-bearing receiver structure keyed on (vc, flow, seq)
+    /// collides memory with DATA: the CREDIT dedup (m_creditsReturned)
+    /// discards DATA flow 0's CREDIT as a duplicate once a memory packet with
+    /// the same seq was re-credited (with one credit the next DATA send
+    /// blocks forever), and two LLR RetryKey entries with the same
+    /// (dest, flow=0, vc=0, seq) alias — the second store overwrites the
+    /// first's retransmit payload. MEMORY_FLOW_ID is outside the flow-id
+    /// space the collective drivers allocate (they number their flows from 1
+    /// upward, 16 bits wide; 0xFFFF is reserved for memory).
+    static constexpr uint16_t MEMORY_FLOW_ID = 0xFFFF;
+
   protected:
     void DoDispose() override;
     void StartApplication() override;
