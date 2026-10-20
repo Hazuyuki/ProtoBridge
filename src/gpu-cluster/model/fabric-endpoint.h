@@ -669,6 +669,11 @@ class FabricEndpoint : public Application
     uint32_t m_soTxWindow{0};                       ///< Max in-flight bulk chunks to remote ranks (0=off)
     uint32_t m_bulkTxInflight{0};                   ///< Chunks dispatched but not yet ACK-purged
     std::deque<BulkTxChunk> m_bulkTxQueue;          ///< Chunks awaiting a window slot
+    /// (destRank, seqNum) of window-dispatched bulk chunks, for exact slot
+    /// release: only a packet that OCCUPIED a slot (PumpBulkTxWindow
+    /// dispatch) may free one — small unfragmented remote sends and local
+    /// (Su) packets share the LLR store but never touch the window.
+    std::set<std::pair<uint16_t, uint32_t>> m_bulkTxWindowSeqs;
     void PumpBulkTxWindow();                        ///< Dispatch queued chunks while window has room
     void ReleaseBulkTxSlot();                       ///< Free one window slot and pump
 

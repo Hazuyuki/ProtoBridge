@@ -920,6 +920,12 @@ FabricEndpoint::PumpBulkTxWindow()
         chunkPacket->AddHeader(header);
 
         m_bulkTxInflight++;
+        // Register window membership so the release paths can release a slot
+        // exactly once and only for packets that actually held one: ACK /
+        // permanent-loss handling sees LLR store entries from ALL send
+        // paths (small unfragmented remote sends, local Su packets), which
+        // must not free a bulk window slot they never consumed.
+        m_bulkTxWindowSeqs.emplace(desc.destRank, seqNum);
         SendPacketOnDevice(chunkPacket, desc.deviceIndex, ResolveDestMac(desc.destRank));
 
         m_txTrace(chunkPacket->GetSize(), seqNum);
@@ -1657,10 +1663,14 @@ FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
     NS_LOG_FUNCTION(this << seqNum << destRank << static_cast<int>(vcId));
 
     // A permanently lost chunk will never be ACKed: free its TX-window slot
-    // so the window can't leak closed (the store entry is already purged by
-    // the LlrManager before this callback fires, so a late ACK can't
-    // double-release).
-    if (m_soTxWindow > 0)
+    // so the window can't leak closed. Gate on window MEMBERSHIP, not just
+    // m_soTxWindow > 0: local (Su) packets and small unfragmented remote
+    // sends also suffer permanent losses, but they never held a window slot
+    // (only PumpBulkTxWindow dispatches occupy one) — releasing for them
+    // would dispatch an extra bulk fragment while one is still in flight.
+    // The store entry is already purged by the LlrManager before this
+    // callback fires, so a late ACK can't double-release.
+    if (m_soTxWindow > 0 && m_bulkTxWindowSeqs.erase({destRank, seqNum}) > 0)
     {
         ReleaseBulkTxSlot();
     }
@@ -1917,29 +1927,23 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
     if (m_llrEnabled && m_llrManager)
     {
-        // Release a TX-window slot exactly once per chunk: only when this ACK
-        // actually purges an outstanding store entry (duplicate ACKs from GBN
-        // blanket retransmits find the store already purged and don't
-        // over-release) AND the ACKed send actually occupied a window slot.
-        // The bulk TX window gates only remote (So) fragments — the ACK's
-        // source rank is the destination the data was sent to — so an ACK for
-        // a local (Su) send must NOT release a window slot: with
-        // soTxWindow=1 and local DATA flowing beside remote bulk, a local
-        // ACK would dispatch the next remote fragment while the previous one
-        // is still in flight (two outstanding under a one-fragment limit).
-        // The IsLocalRank(sourceRank) predicate mirrors the windowing gate
-        // in SendBulkWireTransferSize (m_soTxWindow > 0 && !IsLocalRank).
-        const bool ackIsForRemoteSend = !IsLocalRank(header.GetSourceRank());
-        bool wasOutstanding = m_soTxWindow > 0 && ackIsForRemoteSend &&
-            m_llrManager->HasOutstandingPacket(header.GetSequenceNumber(),
-                                               header.GetSourceRank(),
-                                               header.GetFlowId(),
-                                               header.GetVirtualChannel());
+        // Release a TX-window slot exactly once per chunk: the exact
+        // window-membership set (destRank, seqNum) says whether this ACK is
+        // for a PumpBulkTxWindow-dispatched bulk fragment. The old
+        // remoteness + LLR-outstanding heuristic also matched small
+        // unfragmented remote sends (they share the LLR store but never
+        // held a window slot), releasing a slot that belonged to an
+        // in-flight bulk fragment — with soTxWindow=1 the next fragment
+        // dispatched while the previous one was still outstanding.
+        const bool heldWindowSlot =
+            m_soTxWindow > 0 &&
+            m_bulkTxWindowSeqs.erase({header.GetSourceRank(),
+                                      header.GetSequenceNumber()}) > 0;
         m_llrManager->RemovePacket(header.GetSequenceNumber(),
                                    header.GetSourceRank(),
                                    header.GetFlowId(),
                                    header.GetVirtualChannel());
-        if (wasOutstanding)
+        if (heldWindowSlot)
         {
             ReleaseBulkTxSlot();
         }
