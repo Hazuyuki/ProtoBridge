@@ -851,8 +851,13 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         uint32_t thisChunkDataSize = std::min(static_cast<uint32_t>(chunkSize), remaining);
         const uint8_t* chunkData = data + offset;
 
-        // Build protocol-aware chunks using vendor-specific payload builder
-        std::vector<Ptr<Packet>> chunks = m_payloadBuilder->BuildChunks(
+        // Build protocol-aware chunks using the DESTINATION's payload
+        // builder (GetPayloadBuilderForRank mirrors GetProtocolModelForDest's
+        // Su/So split): a remote (So) dest frames with the So builder — the
+        // receiver extracts with GetPayloadBuilderForRank(sourceRank), so an
+        // Su-framed remote packet would be parsed as the wrong wire format
+        // and deliver nothing.
+        std::vector<Ptr<Packet>> chunks = GetPayloadBuilderForRank(destRank)->BuildChunks(
             chunkData, thisChunkDataSize, protocolId, chunkSize);
 
         // For protocols with overhead (LL/LL128), each sub-packet carries a
@@ -879,7 +884,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             {
                 uint32_t dataStillNeeded = thisChunkDataSize - dataAssigned;
                 std::vector<uint8_t> tmpBuf(pkt->GetSize());
-                uint64_t extracted = m_payloadBuilder->ExtractData(
+                uint64_t extracted = GetPayloadBuilderForRank(destRank)->ExtractData(
                     pkt, protocolId, tmpBuf.data(), tmpBuf.size());
                 subPacketDataSize = static_cast<uint32_t>(
                     std::min<uint64_t>(extracted, dataStillNeeded));

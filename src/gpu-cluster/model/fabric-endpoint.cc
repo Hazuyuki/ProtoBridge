@@ -2096,6 +2096,17 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
                              header.GetFlowId());
         }
     }
+
+    // LLR ACK for every memory packet: unlike DATA (whose delivery paths all
+    // funnel through OnPacketDelivered -> SendLlrAckPacket), memory packets
+    // are processed here directly. The sender stores memory packets in its
+    // LLR retry buffer (SendPacketOnDevice's store filter passes them), so
+    // without an ACK the store entry is never purged: the retry-timer
+    // backstop retransmits forever, duplicating the delivery at every
+    // timeout, and the entry degrades into a false permanent loss once the
+    // retry limit is hit. SendLlrAckPacket is a no-op when LLR is off, so
+    // non-LLR endpoints are unchanged.
+    SendLlrAckPacket(header, false);
 }
 
 void
