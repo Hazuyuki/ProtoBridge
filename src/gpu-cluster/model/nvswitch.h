@@ -23,6 +23,7 @@
 #include <vector>
 #include <unordered_map>
 #include <queue>
+#include <deque>
 #include <cstdint>
 #include <functional>
 
@@ -487,6 +488,41 @@ class NvSwitch : public FabricSwitch
      */
     void MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount);
 
+    /**
+     * @brief LLR ack an accepted SHARP/NVLS upload packet back to its sender.
+     *
+     * The GPU endpoints store ALLREDUCE/ALLGATHER uploads in their LLR
+     * managers (the receive-side store-filter exclusion for these types was
+     * removed — without storage a switch-side drop could never be
+     * retransmitted and the collective stalled forever). The switch is the
+     * receiving end of that link, so it must ACK what it consumed to purge
+     * the sender's retry entry; otherwise the entry lives until the retry
+     * limit turns it into a false permanent loss. The ack carries
+     * SourceRank = the upload's DestRank (the switch-addressed destination,
+     * the same key space the switch's BER NACK already uses), so the
+     * sender's RemovePacket((seq, dest, flow, vc)) lookup matches.
+     */
+    void SendSharpLlrAck(const FabricHeader& uploadHeader, uint32_t inPort);
+
+    /**
+     * @brief Keep a multicast result packet for switch-side LLR retransmit.
+     *
+     * Result packets carry SourceRank 0xFFFF (switch sentinel); the endpoint
+     * receiver's NACK for a lost one is addressed DestRank 0xFFFF and
+     * arrives on the losing GPU's port. HandleSwitchNack looks the packet
+     * up here and retransmits it on the stored port. Bounded FIFO per
+     * destination rank (m_sharpResultWindow) so memory stays flat.
+     */
+    void StoreMulticastResult(uint16_t destRank, uint32_t portIdx,
+                              uint32_t seqNum, Ptr<Packet> pkt);
+
+    /**
+     * @brief Retransmit a multicast result on a receiver NACK (DestRank 0xFFFF).
+     *
+     * @return true when a stored result matched and was retransmitted.
+     */
+    bool HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort);
+
     // In-Network Computing (SHARP)
     bool m_allReduceEnabled;                        ///< All-Reduce enabled flag
     uint32_t m_allReduceThreshold;                  ///< Number of GPUs for aggregation
@@ -514,6 +550,20 @@ class NvSwitch : public FabricSwitch
     // FlowID -> (sourceRank -> bytes received) — track per-GPU chunk contributions
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, uint64_t>> m_allGatherReceivedBytes;
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, std::vector<uint32_t>>> m_allGatherBuffer;
+
+    // Switch-side LLR for multicast results: destRank -> FIFO of (seq,
+    // portIdx, retransmitCount, packet). Entries live until evicted by the
+    // window bound; a NACK re-sends the stored copy (bounded retries).
+    struct SharpResultEntry
+    {
+        uint32_t seqNum;        ///< FabricHeader sequence number of the result
+        uint32_t portIdx;       ///< Port the result was multicast on
+        uint32_t retransmits;   ///< NACK-driven retransmits issued so far
+        Ptr<Packet> packet;     ///< Copy of the multicast result packet
+    };
+    std::unordered_map<uint16_t, std::deque<SharpResultEntry>> m_sharpResultStore;
+    static constexpr size_t SHARP_RESULT_WINDOW = 512; ///< Max stored results per dest
+    static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
 
     // Callbacks
     NetDevice::ReceiveCallback m_rxCallback;

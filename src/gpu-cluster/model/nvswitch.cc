@@ -550,6 +550,18 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
             ProcessAllGather(pkt, fabricHeader, inPort);
             return true;
         }
+
+        // NACK addressed to the switch sentinel rank (0xFFFF): the receiver
+        // lost a multicast result packet and is asking THIS switch to retry.
+        // Must be intercepted before routing — its DestRank is the sentinel,
+        // not a routable GPU, and flooding it to every port would only feed
+        // every endpoint a NACK whose seq matches nothing (retry misses).
+        if (fabricHeader.GetPacketType() == FabricPacketType::NACK &&
+            fabricHeader.GetDestRank() == 0xFFFF)
+        {
+            HandleSwitchNack(fabricHeader, inPort);
+            return true;
+        }
     }
 
     // Learn source MAC address only if not already in routing table
@@ -983,6 +995,11 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
     }
     m_allReduceReceivedBytes[flowId][srcRank] += effectiveSize;
 
+    // LLR ack the accepted upload so the sender purges its retry entry
+    // (uploads ARE stored endpoint-side now; without an ack every entry
+    // would live until the retry limit declared a false permanent loss).
+    SendSharpLlrAck(header, inPort);
+
     // Store chunk sizes only (not full Packet objects) to avoid memory explosion.
     // Data content is dummy; only sizes are needed for multicast result creation.
     m_allReduceBuffer[flowId][srcRank].push_back(
@@ -1150,6 +1167,8 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
 
             // Spray chunks across this GPU's ports
             uint32_t portIdx = ports[chunkIdx % ports.size()];
+            StoreMulticastResult(destRank, portIdx,
+                                 resultHeader.GetSequenceNumber(), pkt);
             m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
         }
     }
@@ -1229,6 +1248,8 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
             pkt->AddHeader(resultHeader);
 
             uint32_t portIdx = ports[chunkIdx % ports.size()];
+            StoreMulticastResult(destRank, portIdx,
+                                 resultHeader.GetSequenceNumber(), pkt);
             m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
         }
     }
@@ -1436,6 +1457,9 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
     }
     m_allGatherReceivedBytes[flowId][srcRank] += effectiveSize;
 
+    // LLR ack the accepted upload (see ProcessAllReduce's SendSharpLlrAck note).
+    SendSharpLlrAck(header, inPort);
+
     // Store chunk sizes only (not full Packet objects) to avoid memory explosion.
     m_allGatherBuffer[flowId][srcRank].push_back(effectiveSize);
 
@@ -1525,6 +1549,8 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
             pkt->AddHeader(resultHeader);
 
             uint32_t portIdx = ports[chunkIdx % ports.size()];
+            StoreMulticastResult(destRank, portIdx,
+                                 resultHeader.GetSequenceNumber(), pkt);
             m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
         }
     }
@@ -1532,6 +1558,94 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
     NS_LOG_INFO("NVLS AllGather: multicast " << allChunkSizes.size()
                 << " result chunks for flowId=" << flowId
                 << " to " << rankPorts.size() << " GPUs");
+}
+
+void
+NvSwitch::SendSharpLlrAck(const FabricHeader& uploadHeader, uint32_t inPort)
+{
+    // No LLR on the fabric -> the sender has no retry entry to purge, and an
+    // unsolicited ack would be counted by the endpoint as a retry miss.
+    if (!m_llrEnabled)
+    {
+        return;
+    }
+    if (inPort >= m_ports.size())
+    {
+        return;
+    }
+    FabricHeader ackHeader;
+    ackHeader.SetPacketType(FabricPacketType::ACK);
+    ackHeader.SetFabricType(uploadHeader.GetFabricType());
+    // SourceRank mirrors the upload's DestRank (the switch-addressed
+    // destination): the endpoint's ProcessAckPacket removes its stored entry
+    // under (seq, dest, flow, vc) — the same key space the switch's BER NACK
+    // already uses — so this must NOT use the 0xFFFF result sentinel.
+    ackHeader.SetSourceRank(uploadHeader.GetDestRank());
+    ackHeader.SetDestRank(uploadHeader.GetSourceRank());
+    ackHeader.SetSequenceNumber(uploadHeader.GetSequenceNumber());
+    ackHeader.SetFlowId(uploadHeader.GetFlowId());
+    ackHeader.SetVirtualChannel(uploadHeader.GetVirtualChannel());
+
+    Ptr<Packet> ackPkt = Create<Packet>(0);
+    ackPkt->AddHeader(ackHeader);
+    m_ports[inPort]->Send(ackPkt, Mac48Address::GetBroadcast(), 0x0800);
+}
+
+void
+NvSwitch::StoreMulticastResult(uint16_t destRank, uint32_t portIdx,
+                               uint32_t seqNum, Ptr<Packet> pkt)
+{
+    // Only needed for NACK-driven retransmit; skip when LLR is off (results
+    // are best-effort in that regime, matching legacy behavior).
+    if (!m_llrEnabled)
+    {
+        return;
+    }
+    auto& window = m_sharpResultStore[destRank];
+    window.push_back({seqNum, portIdx, 0, pkt->Copy()});
+    while (window.size() > SHARP_RESULT_WINDOW)
+    {
+        window.pop_front();
+    }
+}
+
+bool
+NvSwitch::HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort)
+{
+    (void)inPort;
+    uint16_t requestingRank = nackHeader.GetSourceRank();
+    uint32_t seqNum = nackHeader.GetSequenceNumber();
+
+    auto destIt = m_sharpResultStore.find(requestingRank);
+    if (destIt == m_sharpResultStore.end())
+    {
+        return false;
+    }
+    auto& window = destIt->second;
+    for (auto& entry : window)
+    {
+        if (entry.seqNum != seqNum)
+        {
+            continue;
+        }
+        if (entry.portIdx >= m_ports.size() || !IsPortOperational(entry.portIdx))
+        {
+            return false;
+        }
+        if (entry.retransmits >= SHARP_RESULT_RETRY_LIMIT)
+        {
+            NS_LOG_WARN("Switch result retransmit limit reached for seq "
+                        << seqNum << " destRank " << requestingRank);
+            return false;
+        }
+        entry.retransmits++;
+        m_ports[entry.portIdx]->Send(entry.packet->Copy(),
+                                     Mac48Address::GetBroadcast(), 0x0800);
+        NS_LOG_DEBUG("Switch retransmit multicast result seq " << seqNum
+                     << " to rank " << requestingRank);
+        return true;
+    }
+    return false;
 }
 
 } // namespace ns3

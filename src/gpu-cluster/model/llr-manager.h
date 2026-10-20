@@ -106,6 +106,27 @@ class LlrManager : public Object
     bool RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     /**
+     * @brief Peek the FabricHeader packet type of a live outstanding entry.
+     *
+     * Credit bookkeeping on ACK/permanent-loss needs to know whether the
+     * ACKed sequence actually consumed a credit on send. NVLS/SHARP uploads
+     * (ALLREDUCE/ALLGATHER) bypass credit, yet the switch's LLR ack for them
+     * now travels the same ProcessAckPacket path — without the type check
+     * the ack-side recovery would return a credit the send never drew and
+     * grow the VC pool past its total.
+     *
+     * @param seqNum Sequence number of the stored packet
+     * @param destRank Destination rank of the stored packet
+     * @param flowId Flow ID of the stored packet
+     * @param vcId Virtual channel of the stored packet
+     * @param outType Set to the entry's FabricHeader packet type
+     * @return true when a live entry was found (outType valid)
+     */
+    bool PeekOutstandingPacketType(uint32_t seqNum, uint16_t destRank,
+                                   uint16_t flowId, uint8_t vcId,
+                                   uint8_t& outType) const;
+
+    /**
      * @brief Remove all packets up to a sequence number (cumulative ACK)
      * @param seqNum Highest sequence number acknowledged
      * @param destRank Destination rank of the packets

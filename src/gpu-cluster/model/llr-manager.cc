@@ -239,6 +239,26 @@ LlrManager::RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, ui
     return hadEntry;
 }
 
+bool
+LlrManager::PeekOutstandingPacketType(uint32_t seqNum, uint16_t destRank,
+                                       uint16_t flowId, uint8_t vcId,
+                                       uint8_t& outType) const
+{
+    RetryKey key = MakeRetryKey(seqNum, destRank, flowId, vcId);
+    auto it = m_sourceStore.find(key);
+    if (it == m_sourceStore.end() || !it->second.packet)
+    {
+        return false;
+    }
+    FabricHeader hdr;
+    if (!it->second.packet->PeekHeader(hdr))
+    {
+        return false;
+    }
+    outType = static_cast<uint8_t>(hdr.GetPacketType());
+    return true;
+}
+
 void
 LlrManager::RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId)
 {

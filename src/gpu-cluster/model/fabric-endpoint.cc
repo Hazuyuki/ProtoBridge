@@ -2008,6 +2008,19 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
                                       header.GetVirtualChannel(),
                                       header.GetFlowId(),
                                       header.GetSequenceNumber()}) > 0;
+        // Peek the stored entry's type BEFORE RemovePacket destroys it:
+        // credit-bypass types (NVLS/SHARP uploads — the switch's LLR ack for
+        // them lands here too) consumed no credit on send, so none is owed
+        // back; returning one would grow the VC pool past its total.
+        uint8_t storedType = 0;
+        const bool creditBypassEntry =
+            !m_llrManager->PeekOutstandingPacketType(header.GetSequenceNumber(),
+                                                     header.GetSourceRank(),
+                                                     header.GetFlowId(),
+                                                     header.GetVirtualChannel(),
+                                                     storedType) ||
+            storedType == static_cast<uint8_t>(FabricPacketType::ALLREDUCE) ||
+            storedType == static_cast<uint8_t>(FabricPacketType::ALLGATHER);
         const bool removed =
             m_llrManager->RemovePacket(header.GetSequenceNumber(),
                                        header.GetSourceRank(),
@@ -2017,7 +2030,7 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
         {
             ReleaseBulkTxSlot();
         }
-        if (removed)
+        if (removed && !creditBypassEntry)
         {
             // R9#2: the ACK proves the receiver got the packet, so the send's
             // consumed credit is owed back even if the receiver's CREDIT
@@ -2298,6 +2311,20 @@ void
 FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumulative)
 {
     if (!m_llrEnabled || !m_llrManager || m_devices.empty())
+    {
+        return;
+    }
+
+    // Never ack a switch-sourced multicast result (SourceRank 0xFFFF): the
+    // switch runs no LLR manager, so nobody consumes the ack — and the ack
+    // resolves the sentinel rank to the broadcast MAC, which the switch
+    // floods to every port. Each flooded copy lands on endpoints that match
+    // nothing (retry misses) while burning egress on all links — with LLR
+    // on, an 8-GPU NVLS allgather amplified 64 result deliveries into ~1700
+    // switch transmissions even at zero loss. Lost results are recovered by
+    // the receiver's NACK (DestRank 0xFFFF), which the switch intercepts and
+    // services from its own result store — not by acks.
+    if (receivedHeader.GetSourceRank() == 0xFFFF)
     {
         return;
     }
@@ -2608,19 +2635,21 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
 
     // Store in LLR retry buffer only for data/collective packets.
     // Control/retry/permanent-loss packets must not pollute retry state.
-    // NVLS/SHARP packets (ALLREDUCE/ALLGATHER) use credit bypass — the
-    // receiver never sends RETRY_ACK, so storing them would leak memory
-    // at 2+ GB/s (256MB × BER retransmissions, never freed). The switch's
-    // SHARP engine handles its own reliability for these packet types.
+    // NVLS/SHARP uploads (ALLREDUCE/ALLGATHER) ARE stored: the switch
+    // consumes them, so the only recovery for a switch-side BER drop is a
+    // retransmission from this endpoint (the switch NACKs the drop and the
+    // sender re-sends from this store; the switch also LLR-acks accepted
+    // uploads so the entry is purged on success). The old exclusion left a
+    // dropped upload unrecoverable — the collective never completed.
+    // Credit accounting is unaffected: these types bypass credit on send,
+    // and the ack-side recovery gate (IsLocalRank of the ack's source) keeps
+    // the credit pool untouched for them.
     if (m_llrEnabled && m_llrManager && !m_isRetransmitting)
     {
         FabricHeader hdr;
         packet->PeekHeader(hdr);
-        FabricPacketType ptype = hdr.GetPacketType();
         if (hdr.GetSourceRank() == m_rank &&
-            !hdr.IsControlPacket() && !hdr.IsRetryPacket() &&
-            ptype != FabricPacketType::ALLREDUCE &&
-            ptype != FabricPacketType::ALLGATHER)
+            !hdr.IsControlPacket() && !hdr.IsRetryPacket())
         {
             m_llrManager->StorePacket(hdr.GetSequenceNumber(), packet, hdr.GetDestRank());
         }
