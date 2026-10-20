@@ -19,6 +19,7 @@
 #include <cctype>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -608,6 +609,24 @@ ProtocolConfig::Compile(ProtocolTransactionGraph& graph,
             req.effectiveBytes = bytes;
             req.responseBytes = response;
             req.stageId = stageCounter;
+            // The wire flow id is a 16-bit field and the runner RECONSTRUCTS
+            // stageId as flowId - baseFlowId, so baseFlowId + stage must
+            // stay inside the 16-bit range: a stencil with more stages than
+            // the remaining id space would wrap (stage 65535 sending under
+            // the same flow id as stage 0 -- its delivery can never satisfy
+            // the wrapped stage's WAIT) and the op silently never completes.
+            // Fail loudly at compile time instead.
+            if (static_cast<uint64_t>(baseFlowId) + stageCounter >
+                std::numeric_limits<uint16_t>::max())
+            {
+                if (error)
+                {
+                    *error = "flow id overflow: baseFlowId " + std::to_string(baseFlowId)
+                           + " + stage " + std::to_string(stageCounter)
+                           + " exceeds the 16-bit flow-id space; reduce the stage count";
+                }
+                return PROTOCOL_TRANSACTION_INVALID_NODE;
+            }
             req.flowId = static_cast<uint16_t>(baseFlowId + stageCounter);
             req.hasProtocolId = false; // auto: protocol derived from effectiveBytes
             req.label = "t" + std::to_string(tidx) + "-g" + std::to_string(src)
