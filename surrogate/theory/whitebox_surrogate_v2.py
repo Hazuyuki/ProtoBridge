@@ -955,20 +955,33 @@ class TheoryDerivedSurrogate:
                 bsec)
             if include_contention else 1.0)
 
-        if strict_reliability and retry_limit is not None:
+        if strict_reliability:
             # With LLR disabled there is no retransmission machinery: every
             # lost packet is permanent on its first attempt, whatever
             # retry_limit says (the effective attempt count is 1). The old
             # `and llr_enabled` gate skipped this check entirely for LLR-off
             # fabrics, letting a run with dozens of expected permanent losses
-            # report a finite completion time.
-            eff_retry_limit = retry_limit if llr_enabled else 0
-            expected_losses = self.expected_permanent_losses(
-                data_bytes, num_gpus, algo, ber, eff_retry_limit,
-                fec_enabled and include_fec, fec_n, fec_k, fec_t,
-                optical_fraction, optical_hops, collective)
-            if expected_losses >= 0.5:
-                return float('inf')
+            # report a finite completion time. The outer `retry_limit is not
+            # None` gate had the same hole: with LLR off the effective retry
+            # limit is 0 regardless of the parameter, so the check must run
+            # even when retry_limit is omitted (the LLR-off default).
+            # LLR-on fabrics keep retry_limit's meaning: None means "model
+            # default" and the permanent-loss expectation is skipped, exactly
+            # as before.
+            if not llr_enabled:
+                # LLR off: every loss is permanent (no retransmit machinery).
+                eff_retry_limit = 0
+            elif retry_limit is not None:
+                eff_retry_limit = retry_limit
+            else:
+                eff_retry_limit = None
+            if eff_retry_limit is not None:
+                expected_losses = self.expected_permanent_losses(
+                    data_bytes, num_gpus, algo, ber, eff_retry_limit,
+                    fec_enabled and include_fec, fec_n, fec_k, fec_t,
+                    optical_fraction, optical_hops, collective)
+                if expected_losses >= 0.5:
+                    return float('inf')
         T_step = T_fixed_step + T_serial_step
         if include_retransmission:
             effective_ber = (
