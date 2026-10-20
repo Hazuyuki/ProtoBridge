@@ -676,13 +676,24 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
 {
     NS_LOG_FUNCTION(this << destRank << size);
 
+    // Sequence responses from this endpoint's per-dest counter (same key
+    // space as SendMemoryRead/SendMemoryWrite). A hard-coded 0 gave every
+    // MEMORY_RESP the same LLR retry key: with two reads in flight the
+    // second response's store entry overwrote the first's packet copy, and
+    // its ACK purged the shared entry — a lost first response was never
+    // retransmitted with its own payload (its data vanished silently).
+    // Distinct sequence numbers also let the receiver's CREDIT advance the
+    // GBN cumulative-ack window past 1.
+    uint64_t seqKey = MakeSeqKey(destRank, 0, 0);
+    uint32_t seqNum = m_nextSeqNum[seqKey]++;
+
     Ptr<Packet> packet = Create<Packet>(data, size);
 
     FabricHeader header;
     header.SetPacketType(FabricPacketType::MEMORY_RESP);
     header.SetFabricType(GetFabricTypeForDest(destRank));
     header.SetFlowId(0);
-    header.SetSequenceNumber(0);
+    header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetSourceRank(m_rank);
     header.SetDestRank(destRank);
@@ -703,12 +714,12 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
             entry.packet = packet;
             entry.header = header;
             entry.vcId = vcId;
-            entry.seqNum = 0;
+            entry.seqNum = seqNum;
             m_sendQueue.push(entry);
             TrySendQueuedPackets();
             return;
         }
-        m_creditManager->ConsumeCredit(vcId, 0);
+        m_creditManager->ConsumeCredit(vcId, seqNum);
     }
 
     packet->AddHeader(header);

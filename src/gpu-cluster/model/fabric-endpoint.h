@@ -696,6 +696,11 @@ class FabricEndpoint : public Application
     uint32_t m_bypassReorderEvents{0};              ///< Out-of-order arrivals counted in bypass mode
     std::map<uint64_t, uint32_t> m_bypassNextExpectedSeq; ///< Next expected seq per flow (bypass mode)
     std::set<std::pair<uint64_t, uint32_t>> m_bypassDelivered; ///< (flowKey, seqNum) already delivered
+    /// (flowKey, seqNum) MEMORY_* packets already processed. GO_BACK_N
+    /// retransmission is a blanket resend: a retransmitted memory packet
+    /// whose sibling was also outstanding arrives twice, and the memory
+    /// delivery path has no reorder buffer to swallow the duplicate.
+    std::set<std::pair<uint64_t, uint32_t>> m_memoryDelivered;
 
     // Memory attributes
     uint64_t m_memorySize;                          ///< Memory size in bytes (for MEMORY type)
