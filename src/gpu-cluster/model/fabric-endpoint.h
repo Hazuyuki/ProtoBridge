@@ -719,10 +719,13 @@ class FabricEndpoint : public Application
     uint32_t m_bypassReorderEvents{0};              ///< Out-of-order arrivals counted in bypass mode
     std::map<uint64_t, uint32_t> m_bypassNextExpectedSeq; ///< Next expected seq per flow (bypass mode)
     std::set<std::pair<uint64_t, uint32_t>> m_bypassDelivered; ///< (flowKey, seqNum) already delivered
-    /// (flowKey, seqNum) MEMORY_* packets already processed. GO_BACK_N
-    /// retransmission is a blanket resend: a retransmitted memory packet
-    /// whose sibling was also outstanding arrives twice, and the memory
-    /// delivery path has no reorder buffer to swallow the duplicate.
+    /// (flowKey, seqNum) MEMORY_* packets already EXECUTED (reads serviced,
+    /// writes applied, responses delivered). GO_BACK_N retransmission is a
+    /// blanket resend: a retransmitted memory packet arrives twice, and the
+    /// memory path has no reorder buffer to swallow the duplicate. A
+    /// duplicate is still ACKed and credit-returned, but never re-executed —
+    /// a retried write would revert newer data, a retried read would mint a
+    /// fresh response seq that defeats response dedup.
     std::set<std::pair<uint64_t, uint32_t>> m_memoryDelivered;
 
     // Memory attributes

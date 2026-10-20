@@ -2029,7 +2029,27 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
 
     FabricPacketType type = header.GetPacketType();
 
-    if (type == FabricPacketType::MEMORY_READ)
+    // Duplicate suppression for ALL memory packet types, not just responses:
+    // a retransmitted MEMORY_WRITE whose ACK was lost must not execute a
+    // second time (write 1, lose its ACK, write 2 — the retry would revert
+    // memory back to 1), and a retransmitted MEMORY_READ must not schedule a
+    // second response (the fresh response sequence number would defeat the
+    // receiver-side response dedup below). A duplicate is still ACKed and
+    // credit-returned at the bottom of this function so the sender purges
+    // its LLR store entry — only the execution is skipped.
+    uint64_t flowKey = (static_cast<uint64_t>(header.GetVirtualChannel()) << 48) |
+                       (static_cast<uint64_t>(header.GetFlowId()) << 32) |
+                       header.GetSourceRank();
+    auto deliveredKey = std::make_pair(flowKey, header.GetSequenceNumber());
+    bool duplicate = !m_memoryDelivered.insert(deliveredKey).second;
+    if (duplicate)
+    {
+        NS_LOG_DEBUG("Memory packet duplicate: type="
+                     << static_cast<int>(type) << " seq="
+                     << header.GetSequenceNumber() << " — ACK but don't execute");
+    }
+
+    if (!duplicate && type == FabricPacketType::MEMORY_READ)
     {
         // Extract address and size from payload
         uint32_t pktSize = packet->GetSize();
@@ -2065,7 +2085,7 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
                                 dataPtr, availSize);
         }
     }
-    else if (type == FabricPacketType::MEMORY_WRITE)
+    else if (!duplicate && type == FabricPacketType::MEMORY_WRITE)
     {
         uint32_t pktSize = packet->GetSize();
         if (pktSize < 8)
@@ -2093,29 +2113,20 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
             }
         }
     }
-    else if (type == FabricPacketType::MEMORY_RESP)
+    else if (!duplicate && type == FabricPacketType::MEMORY_RESP)
     {
-        // Duplicate suppression: GO_BACK_N retransmission resends a blanket
-        // suffix, so a response whose sibling was also outstanding is
-        // retransmitted even though the original arrived. The memory
-        // delivery path has no reorder buffer to swallow it (unlike
-        // DeliverBypassDataPacket's m_bypassDelivered) — without this check
-        // the same response payload reaches the application twice.
-        uint64_t flowKey = (static_cast<uint64_t>(header.GetVirtualChannel()) << 48) |
-                           (static_cast<uint64_t>(header.GetFlowId()) << 32) |
-                           header.GetSourceRank();
-        auto deliveredKey = std::make_pair(flowKey, header.GetSequenceNumber());
-        bool duplicate = !m_memoryDelivered.insert(deliveredKey).second;
-        if (!duplicate)
+        // (Duplicate suppression already ran at the top of this function —
+        // GO_BACK_N's blanket retransmit can redeliver a response whose
+        // sibling was also outstanding, and the memory delivery path has no
+        // reorder buffer to swallow it. A duplicate is ACKed below but its
+        // payload reaches the application only once.)
+        if (!m_memoryResponseCallback.IsNull())
         {
-            if (!m_memoryResponseCallback.IsNull())
-            {
-                m_memoryResponseCallback(m_rank, packet, header);
-            }
-            else if (!m_receiveCallback.IsNull())
-            {
-                m_receiveCallback(m_rank, packet, header);
-            }
+            m_memoryResponseCallback(m_rank, packet, header);
+        }
+        else if (!m_receiveCallback.IsNull())
+        {
+            m_receiveCallback(m_rank, packet, header);
         }
     }
 
