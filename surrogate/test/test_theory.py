@@ -809,3 +809,40 @@ def test_nvls_expected_losses_count_result_sides():
         D, N, "nvls", 1e-9, 0,
         optical_fraction=1.0, optical_hops=1, collective="allreduce")
     assert losses_ar > 4 * losses / 5  # both sides counted, not 2N*frag
+
+
+def test_nvls_expected_losses_use_spray_fragment_geometry():
+    """The NVLS branch must fragment at SendCollectiveBulk's spray geometry,
+    not the DATA bulk path's. Each rank's upload of D/N (allgather) or D
+    (allreduce) moves as max(lanes, ceil(bytes/spray_chunk)) fragments of
+    ceil(bytes/frags) — 128 KiB-class chunks — and each result chunk mirrors
+    one upload chunk. The pre-fix branch called _packets_per_transfer with
+    D/N (which divides by N internally AGAIN, so the upload sized at D/N^2)
+    and took its packet failure probability from the DATA path's ~932 KB
+    bulk fragments: 8 GPU / 128 MiB allgather / BER 5e-8 / retry 3 reported
+    12.1577 expected losses and strict_reliability rejected a config whose
+    ns-3 run completes in 488.7 us with zero permanent losses (codex round
+    12, finding 6). The C++ geometry gives 0.062731."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 128 * 1024 * 1024, 8
+    # 16 MiB per-rank upload: max(18, ceil(16 MiB / 128 KiB)) = 128 frags of
+    # 131072 B; result per dest = N * 128 = 1024 frags at the same size.
+    losses = nvls.expected_permanent_losses(
+        D, N, "nvls", 5e-8, 3,
+        optical_fraction=1.0, optical_hops=1, collective="allgather")
+    assert abs(losses - 0.062731) < 2e-4
+    # The strict gate must stay finite for this completable config.
+    t = nvls.predict(D, N, "nvls", 128, ber=5e-8, retry_limit=3,
+                     strict_reliability=True, collective="allgather",
+                     llr_enabled=True)
+    assert math.isfinite(t)
+    # BER 8e-8 keeps the same geometry (both sides, one packet size).
+    losses8 = nvls.expected_permanent_losses(
+        D, N, "nvls", 8e-8, 3,
+        optical_fraction=1.0, optical_hops=1, collective="allgather")
+    assert abs(losses8 - 0.386322) < 2e-4
+    # Allreduce uploads carry the full D per rank: 128 frags of 128 KiB.
+    losses_ar = nvls.expected_permanent_losses(
+        D, N, "nvls", 5e-8, 3,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce")
+    assert losses_ar > 2 * losses  # D-byte uploads, N x the upload-side risk

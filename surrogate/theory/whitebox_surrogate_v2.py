@@ -133,6 +133,7 @@ class TheoryDerivedSurrogate:
         self.credit_bdp_ring = credit_bdp_ring_packets
         self.credit_bdp_tree = credit_bdp_tree_packets
         self.chunk_size = spray_chunk_bytes
+        self.spray_chunk_bytes = spray_chunk_bytes
         self.bulk_chunk_size = bulk_chunk_bytes
         self.num_lanes = num_lanes
         self.T_min_switch = t_min_switch_us
@@ -462,6 +463,23 @@ class TheoryDerivedSurrogate:
             emitted += 1
         return max(1, emitted)
 
+    def _spray_fragments(self, data_bytes):
+        """(count, bytes) of one SendCollectiveBulk sprayed transfer.
+
+        Mirrors the collective spray loop: numChunks =
+        max(lanes, ceil(bytes/spray_chunk)) (at least one fragment per
+        lane so the transfer uses the aggregate bandwidth), each fragment
+        ceil(bytes/numChunks) — the geometry NvSwitch's result multicast
+        mirrors chunk-for-chunk. Distinct from _bulk_fragment_count, which
+        models the DATA path's bulk_chunk granularity and protocol framing.
+        """
+        if data_bytes <= 0:
+            return 1, 1
+        num_chunks = max(self.num_lanes,
+                         math.ceil(data_bytes / self.spray_chunk_bytes))
+        frag_bytes = math.ceil(data_bytes / num_chunks)
+        return num_chunks, frag_bytes
+
     def _packets_per_transfer(self, data_bytes, num_gpus, algo, collective=None):
         """Fragments the C++ fabric actually emits for one transfer.
 
@@ -647,20 +665,36 @@ class TheoryDerivedSurrogate:
         # fabric emits 1,296 (144 upload + 1,152 result), so BER 1e-9/0
         # retries gave 0.2683 expected losses instead of ~1.2074 and
         # strict_reliability stayed finite for a config that cannot complete.
+        # The fragment geometry is SendCollectiveBulk's spray, NOT the DATA
+        # bulk path: numChunks = max(lanes, ceil(bytes/spray_chunk)) over the
+        # ACTUAL side size — a rank uploads D/N (allgather) or D (allreduce)
+        # in one sprayed transfer, and each result chunk mirrors one upload
+        # chunk (same wire/effective sizes). Calling _packets_per_transfer
+        # here double-divided by N (it divides internally, and the branch
+        # passed D/N again) and borrowed the DATA path's packet bytes
+        # (~932 KB fragments at D=128 MiB, ~1370x the failure probability of
+        # the real 128 KB spray chunks): 8 GPU / 128 MiB allgather / BER
+        # 5e-8 / retry 3 reported 12.1577 expected losses where the C++
+        # geometry gives 0.0627 and the ns-3 run completes with zero
+        # permanent losses (codex round 12, finding 6).
         if algo == 'nvls' and collective in ('allreduce', 'allgather'):
-            upload_per_rank = self._packets_per_transfer(
-                data_bytes / max(1, num_gpus) if collective == 'allgather'
-                else data_bytes,
-                num_gpus, algo, collective)
-            result_per_dest = num_gpus * self._packets_per_transfer(
-                data_bytes / max(1, num_gpus), num_gpus, algo, collective)
-            upload_count = num_gpus
-            result_count = num_gpus
+            upload_bytes = (data_bytes / max(1, num_gpus)
+                            if collective == 'allgather' else data_bytes)
+            upload_frags, upload_frag_bytes = (
+                self._spray_fragments(upload_bytes))
+            # Result side per destination: the switch re-multicasts every
+            # received upload chunk, so a dest's stream carries N streams of
+            # frag(D/N) chunks at the upload chunk sizes (allreduce results
+            # mirror the D-byte upload chunks the same way).
+            result_frags_per_dest = num_gpus * upload_frags
             attempts = retry_limit + 1
-            return ((upload_count * upload_per_rank
-                     + result_count * result_per_dest)
+            p_frag = self._packet_failure_probability(
+                ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
+            p_path_frag = 1.0 - (1.0 - p_frag) ** max(1.0, optical_hops)
+            return ((num_gpus * upload_frags
+                     + num_gpus * result_frags_per_dest)
                     * min(1.0, max(0.0, optical_fraction))
-                    * p_path ** attempts)
+                    * p_path_frag ** attempts)
         attempts = retry_limit + 1
         return (transfer_count * packets_per_transfer
                 * min(1.0, max(0.0, optical_fraction))

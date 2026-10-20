@@ -6,6 +6,24 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NVLS surrogate reliability uses the collective spray geometry
+
+The NVLS branch of `expected_permanent_losses` called
+`_packets_per_transfer` with D/N — which divides by N internally, so the
+upload side was sized at D/N² — and inherited the DATA bulk path's
+packet failure probability (~932 KB fragments at D=128 MiB instead of
+the collective spray's 128 KB chunks, ~1370× the per-packet failure
+probability). 8 GPU / 128 MiB allgather / BER 5e-8 / retry 3 reported
+12.1577 expected losses and `strict_reliability` rejected a config
+whose ns-3 run completes with zero permanent losses (codex round 12,
+finding 6). The branch now fragments via the new `_spray_fragments`
+helper, mirroring `SendCollectiveBulk` exactly: each rank's upload of
+D/N (allgather) or D (allreduce) moves as
+`max(lanes, ceil(bytes/spray_chunk))` fragments, and each result chunk
+mirrors one upload chunk — giving 0.062731 at the repro point,
+matching the C++ geometry. Regression test pins the 128 MiB value and
+a finite strict gate.
+
 ### Fixed — upload dedup survives the NVLS/SHARP result multicast
 
 The switch erased its upload dedup ledger (`m_seenUploadSeqs`) when a
