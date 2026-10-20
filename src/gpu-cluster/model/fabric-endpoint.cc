@@ -1526,9 +1526,23 @@ FabricEndpoint::ProcessDataPacket(Ptr<Packet> packet, const FabricHeader& header
 {
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
 
-    // Check if this is a protocol-aware packet
-    NcclProtocol protocol = header.GetNcclProtocol();
-    if (protocol != NcclProtocol::NONE && protocol != NcclProtocol::SIMPLE)
+    // Check if this is a protocol-aware packet. The gate is the HANDLING
+    // MODEL's wire efficiency for the packet's protocol byte — NOT an
+    // NcclProtocol enum interpretation of that byte. Vendor protocol ids are
+    // not NCCL ids: UB's MEM_SYNC is 0 (NCCL NONE) and MAINTENANCE is 3
+    // (NCCL SIMPLE), yet both frame a 16-byte transaction header the receiver
+    // must strip — under the enum gate a UB small message took the raw path
+    // and reached the application with its transaction header intact (64
+    // payload bytes delivered as 80, first byte 0). Efficiency < 1.0 is
+    // exactly the set of protocols whose payloads were built by a payload
+    // builder on send (SendDataInternal's same gate), so the receive side
+    // must run the matching extraction. Protocol byte 0 on an efficiency-1.0
+    // model (NCCL NONE, MCCL with default efficiency) still takes the raw
+    // path unchanged.
+    uint8_t protoByte = header.GetProtocol();
+    double protoEfficiency =
+        GetProtocolModelForDest(header.GetSourceRank())->GetEfficiency(protoByte);
+    if (protoEfficiency < 1.0)
     {
         // Delegate to protocol-aware processing
         ProcessProtocolDataPacket(packet, header);
