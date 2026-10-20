@@ -5435,6 +5435,123 @@ class NvlsAllGatherCorrectnessTest : public TestCase
     }
 };
 
+// A bare NvSwitch driven directly through the ALLGATHER aggregation path
+// (ProcessAllGather is normally reached via ReceiveFromPort). One dummy
+// point-to-point port is installed so the multicast-result Send has a real
+// device to fire on; the peer device's receive callback counts the results.
+class NvSwitchAggHarness : public NvSwitch
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::NvSwitchAggHarness")
+                                .SetParent<NvSwitch>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<NvSwitchAggHarness>();
+        return tid;
+    }
+    NvSwitchAggHarness() = default;
+    // Expose the protected test seam at public scope for this harness.
+    using NvSwitch::InjectAggregateUpload;
+};
+
+NS_OBJECT_ENSURE_REGISTERED(NvSwitchAggHarness);
+
+// NVLS/SHARP upload dedup: a retransmitted upload (its LLR ack lost) must not
+// count as a new contribution. Codex repro (round 11, finding 2): 2 GPUs
+// expected 64 B each; rank 0's 32 B fragment retransmitted with the same seq;
+// rank 1 sends 64 B. Only 96 unique bytes exist, yet the switch declared the
+// flow complete and multicasted a 128 B result. The dedup gate must leave
+// rank 0's ledger at 32 B so the flow stays incomplete.
+class SharpUploadDedupTest : public TestCase
+{
+  public:
+    SharpUploadDedupTest()
+        : TestCase("NVLS and SHARP retransmitted uploads are not double-counted")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // One port; its peer counts multicast result packets. The link must
+        // carry a real fabric data rate: the p2p default (32 kbps) serializes
+        // even a ~100 B packet in milliseconds, past the stop time, so the
+        // result packets would never reach the counting peer.
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+        uint32_t resultCount = 0;
+        devs.Get(1)->SetReceiveCallback(
+            [&resultCount](Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&) {
+                resultCount++;
+                return true;
+            });
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(0));
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(2); // 2 GPUs
+        sw->SetAllGatherChunkSize(64); // 64 B expected per GPU
+        sw->SetAllGatherDataSize(128);
+
+        // Rank 0: 32 B fragment, then the SAME seq retransmitted (ack lost).
+        sw->InjectAggregateUpload(1, 0, /*seq=*/100, 32, true);
+        sw->InjectAggregateUpload(1, 0, /*seq=*/100, 32, true); // duplicate
+        // Rank 1: full 64 B chunk.
+        sw->InjectAggregateUpload(1, 1, /*seq=*/200, 64, true);
+
+        // Only 96 unique bytes: the flow must NOT be complete. With the
+        // double-count the switch's m_allGatherReceivedBytes[1][0] read 64,
+        // the result multicast fired, and a "complete" 128 B result was
+        // assembled from 96 unique bytes.
+        Simulator::Stop(MicroSeconds(50)); // aggregation delay is scheduled
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpDuplicateUploads(), 1,
+            "The duplicate upload must be counted exactly once");
+        NS_TEST_ASSERT_MSG_EQ(resultCount, 0,
+            "No result may be multicast while unique bytes < the collective "
+            "size (96 < 128)");
+        Simulator::Destroy();
+
+        // Control: with the missing 32 B delivered under a NEW seq, the flow
+        // completes and the result is multicast (chunk sizes 32+32+64 = 3
+        // result packets to the one learned dest).
+        // Same real link rate for the control run (p2p helper retains the
+        // 200Gbps attribute set above).
+        NodeContainer nodes2;
+        nodes2.Add(CreateObject<Node>());
+        nodes2.Add(CreateObject<Node>());
+        NetDeviceContainer devs2 = p2p.Install(nodes2);
+        uint32_t resultCount2 = 0;
+        devs2.Get(1)->SetReceiveCallback(
+            [&resultCount2](Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&) {
+                resultCount2++;
+                return true;
+            });
+        Ptr<NvSwitchAggHarness> sw2 = CreateObject<NvSwitchAggHarness>();
+        sw2->AddPort(devs2.Get(0));
+        sw2->SetAllGatherEnabled(true);
+        sw2->SetAllGatherThreshold(2);
+        sw2->SetAllGatherChunkSize(64);
+        sw2->SetAllGatherDataSize(128);
+        sw2->InjectAggregateUpload(1, 0, 100, 32, true);
+        sw2->InjectAggregateUpload(1, 0, 100, 32, true); // duplicate — ignored
+        sw2->InjectAggregateUpload(1, 0, 101, 32, true); // the real second fragment
+        sw2->InjectAggregateUpload(1, 1, 200, 64, true);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw2->GetSharpDuplicateUploads(), 1,
+            "Duplicate still counted exactly once in the control run");
+        NS_TEST_ASSERT_MSG_EQ(resultCount2, 3,
+            "Completed flow must multicast its result chunks (32+32+64 B)");
+        Simulator::Destroy();
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -6014,6 +6131,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new AlltoallInjectorCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new SharpAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new NvlsAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new SharpUploadDedupTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
 
     // P1: NvSwitch microarchitecture.

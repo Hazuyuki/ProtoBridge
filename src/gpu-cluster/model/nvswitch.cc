@@ -397,6 +397,46 @@ NvSwitch::IsPortOperational(uint32_t port) const
 }
 
 bool
+NvSwitch::RegisterUploadSeq(uint16_t flowId, uint16_t srcRank, uint32_t seqNum)
+{
+    auto& seen = m_seenUploadSeqs[flowId][srcRank];
+    if (!seen.insert(seqNum).second)
+    {
+        m_sharpDuplicateUploads++;
+        NS_LOG_DEBUG("Duplicate upload ignored: flowId=" << flowId
+                     << " srcRank=" << srcRank << " seq=" << seqNum);
+        return false;
+    }
+    return true;
+}
+
+void
+NvSwitch::InjectAggregateUpload(uint16_t flowId, uint16_t srcRank, uint32_t seqNum,
+                                uint32_t effectiveSize, bool allGather)
+{
+    FabricPacketType type = allGather ? FabricPacketType::ALLGATHER
+                                      : FabricPacketType::ALLREDUCE;
+    FabricHeader fh;
+    fh.SetPacketType(type);
+    fh.SetFlowId(flowId);
+    fh.SetSourceRank(srcRank);
+    fh.SetDestRank(0xFFFF);
+    fh.SetSequenceNumber(seqNum);
+    fh.SetPayloadSize(effectiveSize);
+    fh.SetEffectiveDataSize(effectiveSize);
+    Ptr<Packet> pkt = Create<Packet>(effectiveSize);
+    pkt->AddHeader(fh);
+    if (allGather)
+    {
+        ProcessAllGather(pkt, fh, 0);
+    }
+    else
+    {
+        ProcessAllReduce(pkt, fh, 0);
+    }
+}
+
+bool
 NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
                            uint16_t protocol, const Address& source,
                            const Address& destination, NetDevice::PacketType packetType)
@@ -984,6 +1024,15 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
     uint16_t flowId = header.GetFlowId();
     uint16_t srcRank = header.GetSourceRank();
 
+    // Dedup gate: a retransmitted upload (its LLR ack lost) must not count
+    // as a new contribution. Still re-ACK so the sender purges its retry
+    // entry, but the aggregation ledgers below advance only once per seq.
+    if (!RegisterUploadSeq(flowId, srcRank, header.GetSequenceNumber()))
+    {
+        SendSharpLlrAck(header, inPort);
+        return;
+    }
+
     // Learn port-to-rank mapping for multicast
     m_portRankMap[inPort] = srcRank;
 
@@ -1176,6 +1225,10 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
     NS_LOG_INFO("SHARP AllReduce: multicast " << chunkSizes.size()
                 << " result packets for flowId=" << flowId
                 << " to " << rankPorts.size() << " GPUs");
+
+    // Flow complete: retire the upload dedup ledger with the buffers.
+    m_allReduceReceivedBytes.erase(flowId);
+    m_seenUploadSeqs.erase(flowId);
 }
 
 void
@@ -1260,6 +1313,7 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
         m_allReduceBuffer.erase(flowId);
         m_allReduceReceivedBytes.erase(flowId);
         m_allReduceCompletedPartitions.erase(flowId);
+        m_seenUploadSeqs.erase(flowId);
     }
 
     NS_LOG_INFO("SHARP AllReduce: multicast partition " << partitionIdx
@@ -1446,6 +1500,14 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
     uint16_t flowId = header.GetFlowId();
     uint16_t srcRank = header.GetSourceRank();
 
+    // Dedup gate: mirror ProcessAllReduce — a retransmitted upload must not
+    // advance the aggregation ledgers (re-ACK only).
+    if (!RegisterUploadSeq(flowId, srcRank, header.GetSequenceNumber()))
+    {
+        SendSharpLlrAck(header, inPort);
+        return;
+    }
+
     // Learn port-to-rank mapping
     m_portRankMap[inPort] = srcRank;
 
@@ -1558,6 +1620,10 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
     NS_LOG_INFO("NVLS AllGather: multicast " << allChunkSizes.size()
                 << " result chunks for flowId=" << flowId
                 << " to " << rankPorts.size() << " GPUs");
+
+    // Flow complete: retire the upload dedup ledger with the buffers.
+    m_allGatherReceivedBytes.erase(flowId);
+    m_seenUploadSeqs.erase(flowId);
 }
 
 void

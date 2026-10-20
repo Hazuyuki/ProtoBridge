@@ -6,6 +6,25 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NVLS/SHARP retransmitted uploads no longer double-count toward completion
+
+The switch's aggregation paths (`ProcessAllReduce`/`ProcessAllGather`) counted
+every arriving upload packet toward the flow's received-bytes ledger, with no
+notion of "already seen". A retransmitted upload — its LLR ack lost on a lossy
+fabric — therefore counted twice: with 2 GPUs expected to contribute 64 B each,
+a 32 B fragment retransmitted with the same seq pushed rank 0's ledger to 64 B
+and the switch declared the flow complete off 96 unique bytes, multicasting a
+"complete" 128 B result assembled from partial data (codex round 11, finding 2).
+
+Both aggregation paths now run a dedup gate (`RegisterUploadSeq`, keyed on
+(flowId, srcRank, seqNum)) ahead of the ledgers: a duplicate re-ACKs (so the
+sender purges its retry entry) but advances nothing. The seen-seq ledger is
+retired with the flow's other state in the three multicast tails. Regression
+test `SharpUploadDedupTest` drives the aggregation path directly through a new
+`InjectAggregateUpload` seam: the duplicate must not complete a 96-byte flow,
+while the control run (the missing fragment arriving under a fresh seq) still
+multicasts its 3 result chunks.
+
 ### Fixed — protocol framing is a wire flag, not a model-efficiency inference
 
 `ProcessDataPacket` routed packets to the protocol-aware extraction path by

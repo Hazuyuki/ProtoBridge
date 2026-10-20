@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <queue>
 #include <deque>
+#include <set>
 #include <cstdint>
 #include <functional>
 
@@ -333,9 +334,23 @@ class NvSwitch : public FabricSwitch
     uint32_t GetTtlDrops() const { return m_ttlDrops; }
     uint32_t GetVoqDrops() const { return m_voqDrops; }
     uint32_t GetRouteUnavailableDrops() const { return m_routeUnavailableDrops; }
+    uint32_t GetSharpDuplicateUploads() const { return m_sharpDuplicateUploads; }
+    /// Monotonic count of multicast result packets emitted (0 = no result yet).
+    uint32_t GetMulticastSeqNum() const { return m_multicastSeqNum; }
 
   protected:
     void DoDispose() override;
+
+    /**
+     * @brief Test seam: feed an upload packet straight into the SHARP/NVLS
+     * aggregation path, bypassing ReceiveFromPort's routing/preamble.
+     *
+     * Mirrors the FabricEndpoint test subclasses' Inject* pattern. Used by
+     * the upload-dedup regression test to drive ProcessAllGather without a
+     * full fabric.
+     */
+    void InjectAggregateUpload(uint16_t flowId, uint16_t srcRank, uint32_t seqNum,
+                               uint32_t effectiveSize, bool allGather);
 
     /**
      * @brief Congestion hook called when a packet is enqueued to a VOQ.
@@ -396,6 +411,18 @@ class NvSwitch : public FabricSwitch
      * @brief Return true when the output port and its modeled link are usable.
      */
     bool IsPortOperational(uint32_t port) const;
+
+    /**
+     * @brief Dedup gate for NVLS/SHARP upload packets.
+     *
+     * Returns true the FIRST time (flowId, srcRank, seqNum) is seen; false on
+     * every retransmission of an already-counted upload. The aggregation
+     * ledgers (received bytes + chunk lists) must only advance on the first
+     * arrival — a retransmitted upload whose LLR ack was lost otherwise
+     * double-counts and the switch assembles a "complete" result from fewer
+     * unique bytes than the collective requires.
+     */
+    bool RegisterUploadSeq(uint16_t flowId, uint16_t srcRank, uint32_t seqNum);
 
     /**
      * @brief Enqueue packet to VOQ
@@ -564,6 +591,14 @@ class NvSwitch : public FabricSwitch
     std::unordered_map<uint16_t, std::deque<SharpResultEntry>> m_sharpResultStore;
     static constexpr size_t SHARP_RESULT_WINDOW = 512; ///< Max stored results per dest
     static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
+
+    // Upload dedup: (flowId, srcRank) -> seen upload sequence numbers. A
+    // retransmitted NVLS/SHARP upload (its LLR ack lost) must not count as a
+    // new contribution — the aggregation ledgers (received bytes + chunk
+    // lists) would double-count it and return a "complete" result assembled
+    // from fewer unique bytes than the collective requires.
+    std::unordered_map<uint16_t, std::unordered_map<uint16_t, std::set<uint32_t>>> m_seenUploadSeqs;
+    uint32_t m_sharpDuplicateUploads = 0; ///< Duplicate uploads dropped by the dedup gate
 
     // Callbacks
     NetDevice::ReceiveCallback m_rxCallback;
