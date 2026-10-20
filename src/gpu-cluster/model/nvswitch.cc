@@ -1253,7 +1253,7 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
             uint32_t portIdx = ports[chunkIdx % ports.size()];
             StoreMulticastResult(destRank, flowId, portIdx,
                                  resultHeader.GetSequenceNumber(), pkt);
-            m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            SendMulticastResultOnPort(portIdx, pkt);
         }
     }
 
@@ -1348,7 +1348,7 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
             uint32_t portIdx = ports[chunkIdx % ports.size()];
             StoreMulticastResult(destRank, flowId, portIdx,
                                  resultHeader.GetSequenceNumber(), pkt);
-            m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            SendMulticastResultOnPort(portIdx, pkt);
         }
     }
 
@@ -1664,7 +1664,7 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
             uint32_t portIdx = ports[chunkIdx % ports.size()];
             StoreMulticastResult(destRank, flowId, portIdx,
                                  resultHeader.GetSequenceNumber(), pkt);
-            m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            SendMulticastResultOnPort(portIdx, pkt);
         }
     }
 
@@ -1708,6 +1708,62 @@ NvSwitch::SendSharpLlrAck(const FabricHeader& uploadHeader, uint32_t inPort)
     Ptr<Packet> ackPkt = Create<Packet>(0);
     ackPkt->AddHeader(ackHeader);
     m_ports[inPort]->Send(ackPkt, Mac48Address::GetBroadcast(), 0x0800);
+}
+
+void
+NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
+{
+    if (portIdx >= m_ports.size() || !m_ports[portIdx])
+    {
+        return;
+    }
+
+    // FEC egress for the multicast result path. These sends are direct port
+    // Sends, so without this they bypass FEC entirely: with RS(544,514,15) a
+    // 65,536-B result fragment serialized as 65,536 wire bytes where
+    // GetEncodedSize requires 70,040 (codex round 12, finding 7). Mirror the
+    // endpoint egress convention exactly: pad the body to the encoded size
+    // (the FEC receiver strips parity via header.GetPayloadSize()), and hold
+    // the send for the codec latency like ForwardPacket's scheduled path.
+    // The un-padded packet still goes to StoreMulticastResult: repairs
+    // re-expand from the header's payload size on their own pass through
+    // here.
+    uint64_t wireSize = pkt->GetSize();
+    Time codingLatency = Seconds(0);
+    if (m_fecModel && m_fecModel->IsEnabled() && PortUsesFec(portIdx))
+    {
+        FabricHeader header;
+        if (pkt->PeekHeader(header))
+        {
+            uint32_t payloadSize = pkt->GetSize() - header.GetSerializedSize();
+            uint32_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
+            if (encodedPayloadSize > payloadSize)
+            {
+                uint32_t padding = encodedPayloadSize - payloadSize;
+                pkt->AddAtEnd(Create<Packet>(padding));
+                wireSize = header.GetSerializedSize() + encodedPayloadSize;
+            }
+            codingLatency = m_fecModel->GetEncodeLatency()
+                            + m_fecModel->GetDecodeLatency();
+        }
+    }
+    m_txTrace(pkt);
+    m_txPackets++;
+    m_txBytes += wireSize;
+
+    if (codingLatency > Seconds(0))
+    {
+        Simulator::Schedule(codingLatency, [this, portIdx, pkt]() {
+            if (portIdx < m_ports.size() && m_ports[portIdx])
+            {
+                m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            }
+        });
+    }
+    else
+    {
+        m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+    }
 }
 
 void
@@ -1803,9 +1859,10 @@ NvSwitch::HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort)
         entry.retransmits++;
         // Rebuild the body (dummy bytes — only the size matters) and stamp
         // the stored header so the retransmit is wire-identical in shape.
+        // Re-expands FEC parity on FEC ports like the original multicast.
         Ptr<Packet> pkt = Create<Packet>(entry.header.GetPayloadSize());
         pkt->AddHeader(entry.header);
-        m_ports[entry.portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+        SendMulticastResultOnPort(entry.portIdx, pkt);
         NS_LOG_DEBUG("Switch retransmit multicast result seq " << seqNum
                      << " to rank " << requestingRank);
         return true;

@@ -5770,6 +5770,77 @@ class SharpUploadDedupSurvivesResultTest : public TestCase
     }
 };
 
+// Multicast result sends must honor FEC wire expansion. The direct
+// port->Send sites bypassed FEC egress entirely: with RS(544,514,15) a
+// 65,536-B result fragment serialized as 65,536 wire bytes where
+// GetEncodedSize requires 70,040 — the result link's serialization (and
+// txBytes accounting) was ~6.6% understated, and the codec latency never
+// applied (codex round 12, finding 7).
+class MulticastResultFecExpansionTest : public TestCase
+{
+  public:
+    MulticastResultFecExpansionTest()
+        : TestCase("Multicast results expand for FEC on the result port")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(0));
+
+        // FEC RS(544,514,15) on the switch, optical-only, port 0 optical.
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        fec->SetFecParams(544, 514, 15);
+        fec->SetEnabled(true);
+        sw->SetFecModel(fec);
+        sw->SetFecOpticalOnly(true);
+        Ptr<LinkDegradationModel> portModel = CreateObject<LinkDegradationModel>();
+        LinkMetadata meta;
+        meta.linkClass = "inter_rack";
+        meta.medium = "optical";
+        meta.protocol = "RoCEv2";
+        portModel->SetLinkMetadata(meta);
+        sw->SetPortDegradationModel(0, portModel);
+
+        uint64_t wireBodyBytes = 0;
+        devs.Get(1)->SetReceiveCallback(
+            [&wireBodyBytes](Ptr<NetDevice>, Ptr<const Packet> p, uint16_t, const Address&) {
+                Ptr<Packet> c = p->Copy();
+                PppHeader ppp;
+                c->RemoveHeader(ppp);
+                wireBodyBytes += c->GetSize();
+                return true;
+            });
+
+        // AllGather: 2 GPUs x 65,536 B -> two 65,536-B result chunks on
+        // port 0, each of which must expand to 70,040 wire bytes.
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(2);
+        sw->SetAllGatherChunkSize(65536);
+        sw->SetAllGatherDataSize(131072);
+        sw->InjectAggregateUpload(1, 0, 100, 65536, true);
+        sw->InjectAggregateUpload(1, 1, 200, 65536, true);
+
+        Simulator::Stop(MicroSeconds(200)); // codec latency is scheduled
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(
+            wireBodyBytes,
+            static_cast<uint64_t>(2 * (fec->GetEncodedSize(65536) + 37)),
+            "Each 65,536-B result fragment must serialize with its FEC parity "
+            "(70,040 B body + 37 B FabricHeader)");
+        Simulator::Destroy();
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -6551,6 +6622,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new NvlsAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new SharpUploadDedupTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpUploadDedupSurvivesResultTest, TestCase::Duration::QUICK);
+    AddTestCase(new MulticastResultFecExpansionTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);

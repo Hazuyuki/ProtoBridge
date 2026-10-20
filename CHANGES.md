@@ -6,6 +6,22 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — multicast result sends honor FEC wire expansion
+
+The NVLS/SHARP multicast result paths (AllReduce single and partitioned,
+AllGather, and the NACK-driven result repairs) sent result fragments with
+direct `port->Send` calls, bypassing FEC egress entirely: with
+RS(544,514,15) on the result port a 65,536-B fragment serialized as
+65,536 wire bytes where `GetEncodedSize` requires 70,040 — the result
+link's serialization was understated and the codec latency never applied
+(codex round 12, finding 7). The four sites now go through the new
+`NvSwitch::SendMulticastResultOnPort`, which mirrors the endpoint egress
+convention exactly: the body is padded to the encoded size (the FEC
+receiver strips parity via the header's payload size), tx accounting
+uses the encoded wire size, and the send is held for the
+encode+decode latency. Regression test `MulticastResultFecExpansionTest`
+pins two 65,536-B fragments serializing as 2×(70,040+37) wire bytes.
+
 ### Fixed — NVLS surrogate reliability uses the collective spray geometry
 
 The NVLS branch of `expected_permanent_losses` called

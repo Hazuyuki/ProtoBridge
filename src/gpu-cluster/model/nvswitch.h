@@ -562,6 +562,16 @@ class NvSwitch : public FabricSwitch
                               uint32_t portIdx, uint32_t seqNum, Ptr<Packet> pkt);
 
     /**
+     * @brief Egress helper for multicast result sends (FEC-aware).
+     *
+     * Pads the packet body to GetEncodedSize on FEC ports (the receiver
+     * strips parity via the header's payload size) and holds the send for
+     * the codec latency, matching the endpoint egress convention. Direct
+     * port->Send calls otherwise skip FEC wire expansion entirely.
+     */
+    void SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt);
+
+    /**
      * @brief Retransmit a multicast result on a receiver NACK (DestRank 0xFFFF).
      *
      * @return true when a stored result matched and was retransmitted.
