@@ -6,6 +6,25 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — surrogate ring AllGather step count is a single ring pass
+
+`_steps(N, 'ring', 'allgather')` returned the AllReduce's `2(N-1)` —
+ring AllGather executes one pass of `N-1` steps (`ns-3 RingAllGather`
+sets `m_totalSteps = numGpus - 1`); the second pass is the
+reduce-scatter half, which AllGather does not have. At 0.4-µs link
+latency the surrogate charged 5.6 µs instead of 2.8 µs of fixed
+per-step communication latency, independent of serialization (codex
+round 16, finding 7). Because the rs/ag `phase=` halving was likewise
+inherited from the AllReduce, the hierarchical AllGather stages
+(`phase='ag'`) were compensating back to a single pass — the guide pins
+(450.39 / 413.76 µs) are byte-identical after the fix; only direct
+`collective='allgather'` predictions were overcharged. The halving is
+now guarded to `collective == 'allreduce'`, so `phase='ag'` on an
+AllGather is the whole collective. `test_ring_allgather_steps_single_pass`
+pins `_steps(8,'ring','allgather') == 7`, the phase-equivalence, and the
+unchanged AllReduce halving; it fails on the pre-fix module. The
+USER_GUIDE step table gains the `allgather | ring | N-1` row.
+
 ### Fixed — fullmesh reduce-scatter sizes contributions by destination chunk
 
 The FullMeshAllReduce reduce-scatter phase sized each contribution with

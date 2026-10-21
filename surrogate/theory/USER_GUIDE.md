@@ -174,6 +174,7 @@ mapping (full formulas in §6 of `WHITEBOX_SURROGATE.md`):
 | `collective` | `algo` | steps | per-step volume | per-GPU volume |
 |---|---|---|---|---|
 | `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allgather` | `ring` | `N-1` (one pass) | `D(N-1)/N / steps` | `D(N-1)/N` |
 | `allreduce` | `tree` | `2⌊log₂N⌋` | `α(N)·D/steps` (α(N)=1.0/2.0/3.0 structural trunk load: single edge / root with two children / interior node) | `α(N)·D` per trunk |
 | `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
 | `allreduce` | `fullmesh` | `2` | `D/N` | `D/N` per peer (N−1 concurrent) |

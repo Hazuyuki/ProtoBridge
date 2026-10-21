@@ -189,7 +189,11 @@ class TheoryDerivedSurrogate:
         """Sequential transfer phases for (collective, algorithm).
 
         AllReduce: ring 2(N-1), tree 2*floor(log2 N)  (reduce-scatter + gather)
-        AllGather: nvls 2                              (scatter-reduce + gather)
+        AllGather: ring N-1 (a single ring pass — ns-3 RingAllGather runs
+                   m_totalSteps = N-1, not the allreduce's 2(N-1); inheriting
+                   the allreduce's doubled count charged 5.6 us instead of
+                   2.8 us of fixed per-step latency at 0.4-us links, codex
+                   round 16, finding 7); nvls 2 (scatter-reduce + gather)
         AlltoAll:  ring/collnetdirect N-1 permutation phases; tree ceil(log2 N)
                    recursive-doubling rounds
         Send-Recv: 1                                   (single point-to-point hop)
@@ -211,6 +215,11 @@ class TheoryDerivedSurrogate:
             return 2 * max(1, int(math.log2(N)))
         if algo == 'nvls':
             return 2
+        if collective == 'allgather':
+            # Ring AllGather is ONE pass of N-1 steps (each rank forwards
+            # every other rank's segment once). The allreduce's second pass
+            # is the reduce-scatter half, which allgather does not have.
+            return max(1, N - 1)
         return 2 * (N - 1)
 
     @staticmethod
@@ -1258,7 +1267,11 @@ class TheoryDerivedSurrogate:
             self.S_nvls_startup if resolved == 'allgather'
             and algo == 'nvls' else self.S_startup)
         steps = self._steps(num_gpus, algo, collective)
-        if phase in ('rs', 'ag'):
+        # The rs/ag halving is an ALLREDUCE concept: the allreduce's step
+        # count covers its two ring passes, so one pass is half. Ring
+        # allgather's step count already IS one pass (N-1) — halving it again
+        # would undercount the hierarchical allgather stages by 2x.
+        if phase in ('rs', 'ag') and collective == 'allreduce':
             steps = max(1, steps // 2)
         per_step = self._per_step(data_bytes, num_gpus, algo, steps, collective)
 

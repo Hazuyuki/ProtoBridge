@@ -253,6 +253,28 @@ def test_collective_explicit_reproduces_calibrated():
                      collective="allgather") == pytest.approx(1018.01, rel=1e-3)
 
 
+def test_ring_allgather_steps_single_pass():
+    """Ring AllGather runs ONE pass of N-1 steps (ns-3 RingAllGather sets
+    m_totalSteps = numGpus - 1), not the allreduce's 2(N-1): the second ring
+    pass is the reduce-scatter half, which allgather does not have. The
+    pre-fix count charged 5.6 us instead of 2.8 us of fixed per-step latency
+    at 0.4-us links (codex round 16, finding 7). The rs/ag phase halving is
+    an allreduce-only concept, so phase='ag' on allgather must keep the full
+    single-pass count and stay byte-identical to phase='full'."""
+    s = wb.make_h200_ring_theory()
+    assert s._steps(8, "ring", "allgather") == 7
+    assert s._steps(8, "ring", "allreduce") == 14
+    assert s._steps(4, "ring", "allgather") == 3
+    D = 1 << 22
+    full = s.predict(D, 8, "ring", credits=32, collective="allgather")
+    one_pass = s.predict(D, 8, "ring", credits=32, collective="allgather",
+                         phase="ag")
+    assert full == one_pass
+    # The allreduce keeps its halving semantics unchanged.
+    rs = s.predict(D, 8, "ring", credits=32, collective="allreduce", phase="rs")
+    assert rs < s.predict(D, 8, "ring", credits=32, collective="allreduce")
+
+
 def test_fullmesh_steps_not_ring_fallthrough():
     """Full-mesh is 2 phases (AR: reduce-scatter + all-gather) / 1 phase (AG),
     NOT the ring's 2*(N-1) sequential steps -- the N-1 per-peer sends are
