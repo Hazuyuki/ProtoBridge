@@ -4971,6 +4971,119 @@ class EgressDisposeCancelsFecReceiveTest : public TestCase
     }
 };
 
+// Codex round 16, finding 1: SACK source-reload retransmissions scheduled
+// with a readyDelay captured raw `this` and were NOT tracked in
+// m_deferredEgressEvents, so DoDispose could not cancel them. With a
+// one-entry retry buffer and a 100-us reload latency, a NACK for the
+// evicted first packet deferred SendRetransmission to the 100-us mark;
+// disposing and releasing the endpoint at 1 us left the callback firing
+// into freed memory (valgrind-confirmed). Regression: store two packets,
+// NACK the evicted first, dispose+release at 1 us, and run past the reload
+// deadline without a crash.
+class EgressDisposeCancelsSourceReloadRetransmissionsTest : public TestCase
+{
+  public:
+    EgressDisposeCancelsSourceReloadRetransmissionsTest()
+        : TestCase("endpoint Dispose cancels deferred source-reload retransmissions") {}
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(1);
+        ep->SetLocalRankRange(1, 1); // rank 0 remote
+        ep->AddNetDevice(devs.Get(0));
+        ep->SetNeighborMac(0, Mac48Address::Allocate());
+        ep->SetRoutingEntry(0, 0);
+        ep->SetBypassReorderBuffer(true);
+
+        // SACK with a one-entry retry buffer and a 100-us source-reload
+        // latency: the second stored packet evicts the first from the
+        // fast buffer, so NACKing the first queues a SOURCE-RELOAD
+        // retransmission whose readyDelay defers SendRetransmission to
+        // ~100 us while the endpoint is disposed at 1 us and released at
+        // 1.1 us.
+        Ptr<LlrManager> llr = ep->GetLlrManager();
+        llr->SetLlrMode(LlrMode::SACK);
+        llr->SetRetryLimit(3);
+        llr->SetMaxBufferSize(1);
+        llr->SetSourceReloadBandwidth(0);
+        llr->SetSourceReloadLatency(MicroSeconds(100));
+        ep->SetLlrEnabled(true);
+        ep->EnableLlrTimeoutRetransmit();
+
+        ep->Initialize();
+
+        // Two 64-B DATA packets from rank 0 (the source ranks in the
+        // stored headers name the RETRANSMIT target; the retry keys come
+        // from the NACK's (source, flow, vc) triple, so both use rank 0 /
+        // flow 1 / vc 0 with distinct seqs).
+        auto makeData = [](uint32_t seq) {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::DATA);
+            h.SetSourceRank(0);
+            h.SetDestRank(1);
+            h.SetSequenceNumber(seq);
+            h.SetFlowId(1);
+            h.SetVirtualChannel(0);
+            h.SetPayloadSize(64);
+            pkt->AddHeader(h);
+            return pkt;
+        };
+        Simulator::Schedule(NanoSeconds(100), [&ep, makeData]() {
+            // Store both packets directly in the LLR source store: seq 0
+            // occupies the one-entry fast buffer, seq 1 evicts it (the
+            // evicted entry stays recoverable only via source reload).
+            ep->GetLlrManager()->StorePacket(0, makeData(0), 0);
+            ep->GetLlrManager()->StorePacket(1, makeData(1), 0);
+        });
+        // NACK seq 0 (the evicted entry) at 500 ns: DispatchRetransmissions
+        // defers SendRetransmission by the ~100-us reload latency.
+        Ptr<Packet> nack = Create<Packet>(0);
+        {
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::NACK);
+            h.SetSourceRank(0);
+            h.SetDestRank(1);
+            h.SetSequenceNumber(0);
+            h.SetFlowId(1);
+            h.SetVirtualChannel(0);
+            nack->AddHeader(h);
+        }
+        Simulator::Schedule(NanoSeconds(500), [&devs, nack]() {
+            devs.Get(1)->Send(
+                nack, Mac48Address::ConvertFrom(devs.Get(0)->GetAddress()), 0x0800);
+        });
+        Simulator::Schedule(NanoSeconds(1000), [ep]() {
+            ep->Dispose();
+        });
+        // Drop the last strong reference; the pre-fix deferred lambda held
+        // only raw `this` and read freed memory at the reload deadline.
+        Simulator::Schedule(NanoSeconds(1100), [&ep]() {
+            ep = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(200)); // past the 100-us reload deadline
+        Simulator::Run();
+        // The NACK must have taken the source-reload path (seq 0 was evicted
+        // from the one-entry fast buffer by seq 1): otherwise this test
+        // would pass vacuously without exercising the deferred
+        // retransmission.
+        NS_TEST_ASSERT_MSG_EQ(llr->GetSourceReloadCount(), 1u,
+            "the NACK for the evicted entry must queue exactly one "
+            "source-reload retransmission");
+        // Reaching this line without a crash is the assertion.
+        Simulator::Destroy();
+    }
+};
+
 // (1b-3) LLR retry timers must not start while the pacer still holds the
 // packet. Codex round 12, finding 4: StorePacket armed the timeout at
 // ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
@@ -7687,6 +7800,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new EgressDisposeCancelsDeferredSendsTest, TestCase::Duration::QUICK);
     AddTestCase(new EgressDisposeCancelsBacklogCallbacksTest, TestCase::Duration::QUICK);
     AddTestCase(new EgressDisposeCancelsFecReceiveTest, TestCase::Duration::QUICK);
+    AddTestCase(new EgressDisposeCancelsSourceReloadRetransmissionsTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

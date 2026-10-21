@@ -1837,10 +1837,19 @@ FabricEndpoint::ProcessRetryPacket(Ptr<Packet> packet, const FabricHeader& heade
             {
                 if (retransmission.readyDelay > Time(0))
                 {
-                    Simulator::Schedule(retransmission.readyDelay,
-                                        [this, retransmission]() {
-                                            SendRetransmission(retransmission);
-                                        });
+                    // Tracked in m_deferredEgressEvents so DoDispose cancels
+                    // it: the lambda captures raw `this` and a source-reload
+                    // delay can be far in the future (codex round 16,
+                    // finding 1 — with SACK, a one-entry retry buffer, and a
+                    // 100-us reload latency, a NACK for the evicted first
+                    // packet left the deferred SendRetransmission firing
+                    // into freed memory at the 100-us mark after the
+                    // endpoint was disposed and released at 1 us).
+                    m_deferredEgressEvents.push_back(
+                        Simulator::Schedule(retransmission.readyDelay,
+                                            [this, retransmission]() {
+                                                SendRetransmission(retransmission);
+                                            }));
                 }
                 else
                 {
@@ -1911,10 +1920,15 @@ FabricEndpoint::DispatchRetransmissions(
     {
         if (retransmission.readyDelay > Time(0))
         {
-            Simulator::Schedule(retransmission.readyDelay,
-                                [this, retransmission]() {
-                                    SendRetransmission(retransmission);
-                                });
+            // Tracked in m_deferredEgressEvents so DoDispose cancels it:
+            // the lambda captures raw `this` and a source-reload delay can
+            // be far in the future (codex round 16, finding 1 — see the
+            // matching comment in ProcessRetryPacket).
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(retransmission.readyDelay,
+                                    [this, retransmission]() {
+                                        SendRetransmission(retransmission);
+                                    }));
         }
         else
         {

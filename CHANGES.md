@@ -6,6 +6,25 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — endpoint Dispose cancels deferred source-reload retransmissions
+
+Both SACK retransmission dispatch sites — `ProcessRetryPacket` (the GBN
+path) and `DispatchRetransmissions` (the SACK/NACK path) — scheduled
+retransmissions with a nonzero `readyDelay` via lambdas capturing raw
+`this`, WITHOUT tracking the EventIds in `m_deferredEgressEvents`, so
+`DoDispose` could not cancel them. Repro (codex round 16, finding 1):
+SACK, one-entry retry buffer, 100-µs source-reload latency — store two
+packets, NACK the evicted first entry, then dispose and release the
+endpoint at 1 µs: the deferred `SendRetransmission` fired at the 100-µs
+reload deadline and read freed memory (valgrind-confirmed pre-fix invalid
+read in `SendRetransmission` via the `DispatchRetransmissions` lambda;
+post-fix valgrind-clean). Both sites now push their EventId into
+`m_deferredEgressEvents`, the same structure every other deferred-egress
+site uses. New regression
+`EgressDisposeCancelsSourceReloadRetransmissionsTest` (drives the exact
+geometry and asserts the reload path fired via the reload counter, so the
+test cannot pass vacuously). EXTENSIVE 86; integration PASS.
+
 ### Fixed — documented NVLS parity value refreshed
 
 CONFIG_GUIDE.md's verified-cases table claimed `simTimeNs=27576` for the
