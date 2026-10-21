@@ -63,6 +63,11 @@ public:
     }
     /// Cumulative effective bytes the wire path sent (coverage probe).
     uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
+    /// Test probe: per-phase completion threshold for destination `dest`.
+    uint64_t ProbeExpectedBytesPerDest(uint16_t dest) const
+    {
+        return ExpectedBytesPerDest(dest);
+    }
 
 private:
     void DoDispose() override;

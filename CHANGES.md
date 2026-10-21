@@ -6,6 +6,22 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — fullmesh allreduce degenerate sub-GPU-count grid
+
+With `dataSize < numGpus` (4 GPUs, 3 B), the degenerate fallback set
+every chunk to the whole dataSize, so `ExpectedBytesPerDest =
+dataSize - chunk` was zero for every rank: the first RS delivery
+flipped the state to AllGather and the second completed the collective
+with zero AllGather bytes on the wire (completion at 65,214 ns; codex
+round 16, finding 4). The degenerate grid is now one byte on each of
+the first dataSize ranks and zero on the rest (still summing to exactly
+dataSize), thresholds are dataSize minus the rank's own chunk — never
+zero — and ranks with a zero chunk send nothing. The probe reported
+`chunk0=3, expected0=0, sentBytes=72` pre-fix; `[1,1,1,0]` grid with
+18 wire bytes post-fix. `FullMeshDegenerateGridTest` pins the grid, the
+positive thresholds, and the `2(N-1)*dataSize` wire coverage; it fails
+on the pre-fix build.
+
 ### Fixed — injector events and receive callbacks are cancelled at dispose
 
 Every collective injector scheduled its startup phase (and the pipelined

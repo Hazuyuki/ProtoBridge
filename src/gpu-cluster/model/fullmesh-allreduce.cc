@@ -86,12 +86,21 @@ FullMeshAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     // truncation RingAllReduce fixed in round 13, finding 3).
     m_chunkSize = dataSize / numGpus;
     m_chunkRemainder = dataSize % numGpus;
-    if (m_chunkSize == 0)
+    if (m_chunkSize == 0 && dataSize > 0)
     {
-        // Degenerate dataSize < numGpus: keep the legacy fallback (each
-        // rank broadcasts the whole dataSize).
-        m_chunkSize = dataSize;
-        m_chunkRemainder = 0;
+        // Degenerate dataSize < numGpus: the grid degenerates to one byte
+        // on each of the first dataSize ranks and zero on the rest (still
+        // summing to exactly dataSize), so the completion thresholds stay
+        // positive for every rank that owns a byte. The legacy fallback
+        // (every rank broadcasts the whole dataSize) made
+        // ExpectedBytesPerDest zero for every rank, so the first delivery
+        // flipped the state to AllGather and the second completed the
+        // collective with zero AllGather bytes on the wire (codex round 16,
+        // finding 4). Ranks with a zero chunk send nothing in either phase
+        // and complete on their (dataSize - 0) threshold once the other
+        // ranks' bytes arrive.
+        m_chunkSize = 0;
+        m_chunkRemainder = dataSize;
     }
 
     m_gpuReceivedBytes.resize(numGpus, 0);

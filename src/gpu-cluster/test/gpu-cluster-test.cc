@@ -5175,6 +5175,92 @@ class DeviceCallbackDetachAtDisposeTest : public TestCase
 // Forward declaration: the link-error helper is defined further below.
 static void DisableLinkErrorsGlobally();
 
+// (codex round 16, finding 4) Messages smaller than the GPU count produced
+// zero completion thresholds. With 4 GPUs and dataSize=3, the legacy
+// degenerate fallback set every chunk to 3 B, so ExpectedBytesPerDest =
+// dataSize - chunk = 0 for every rank: the first RS delivery flipped the
+// state to AllGather and the second completed the collective with zero
+// AllGather bytes on the wire. The degenerate grid is now [1,1,1,0] (sums
+// to dataSize), thresholds are [2,2,2,3], and the collective only
+// completes after both phases' bytes have actually crossed the wire.
+class FullMeshDegenerateGridTest : public TestCase
+{
+  public:
+    FullMeshDegenerateGridTest()
+        : TestCase("fullmesh allreduce degenerate sub-GPU-count grid") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // < numGpus -> degenerate grid
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<FullMeshAllReduce> inj = CreateObject<FullMeshAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+
+        // Grid: one byte on each of the first dataSize ranks, zero on the
+        // rest; thresholds: dataSize minus the rank's own chunk.
+        const uint64_t grid[4] = {1, 1, 1, 0};
+        for (uint16_t g = 0; g < numGpus; ++g)
+        {
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeChunkSizeOf(g), grid[g],
+                "degenerate grid must be one byte on the first dataSize ranks");
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeExpectedBytesPerDest(g),
+                                  dataSize - grid[g],
+                "degenerate thresholds must be dataSize minus the own chunk");
+            NS_TEST_ASSERT_MSG_GT(inj->ProbeExpectedBytesPerDest(g), 0u,
+                "no threshold may be zero (the pre-fix defect)");
+        }
+
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the degenerate collective must still complete");
+        // Both phases send each nonzero chunk to N-1 peers:
+        // 2 * (N-1) * dataSize = 18 wire bytes (zero-chunk ranks send nothing).
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 2 * (numGpus - 1) * dataSize,
+            "degenerate wire traffic must cover 2(N-1)*dataSize bytes, "
+            "not the zero-AG-byte instant completion");
+        Simulator::Destroy();
+    }
+};
+
 // (codex round 16, finding 3) The injector startup event survives disposal.
 // Start() schedules the first phase with raw `this`; DoDispose must cancel
 // it (via the CollectiveInjector::m_pendingEvents discipline), otherwise a
@@ -7970,6 +8056,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new EgressDisposeCancelsSourceReloadRetransmissionsTest, TestCase::Duration::QUICK);
     AddTestCase(new DeviceCallbackDetachAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new InjectorStartupEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new FullMeshDegenerateGridTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
