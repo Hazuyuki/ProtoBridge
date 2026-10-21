@@ -6604,6 +6604,64 @@ class RingAllReduceChunkRotationTest : public TestCase
         }
         NS_TEST_ASSERT_MSG_EQ(totalGrid, 2 * (4 - 1) * 259u,
             "the full step grid must still sum to 2(N-1)*D");
+
+        // Codex round 15, finding 4: the SAME invariant with a
+        // topology-embedded REORDERED ring, 0->1->3->2. Numeric-rank
+        // ownership breaks here — rank 2 sits at ring POSITION 3, so it
+        // must transmit the position-3 chunk (64 B of 259 = 4x64 + 3),
+        // not the rank-2 chunk (65 B). The bare endpoint above carries no
+        // embedding, so its rank-arithmetic fallback masked this case.
+        {
+            const uint16_t n = 4;
+            const uint16_t next[4] = {1, 3, 0, 2}; // 0->1, 1->3, 3->2, 2->0
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint16_t r = 0; r < n; ++r)
+            {
+                Ptr<FabricEndpoint> e = CreateObject<FabricEndpoint>();
+                e->SetRank(r);
+                e->SetProtocolModel(protoModel);
+                uint16_t prev = 0xFFFF; // the rank whose next is r
+                for (uint16_t d = 0; d < n; ++d)
+                {
+                    if (next[d] == r)
+                    {
+                        prev = d;
+                    }
+                }
+                e->SetRingNeighbors(next[r], prev);
+                eps.push_back(e);
+            }
+            Ptr<RingAllReduce> reordered = CreateObject<RingAllReduce>();
+            reordered->Initialize(n, /*dataSize=*/259, eps);
+            const uint32_t reorderedSteps = 2 * (n - 1);
+            uint64_t reorderedGrid = 0;
+            for (uint32_t step = 0; step < reorderedSteps; ++step)
+            {
+                for (uint16_t gpu = 0; gpu < n; ++gpu)
+                {
+                    reorderedGrid += reordered->ProbeSegmentSizeOf(gpu, step);
+                }
+            }
+            NS_TEST_ASSERT_MSG_EQ(reorderedGrid, 2 * (n - 1) * 259u,
+                "reordered ring: the step grid must sum to 2(N-1)*D");
+            for (uint32_t step = 0; step + 1 < reorderedSteps; ++step)
+            {
+                for (uint16_t gpu = 0; gpu < n; ++gpu)
+                {
+                    const uint64_t sent = reordered->ProbeSegmentSizeOf(gpu, step);
+                    const uint16_t target = reordered->ProbeSendTarget(gpu, step);
+                    const uint64_t forwarded =
+                        reordered->ProbeSegmentSizeOf(target, step + 1);
+                    std::ostringstream oss;
+                    oss << "reordered ring (0->1->3->2) gpu=" << gpu
+                        << " step=" << step << ": rank " << gpu << " sends "
+                        << sent << " B but target rank " << target
+                        << " forwards " << forwarded
+                        << " B — chunk identity must survive the step";
+                    NS_TEST_ASSERT_MSG_EQ(forwarded, sent, oss.str());
+                }
+            }
+        }
         Simulator::Destroy();
         Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
     }

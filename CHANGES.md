@@ -6,6 +6,33 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — ring chunk ownership keys on ring position, not numeric rank
+
+`RingAllReduce::SegmentSizeOf` computed the segment-ownership index from the
+GPU's NUMERIC RANK, while `GetSendTarget` already followed the
+topology-embedded ring neighbors installed by
+`GpuClusterTopologyHelper::InstallCollectiveEmbedding`. On a reordered ring
+(such as the supported switched-fabric order 0→1→3→2) the two disagreed:
+rank 2 sits at ring POSITION 3, so it must transmit the position-3 chunk, but
+the rank-keyed formula handed it the rank-2 chunk. Repro (codex round 15,
+finding 4): 4 GPUs / 259 B on ring order 0→1→3→2 — pre-fix, rank 2 sent
+65 B to rank 0 at step 0 while rank 0 forwarded 64 B at step 1, violating
+the forward invariant (a rank forwards at step s+1 exactly the chunk it
+received at step s). `Initialize` now derives a `m_ringPos` table by walking
+the reduce-scatter direction of the embedded ring from rank 0 (the same
+neighbor source `GetSendTarget` reads; identity fallback when no embedding
+is installed or the embedding is not a single cycle covering every rank),
+and `SegmentSizeOf` evaluates the existing idx formulas with the position in
+place of the rank — preserving both the forward invariant across the AG
+reversal and the 2(N−1)·D grid sum. `StepExpectedBytes` needed no change: it
+already scans `GetSendTarget` for the step's sender and reads that sender's
+`SegmentSizeOf`. Extended `RingAllReduceChunkRotationTest` with the
+reordered-ring geometry (real endpoints carrying `SetRingNeighbors`
+0→1→3→2; the previous bare-endpoint cases fall back to rank arithmetic,
+which is exactly why they missed this). EXTENSIVE 84 PASS; integration PASS;
+surrogate 77; parity 14/14 (all ring pins unchanged — canonical-order
+simulations are unaffected).
+
 ### Fixed — ring transaction graph waits on input receipt, not own delivery
 
 `RingAllReduce::BuildTransactionGraph` chained each GPU's step s+1 send on

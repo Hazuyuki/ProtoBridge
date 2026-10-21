@@ -99,6 +99,7 @@ RingAllReduce::DoDispose()
     m_transactionGpuByNode.clear();
     m_transactionStepByNode.clear();
     m_endpoints.clear();
+    m_ringPos.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
 }
@@ -132,6 +133,8 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_allGatherSteps = numGpus - 1;
     m_totalSteps = 2 * (numGpus - 1);
 
+    ComputeRingPositions();
+
     m_gpuCompletedStep.resize(numGpus, 0);
     m_gpuStepReceivedBytes.assign(numGpus,
                                   std::vector<uint64_t>(m_totalSteps, 0));
@@ -158,6 +161,58 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
                 << " totalSteps=" << m_totalSteps
                 << " protocol=" << static_cast<int>(wireProto)
                 << " startupDelay=" << m_startupDelayNs << "ns");
+}
+
+void
+RingAllReduce::ComputeRingPositions()
+{
+    // Walk the reduce-scatter (clockwise) direction from rank 0, reading
+    // the SAME topology-embedded neighbors GetSendTarget uses, so the
+    // ownership grid and the physical send targets stay consistent. The
+    // walk must visit every rank exactly once; anything else (no embedding,
+    // 0xFFFF sentinel, or a partial/tangled graph) falls back to the
+    // identity map, which reproduces the legacy rank-keyed arithmetic.
+    m_ringPos.assign(m_numGpus, 0);
+    bool identity = true;
+    if (m_endpoints.size() >= m_numGpus)
+    {
+        std::vector<bool> seen(m_numGpus, false);
+        uint16_t cur = 0;
+        uint16_t pos = 0;
+        identity = false;
+        do
+        {
+            if (cur >= m_numGpus || seen[cur])
+            {
+                identity = true; // not a single cycle: tangle or short loop
+                break;
+            }
+            seen[cur] = true;
+            m_ringPos[cur] = pos++;
+            uint16_t next = 0xFFFF;
+            if (m_endpoints[cur])
+            {
+                next = m_endpoints[cur]->GetRingNext();
+            }
+            if (next >= m_numGpus)
+            {
+                identity = true; // no embedding (0xFFFF) or out-of-range rank
+                break;
+            }
+            cur = next;
+        } while (cur != 0 && pos < m_numGpus);
+        if (!identity && pos != m_numGpus)
+        {
+            identity = true; // walk closed early: does not cover all ranks
+        }
+    }
+    if (identity)
+    {
+        for (uint16_t r = 0; r < m_numGpus; ++r)
+        {
+            m_ringPos[r] = r;
+        }
+    }
 }
 
 void
@@ -444,33 +499,40 @@ RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step) const
 uint64_t
 RingAllReduce::SegmentSizeOf(uint16_t gpu, uint32_t step) const
 {
-    // Which segment the GPU holds at this step. Reduce-Scatter sends run
-    // clockwise (to ring next): ownership of chunk c sits at rank
-    // (c + s) mod N, so rank g holds chunk (g - s) mod N. The AllGather
-    // phase REVERSES the send direction (counterclockwise, to ring prev),
-    // so ownership keeps rotating in the SAME physical direction the bytes
-    // flow: continuing (g - s) mod N across the reversal let the index
-    // drift backwards and chunks changed size as they traveled (codex
-    // round 14, finding 4: at 4 GPUs / 259 B, rank 1 received a 64-B
-    // chunk at step 3 and forwarded 65 B at step 4). From the first AG
-    // step s0 = N-1 the offset advances +1 per step instead:
-    // idx = (g + s - 2(N-1)) mod N, which preserves the chunk invariant —
-    // a rank forwards at step s+1 exactly the chunk it received at step s.
-    // That expression simplifies algebraically to (g + s + 2) mod N; the
-    // simplified form is what gets evaluated because the direct one wraps
-    // in unsigned arithmetic (s - 2(N-1) is negative throughout AG, and
-    // 2^32 mod N != 0 for N = 3 or 5, which silently shifted the index).
-    // The base size is uniform with the first dataSize % numGpus segments
-    // one byte larger.
+    // Which segment the GPU holds at this step, keyed on ring POSITION —
+    // the GPU's slot along the topology-embedded reduce-scatter ring, NOT
+    // its numeric rank. With a reordered ring such as 0->1->3->2, rank 2
+    // sits at position 3 and must transmit the position-3 chunk; keying on
+    // the numeric rank made it forward a different-sized chunk than it
+    // received (codex round 15, finding 4: at 4 GPUs / 259 B, rank 2 sent
+    // 65 B to rank 0 at step 0 while rank 0 forwarded 64 B at step 1).
+    // Reduce-Scatter sends run clockwise (to ring next): ownership of
+    // chunk c sits at position (c + s) mod N, so position p holds chunk
+    // (p - s) mod N. The AllGather phase REVERSES the send direction
+    // (counterclockwise, to ring prev), so ownership keeps rotating in
+    // the SAME physical direction the bytes flow: continuing (p - s) mod N
+    // across the reversal let the index drift backwards and chunks changed
+    // size as they traveled (codex round 14, finding 4: at 4 GPUs / 259 B,
+    // rank 1 received a 64-B chunk at step 3 and forwarded 65 B at step
+    // 4). From the first AG step s0 = N-1 the offset advances +1 per step
+    // instead: idx = (p + s - 2(N-1)) mod N, which preserves the chunk
+    // invariant — a rank forwards at step s+1 exactly the chunk it
+    // received at step s. That expression simplifies algebraically to
+    // (p + s + 2) mod N; the simplified form is what gets evaluated
+    // because the direct one wraps in unsigned arithmetic (s - 2(N-1) is
+    // negative throughout AG, and 2^32 mod N != 0 for N = 3 or 5, which
+    // silently shifted the index). The base size is uniform with the
+    // first dataSize % numGpus segments one byte larger.
     const uint32_t n = m_numGpus;
+    const uint32_t pos = (gpu < m_ringPos.size()) ? m_ringPos[gpu] : gpu;
     uint32_t idx;
     if (step < n - 1)
     {
-        idx = (gpu + n - (step % n)) % n;
+        idx = (pos + n - (step % n)) % n;
     }
     else
     {
-        idx = (gpu + step + 2) % n;
+        idx = (pos + step + 2) % n;
     }
     return m_segmentSize + (idx < m_segmentRemainder ? 1 : 0);
 }

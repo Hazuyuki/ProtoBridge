@@ -75,6 +75,9 @@ public:
 private:
     void DoDispose() override;
     void SetupReceiveCallbacks();
+    /// Fill m_ringPos from the endpoints' embedded ring neighbors (walk the
+    /// reduce-scatter direction from rank 0), with the identity fallback.
+    void ComputeRingPositions();
     void OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header);
     void BuildTransactionGraph();
     void ExecuteTransactionAction(const ProtocolTransactionAction& action);
@@ -117,6 +120,15 @@ private:
     uint64_t m_chunkSize;
     /// Number of one-byte-larger segments in the grid (dataSize % numGpus).
     uint64_t m_segmentRemainder;
+    /// Ring POSITION of each rank (0 = rank 0's slot), walked from rank 0
+    /// along the reduce-scatter direction of the topology-embedded ring —
+    /// the same neighbor source GetSendTarget reads. Falls back to the
+    /// identity map (position == rank) when no embedding is installed or
+    /// the embedding is not a single cycle covering every rank.
+    /// Ownership math (SegmentSizeOf) keys on position, not numeric rank:
+    /// with a reordered ring such as 0->1->3->2, rank 2 sits at position 3
+    /// and must transmit the position-3 chunk (codex round 15, finding 4).
+    std::vector<uint16_t> m_ringPos;
     /// Cumulative effective bytes the wire path sent (coverage probe; the
     /// transaction path derives its byte weights from SegmentSizeOf instead).
     uint64_t m_sentDataBytes;
