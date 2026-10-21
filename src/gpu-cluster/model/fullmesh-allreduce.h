@@ -56,6 +56,14 @@ public:
 
     FullMeshArState GetState() const { return m_state; }
 
+    /// Test probe: chunk `gpu`'s size in the coverage grid.
+    uint64_t ProbeChunkSizeOf(uint16_t gpu) const
+    {
+        return ChunkSizeOf(gpu);
+    }
+    /// Cumulative effective bytes the wire path sent (coverage probe).
+    uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
+
 private:
     void DoDispose() override;
     void SetupReceiveCallbacks();
@@ -65,10 +73,19 @@ private:
     void CheckReduceScatterComplete();
     void CheckAllGatherComplete();
     void Complete();
+    // Chunk `gpu` of the grid: base dataSize/numGpus bytes plus one byte
+    // for the first dataSize % numGpus chunks, so the grid sums to exactly
+    // dataSize.
+    uint64_t ChunkSizeOf(uint16_t gpu) const;
+    // Bytes one destination receives per phase: the whole grid minus its
+    // own chunk.
+    uint64_t ExpectedBytesPerDest(uint16_t dest) const;
 
     uint16_t m_numGpus;
     uint64_t m_dataSize;
     uint64_t m_chunkSize;  // dataSize / numGpus (per-destination amount)
+    /// Number of one-byte-larger chunks in the grid (dataSize % numGpus).
+    uint64_t m_chunkRemainder;
     uint16_t m_flowId;
     uint8_t m_protocolId;
 
@@ -82,6 +99,9 @@ private:
 
     uint32_t m_reduceScatterDoneCount;
     uint32_t m_allGatherDoneCount;
+
+    /// Cumulative effective bytes the wire path sent (coverage probe).
+    uint64_t m_sentDataBytes;
 
     uint64_t m_startTimeNs;
     uint64_t m_endTimeNs;

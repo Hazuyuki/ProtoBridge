@@ -35,11 +35,13 @@ FullMeshAllReduce::FullMeshAllReduce()
     : m_numGpus(0),
       m_dataSize(0),
       m_chunkSize(0),
+      m_chunkRemainder(0),
       m_flowId(1),
       m_state(FullMeshArState::IDLE),
       m_startupDelayNs(0),
       m_reduceScatterDoneCount(0),
       m_allGatherDoneCount(0),
+      m_sentDataBytes(0),
       m_startTimeNs(0),
       m_endTimeNs(0)
 {
@@ -65,10 +67,19 @@ FullMeshAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
+    // Chunk grid: rank r's base chunk is dataSize/numGpus bytes, with the
+    // first dataSize % numGpus chunks carrying one extra byte, so the grid
+    // sums to exactly dataSize (codex round 15, finding 7: plain integer
+    // division silently dropped dataSize % numGpus bytes — the same
+    // truncation RingAllReduce fixed in round 13, finding 3).
     m_chunkSize = dataSize / numGpus;
+    m_chunkRemainder = dataSize % numGpus;
     if (m_chunkSize == 0)
     {
+        // Degenerate dataSize < numGpus: keep the legacy fallback (each
+        // rank broadcasts the whole dataSize).
         m_chunkSize = dataSize;
+        m_chunkRemainder = 0;
     }
 
     m_gpuReceivedBytes.resize(numGpus, 0);
@@ -133,6 +144,22 @@ FullMeshAllReduce::Start()
     Simulator::Schedule(NanoSeconds(m_startupDelayNs), &FullMeshAllReduce::TriggerReduceScatterPhase, this);
 }
 
+uint64_t
+FullMeshAllReduce::ChunkSizeOf(uint16_t gpu) const
+{
+    // Chunk `gpu` of the grid: base size plus one byte for the first
+    // dataSize % numGpus chunks.
+    return m_chunkSize + (gpu < m_chunkRemainder ? 1 : 0);
+}
+
+uint64_t
+FullMeshAllReduce::ExpectedBytesPerDest(uint16_t dest) const
+{
+    // Each destination receives the chunks of all N-1 sources: the whole
+    // grid minus its OWN chunk (which it already holds).
+    return m_dataSize - ChunkSizeOf(dest);
+}
+
 void
 FullMeshAllReduce::TriggerReduceScatterPhase()
 {
@@ -152,11 +179,13 @@ FullMeshAllReduce::TriggerReduceScatterPhase()
             }
 
             // GPU gpu sends chunk gpu to dest GPU (each GPU gets chunk from each source)
+            const uint64_t chunkBytes = ChunkSizeOf(gpu);
+            m_sentDataBytes += chunkBytes;
             m_endpoints[gpu]->SendBulkWireTransferSize(
-                dest, m_chunkSize, m_protocolId, m_flowId, 0);
+                dest, chunkBytes, m_protocolId, m_flowId, 0);
 
             NS_LOG_DEBUG("RS: GPU " << gpu << " sending chunk " << gpu
-                         << " to GPU " << dest << " size=" << m_chunkSize);
+                         << " to GPU " << dest << " size=" << chunkBytes);
         }
     }
 
@@ -190,8 +219,10 @@ FullMeshAllReduce::TriggerAllGatherPhase()
                 continue;
             }
 
+            const uint64_t chunkBytes = ChunkSizeOf(gpu);
+            m_sentDataBytes += chunkBytes;
             m_endpoints[gpu]->SendBulkWireTransferSize(
-                dest, m_chunkSize, m_protocolId, m_flowId + 100, 0);
+                dest, chunkBytes, m_protocolId, m_flowId + 100, 0);
 
             NS_LOG_DEBUG("AG: GPU " << gpu << " sending reduced chunk to GPU " << dest);
         }
@@ -235,11 +266,11 @@ FullMeshAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fabric
 void
 FullMeshAllReduce::CheckReduceScatterComplete()
 {
-    // Each GPU should receive chunks from N-1 sources, total = (N-1) * chunkSize
-    uint64_t expectedTotal = (m_numGpus - 1) * m_chunkSize;
-
+    // Each GPU receives the chunks of the other N-1 sources: the grid
+    // total minus its own chunk.
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
+        const uint64_t expectedTotal = ExpectedBytesPerDest(gpu);
         if (m_gpuSrcDoneCount[gpu] == 0 && m_gpuReceivedBytes[gpu] >= expectedTotal)
         {
             m_gpuSrcDoneCount[gpu] = m_numGpus - 1;
@@ -258,11 +289,12 @@ FullMeshAllReduce::CheckReduceScatterComplete()
 void
 FullMeshAllReduce::CheckAllGatherComplete()
 {
-    // Each GPU should receive chunks from N-1 sources, total = (N-1) * chunkSize
-    uint64_t expectedTotal = (m_numGpus - 1) * m_chunkSize;
-
+    // Each GPU receives the chunks of the other N-1 sources: the grid
+    // total minus its own chunk (same as reduce-scatter — each rank
+    // broadcasts its reduced chunk to all others).
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
+        const uint64_t expectedTotal = ExpectedBytesPerDest(gpu);
         if (m_gpuSrcDoneCount[gpu] == 0 && m_gpuReceivedBytes[gpu] >= expectedTotal)
         {
             m_gpuSrcDoneCount[gpu] = m_numGpus - 1;

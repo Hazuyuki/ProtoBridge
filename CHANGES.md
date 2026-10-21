@@ -6,6 +6,30 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — Ring AG/RS and FullMesh grids cover the full data size
+
+`RingAllGather`, `RingReduceScatter`, and `FullMeshAllReduce` sized every
+per-step/per-phase transfer with plain `dataSize / numGpus`, silently
+dropping `dataSize % numGpus` bytes — the same truncation `RingAllReduce`
+fixed in round 13 (commit 81108d5). Repro (codex round 15, finding 7):
+4-GPU / 15-B fullmesh allreduce reported complete after 72 effective wire
+bytes where 2(N−1)·D = 90 is required (only 12 of 15 tensor bytes
+represented); the ring AG/RS injectors dropped 3 of 15 bytes the same way.
+All three now carry a remainder grid — base size with the first
+`dataSize % numGpus` segments/chunks one byte larger — keyed on ring
+POSITION for the ring injectors (mirroring the round-15 finding-4 rule:
+`idx = (pos − step) mod N` for ReduceScatter's clockwise sends,
+`idx = (pos + step) mod N` for AllGather's counterclockwise sends; both
+preserve the forward invariant a rank forwards exactly the chunk it
+received, including on topology-embedded reordered rings). The receive
+ledgers compare against the SENDER's step size (`StepExpectedBytes`,
+scanning the send-target permutation like RingAllReduce), and fullmesh
+completion thresholds use `dataSize − ownChunk` per destination. New
+`CollectiveInjectorCoverageTest` (4 GPUs / 15 B: ring AG/RS 45 B,
+fullmesh 90 B exact-traffic assertions via new `GetSentDataBytes`
+probes). EXTENSIVE 85; integration PASS; surrogate 79; parity 14/14
+(parity scenarios use divisible sizes — no pins moved).
+
 ### Fixed — surrogate coalescing gates on the 512-MiB COALESCE_THRESHOLD
 
 `TheoryDerivedSurrogate._spray_fragments` gated its large-transfer

@@ -6431,6 +6431,95 @@ class RingAllReduceSegmentCoverageTest : public TestCase
     }
 };
 
+// R15#7: the OTHER collective injectors must also cover the full data
+// size. RingAllGather, RingReduceScatter, and FullMeshAllReduce sized
+// every transfer with plain dataSize / numGpus, dropping dataSize %
+// numGpus bytes — 4 GPUs / 15 B completed after 72 of the 90 wire bytes a
+// fullmesh allreduce requires (only 12 of 15 tensor bytes represented).
+// The coverage probes assert the exact whole-collective traffic:
+// ring AG/RS: (N-1)*D; fullmesh allreduce: 2(N-1)*D (both phases).
+class CollectiveInjectorCoverageTest : public TestCase
+{
+  public:
+    CollectiveInjectorCoverageTest()
+        : TestCase("Ring AG/RS and FullMesh grids cover the full data size") {}
+
+    template <typename InjectorT>
+    void RunCoverage(uint64_t dataSize, uint64_t expectedBytes,
+                     const char* what)
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        const uint16_t numGpus = 4;
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<InjectorT> inj = CreateObject<InjectorT>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 15-B collective must complete");
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), expectedBytes, what);
+        Simulator::Destroy();
+    }
+
+    void DoRun() override
+    {
+        // 4 GPUs / 15 B: segment grid 4+4+4+3.
+        // RingAllGather / RingReduceScatter: N-1 steps, each rank sends
+        // its segment once per step -> (N-1)*D = 45 wire bytes (the old
+        // floor division sent 36).
+        RunCoverage<RingAllGather>(15, 45,
+            "RingAllGather traffic must cover the full data size: "
+            "(N-1)*D = 45 B, not 36 B");
+        RunCoverage<RingReduceScatter>(15, 45,
+            "RingReduceScatter traffic must cover the full data size: "
+            "(N-1)*D = 45 B, not 36 B");
+        // FullMeshAllReduce: both phases broadcast the full grid to N-1
+        // peers -> 2(N-1)*D = 90 wire bytes (the old floor division sent
+        // 72, covering only 12 of 15 tensor bytes).
+        RunCoverage<FullMeshAllReduce>(15, 90,
+            "FullMeshAllReduce traffic must cover the full data size: "
+            "2(N-1)*D = 90 B, not 72 B");
+    }
+};
+
 // Wire-path receive ledger must be keyed per SENDER step. Codex round 14,
 // finding 3: a single per-dest counter mixed bytes of different steps when
 // pipelined senders drifted ahead of the receiver (or a retransmission
@@ -7624,6 +7713,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new MulticastResultFecExpansionTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclRingChunkCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceSegmentCoverageTest, TestCase::Duration::QUICK);
+    AddTestCase(new CollectiveInjectorCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceLossyWireLedgerTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceChunkRotationTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceTransactionInputDependencyTest, TestCase::Duration::QUICK);
