@@ -413,6 +413,10 @@ MultiNodeTopologyHelper::BuildIntraNodeSwitched(uint32_t nodeId, NodeInfo& info)
         {
             info.nvSwitch->AddStaticRoute(info.gpuMacs[localIdx][0], info.gpuSwitchPorts[localIdx][0]);
             info.nvSwitch->AddSprayPorts(info.gpuMacs[localIdx][0], info.gpuSwitchPorts[localIdx]);
+            // Rank->port registration: multicast results must also reach
+            // zero-chunk ranks that never upload (codex round 19, finding 6).
+            info.nvSwitch->AddRankPort(GetGlobalRank(nodeId, localIdx),
+                                       info.gpuSwitchPorts[localIdx][0]);
         }
     }
     else
@@ -420,6 +424,8 @@ MultiNodeTopologyHelper::BuildIntraNodeSwitched(uint32_t nodeId, NodeInfo& info)
         for (uint32_t localIdx = 0; localIdx < m_gpusPerNode; ++localIdx)
         {
             info.nvSwitch->AddStaticRoute(info.gpuMacs[localIdx][0], info.gpuSwitchPorts[localIdx][0]);
+            info.nvSwitch->AddRankPort(GetGlobalRank(nodeId, localIdx),
+                                       info.gpuSwitchPorts[localIdx][0]);
         }
     }
 

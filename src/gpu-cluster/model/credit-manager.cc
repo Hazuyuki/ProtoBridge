@@ -214,10 +214,31 @@ CreditManager::SetCreditAvailableCallback(CreditAvailableCallback cb)
     m_creditAvailableCallback = cb;
 }
 
+CreditManager::CreditAvailableCallback
+CreditManager::GetCreditAvailableCallback() const
+{
+    return m_creditAvailableCallback;
+}
+
 void
-CreditManager::DetachFromEndpoint()
+CreditManager::DetachFromEndpoint(CreditAvailableCallback owner)
 {
     NS_LOG_FUNCTION(this);
+    // Ownership check (codex round 19, findings 1 and 7): when the caller
+    // names the callback it installed, clear ONLY that binding — a later
+    // owner that re-bound the callback keeps its notifications. A default
+    // (null) owner means plain cleanup: detach unconditionally.
+    if (!owner.IsNull())
+    {
+        // IsEqual dereferences both impls; a null stored binding can never
+        // match a non-null owner, so short-circuit that case first.
+        if (!m_creditAvailableCallback.IsNull()
+            && m_creditAvailableCallback.IsEqual(owner))
+        {
+            m_creditAvailableCallback = MakeNullCallback<void, uint8_t>();
+        }
+        return;
+    }
     m_creditAvailableCallback = MakeNullCallback<void, uint8_t>();
 }
 

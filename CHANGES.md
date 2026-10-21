@@ -6,6 +6,81 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 19: nine defects across credit ownership, ring volumes, and degenerate grids
+
+1. **CreditManager attribute swap detaches the old binding** (high). The
+   `CreditManager` pointer attribute used a raw member accessor: swapping
+   the manager rebound the endpoint but left the OLD manager holding the
+   `OnCreditAvailable` callback — credit returns on the retired manager
+   fired into the endpoint after re-swap/dispose. The setter-based
+   accessor detaches only our binding at swap (ownership-checked) and
+   installs it on the new manager immediately. Test: `credit manager
+   attribute swap detaches old binding`.
+2. **Hierarchical ring reduce-scatter moves the full ring volume** (high).
+   The ring branch sent ONE undersized segment instead of the g−1 steps'
+   aggregate: at g=4 / segment 4 MiB each GPU shipped 1 MiB locally
+   instead of 12 MiB (12× under-transfer) while the completion threshold
+   matched the under-send. Both `HierarchicalAllReduce` and
+   `HierarchicalReduceScatter` now send `m_segmentSize * (gpusPerNode−1)`
+   as one aggregate transfer and expect the same volume. Test:
+   `hierarchical ring reduce-scatter moves segment*(g-1) bytes`.
+3. **SHARP/NVLS switch byte ledgers count effective bytes only** (medium).
+   The per-source ledger fell back to `payloadSize` when
+   `effectiveDataSize == 0`, crediting collective-spray padding fragments
+   as real data — the switch could aggregate before every source's
+   EFFECTIVE bytes arrived. Padding now legitimately counts 0 (every real
+   producer stamps the field); the partition ratio divide is guarded
+   against a zero-effective source (SIGFPE). Test: `SHARP switch ledger
+   counts effective bytes only`.
+4. **Zero-data AllToAll re-fires its completion callback at Start()**
+   (medium). `Start()` early-returned on an already-COMPLETED collective
+   without firing the callback registered after `Initialize` — the CLI
+   reported `status=incomplete` at dataSize=0 while the collective itself
+   was complete. `Start()` now re-fires the callback with the recorded
+   duration.
+5. **Hierarchical AllGather covers the full data size** (medium). Uniform
+   `D/N` chunks truncated the remainder (2×2 at 15 B exchanged 36 instead
+   of 45 bytes) and the phase-2 expectation used the rank's OWN node
+   chunk instead of the sum of REMOTE nodes' chunks — rank 0 expected 8
+   bytes but receives node 1's 7, stalling the collective. Now the frozen
+   chunk grid (`ChunkSizeOf`) sizes every send and the phase-2 threshold
+   sums remote node chunks.
+6. **NVLS AllGather degenerate grid reaches zero-chunk ranks** (medium).
+   With `dataSize < numGpus`, ranks past `dataSize` hold zero-sized
+   chunks and never upload, so the switch's learned `m_portRankMap` never
+   saw them — the multicast result loop skipped them and every such
+   receiver stalled at done=N−1 of N (CLI `--dataSize=3` /
+   `--dataSize=1`: status incomplete). New `NvSwitch::AddRankPort`
+   registration seam (populated by the helpers alongside the static
+   route); the multicast builders union the registered map with the
+   learned one, and the switch's completion gate credits zero-chunk
+   ranks. The injector sizes uploads with the frozen grid and skips
+   zero chunks. Test: `NVLS allgather degenerate grid reaches zero-chunk
+   ranks`.
+7. **`CreditManager::DetachFromEndpoint` is ownership-checked** (medium).
+   The detach cleared the stored binding unconditionally, so a shared
+   manager serving two endpoints lost the OTHER endpoint's callback when
+   one disposed. The binding is now cleared only when the owner callback
+   matches (`Callback::IsEqual`), null owner = unconditional.
+8. **Zero-data FullMesh collectives complete** (medium). With
+   `dataSize == 0` every chunk is zero, bulk sends are no-ops, and no
+   receive ever fired the completion check — both FullMeshAllGather and
+   FullMeshAllReduce stalled to the simulation cap (CLI `status=incomplete`
+   at the 1-hour limit). `TriggerSends` / `TriggerReduceScatterPhase` now
+   complete the collective directly, matching the NVLS convention. Test:
+   `zero-data fullmesh collectives complete without wire traffic`.
+9. **Surrogate LLR-off normalization precedes the retry-limit early
+   return** (medium). `expected_permanent_losses` checked
+   `retry_limit is None or < 0` BEFORE the LLR-off normalization, so
+   `llr_enabled=False / retry_limit=None` returned 0.0 — zero risk for a
+   config whose packets have exactly one attempt (strict_reliability
+   blessed incompletable configs). The normalization now runs first.
+   Test: `test_llr_off_retry_limit_none_means_one_attempt`.
+
+Suite state: EXTENSIVE 111 PASS / 0 FAIL, integration 5 PASS, surrogate
+pytest 84 passed, 14/14 parity scripts, valgrind QUICK exit 0 with zero
+errors on the credit-swap / sharp / ring / ag / degenerate-grid probes.
+
 ### Fixed — codex round 18: ten defects across endpoint disposal, chunk grids, and the surrogate
 
 1. **Credit manager detached at endpoint dispose** (high). An externally

@@ -377,7 +377,16 @@ HierarchicalAllReduce::StartLocalReduceScatter()
     }
     else
     {
-        // Ring: each GPU sends segmentSize/gpusPerNode to next local peer
+        // Ring reduce-scatter (codex round 19, finding 2): a real ring RS
+        // runs g-1 steps, each moving one full ring chunk of m_segmentSize
+        // (= dataSize/gpusPerNode) to the successor, so each GPU ships
+        // m_segmentSize*(gpusPerNode-1) bytes locally — the same volume the
+        // fullmesh branch sends. The old code divided a second time
+        // (segmentSize/g per step) AND sent only one step, under-transferring
+        // 12x at g=4 (1 MiB moved locally instead of 12 MiB) while still
+        // completing on a threshold that matched the under-send. Modeled as
+        // one aggregate transfer (per-step pacing is a latency detail the
+        // surrogate already folds into per-chunk delays).
         for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             uint32_t myNodeId = GetNodeId(gpu);
@@ -385,12 +394,12 @@ HierarchicalAllReduce::StartLocalReduceScatter()
             uint16_t nextLocalIdx = (localIdx + 1) % m_gpusPerNode;
             uint16_t nextRank = GetGlobalRank(myNodeId, nextLocalIdx);
 
-            uint64_t chunkSize = m_segmentSize / m_gpusPerNode;
-            if (chunkSize == 0) chunkSize = 1;
+            uint64_t ringVolume = m_segmentSize * (m_gpusPerNode - 1);
+            if (ringVolume == 0) ringVolume = 1;
 
             if (m_endpoints[gpu])
             {
-                m_endpoints[gpu]->SendBulkWireTransfer(nextRank, m_dummyData.data(), chunkSize,
+                m_endpoints[gpu]->SendBulkWireTransfer(nextRank, m_dummyData.data(), ringVolume,
                                                         m_protocolId, m_flowId, 0);
             }
         }
@@ -431,8 +440,10 @@ HierarchicalAllReduce::CheckLocalReduceScatterComplete(uint16_t gpu)
     }
     else
     {
-        // Ring: each GPU receives one chunk of segmentSize/gpusPerNode from predecessor
-        expectedBytes = m_segmentSize / m_gpusPerNode;
+        // Ring RS: each GPU receives m_segmentSize*(gpusPerNode-1) from its
+        // predecessor over g-1 steps (codex round 19, finding 2) — matching
+        // the ring send volume above and the fullmesh branch's threshold.
+        expectedBytes = m_segmentSize * (m_gpusPerNode - 1);
     }
     if (expectedBytes == 0) expectedBytes = 1;
 

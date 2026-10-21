@@ -7,6 +7,8 @@
 
 #include "nvswitch.h"
 
+#include <algorithm>
+
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/packet.h"
@@ -159,6 +161,7 @@ NvSwitch::DoDispose()
     m_allReduceBuffer.clear();
     m_allReduceReceivedBytes.clear();
     m_portRankMap.clear();
+    m_rankPortMap.clear();
     m_allGatherBuffer.clear();
     m_allGatherReceivedBytes.clear();
     m_seenUploadSeqs.clear();
@@ -366,6 +369,43 @@ NvSwitch::AddStaticRoute(Mac48Address addr, uint32_t port)
 {
     NS_LOG_FUNCTION(this << addr << port);
     m_macTable[addr] = port;
+}
+
+void
+NvSwitch::AddRankPort(uint16_t rank, uint32_t port)
+{
+    NS_LOG_FUNCTION(this << rank << port);
+    auto& ports = m_rankPortMap[rank];
+    if (std::find(ports.begin(), ports.end(), port) == ports.end())
+    {
+        ports.push_back(port);
+    }
+}
+
+std::unordered_map<uint16_t, std::vector<uint32_t>>
+NvSwitch::BuildRankPorts() const
+{
+    // The learned map is authoritative for ranks that uploaded: a GPU's ports
+    // may include links added after registration, and upload ingress is the
+    // ground truth for which port actually reaches it. Registered ports fill
+    // the gaps (and are appended, deduped, for spraying).
+    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts;
+    for (const auto& entry : m_portRankMap)
+    {
+        rankPorts[entry.second].push_back(entry.first);
+    }
+    for (const auto& entry : m_rankPortMap)
+    {
+        auto& ports = rankPorts[entry.first];
+        for (uint32_t port : entry.second)
+        {
+            if (std::find(ports.begin(), ports.end(), port) == ports.end())
+            {
+                ports.push_back(port);
+            }
+        }
+    }
+    return rankPorts;
 }
 
 void
@@ -1093,12 +1133,17 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
     // Learn port-to-rank mapping for multicast
     m_portRankMap[inPort] = srcRank;
 
-    // Track bytes received per (flowId, srcRank)
+    // Track bytes received per (flowId, srcRank). Effective bytes only: the
+    // collective spray path stamps each fragment's share of the effective
+    // payload (fabric-endpoint-send.cc), and a padding fragment legitimately
+    // carries ZERO effective bytes while holding real wire bytes. The old
+    // zero → payloadSize fallback credited such fragments with their full
+    // wire payload, so a rank's ledger hit its threshold from padding alone
+    // and the switch aggregated before the rank's real data arrived (codex
+    // round 19, finding 3: 4-GPU/1-byte AllReduce, rank 0's effective-byte
+    // lane delayed 100 µs — completed at 2 µs with rank 0 at 0/1 bytes).
+    // Every upload producer stamps the field; zero means zero.
     uint32_t effectiveSize = header.GetEffectiveDataSize();
-    if (effectiveSize == 0)
-    {
-        effectiveSize = header.GetPayloadSize();
-    }
     m_allReduceReceivedBytes[flowId][srcRank] += effectiveSize;
 
     // LLR ack the accepted upload so the sender purges its retry entry
@@ -1176,13 +1221,33 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
                 receivedWireBytes += chunk.wireBytes;
                 receivedEffectiveBytes += chunk.effectiveBytes;
             }
-            uint64_t ratioWhole = receivedWireBytes / receivedEffectiveBytes;
-            uint64_t ratioRemainder = receivedWireBytes % receivedEffectiveBytes;
-            uint64_t wirePartitionSize =
-                thisPartitionSize * ratioWhole +
-                (thisPartitionSize * ratioRemainder +
-                 receivedEffectiveBytes - 1) /
-                    receivedEffectiveBytes;
+            // Padding fragments carry wire bytes but zero effective bytes
+            // (codex round 19, finding 3): a source whose accepted uploads
+            // are all padding sums to receivedEffectiveBytes == 0, and the
+            // wire/effective ratio below would divide by zero. That cannot
+            // happen when the partition check runs on effective ledgers
+            // (every source has >= requiredBytes effective before we get
+            // here), but guard anyway — a zero-effective source maps its
+            // partition to wire bytes at the ratio 1 (no expansion).
+            uint64_t ratioWhole;
+            uint64_t ratioRemainder;
+            uint64_t wirePartitionSize;
+            if (receivedEffectiveBytes == 0)
+            {
+                ratioWhole = 1;
+                ratioRemainder = 0;
+                wirePartitionSize = thisPartitionSize;
+            }
+            else
+            {
+                ratioWhole = receivedWireBytes / receivedEffectiveBytes;
+                ratioRemainder = receivedWireBytes % receivedEffectiveBytes;
+                wirePartitionSize =
+                    thisPartitionSize * ratioWhole +
+                    (thisPartitionSize * ratioRemainder +
+                     receivedEffectiveBytes - 1) /
+                        receivedEffectiveBytes;
+            }
             m_deferredResultEvents.push_back(
                 Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
                                     &NvSwitch::MulticastAllReducePartition, this,
@@ -1243,11 +1308,7 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
     gpuBuffers.clear();
 
     // Group ports by GPU rank for spraying chunks across multiple links per GPU
-    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts;
-    for (const auto& entry : m_portRankMap)
-    {
-        rankPorts[entry.second].push_back(entry.first);
-    }
+    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts = BuildRankPorts();
 
     // Multicast result packets to each GPU. Create new packets from stored
     // chunk sizes (data content is dummy — only size matters for timing).
@@ -1310,11 +1371,7 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
                          << wirePartitionSize << numPartitions);
 
     // Group ports by GPU rank for spraying chunks across multiple links per GPU
-    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts;
-    for (const auto& entry : m_portRankMap)
-    {
-        rankPorts[entry.second].push_back(entry.first);
-    }
+    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts = BuildRankPorts();
 
     // Create result packets totaling wirePartitionSize, sprayed across GPU's ports.
     // Ensure at least one chunk per link (like SendCollective) so all links are
@@ -1586,12 +1643,11 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
     // Learn port-to-rank mapping
     m_portRankMap[inPort] = srcRank;
 
-    // Track bytes received per (flowId, srcRank)
+    // Track bytes received per (flowId, srcRank) — effective bytes only,
+    // same rule as ProcessAllReduce (codex round 19, finding 3): padding
+    // fragments stamp zero effective bytes and must contribute zero, not
+    // their wire payload.
     uint32_t effectiveSize = header.GetEffectiveDataSize();
-    if (effectiveSize == 0)
-    {
-        effectiveSize = header.GetPayloadSize();
-    }
     m_allGatherReceivedBytes[flowId][srcRank] += effectiveSize;
 
     // LLR ack the accepted upload (see ProcessAllReduce's SendSharpLlrAck note).
@@ -1617,10 +1673,23 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
     // aggregation that never completed — every receiver stuck at 8/9 (codex
     // round 18, finding 3). When dataSize was set, derive the per-source
     // expectation from it; fall back to the uniform chunk otherwise.
+    //
+    // Degenerate grid (codex round 19, finding 6): ranks at or past dataSize
+    // hold a ZERO-sized chunk and never upload — sourceCount never reaches
+    // the threshold and the aggregation stalled to the 1-hour cap (D=3/N=4
+    // stopped at 3/4 sources; D=1 at 1/4). When dataSize is known, a rank
+    // with expected == 0 is satisfied by construction, so the gate counts
+    // sources with actual traffic plus zero-chunk ranks that owe nothing.
     bool allComplete = false;
     if (m_allGatherChunkSize > 0)
     {
-        if (sourceCount >= m_allGatherThreshold)
+        uint64_t numGpus = m_allGatherThreshold;
+        uint64_t satisfied = sourceCount;
+        if (m_allGatherDataSize > 0 && m_allGatherDataSize < numGpus)
+        {
+            satisfied += numGpus - m_allGatherDataSize; // zero-chunk ranks owe nothing
+        }
+        if (satisfied >= numGpus)
         {
             allComplete = true;
             for (const auto& src : m_allGatherReceivedBytes[flowId])
@@ -1628,7 +1697,6 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
                 uint64_t expected = m_allGatherChunkSize;
                 if (m_allGatherDataSize > 0)
                 {
-                    uint64_t numGpus = m_allGatherThreshold;
                     expected += (src.first < (m_allGatherDataSize % numGpus)) ? 1 : 0;
                 }
                 if (src.second < expected)
@@ -1641,7 +1709,12 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
     }
     else
     {
-        allComplete = (sourceCount >= m_allGatherThreshold);
+        uint64_t satisfied = sourceCount;
+        if (m_allGatherDataSize > 0 && m_allGatherDataSize < m_allGatherThreshold)
+        {
+            satisfied += m_allGatherThreshold - m_allGatherDataSize;
+        }
+        allComplete = (satisfied >= m_allGatherThreshold);
     }
 
     if (allComplete)
@@ -1673,11 +1746,7 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
     gpuBuffers.clear();
 
     // Group ports by GPU rank for spraying
-    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts;
-    for (const auto& entry : m_portRankMap)
-    {
-        rankPorts[entry.second].push_back(entry.first);
-    }
+    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts = BuildRankPorts();
 
     // Multicast all concatenated chunks to each GPU. Create new packets from
     // stored chunk sizes (data content is dummy — only size matters for timing).

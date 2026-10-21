@@ -278,6 +278,15 @@ class FabricEndpoint : public Application
     void SetNumVirtualChannels(uint8_t numVcs);
     void SetVcCredits(uint8_t vcId, uint32_t credits);
 
+    // CreditManager attribute seam: setting the attribute swaps the manager
+    // this endpoint consults. The old manager may already carry our
+    // credit-available binding from a prior Initialize/StartApplication, and
+    // leaving it bound lets a post-dispose ReturnCredits fire
+    // OnCreditAvailable into freed memory (codex round 19, finding 1). The
+    // setter detaches only the binding this endpoint installed.
+    void SetCreditManager(Ptr<CreditManager> manager);
+    Ptr<CreditManager> GetCreditManager() const;
+
     // Flow-control policy seam (send gate dispatches on this)
     void SetFlowControlPolicy(FlowControlPolicy policy);
     FlowControlPolicy GetFlowControlPolicy() const;

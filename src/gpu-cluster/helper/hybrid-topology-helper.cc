@@ -8,6 +8,7 @@
 #include "hybrid-topology-helper.h"
 #include "gpu-cluster-helper.h"
 #include "ns3/fabric-endpoint.h"
+#include "ns3/nvswitch.h"
 #include "ns3/gateway-endpoint.h"
 #include "ns3/hybrid-routing-table.h"
 #include "ns3/link-degradation.h"
@@ -345,7 +346,28 @@ HybridTopologyHelper::BuildFabric(FabricConfig& config)
 
             m_rankToFabric[rank] = config.fabricId;
 
-            switchHelper.AddPort(sw, devices.Get(1));
+            // AddPort returns the switch port index — remember it so the
+            // rank->port registration below can use it.
+            uint32_t portIdx = switchHelper.AddPort(sw, devices.Get(1));
+            if (i == 0)
+            {
+                m_fabricFirstPort[config.fabricId] = portIdx;
+            }
+        }
+
+        // Rank->port registration: multicast results must also reach
+        // zero-chunk ranks that never upload (codex round 19, finding 6).
+        // Every GPU of this fabric sits on a consecutively added port, so
+        // rank base+i maps to firstPort+i.
+        Ptr<NvSwitch> nvSw = DynamicCast<NvSwitch>(sw);
+        if (nvSw)
+        {
+            uint32_t firstPort = m_fabricFirstPort[config.fabricId];
+            for (uint32_t i = 0; i < config.numGpus; ++i)
+            {
+                nvSw->AddRankPort(static_cast<uint16_t>(config.baseRank + i),
+                                  firstPort + i);
+            }
         }
     }
 

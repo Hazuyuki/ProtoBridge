@@ -333,6 +333,11 @@ HierarchicalReduceScatter::StartLocalReduceScatter()
     }
     else
     {
+        // Ring reduce-scatter (codex round 19, finding 2 — same defect as
+        // HierarchicalAllReduce): g-1 ring steps of one m_segmentSize chunk
+        // each, i.e. m_segmentSize*(gpusPerNode-1) bytes to the successor.
+        // The old single undersized transfer moved segmentSize/g once,
+        // 12x under the required local RS volume at g=4.
         for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             uint32_t myNodeId = GetNodeId(gpu);
@@ -340,13 +345,13 @@ HierarchicalReduceScatter::StartLocalReduceScatter()
             uint16_t nextLocalIdx = (localIdx + 1) % m_gpusPerNode;
             uint16_t nextRank = GetGlobalRank(myNodeId, nextLocalIdx);
 
-            uint64_t chunkSize = m_segmentSize / m_gpusPerNode;
-            if (chunkSize == 0) chunkSize = 1;
+            uint64_t ringVolume = m_segmentSize * (m_gpusPerNode - 1);
+            if (ringVolume == 0) ringVolume = 1;
 
             if (m_endpoints[gpu])
             {
                 m_endpoints[gpu]->SendBulkWireTransferSize(
-                    nextRank, chunkSize, m_protocolId, m_flowId, 0);
+                    nextRank, ringVolume, m_protocolId, m_flowId, 0);
             }
         }
     }
@@ -369,7 +374,9 @@ HierarchicalReduceScatter::CheckLocalReduceScatterComplete(uint16_t gpu)
     }
     else
     {
-        expectedBytes = m_segmentSize / m_gpusPerNode;
+        // Ring RS: predecessor delivers m_segmentSize*(gpusPerNode-1) over
+        // g-1 steps (codex round 19, finding 2).
+        expectedBytes = m_segmentSize * (m_gpusPerNode - 1);
     }
     if (expectedBytes == 0) expectedBytes = 1;
 

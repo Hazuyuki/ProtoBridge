@@ -190,6 +190,17 @@ FullMeshAllReduce::ExpectedBytesPerDest(uint16_t dest) const
 void
 FullMeshAllReduce::TriggerReduceScatterPhase()
 {
+    // Zero-data collective: every chunk is zero, so no bulk transfer fires a
+    // receive and neither phase's completion check ever runs — the collective
+    // would stall to the simulation cap. Complete now instead (codex round
+    // 19, finding 8; same convention as NvlsAllGather::TriggerSendPhase).
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("FullMesh AllReduce trivially complete (zero data)");
+        Complete();
+        return;
+    }
+
     // Each GPU sends its chunk to all N-1 other GPUs simultaneously
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {

@@ -80,11 +80,19 @@ NvlsAllGather::Initialize(uint16_t numGpus, uint64_t dataSize,
     // one extra byte so the chunks sum to dataSize.
     m_chunkSize = dataSize / numGpus;
     m_remainder = dataSize % numGpus;
-    if (m_chunkSize == 0)
+    if (m_chunkSize == 0 && dataSize > 0)
     {
-        m_chunkSize = 1; // minimum chunk size
-        m_remainder = 0; // chunk already >= dataSize/N; no extra bytes to add
+        // Degenerate dataSize < numGpus (codex round 19, finding 6): one
+        // byte on each of the first dataSize ranks, zero on the rest — the
+        // same frozen-grid rule the other injectors apply. The old
+        // "m_chunkSize = 1, remainder = 0" fallback fabricated [1,1,1,1]
+        // for a 3-byte collective over 4 GPUs (the switch aggregated 4
+        // bytes), and made dataSize=0 upload four 1-byte chunks.
+        m_remainder = dataSize;
     }
+    // dataSize == 0: chunkSize stays 0 — TriggerSendPhase's zero-chunk
+    // guard skips every upload and Start() completes the collective
+    // without any receive (no bytes exist to gather).
 
     m_gpuBroadcastReceivedBytes.resize(numGpus, 0);
     m_broadcastDoneCount = 0;
@@ -150,6 +158,17 @@ NvlsAllGather::TriggerSendPhase()
 {
     m_state = NvlsAllGatherState::BROADCAST_PHASE;
 
+    // Zero-data collective: every chunk is zero, so no upload (and no
+    // result multicast) will ever fire a receive to complete the broadcast
+    // phase. Complete now instead of stalling to the 1-hour cap (codex
+    // round 19, finding 6).
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("NVLS AllGather trivially complete (zero data)");
+        Complete();
+        return;
+    }
+
     // Each GPU sends only its chunk (dataSize/N) to the switch
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
@@ -159,8 +178,15 @@ NvlsAllGather::TriggerSendPhase()
         }
 
         // First (dataSize % numGpus) GPUs carry one extra byte so the chunks
-        // sum to exactly dataSize (see Initialize).
+        // sum to exactly dataSize (see Initialize). A zero chunk (degenerate
+        // dataSize < numGpus, rank past dataSize — or dataSize == 0) sends
+        // nothing: SendCollectiveBulk aborts on a zero-size upload.
         uint64_t chunk = m_chunkSize + (gpu < m_remainder ? 1 : 0);
+        if (chunk == 0)
+        {
+            NS_LOG_DEBUG("GPU " << gpu << " holds a zero-sized chunk: no upload");
+            continue;
+        }
         std::vector<uint8_t> data(chunk, 0xAB);
         m_endpoints[gpu]->SendCollective(FabricPacketType::ALLGATHER, 0,
                                           data.data(), chunk);

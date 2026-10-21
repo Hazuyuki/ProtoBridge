@@ -740,6 +740,9 @@ GpuClusterTopologyHelper::BuildFullyConnected()
             nvSwitch->AddStaticRoute(gpuMacs[gpu][0], gpuSwitchPorts[gpu][0]);
             // Spray: all ports to this GPU
             nvSwitch->AddSprayPorts(gpuMacs[gpu][0], gpuSwitchPorts[gpu]);
+            // Rank->port registration: multicast results must also reach
+            // zero-chunk ranks that never upload (codex round 19, finding 6).
+            nvSwitch->AddRankPort(static_cast<uint16_t>(gpu), gpuSwitchPorts[gpu][0]);
         }
     }
     else if (nvSwitch)
@@ -748,6 +751,7 @@ GpuClusterTopologyHelper::BuildFullyConnected()
         for (uint32_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             nvSwitch->AddStaticRoute(gpuMacs[gpu][0], gpuSwitchPorts[gpu][0]);
+            nvSwitch->AddRankPort(static_cast<uint16_t>(gpu), gpuSwitchPorts[gpu][0]);
         }
     }
 
@@ -1775,6 +1779,7 @@ GpuClusterTopologyHelper::BuildNvl72(uint32_t numSwitchPlanes, uint32_t gpusPerG
         for (uint32_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             nvSw->AddStaticRoute(gpuMacs[gpu], switchGpuPorts[sw][gpu][0]);
+            nvSw->AddRankPort(static_cast<uint16_t>(gpu), switchGpuPorts[sw][gpu][0]);
         }
 
         nvSw->SetSprayRouting(true);

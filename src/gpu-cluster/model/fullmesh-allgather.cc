@@ -143,6 +143,17 @@ FullMeshAllGather::Start()
 void
 FullMeshAllGather::TriggerSends()
 {
+    // Zero-data collective: every chunk is zero, so no bulk transfer fires a
+    // receive and CheckCompletion never runs — the collective would stall to
+    // the simulation cap. Complete now instead (codex round 19, finding 8;
+    // same convention as NvlsAllGather::TriggerSendPhase).
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("FullMesh AllGather trivially complete (zero data)");
+        Complete();
+        return;
+    }
+
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
         if (gpu >= m_endpoints.size() || !m_endpoints[gpu]) continue;

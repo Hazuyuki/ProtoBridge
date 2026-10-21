@@ -75,7 +75,8 @@ FabricEndpoint::GetTypeId()
         .AddAttribute("CreditManager",
                       "Credit manager for flow control",
                       PointerValue(),
-                      MakePointerAccessor(&FabricEndpoint::m_creditManager),
+                      MakePointerAccessor(&FabricEndpoint::SetCreditManager,
+                                          &FabricEndpoint::GetCreditManager),
                       MakePointerChecker<CreditManager>())
         .AddAttribute("LinkDegradationModel",
                       "Link degradation model for this endpoint",
@@ -244,7 +245,12 @@ FabricEndpoint::DoDispose()
     // invalid reads in TrySendQueuedPackets — codex round 18, finding 1).
     if (m_creditManager)
     {
-        m_creditManager->DetachFromEndpoint();
+        // Identity-detach (codex round 19, finding 7): clear only the
+        // binding THIS endpoint installed. If a later owner re-bound the
+        // callback after our Initialize/StartApplication, its binding
+        // survives this endpoint's disposal.
+        m_creditManager->DetachFromEndpoint(
+            MakeCallback(&FabricEndpoint::OnCreditAvailable, this));
     }
     m_creditManager = nullptr;
     m_payloadBuilder = nullptr;
@@ -696,6 +702,40 @@ void
 FabricEndpoint::SetNumVirtualChannels(uint8_t numVcs)
 {
     m_numVcs = numVcs;
+}
+
+void
+FabricEndpoint::SetCreditManager(Ptr<CreditManager> manager)
+{
+    NS_LOG_FUNCTION(this << manager);
+    // Attribute swap (codex round 19, finding 1): the manager being replaced
+    // may carry the credit-available binding this endpoint installed in
+    // Initialize()/StartApplication(). Leaving it bound lets a later
+    // ReturnCredits on the old manager fire OnCreditAvailable into freed
+    // memory once this endpoint is disposed. Detach only OUR binding — a
+    // different owner that re-bound the callback keeps its notifications
+    // (the ownership check mirrors round-19 finding 7).
+    if (m_creditManager && m_creditManager != manager)
+    {
+        m_creditManager->DetachFromEndpoint(
+            MakeCallback(&FabricEndpoint::OnCreditAvailable, this));
+    }
+    m_creditManager = manager;
+    // Install OUR binding on the new manager immediately: Initialize()/
+    // StartApplication() rebind only when they run AFTER the swap, and a
+    // swap after initialization would otherwise leave the endpoint with no
+    // credit notifications at all.
+    if (m_creditManager)
+    {
+        m_creditManager->SetCreditAvailableCallback(
+            MakeCallback(&FabricEndpoint::OnCreditAvailable, this));
+    }
+}
+
+Ptr<CreditManager>
+FabricEndpoint::GetCreditManager() const
+{
+    return m_creditManager;
 }
 
 void

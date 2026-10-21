@@ -254,6 +254,19 @@ class NvSwitch : public FabricSwitch
      */
     void AddStaticRoute(Mac48Address addr, uint32_t port) override;
 
+    /**
+     * @brief Register a rank-to-port mapping for multicast result delivery.
+     *
+     * m_portRankMap only learns from GPUs that UPLOAD collective fragments, so
+     * a rank whose chunk is zero-sized under the frozen chunk grid (rank >=
+     * dataSize when dataSize < numGpus) never appears in it and the multicast
+     * result loop skips it — its receiver stalls forever at done=N-1 of N
+     * (codex round 19, finding 6). Helpers call this alongside AddStaticRoute
+     * to pre-register every rank's port(s); the multicast builders union this
+     * table with the learned map so zero-chunk ranks still get the result.
+     */
+    void AddRankPort(uint16_t rank, uint32_t port);
+
     std::string GetVendorName() const override;
 
     /**
@@ -583,6 +596,15 @@ class NvSwitch : public FabricSwitch
      */
     bool HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort);
 
+    /**
+     * @brief Build rank -> ports for a multicast result pass.
+     *
+     * Unions the upload-learned m_portRankMap with the helper-registered
+     * m_rankPortMap so ranks that never uploaded (zero-sized chunk under the
+     * frozen grid) still receive the result (codex round 19, finding 6).
+     */
+    std::unordered_map<uint16_t, std::vector<uint32_t>> BuildRankPorts() const;
+
     // In-Network Computing (SHARP)
     bool m_allReduceEnabled;                        ///< All-Reduce enabled flag
     uint32_t m_allReduceThreshold;                  ///< Number of GPUs for aggregation
@@ -608,6 +630,9 @@ class NvSwitch : public FabricSwitch
     // FlowID -> (sourceRank -> bytes received) — for chunk-level tracking
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, uint64_t>> m_allReduceReceivedBytes;
     std::unordered_map<uint32_t, uint16_t> m_portRankMap; ///< port -> GPU rank (learned from ALLREDUCE packets)
+    // rank -> port(s), pre-registered by helpers (see AddRankPort): covers
+    // zero-chunk ranks that never upload and thus never enter m_portRankMap.
+    std::unordered_map<uint16_t, std::vector<uint32_t>> m_rankPortMap;
 
     // NVLS AllGather
     bool m_allGatherEnabled;                        ///< All-Gather enabled flag

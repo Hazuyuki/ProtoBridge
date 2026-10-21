@@ -115,6 +115,15 @@ class CreditManager : public Object
     void SetCreditAvailableCallback(CreditAvailableCallback cb);
 
     /**
+     * @brief Get the currently installed credit-availability callback.
+     *
+     * Identity-comparison support for the ownership-checked detach: an
+     * owner detaches only if the callback still equals the one IT
+     * installed (a later re-binding by another owner is untouched).
+     */
+    CreditAvailableCallback GetCreditAvailableCallback() const;
+
+    /**
      * @brief Detach the credit-available callback from its endpoint owner.
      *
      * Called by FabricEndpoint::DoDispose: the manager can outlive the
@@ -122,8 +131,19 @@ class CreditManager : public Object
      * reference, and its m_creditAvailableCallback then still points at
      * the freed endpoint — a ReturnCredits after endpoint disposal fires
      * OnCreditAvailable into freed memory (codex round 18, finding 1).
+     *
+     * OWNERSHIP-CHECKED (codex round 19, findings 1 and 7): only the
+     * callback THIS owner installed is cleared. Replacing the endpoint's
+     * CreditManager attribute re-binds the OLD manager's callback to
+     * nothing while the NEW manager keeps its own binding — a blind null
+     * would drop the new owner's notifications (and swapping the
+     * attribute without re-initializing left the old manager's callback
+     * bound to the endpoint, so disposal detached the WRONG manager).
+     * \param owner The callback the detaching owner installed; detached
+     *              only on an identity match (a null callback detaches
+     *              unconditionally for plain cleanup callers).
      */
-    void DetachFromEndpoint();
+    void DetachFromEndpoint(CreditAvailableCallback owner = CreditAvailableCallback());
 
     /**
      * @brief Traced callback for credit changes

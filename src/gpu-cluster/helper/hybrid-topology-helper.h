@@ -263,6 +263,7 @@ class HybridTopologyHelper
     NodeContainer m_allNodes;                      ///< All nodes
     ApplicationContainer m_allEndpoints;           ///< All endpoints
     std::unordered_map<uint16_t, uint16_t> m_rankToFabric; ///< rank -> fabricId mapping
+    std::unordered_map<uint16_t, uint32_t> m_fabricFirstPort; ///< fabricId -> first GPU port on its switch (rank->port registration)
     uint16_t m_nextFabricId;                       ///< Next fabric ID to assign
 };
 

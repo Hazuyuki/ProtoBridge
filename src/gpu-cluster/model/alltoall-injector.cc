@@ -216,6 +216,17 @@ AlltoAllInjector::Start()
     if (m_state == AlltoAllState::COMPLETED)
     {
         NS_LOG_INFO("AlltoAll already complete at Start() (degenerate grid)");
+        // The completion callback is typically registered AFTER Initialize
+        // completed the collective, so the Initialize-time Complete() fired
+        // into a null callback — the CLI then reported status=incomplete /
+        // simTimeUs=3600000000.0 despite a COMPLETED state. Re-fire it here
+        // (codex round 19, finding 4); callers with a callback already
+        // registered at Initialize time see it twice, which every consumer
+        // treats as idempotent status notification.
+        if (m_completionCallback)
+        {
+            m_completionCallback(m_endTimeNs - m_startTimeNs);
+        }
         return;
     }
     m_state = AlltoAllState::RUNNING;

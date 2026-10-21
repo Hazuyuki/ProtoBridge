@@ -726,16 +726,20 @@ class TheoryDerivedSurrogate:
                                   optical_hops=1.0, collective=None,
                                   llr_enabled=True):
         """Expected packets that exhaust the configured retry limit."""
-        if retry_limit is None or retry_limit < 0:
-            return 0.0
         # With LLR disabled there is NO retransmit machinery anywhere: every
         # lost packet is permanent on its first attempt, whatever
         # retry_limit says (the same rule predict()'s strict-reliability
         # gate applies — codex round 18, finding 9: a direct call with
         # llr_enabled=False / retry_limit=3 granted 4 attempts and reported
         # 6.17 expected losses where the one-attempt truth is 153.48).
+        # Normalize BEFORE the None/-1 early return: LLR-off with an
+        # unspecified retry_limit means exactly one attempt, not zero risk
+        # (codex round 19, finding 9 — the old order returned 0.0 for
+        # llr_enabled=False / retry_limit=None).
         if not llr_enabled:
             retry_limit = 0
+        if retry_limit is None or retry_limit < 0:
+            return 0.0
         packet_bytes = self._packet_bytes_per_transfer(
             data_bytes, num_gpus, algo, collective)
         p_link = self._packet_failure_probability(

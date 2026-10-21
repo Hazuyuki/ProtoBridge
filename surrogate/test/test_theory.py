@@ -886,6 +886,32 @@ def test_nvls_llr_off_results_have_one_attempt():
     assert losses_on < 0.5
 
 
+def test_llr_off_retry_limit_none_means_one_attempt():
+    """LLR off with retry_limit unspecified (None or negative) means exactly
+    ONE attempt per packet, not zero risk. The pre-fix order ran the
+    None/-1 early return BEFORE the LLR-off normalization, so
+    expected_permanent_losses(..., llr_enabled=False, retry_limit=None)
+    returned 0.0 and strict_reliability blessed configs whose ns-3 runs
+    stay incomplete (codex round 19, finding 9)."""
+    ring = wb.make_h200_ring_theory()
+    D, N = 16 * 1024 * 1024, 8
+    ref = ring.expected_permanent_losses(
+        D, N, "ring", 2e-7, 0, collective="allreduce", llr_enabled=False)
+    assert ref > 0
+    # None and -1 normalize to the same one-attempt budget as an explicit 0.
+    losses_none = ring.expected_permanent_losses(
+        D, N, "ring", 2e-7, None, collective="allreduce", llr_enabled=False)
+    losses_neg = ring.expected_permanent_losses(
+        D, N, "ring", 2e-7, -1, collective="allreduce", llr_enabled=False)
+    assert abs(losses_none - ref) < 1e-12
+    assert abs(losses_neg - ref) < 1e-12
+    # LLR ON keeps the old semantics: an unspecified retry limit is
+    # unlimited retries, i.e. zero expected permanent losses.
+    losses_on = ring.expected_permanent_losses(
+        D, N, "ring", 2e-7, None, collective="allreduce", llr_enabled=True)
+    assert losses_on == 0.0
+
+
 def test_nvls_expected_losses_use_spray_fragment_geometry():
     """The NVLS branch must fragment at SendCollectiveBulk's spray geometry,
     not the DATA bulk path's. Each rank's upload of D/N (allgather) or D

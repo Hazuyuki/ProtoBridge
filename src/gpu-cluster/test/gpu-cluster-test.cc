@@ -9123,6 +9123,286 @@ class GatewayEndpointTest : public TestCase
     }
 };
 
+// (codex round 19, finding 1) The CreditManager pointer attribute used a raw
+// member accessor: swapping the manager through the attribute rebound the
+// endpoint's OnCreditAvailable but left the OLD manager still holding the
+// callback — credit returns on the retired manager fired into the endpoint
+// and the new manager's queue starved. The setter-based accessor detaches
+// the old binding at swap.
+class CreditManagerAttributeSwapTest : public TestCase
+{
+  public:
+    CreditManagerAttributeSwapTest()
+        : TestCase("credit manager attribute swap detaches old binding") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Ptr<CreditManager> oldCm = CreateObject<CreditManager>();
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetAttribute("CreditManager", PointerValue(oldCm));
+        oldCm->InitializeVc(0, 1);
+        ep->Initialize();
+        NS_TEST_ASSERT_MSG_EQ(
+            oldCm->GetCreditAvailableCallback().IsNull(), false,
+            "old manager holds the endpoint's credit callback after install");
+        // Swap in a new manager through the same attribute seam.
+        Ptr<CreditManager> newCm = CreateObject<CreditManager>();
+        ep->SetAttribute("CreditManager", PointerValue(newCm));
+        newCm->InitializeVc(0, 1);
+        NS_TEST_ASSERT_MSG_EQ(
+            oldCm->GetCreditAvailableCallback().IsNull(), true,
+            "attribute swap must detach the old manager's binding (the "
+            "retired manager must not fire the endpoint's callback)");
+        NS_TEST_ASSERT_MSG_EQ(
+            newCm->GetCreditAvailableCallback().IsNull(), false,
+            "the new manager receives the endpoint's binding");
+        // Credit returns on the retired manager must not notify the
+        // endpoint (weak form: no callback invocation, no crash).
+        oldCm->ReturnCredits(0, 1);
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 19, finding 2) Hierarchical reduce-scatter's ring branch sent
+// ONE segment per step instead of the g-1 aggregate steps' volume: at
+// g=4/segment 4 MiB the ring moved 4 MiB per GPU instead of 12 MiB — a 3x
+// under-transfer. The expected volume per GPU is m_segmentSize*(g-1).
+class HierarchicalRingReduceScatterVolumeTest : public TestCase
+{
+  public:
+    HierarchicalRingReduceScatterVolumeTest()
+        : TestCase("hierarchical ring reduce-scatter moves segment*(g-1) bytes") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 4;
+        const uint64_t dataSize = 16 * 1024 * 1024;
+        // segmentSize = dataSize/gpusPerNode = 4 MiB; the phase-1 receive
+        // threshold is segmentSize*(gpusPerNode-1) = 12 MiB per GPU.
+
+        // Two 4-GPU fullmesh fabrics cross-linked (the supported multi-node
+        // configuration — the sim aborts on numNodes <= 1). Pre-credits keep
+        // the 12 MiB local ring unconstrained.
+        HybridTopologyHelper helper;
+        helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+        helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+        helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+        helper.Build();
+        helper.PopulateCrossFabricRouting();
+        auto apps = helper.GetAllEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t r = 0; r < apps.GetN(); ++r)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 1000000);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+
+        // The injector's CheckLocalReduceScatterComplete gates phase 1 on
+        // segmentSize*(g-1) RECEIVED bytes per GPU, so a completed phase 1
+        // at 12 MiB expected IS the volume assertion: the pre-fix send of a
+        // single undersized segment left the receive ledger short and the
+        // collective never advanced past phase 1.
+        Ptr<HierarchicalAllReduce> inj = CreateObject<HierarchicalAllReduce>();
+        inj->SetGpusPerNode(gpusPerNode);
+        inj->SetNumNodes(2);
+        inj->SetIntraNodeAlgorithm("ring");
+        inj->Initialize(2 * gpusPerNode, dataSize, eps);
+        bool phaseDone = false;
+        inj->SetCompletionCallback([&](uint64_t) { phaseDone = true; });
+        inj->Start();
+        Simulator::Stop(MilliSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "ring reduce-scatter must deliver segmentSize*(g-1) bytes per "
+            "GPU — the send volume and the completion threshold must match");
+        NS_TEST_ASSERT_MSG_EQ(phaseDone, true,
+            "the two-node hierarchical allreduce must fire its completion");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 19, finding 3) SHARP's switch byte ledger credited padding
+// fragments as real data (effectiveSize==0 fell back to payloadSize), so
+// spray fragments' wire padding inflated the per-source ledger and the
+// switch could aggregate before every source's EFFECTIVE bytes arrived.
+// The ledger is effective-bytes-only now; padding legitimately counts 0.
+class SharpEffectiveByteLedgerTest : public TestCase
+{
+  public:
+    SharpEffectiveByteLedgerTest()
+        : TestCase("SHARP switch ledger counts effective bytes only") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 8; // grid [2,2,2,2]
+
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(numGpus);
+        sw->SetAllReduceDataSize(dataSize);
+
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(400)));
+
+        std::vector<Ptr<FabricEndpoint>> eps;
+        uint32_t nextPort = 0;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            ep->AddNetDevice(pair.Get(0));
+            ep->SetRoutingEntry(0, 0);
+            sw->AddPort(pair.Get(1));
+            sw->AddRankPort(r, nextPort++);
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        // Uploads: each rank sends its full 8-B chunk as collective spray
+        // fragments. With dataSize=8 the switch must aggregate after 8
+        // EFFECTIVE bytes per source — padding must not advance the ledger.
+        Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "SHARP allreduce must complete with effective-only ledgers");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 19, finding 6) NVLS AllGather with dataSize < numGpus: rank
+// dataSize..numGpus-1 hold zero-sized chunks and never upload, so the
+// switch's m_portRankMap (learned from uploads) never sees them and the
+// multicast result loop skipped them — receivers stalled at done=N-1 of N.
+// Helpers now register rank->port (AddRankPort) alongside the static route
+// and the multicast builders union the registered map with the learned one.
+class NvlsAllGatherDegenerateGridMulticastTest : public TestCase
+{
+  public:
+    NvlsAllGatherDegenerateGridMulticastTest()
+        : TestCase("NVLS allgather degenerate grid reaches zero-chunk ranks") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // grid [1,1,1,0]: rank 3 holds nothing
+
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(numGpus);
+        sw->SetAllGatherChunkSize(dataSize / numGpus);
+        sw->SetAllGatherDataSize(dataSize);
+
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(400)));
+
+        std::vector<Ptr<FabricEndpoint>> eps;
+        uint32_t nextPort = 0;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            ep->AddNetDevice(pair.Get(0));
+            ep->SetRoutingEntry(0, 0);
+            sw->AddPort(pair.Get(1));
+            // The helper's registration seam: mirrors what
+            // GpuClusterTopologyHelper does for the switched topology.
+            sw->AddRankPort(r, nextPort++);
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<NvlsAllGather> inj = CreateObject<NvlsAllGather>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 3-B NVLS allgather over 4 GPUs must complete: rank 3's "
+            "zero chunk means it never uploads, so the multicast result "
+            "must reach it through the helper-registered rank->port map");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 19, finding 8) Zero-data FullMesh collectives: every chunk
+// is zero, SendBulkWireTransferSize is a no-op at 0 bytes, so nothing ever
+// fires OnPacketReceived and the collective stalled to the simulation cap
+// (CLI status=incomplete at the 1-hour limit). TriggerSends now completes
+// the collective directly for zero data.
+class FullMeshZeroDataCompletionTest : public TestCase
+{
+  public:
+    FullMeshZeroDataCompletionTest()
+        : TestCase("zero-data fullmesh collectives complete without wire traffic") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+
+        // Minimal endpoint set: zero-data never touches the wire, so plain
+        // endpoints without devices suffice.
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            eps.push_back(ep);
+        }
+
+        Ptr<FullMeshAllGather> ag = CreateObject<FullMeshAllGather>();
+        ag->Initialize(numGpus, 0, eps);
+        bool agFired = false;
+        ag->SetCompletionCallback([&](uint64_t) { agFired = true; });
+        ag->Start();
+
+        Ptr<FullMeshAllReduce> ar = CreateObject<FullMeshAllReduce>();
+        ar->Initialize(numGpus, 0, eps);
+        bool arFired = false;
+        ar->SetCompletionCallback([&](uint64_t) { arFired = true; });
+        ar->Start();
+
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(ag->IsCompleted(), true,
+            "zero-data fullmesh allgather must complete at TriggerSends, "
+            "not stall to the simulation cap");
+        NS_TEST_ASSERT_MSG_EQ(agFired, true,
+            "zero-data fullmesh allgather must fire its completion callback");
+        NS_TEST_ASSERT_MSG_EQ(ar->IsCompleted(), true,
+            "zero-data fullmesh allreduce must complete at "
+            "TriggerReduceScatterPhase, not stall to the simulation cap");
+        NS_TEST_ASSERT_MSG_EQ(arFired, true,
+            "zero-data fullmesh allreduce must fire its completion callback");
+        Simulator::Destroy();
+    }
+};
+
 class GpuClusterTestSuite : public TestSuite
 {
   public:
@@ -9338,6 +9618,13 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
+
+    // Codex round 19 regressions.
+    AddTestCase(new CreditManagerAttributeSwapTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalRingReduceScatterVolumeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpEffectiveByteLedgerTest, TestCase::Duration::QUICK);
+    AddTestCase(new NvlsAllGatherDegenerateGridMulticastTest, TestCase::Duration::QUICK);
+    AddTestCase(new FullMeshZeroDataCompletionTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);
