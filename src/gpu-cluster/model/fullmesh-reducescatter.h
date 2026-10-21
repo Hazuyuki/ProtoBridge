@@ -51,6 +51,17 @@ public:
     }
     /// Cumulative effective bytes the wire path sent (coverage probe).
     uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
+    /// Per-destination received bytes (load probe — the RS threshold ledger).
+    uint64_t ProbeReceivedBytes(uint16_t destRank) const
+    {
+        return (destRank < m_gpuReceivedBytes.size()) ? m_gpuReceivedBytes[destRank] : 0;
+    }
+    /// The RS completion threshold for destination `destRank`:
+    /// (N-1)*ChunkSizeOf(destRank).
+    uint64_t ProbeExpectedBytesPerDest(uint16_t destRank) const
+    {
+        return static_cast<uint64_t>(m_numGpus - 1) * ChunkSizeOf(destRank);
+    }
 
 private:
     void DoDispose() override;

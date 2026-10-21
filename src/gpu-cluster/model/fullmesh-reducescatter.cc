@@ -152,7 +152,15 @@ FullMeshReduceScatter::TriggerSends()
         {
             if (dest == gpu) continue;
 
-            const uint64_t chunkBytes = ChunkSizeOf(gpu);
+            // Reduce-scatter: destination dest reduces its OWN chunk, so
+            // every source sends ITS copy of chunk dest — per-destination
+            // load is (N-1)*ChunkSizeOf(dest). Sizing by the sender's
+            // chunk instead skewed per-rank load: the 15-B [4,4,4,3] grid
+            // delivered [11,11,11,12] bytes instead of [12,12,12,9] (the
+            // same defect codex round 16, finding 6 fixed in
+            // FullMeshAllReduce's RS phase; this standalone injector is
+            // codex round 17, finding 5).
+            const uint64_t chunkBytes = ChunkSizeOf(dest);
             m_sentDataBytes += chunkBytes;
             m_endpoints[gpu]->SendBulkWireTransferSize(
                 dest, chunkBytes, m_protocolId, m_flowId, 0);
@@ -179,9 +187,14 @@ FullMeshReduceScatter::CheckCompletion()
 {
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
-        // Each destination receives the chunks of all N-1 sources: the
-        // whole grid minus its OWN chunk (which it already holds).
-        const uint64_t expectedTotal = m_dataSize - ChunkSizeOf(gpu);
+        // Each destination receives the other N-1 sources' copies of its
+        // OWN chunk — (N-1)*ChunkSizeOf(gpu). The whole-grid-minus-own-
+        // chunk formula is the AllGather threshold; conflating the two is
+        // what allowed the sender-chunk sizing above to complete at all
+        // (both sum to the same total across the collective, so the
+        // coverage test passed while per-rank load was wrong).
+        const uint64_t expectedTotal =
+            static_cast<uint64_t>(m_numGpus - 1) * ChunkSizeOf(gpu);
         if (m_gpuSrcDoneCount[gpu] == 0 && m_gpuReceivedBytes[gpu] >= expectedTotal)
         {
             m_gpuSrcDoneCount[gpu] = m_numGpus - 1;

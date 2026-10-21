@@ -5344,6 +5344,88 @@ class FullMeshReduceScatterPerDestLoadTest : public TestCase
     }
 };
 
+// (codex round 17, finding 5) The standalone fullmesh ReduceScatter sized
+// each peer contribution with the SENDER's chunk, but destination dest
+// reduces its own chunk: every source sends its copy of chunk dest, so
+// per-destination RS load is (N-1)*ChunkSizeOf(dest). For the 15-B
+// [4,4,4,3] grid the correct load is [12,12,12,9]; the pre-fix code
+// delivered [11,11,11,12] while whole-collective traffic still totaled
+// 45 B, so the coverage test passed while per-rank load and timing were
+// wrong (the same defect as round 16 finding 6, which fixed
+// FullMeshAllReduce's RS phase but not this standalone injector).
+class FullMeshRsStandalonePerDestLoadTest : public TestCase
+{
+  public:
+    FullMeshRsStandalonePerDestLoadTest()
+        : TestCase("standalone fullmesh RS sizes contributions by destination chunk") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 15; // grid [4,4,4,3]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<FullMeshReduceScatter> inj = CreateObject<FullMeshReduceScatter>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 15-B standalone reduce-scatter must complete");
+
+        // Each destination receives (N-1) copies of its OWN chunk.
+        const uint64_t grid[4] = {4, 4, 4, 3};
+        for (uint16_t dest = 0; dest < numGpus; ++dest)
+        {
+            const uint64_t expected = 3 * grid[dest]; // [12,12,12,9]
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeExpectedBytesPerDest(dest), expected,
+                "RS threshold must be (N-1)*own chunk");
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeReceivedBytes(dest), expected,
+                "RS per-destination load must be (N-1)*own chunk "
+                "(the pre-fix code delivered the sender's chunk instead)");
+        }
+        // Whole-collective traffic is unchanged: (N-1)*D = 45.
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 45,
+            "RS re-chunking must not change whole-collective traffic");
+        Simulator::Destroy();
+    }
+};
+
 // (codex round 17, finding 1) Zero-sized chunks crashed multi-lane fabrics.
 // The degenerate sub-GPU-count grid gives ranks past dataSize a zero chunk;
 // the zero-byte bulk transfer reached the fragment math, where wireSize=0
@@ -8536,6 +8618,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new MemoryEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrManagerDetachedAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new ProtocolConfigRunnerDetachTest, TestCase::Duration::QUICK);
+    AddTestCase(new FullMeshRsStandalonePerDestLoadTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

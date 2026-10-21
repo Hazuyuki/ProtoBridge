@@ -6,6 +6,25 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — standalone fullmesh ReduceScatter sizes contributions by destination chunk
+
+`FullMeshReduceScatter::TriggerSends` sized every peer contribution with
+the SENDER's chunk, but reduce-scatter semantics have destination `dest`
+reduce its own chunk — every source sends its copy of chunk `dest`, so
+per-destination RS load is `(N-1)*ChunkSizeOf(dest)` (the same defect as
+round 16 finding 6, whose fix covered `FullMeshAllReduce`'s RS phase but
+not this standalone injector; codex round 17, finding 5). The 15-B
+[4,4,4,3] grid delivered [11,11,11,12] per-rank bytes instead of
+[12,12,12,9] while whole-collective traffic still totaled 45 B, so the
+coverage test passed while per-rank load and timing were wrong. Sends now
+size by `ChunkSizeOf(dest)` and the completion threshold is
+`(N-1)*ChunkSizeOf(dest)` (the whole-grid-minus-own-chunk formula belongs
+to AllGather). New probes `ProbeReceivedBytes`/
+`ProbeExpectedBytesPerDest` and the new
+`FullMeshRsStandalonePerDestLoadTest` pin the per-destination load (5
+assertions fail pre-fix). Fullmesh surrogate parity (allreduce,
+allgather) unchanged.
+
 ### Fixed — ProtocolConfigRunner destructor detaches endpoint callbacks
 
 `~ProtocolConfigRunner` was defaulted, leaving the
