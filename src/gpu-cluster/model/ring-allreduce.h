@@ -56,6 +56,9 @@ public:
 
     RingState GetState() const { return m_state; }
 
+    /// Cumulative effective bytes the wire path sent (coverage probe).
+    uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
+
 private:
     void DoDispose() override;
     void SetupReceiveCallbacks();
@@ -69,6 +72,10 @@ private:
     void OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step);
     void CheckGlobalCompletion();
     uint16_t GetSendTarget(uint16_t gpu, uint32_t step);
+    // Segment size (in bytes) that `gpu` transmits at `step`: ownership of
+    // segment (g - s) mod N, with the first dataSize % numGpus segments one
+    // byte larger so the grid sums to exactly dataSize.
+    uint64_t SegmentSizeOf(uint16_t gpu, uint32_t step) const;
     bool IsReduceScatterStep(uint32_t step) const;
     bool IsAllGatherStep(uint32_t step) const;
     void Complete();
@@ -90,6 +97,11 @@ private:
     uint64_t m_llThreshold;
     uint64_t m_ll128Threshold;
     uint64_t m_chunkSize;
+    /// Number of one-byte-larger segments in the grid (dataSize % numGpus).
+    uint64_t m_segmentRemainder;
+    /// Cumulative effective bytes the wire path sent (coverage probe; the
+    /// transaction path derives its byte weights from SegmentSizeOf instead).
+    uint64_t m_sentDataBytes;
 
     std::vector<uint32_t> m_gpuCompletedStep;
     std::vector<uint64_t> m_gpuStepReceivedBytes;

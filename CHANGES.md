@@ -6,6 +6,27 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — RingAllReduce segment grid covers the full data size
+
+`RingAllReduce` sized every per-step transfer and the receive-completion
+threshold with plain `dataSize / numGpus`, silently dropping
+`dataSize % numGpus` bytes: at 4 ranks / 15 B the ring reported complete
+after 72 effective bytes of traffic where 2(N−1)·D = 90 is required
+(codex round 13, finding 3). The segment grid is now rank-indexed with the
+first `dataSize % numGpus` segments one byte larger (`SegmentSizeOf`:
+rank g's step-s send moves segment (g−s) mod N); both execution paths use
+it (the transaction graph's per-edge `effectiveBytes` and the wire path's
+`SendBulkWireTransferSize`). The wire path's receive ledger also gained
+two corrections exposed while pinning this: the expected byte count keys
+on the SENDER's segment size decoded from the packet's step-encoded
+flowId (the sender's step counter drifts from the receiver's in the
+pipeline), and the receive callback's first argument is the receiving
+endpoint's rank — the sender comes from the header (the old code read the
+receiver's rank from the callback and the dest from the header, which
+happened to work only because the two agreed in the uniform-segment
+world). Regression test `RingAllReduceSegmentCoverageTest` pins 90 B of
+effective traffic and completion on both paths.
+
 ### Fixed — endpoint Dispose cancels deferred egress callbacks
 
 The three deferred-egress sites in `SendPacketOnDevice` (WFQ total-delay,

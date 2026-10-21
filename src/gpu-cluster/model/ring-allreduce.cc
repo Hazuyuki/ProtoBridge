@@ -68,6 +68,8 @@ RingAllReduce::RingAllReduce()
       m_llThreshold(8192),
       m_ll128Threshold(2 * 1024 * 1024),
       m_chunkSize(0),
+      m_segmentRemainder(0),
+      m_sentDataBytes(0),
       m_gpuDoneCount(0),
       m_permanentLossCount(0),
       m_reduceScatterSteps(0),
@@ -109,10 +111,20 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
+    // Segment grid: rank r's base segment is dataSize/numGpus bytes, with the
+    // first dataSize % numGpus segments carrying one extra byte, so the grid
+    // sums to exactly dataSize (codex round 13, finding 3: plain integer
+    // division silently dropped dataSize % numGpus bytes — 4 ranks / 15 B
+    // reported complete after 72 effective bytes where 2(N-1)*D = 90).
     m_segmentSize = dataSize / numGpus;
+    m_segmentRemainder = dataSize % numGpus;
     if (m_segmentSize == 0)
     {
+        // Degenerate dataSize < numGpus: keep the legacy fallback (each rank
+        // transmits the whole dataSize every step) — an empty-segment grid
+        // would need zero-byte steps the receive ledger cannot close.
         m_segmentSize = dataSize;
+        m_segmentRemainder = 0;
     }
     m_chunkSize = m_segmentSize;
 
@@ -251,7 +263,7 @@ RingAllReduce::BuildTransactionGraph()
             request.destinationRank = GetSendTarget(gpu, step);
             request.flowId = m_flowId + step;
             request.virtualChannel = 0;
-            request.effectiveBytes = m_segmentSize;
+            request.effectiveBytes = SegmentSizeOf(gpu, step);
             request.stageId = step;
             request.hasProtocolId = true;
             request.protocolId = m_protocolId;
@@ -396,6 +408,19 @@ RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step)
     }
 }
 
+uint64_t
+RingAllReduce::SegmentSizeOf(uint16_t gpu, uint32_t step) const
+{
+    // Which segment the GPU holds at this step: each step moves the segment
+    // ownership one rank backwards around the ring (RS clockwise sends,
+    // AG counterclockwise sends), so at step s rank g holds segment
+    // (g - s) mod N. The base size is uniform with the first
+    // dataSize % numGpus segments one byte larger.
+    const uint32_t n = m_numGpus;
+    const uint32_t idx = (gpu + n - (step % n)) % n;
+    return m_segmentSize + (idx < m_segmentRemainder ? 1 : 0);
+}
+
 void
 RingAllReduce::SendGpuStepData(uint16_t gpu, uint32_t step)
 {
@@ -405,12 +430,14 @@ RingAllReduce::SendGpuStepData(uint16_t gpu, uint32_t step)
     }
 
     uint16_t target = GetSendTarget(gpu, step);
+    uint64_t segmentBytes = SegmentSizeOf(gpu, step);
+    m_sentDataBytes += segmentBytes;
 
     // Use a unique flowId per step to avoid reorder buffer confusion
     uint16_t stepFlowId = m_flowId + step;
 
     m_endpoints[gpu]->SendBulkWireTransferSize(
-        target, m_segmentSize, m_protocolId, stepFlowId, 0);
+        target, segmentBytes, m_protocolId, stepFlowId, 0);
 
     NS_LOG_DEBUG("GPU " << gpu << " sending step " << step
                  << " to GPU " << target
@@ -419,7 +446,7 @@ RingAllReduce::SendGpuStepData(uint16_t gpu, uint32_t step)
 }
 
 void
-RingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
+RingAllReduce::OnPacketReceived(uint16_t receiverRank, Ptr<Packet> packet, FabricHeader header)
 {
     if (header.GetPacketType() != FabricPacketType::DATA
         && header.GetPacketType() != FabricPacketType::PERMANENT_LOSS)
@@ -427,7 +454,11 @@ RingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHead
         return;
     }
 
-    uint16_t destRank = header.GetDestRank();
+    // The callback's first argument is the RECEIVING endpoint's rank; the
+    // sender is in the header (the wire hops are single-switch, so the
+    // original source rank survives unmodified).
+    uint16_t srcRank = header.GetSourceRank();
+    uint16_t destRank = receiverRank;
 
     uint32_t effectiveSize = header.GetEffectiveDataSize();
     if (effectiveSize == 0)
@@ -489,8 +520,21 @@ RingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHead
                      << " totalReceived=" << m_gpuStepReceivedBytes[destRank]
                      << " step=" << currentStep);
 
-    // Check if this GPU has received its full segment for the current step
-    if (m_gpuStepReceivedBytes[destRank] >= m_segmentSize)
+    // Check if this GPU has received its full segment for the current step:
+    // the expected byte count is the SENDER's segment size at the step the
+    // packet belongs to. The step is encoded in the flowId (stepFlowId =
+    // m_flowId + step), because the sender's step counter runs independently
+    // of this receiver's currentStep in the pipeline — the sender may already
+    // be a step ahead. Keying on currentStep mis-sized the threshold and
+    // stalled the collective whenever the pipelined counters drifted.
+    const uint32_t senderStep = (header.GetFlowId() >= m_flowId)
+                                    ? header.GetFlowId() - m_flowId
+                                    : 0;
+    const uint64_t expectedBytes =
+        (srcRank < m_numGpus)
+            ? SegmentSizeOf(srcRank, senderStep)
+            : m_segmentSize;
+    if (m_gpuStepReceivedBytes[destRank] >= expectedBytes)
     {
         // GPU completed receiving its segment for this step
         m_gpuStepReceivedBytes[destRank] = 0;

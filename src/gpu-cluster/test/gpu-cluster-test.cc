@@ -6130,6 +6130,92 @@ class NcclRingChunkCoverageTest : public TestCase
     }
 };
 
+// R13#3: RingAllReduce's segment grid must cover the full data size. Plain
+// integer division dropped dataSize % numGpus bytes: 4 ranks / 15 B sent 72
+// effective bytes where 2(N-1)*D = 90 is required. Both execution paths.
+class RingAllReduceSegmentCoverageTest : public TestCase
+{
+  public:
+    RingAllReduceSegmentCoverageTest()
+        : TestCase("RingAllReduce segment grid covers the full data size") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        for (int mode = 0; mode < 2; ++mode)
+        {
+            const uint16_t numGpus = 4;
+            NodeContainer nodes;
+            for (int i = 0; i < numGpus; ++i)
+            {
+                nodes.Add(CreateObject<Node>());
+            }
+            NodeContainer switchNode;
+            switchNode.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+            Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            std::vector<Mac48Address> macs;
+            for (uint16_t r = 0; r < numGpus; ++r)
+            {
+                NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+                Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+                ep->SetRank(r);
+                ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+                ep->AddNetDevice(pair.Get(0));
+                for (uint16_t d = 0; d < numGpus; ++d)
+                {
+                    if (d != r)
+                    {
+                        ep->SetRoutingEntry(d, 0);
+                    }
+                }
+                ep->SetBypassReorderBuffer(true);
+                eps.push_back(ep);
+                macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+                sw->AddPort(pair.Get(1));
+            }
+            for (uint16_t r = 0; r < numGpus; ++r)
+            {
+                sw->AddStaticRoute(macs[r], r);
+                for (uint16_t d = 0; d < numGpus; ++d)
+                {
+                    if (d != r)
+                    {
+                        eps[r]->SetNeighborMac(d, macs[d]);
+                    }
+                }
+            }
+            for (auto& ep : eps)
+            {
+                ep->Initialize();
+            }
+
+            Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
+                               BooleanValue(mode == 0));
+            Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+            ring->SetPerStepSwOverhead(NanoSeconds(0));
+            ring->SetStartupDelay(NanoSeconds(0));
+            ring->Initialize(numGpus, /*dataSize=*/15, eps);
+            ring->Start();
+            Simulator::Stop(MicroSeconds(2000));
+            Simulator::Run();
+            NS_TEST_ASSERT_MSG_EQ(ring->IsCompleted(), true,
+                "the 15-B ring must complete (both transaction and wire paths)");
+            NS_TEST_ASSERT_MSG_EQ(ring->GetSentDataBytes(),
+                                  mode == 0 ? 0u : 90u,
+                "wire-path traffic must cover the full data size: "
+                "2(N-1)*D = 90 B, not 72 B");
+            Simulator::Destroy();
+        }
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -6915,6 +7001,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SharpUploadDedupSurvivesResultTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastResultFecExpansionTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclRingChunkCoverageTest, TestCase::Duration::QUICK);
+    AddTestCase(new RingAllReduceSegmentCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
