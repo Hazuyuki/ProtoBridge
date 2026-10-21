@@ -6,6 +6,28 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — surrogate NVLS result losses are permanent when LLR is off
+
+`TheoryDerivedSurrogate.expected_permanent_losses` granted NVLS multicast
+RESULT packets the full switch-side repair budget
+(`nvls_switch_result_retry_limit + 1` = 65 attempts) unconditionally, while
+the C++ side only has that machinery when LLR is enabled:
+`NvSwitch::StoreMulticastResult` skips outright when `!m_llrEnabled`, so
+`HandleSwitchNack` has nothing to retransmit and a lost result is permanent
+on its FIRST attempt. Repro (codex round 15, finding 5): 8-GPU / 16-MiB
+allgather / BER 8e-4 / RS(544,514,15) / LLR off — the model counted 0.303
+expected unrepaired losses and `strict_reliability` returned a finite
+90.247 µs, while the ns-3 run (seed 2) stays incomplete after two
+uncorrectable result packets with zero upload drops; the one-attempt budget
+gives 2.728 expected losses. `expected_permanent_losses` now takes
+`llr_enabled` (default True — direct callers keep the LLR-on split budgets
+pinned by the round-14 tests) and collapses `result_attempts` to 1 when LLR
+is off; `predict` passes its own `llr_enabled` through, so the strict gate
+correctly rejects the LLR-off config. New regression
+`test_nvls_llr_off_results_have_one_attempt` (LLR-off 2.728 pin + strict
+infinity, the omitted-retry-limit path, and the LLR-on control staying
+completable). Surrogate 78; integration PASS; parity 14/14.
+
 ### Fixed — ring chunk ownership keys on ring position, not numeric rank
 
 `RingAllReduce::SegmentSizeOf` computed the segment-ownership index from the

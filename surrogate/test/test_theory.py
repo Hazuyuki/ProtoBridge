@@ -820,6 +820,50 @@ def test_nvls_expected_losses_count_result_sides():
     assert abs(losses_ar - 1.073179) < 2e-3
 
 
+def test_nvls_llr_off_results_have_one_attempt():
+    """The switch's SHARP result store only exists when LLR is on:
+    NvSwitch::StoreMulticastResult skips outright when !m_llrEnabled, so
+    HandleSwitchNack has nothing to retransmit — a lost multicast result
+    is permanent on its FIRST attempt, whatever the switch retry limit
+    models for the LLR-on regime. The pre-fix loss model always granted
+    result packets nvls_switch_result_retry_limit + 1 = 65 attempts: at
+    8 GPU / 16 MiB allgather / BER 8e-4 / RS(544,514,15) / LLR off it
+    counted only 0.303 expected unrepaired losses and strict_reliability
+    returned a finite 90.247 us for a config whose ns-3 run stays
+    incomplete after two uncorrectable result packets (codex round 15,
+    finding 5; expected ~2.728 with the one-attempt budget)."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 16 * 1024 * 1024, 8
+    # LLR off: every result packet has exactly one attempt.
+    losses_off = nvls.expected_permanent_losses(
+        D, N, "nvls", 8e-4, 0,
+        fec_enabled=True, fec_n=544, fec_k=514, fec_t=15,
+        optical_fraction=1.0, optical_hops=1, collective="allgather",
+        llr_enabled=False)
+    assert abs(losses_off - 2.727986) < 2e-3
+    assert losses_off >= 0.5  # incompletable: strict must reject
+    t = nvls.predict(D, N, "nvls", 128, ber=8e-4, retry_limit=0,
+                     fec_enabled=True, fec_n=544, fec_k=514, fec_t=15,
+                     llr_enabled=False, strict_reliability=True,
+                     collective="allgather")
+    assert not math.isfinite(t)
+    # LLR off with the retry limit omitted: predict's eff_retry_limit = 0
+    # path must reach the same rejection.
+    t2 = nvls.predict(D, N, "nvls", 128, ber=8e-4,
+                      fec_enabled=True, fec_n=544, fec_k=514, fec_t=15,
+                      llr_enabled=False, strict_reliability=True,
+                      collective="allgather")
+    assert not math.isfinite(t2)
+    # LLR on at the same BER keeps the 65-attempt switch budget, so the
+    # result side stays completable (the LLR-off collapse must be gated).
+    losses_on = nvls.expected_permanent_losses(
+        D, N, "nvls", 8e-4, 0,
+        fec_enabled=True, fec_n=544, fec_k=514, fec_t=15,
+        optical_fraction=1.0, optical_hops=1, collective="allgather",
+        llr_enabled=True)
+    assert losses_on < 0.5
+
+
 def test_nvls_expected_losses_use_spray_fragment_geometry():
     """The NVLS branch must fragment at SendCollectiveBulk's spray geometry,
     not the DATA bulk path's. Each rank's upload of D/N (allgather) or D

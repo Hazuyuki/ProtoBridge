@@ -683,7 +683,8 @@ class TheoryDerivedSurrogate:
     def expected_permanent_losses(self, data_bytes, num_gpus, algo, ber,
                                   retry_limit, fec_enabled=False, fec_n=None,
                                   fec_k=None, fec_t=None, optical_fraction=1.0,
-                                  optical_hops=1.0, collective=None):
+                                  optical_hops=1.0, collective=None,
+                                  llr_enabled=True):
         """Expected packets that exhaust the configured retry limit."""
         if retry_limit is None or retry_limit < 0:
             return 0.0
@@ -790,7 +791,16 @@ class TheoryDerivedSurrogate:
             # one switch result repair, so the loss model must predict
             # ~0.1342, not the 1.2074 the shared attempts count produced).
             upload_attempts = retry_limit + 1
-            result_attempts = self.nvls_switch_result_retry_limit + 1
+            # The switch's result store only exists when LLR is on:
+            # StoreMulticastResult skips outright when !m_llrEnabled, so
+            # HandleSwitchNack has nothing to retransmit and every result
+            # loss is permanent on its first attempt (codex round 15,
+            # finding 5: 8 GPU / 16 MiB allgather / BER 8e-4 / RS(544,514,15)
+            # / LLR off — ns-3 seed 2 stays incomplete after two
+            # uncorrectable result packets while the LLR-on budget of 65
+            # attempts predicted only 0.303 expected losses).
+            result_attempts = (self.nvls_switch_result_retry_limit + 1
+                               if llr_enabled else 1)
             if collective == 'allgather':
                 upload_bytes = data_bytes / max(1, num_gpus)
                 upload_frags, upload_frag_bytes = (
@@ -1313,7 +1323,8 @@ class TheoryDerivedSurrogate:
                 expected_losses = self.expected_permanent_losses(
                     data_bytes, num_gpus, algo, ber, eff_retry_limit,
                     fec_enabled and include_fec, fec_n, fec_k, fec_t,
-                    optical_fraction, optical_hops, collective)
+                    optical_fraction, optical_hops, collective,
+                    llr_enabled=llr_enabled)
                 if expected_losses >= 0.5:
                     return float('inf')
         T_step = T_fixed_step + T_serial_step
