@@ -4758,6 +4758,80 @@ class DcqcnDisposeCancelsTimersTest : public TestCase
     }
 };
 
+// (1b-2) R13#2: SendPacketOnDevice's deferred-egress callbacks capture raw
+// `this` and dereference m_devices; DoDispose must cancel every pending one.
+// Pre-fix: three same-flow paced packets, Dispose at 5us — the deferred sends
+// armed for ~13.4us and ~26.8us fired into the cleared member (SIGSEGV).
+class EgressDisposeCancelsDeferredSendsTest : public TestCase
+{
+  public:
+    EgressDisposeCancelsDeferredSendsTest()
+        : TestCase("endpoint Dispose cancels deferred egress callbacks") {}
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(false);
+
+        static uint64_t delivered = 0;
+        delivered = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader) {
+            delivered++;
+        });
+
+        Ptr<DcqcnRateMachine> dcqcn = CreateObject<DcqcnRateMachine>();
+        dcqcn->SetAttribute("PerQpCeilingGbps", DoubleValue(0.1));
+        tx->SetDcqcnRateMachine(dcqcn);
+
+        tx->Initialize();
+        rx->Initialize();
+
+        // Same flow: consecutive egress starts are a full pace slot apart
+        // (~13.4us), so packets 2 and 3 are deferred past the 5us teardown.
+        std::vector<uint8_t> buf(64, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 64, NcclProtocol::LL, 1, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 64, NcclProtocol::LL, 1, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 64, NcclProtocol::LL, 1, 0);
+
+        Simulator::Schedule(MicroSeconds(5), [tx]() {
+            tx->Dispose();
+        });
+        // Drop the main reference at the same instant; the object's remaining
+        // refcount is held only by the (to-be-cancelled) event lambdas and
+        // this very schedule closure.
+        Simulator::Schedule(MicroSeconds(5), [&tx]() {
+            tx = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(3000));
+        Simulator::Run();
+        // No SIGSEGV past this point is the primary assertion. The first
+        // packet left before disposal and must have been delivered.
+        NS_TEST_ASSERT_MSG_EQ(delivered, 1u,
+            "the pre-disposal packet must be delivered; deferred ones are cancelled");
+        Simulator::Destroy();
+    }
+};
+
 // (1b-3) LLR retry timers must not start while the pacer still holds the
 // packet. Codex round 12, finding 4: StorePacket armed the timeout at
 // ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
@@ -6816,6 +6890,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnDisposeCancelsTimersTest, TestCase::Duration::QUICK);
+    AddTestCase(new EgressDisposeCancelsDeferredSendsTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

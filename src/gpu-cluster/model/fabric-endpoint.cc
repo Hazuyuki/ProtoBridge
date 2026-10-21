@@ -21,6 +21,8 @@
 #include "ns3/pointer.h"
 #include "ns3/enum.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
@@ -207,6 +209,19 @@ void
 FabricEndpoint::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    // Cancel every pending deferred-egress event: each captures raw `this`
+    // and dereferences m_devices, which is cleared below. A survivor fired
+    // after disposal crashed on the cleared member (codex round 13,
+    // finding 2) — SIGSEGV when a paced send's callback landed after the
+    // endpoint was disposed and released.
+    for (const EventId& ev : m_deferredEgressEvents)
+    {
+        if (!ev.IsExpired())
+        {
+            Simulator::Cancel(ev);
+        }
+    }
+    m_deferredEgressEvents.clear();
     m_devices.clear();
     m_creditManager = nullptr;
     m_payloadBuilder = nullptr;
@@ -2578,6 +2593,14 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         return;
     }
 
+    // Prune fired deferred-egress events so the tracking vector stays
+    // bounded (each egress schedules at most one; DoDispose cancels what is
+    // still pending).
+    m_deferredEgressEvents.erase(
+        std::remove_if(m_deferredEgressEvents.begin(), m_deferredEgressEvents.end(),
+                       [](const EventId& ev) { return ev.IsExpired(); }),
+        m_deferredEgressEvents.end());
+
     // DCQCN shaping: fold the per-flow rate-backoff delay into the egress
     // chokepoint. So-only (efficiency < 1.0) data/collective traffic; control,
     // memory, retry, and scale-up traffic are untouched. At alpha=0 (no CNP)
@@ -2700,11 +2723,12 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                              << " numActive=" << numActive
                              << " serviceTime=" << serviceTime.GetNanoSeconds() << "ns"
                              << " encodeLatency=" << encodeLatency.GetNanoSeconds() << "ns");
-                Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, tc]() {
-                    Ptr<NetDevice> dev = m_devices[deviceIndex];
-                    ArmRetryTimeoutOnWire(packet);
-                    dev->Send(packet, dest, 0x0800);
-                });
+                m_deferredEgressEvents.push_back(
+                    Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, tc]() {
+                        Ptr<NetDevice> dev = m_devices[deviceIndex];
+                        ArmRetryTimeoutOnWire(packet);
+                        dev->Send(packet, dest, 0x0800);
+                    }));
                 // Decrement backlog after packet finishes transmission (serialization)
                 Time txDone = totalDelay + serialization;
                 Simulator::Schedule(txDone, [this, tc]() {
@@ -2722,11 +2746,12 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         Time delay = encodeLatency + shapingDelay;
         if (delay > Seconds(0))
         {
-            Simulator::Schedule(delay, [this, packet, deviceIndex, dest]() {
-                Ptr<NetDevice> device = m_devices[deviceIndex];
-                ArmRetryTimeoutOnWire(packet);
-                device->Send(packet, dest, 0x0800);
-            });
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(delay, [this, packet, deviceIndex, dest]() {
+                    Ptr<NetDevice> device = m_devices[deviceIndex];
+                    ArmRetryTimeoutOnWire(packet);
+                    device->Send(packet, dest, 0x0800);
+                }));
             // Decrement backlog after serialization
             if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
             {
@@ -2744,11 +2769,12 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     // (parity-identical to the unmounted baseline).
     if (shapingDelay > Time(0))
     {
-        Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest]() {
-            Ptr<NetDevice> dev = m_devices[deviceIndex];
-            ArmRetryTimeoutOnWire(packet);
-            dev->Send(packet, dest, 0x0800);
-        });
+        m_deferredEgressEvents.push_back(
+            Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest]() {
+                Ptr<NetDevice> dev = m_devices[deviceIndex];
+                ArmRetryTimeoutOnWire(packet);
+                dev->Send(packet, dest, 0x0800);
+            }));
     }
     else
     {

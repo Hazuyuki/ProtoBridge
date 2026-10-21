@@ -6,6 +6,21 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — endpoint Dispose cancels deferred egress callbacks
+
+The three deferred-egress sites in `SendPacketOnDevice` (WFQ total-delay,
+FEC-encode-latency, DCQCN/RTTCC shapingDelay) schedule lambdas that capture
+raw `this` and dereference `m_devices`; `DoDispose` cleared `m_devices`
+without cancelling them, so disposing and releasing the endpoint while a
+paced send was pending crashed with SIGSEGV when the callback landed
+(codex round 13, finding 2: three same-flow packets paced at a 13.4-µs
+slot, Dispose at 5 µs → reproducible SIGSEGV at the deferred send). Every
+deferred egress now records its `EventId` in `m_deferredEgressEvents`
+(pruned of fired entries at each egress), and `DoDispose` cancels all
+pending ones before clearing the members. Regression test
+`EgressDisposeCancelsDeferredSendsTest` re-runs the repro scenario and
+asserts the pre-disposal packet still delivers with no crash.
+
 ### Fixed — retransmission retry countdown starts at its wire transmission
 
 The GBN and SACK retransmission paths armed the source entry's retry timer

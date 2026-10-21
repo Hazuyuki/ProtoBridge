@@ -685,6 +685,11 @@ class FabricEndpoint : public Application
     // Send queue
     std::queue<SendQueueEntry> m_sendQueue;         ///< Pending send queue
     std::unordered_map<uint64_t, uint32_t> m_nextSeqNum; ///< Next sequence number per (destRank, vcId) key
+    /// Deferred-egress events scheduled by SendPacketOnDevice (pacer/FEC/WFQ
+    /// holds). Each captures raw `this` and touches m_devices, so DoDispose
+    /// must cancel every pending one before the endpoint goes away — a
+    /// survivor fires into cleared state (codex round 13, finding 2).
+    std::vector<EventId> m_deferredEgressEvents;
 
     // Configuration
     uint8_t m_numVcs;                               ///< Number of virtual channels
