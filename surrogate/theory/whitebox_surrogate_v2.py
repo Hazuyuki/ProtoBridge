@@ -501,7 +501,11 @@ class TheoryDerivedSurrogate:
         With multiple links, numChunks = max(lanes, ceil(bytes/spray_chunk))
         (at least one fragment per lane so the transfer uses the aggregate
         bandwidth), each fragment ceil(bytes/numChunks) — the geometry
-        NvSwitch's result multicast mirrors chunk-for-chunk. Distinct from
+        NvSwitch's result multicast mirrors chunk-for-chunk. The RETURNED
+        count is the fragments actually SENT (the C++ spray loop skips
+        trailing lane-pad fragments whose offset is past the wire end), so
+        a transfer smaller than numChunks*fragBytes counts fewer than
+        numChunks. Distinct from
         _bulk_fragment_count, which models the DATA path's bulk_chunk
         granularity and protocol framing.
         """
@@ -517,6 +521,18 @@ class TheoryDerivedSurrogate:
             return 1, math.ceil(data_bytes)
         num_chunks = max(min_chunks,
                          math.ceil(data_bytes / self.spray_chunk_bytes))
+        # ... but the C++ spray loop SKIPS trailing lane-pad fragments whose
+        # offset is past the wire end (fabric-endpoint-send.cc: `offset >=
+        # wireSize -> continue`): chunkSize = ceil(wire/numChunks), so a
+        # transfer smaller than numChunks*ceil(...) emits fewer fragments
+        # than numChunks — 32 wire bytes over 18 lanes is 16 x 2-byte
+        # fragments, not 18 (codex round 18, finding 6: counting the two
+        # phantom fragments over-stated expected losses 0.506 vs 0.450 at
+        # BER 2.2e-4 / retry 0, crossing the strict-reliability threshold).
+        sent_fragments = sum(
+            1 for i in range(num_chunks)
+            if i * math.ceil(data_bytes / num_chunks) < data_bytes
+        )
         # Large-transfer coalescing (codex round 14, finding 2): above
         # 512 MiB the C++ caps the event count by coalescing into
         # ~8 MiB path-balanced chunks — coalesced = ceil(wire/8 MiB),
@@ -541,8 +557,14 @@ class TheoryDerivedSurrogate:
                 path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
                 num_chunks = max(min_chunks,
                                  min(num_chunks, path_balanced))
+                # Recompute after coalescing changes numChunks: the skip rule
+                # (offset >= wire end) applies to the FINAL chunk geometry.
+                sent_fragments = sum(
+                    1 for i in range(num_chunks)
+                    if i * math.ceil(data_bytes / num_chunks) < data_bytes
+                )
         frag_bytes = math.ceil(data_bytes / num_chunks)
-        return num_chunks, frag_bytes
+        return sent_fragments, frag_bytes
 
     def _packets_per_transfer(self, data_bytes, num_gpus, algo, collective=None):
         """Fragments the C++ fabric actually emits for one transfer.
@@ -706,6 +728,14 @@ class TheoryDerivedSurrogate:
         """Expected packets that exhaust the configured retry limit."""
         if retry_limit is None or retry_limit < 0:
             return 0.0
+        # With LLR disabled there is NO retransmit machinery anywhere: every
+        # lost packet is permanent on its first attempt, whatever
+        # retry_limit says (the same rule predict()'s strict-reliability
+        # gate applies — codex round 18, finding 9: a direct call with
+        # llr_enabled=False / retry_limit=3 granted 4 attempts and reported
+        # 6.17 expected losses where the one-attempt truth is 153.48).
+        if not llr_enabled:
+            retry_limit = 0
         packet_bytes = self._packet_bytes_per_transfer(
             data_bytes, num_gpus, algo, collective)
         p_link = self._packet_failure_probability(
@@ -2113,10 +2143,11 @@ class HierarchicalSurrogate:
     node buffer D/n_so with each of its n_so-1 peers: per-GPU So volume
     D*(n_so-1)/n_so) — two phases, matching ``ns-3 hierarchical-allgather.cc``
     whose ``Complete()`` fires at the end of ``INTER_ALLGATHER`` (no third
-    local broadcast); alltoall ships ``D*(n_su-1)/n_su`` on the Su stage and
-    ``D*(n_so-1)/n_so`` on the So stage (the hierarchical shuffle routes each
-    GPU's (N-1)/N share through its node: the local share to local peers, the
-    remote share via the node's exit GPU), matching
+    local broadcast); alltoall ships ``D*(n_su-1)/(n_su*n_so)`` on the Su
+    stage and ``D*(n_so-1)/n_so`` on the So stage (each GPU's own chunk is
+    ``D/(n_su*n_so)``: the Su stage delivers it to the node's ``n_su-1``
+    other GPUs, and the So stage carries it to the ``n_su`` GPUs on each of
+    the ``n_so-1`` remote nodes), matching
     ``ns-3 hierarchical-alltoall.cc``.
     stages. Each stage's bus-factor volume ``D_phase*(N-1)/N`` then comes from
     the ring per-step model. ``collective`` is a REQUIRED keyword-only argument

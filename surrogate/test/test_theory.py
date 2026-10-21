@@ -1186,3 +1186,52 @@ def test_nvls_retry_overhead_uses_spray_geometry():
     attempts = ring._expected_max_attempts(p, ring_packets)
     expected = 2 * (8 - 1) * T * max(0.0, attempts - 1.0)
     assert abs(ring_ro - expected) < 1e-9
+
+
+def test_spray_fragments_skips_trailing_lane_pad_fragments():
+    """The C++ spray loop SKIPS trailing lane-pad fragments whose offset is
+    past the wire end (fabric-endpoint-send.cc: `offset >= wireSize ->
+    continue`): chunkSize = ceil(wire/numChunks), so a transfer smaller
+    than numChunks*chunkSize emits FEWER fragments than numChunks. 32 wire
+    bytes over 18 lanes is 16 x 2-byte fragments, not 18 x 2 (the C++ packet
+    and retry-store counters both report 16). Counting the two phantom
+    fragments over-stated expected losses 0.506 vs 0.450 at BER 2.2e-4 /
+    retry 0 — enough to cross the strict-reliability rejection threshold
+    (codex round 18, finding 6)."""
+    nvls = wb.make_h200_nvls_theory()
+    nvls.num_lanes = 18
+    # 32 wire bytes / 18 lanes: numChunks=18, chunkSize=ceil(32/18)=2, but
+    # fragment 16 starts at offset 32 (>= wire end) and fragment 17 at 34 —
+    # both skipped, so 16 fragments carry the transfer.
+    frags, frag_bytes = nvls._spray_fragments(32)
+    assert (frags, frag_bytes) == (16, 2)
+    # 2 bytes over 18 lanes: chunkSize=1, fragments 2..17 all start past
+    # the wire end — only 2 fragments carry the transfer.
+    assert nvls._spray_fragments(2) == (2, 1)
+    # Evenly dividing sizes are unchanged (no trailing pad fragments).
+    assert nvls._spray_fragments(36) == (18, 2)
+    # 128-KiB multiples still give exactly bytes/128KiB fragments.
+    assert nvls._spray_fragments(16 * 1024 * 1024) == (128, 131072)
+
+
+def test_expected_losses_llr_off_grants_no_retries():
+    """With LLR disabled there is no retransmit machinery anywhere: every
+    lost packet is permanent on its FIRST attempt, whatever retry_limit
+    says. The direct estimator previously granted retry_limit+1 attempts
+    even for llr_enabled=False — a 16-MiB 8-GPU ring AllReduce at BER 1e-7
+    with retry_limit=3 reported 6.17 expected losses where the one-attempt
+    truth is 153.48 (codex round 18, finding 9). predict()'s
+    strict-reliability gate already normalized the limit to zero; the
+    direct call must agree with it."""
+    ring = wb.make_h200_ring_theory()
+    D, N = 16 * 1024 * 1024, 8
+    one_attempt = ring.expected_permanent_losses(
+        D, N, "ring", 1e-7, 0, collective="allreduce", llr_enabled=False)
+    with_retries = ring.expected_permanent_losses(
+        D, N, "ring", 1e-7, 3, collective="allreduce", llr_enabled=False)
+    assert one_attempt > 100.0  # the LLR-off reality: unrecoverable
+    assert with_retries == one_attempt  # retry_limit is inert without LLR
+    # LLR ON keeps the retry budget.
+    with_llr = ring.expected_permanent_losses(
+        D, N, "ring", 1e-7, 3, collective="allreduce", llr_enabled=True)
+    assert with_llr < one_attempt
