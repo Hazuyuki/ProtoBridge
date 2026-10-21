@@ -133,7 +133,8 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_totalSteps = 2 * (numGpus - 1);
 
     m_gpuCompletedStep.resize(numGpus, 0);
-    m_gpuStepReceivedBytes.resize(numGpus, 0);
+    m_gpuStepReceivedBytes.assign(numGpus,
+                                  std::vector<uint64_t>(m_totalSteps, 0));
     m_gpuDoneCount = 0;
 
     m_flowId = 1;
@@ -376,7 +377,7 @@ RingAllReduce::IsAllGatherStep(uint32_t step) const
 }
 
 uint16_t
-RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step)
+RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step) const
 {
     if (IsReduceScatterStep(step))
     {
@@ -512,39 +513,65 @@ RingAllReduce::OnPacketReceived(uint16_t receiverRank, Ptr<Packet> packet, Fabri
         return;
     }
 
-    m_gpuStepReceivedBytes[destRank] += effectiveSize;
+    // The step this packet belongs to is encoded in the flowId
+    // (stepFlowId = m_flowId + step): the sender's step counter runs
+    // independently of this receiver's currentStep in the pipeline — the
+    // sender may already be a step ahead.
+    const uint32_t senderStep = (header.GetFlowId() >= m_flowId)
+                                    ? header.GetFlowId() - m_flowId
+                                    : 0;
+
+    // Per-STEP ledger, keyed by the SENDER's step (codex round 14,
+    // finding 3). A single per-dest counter mixed bytes of different
+    // steps whenever the pipelined senders drifted ahead of the
+    // receiver, or a retransmission delivered a late copy after the
+    // counter had already advanced — the mixed counter could cross one
+    // step's threshold with another step's bytes and then starve a later
+    // step, stalling the collective despite zero permanent losses.
+    if (senderStep >= m_totalSteps)
+    {
+        return; // malformed/late flowId: ignore rather than corrupt ledgers
+    }
+    m_gpuStepReceivedBytes[destRank][senderStep] += effectiveSize;
 
     NS_LOG_DEBUG("Packet: src=" << srcRank << " -> dest=" << destRank
                      << " wireSize=" << packet->GetSize()
                      << " effectiveSize=" << effectiveSize
-                     << " totalReceived=" << m_gpuStepReceivedBytes[destRank]
+                     << " totalReceived=" << m_gpuStepReceivedBytes[destRank][senderStep]
                      << " step=" << currentStep);
 
-    // Check if this GPU has received its full segment for the current step:
-    // the expected byte count is the SENDER's segment size at the step the
-    // packet belongs to. The step is encoded in the flowId (stepFlowId =
-    // m_flowId + step), because the sender's step counter runs independently
-    // of this receiver's currentStep in the pipeline — the sender may already
-    // be a step ahead. Keying on currentStep mis-sized the threshold and
-    // stalled the collective whenever the pipelined counters drifted.
-    const uint32_t senderStep = (header.GetFlowId() >= m_flowId)
-                                    ? header.GetFlowId() - m_flowId
-                                    : 0;
-    const uint64_t expectedBytes =
-        (srcRank < m_numGpus)
-            ? SegmentSizeOf(srcRank, senderStep)
-            : m_segmentSize;
-    if (m_gpuStepReceivedBytes[destRank] >= expectedBytes)
+    // A step is complete when its own ledger entry reaches the SENDER's
+    // segment size at that step; steps complete in order (currentStep).
+    while (m_gpuCompletedStep[destRank] < m_totalSteps &&
+           m_gpuStepReceivedBytes[destRank][m_gpuCompletedStep[destRank]]
+               >= StepExpectedBytes(destRank, m_gpuCompletedStep[destRank]))
     {
         // GPU completed receiving its segment for this step
-        m_gpuStepReceivedBytes[destRank] = 0;
-        m_gpuCompletedStep[destRank] = currentStep + 1;
+        const uint32_t completedStep = m_gpuCompletedStep[destRank];
+        m_gpuCompletedStep[destRank] = completedStep + 1;
 
-        NS_LOG_INFO("GPU " << destRank << " completed step " << currentStep
+        NS_LOG_INFO("GPU " << destRank << " completed step " << completedStep
                      << " (now at step " << m_gpuCompletedStep[destRank] << ")");
 
-        OnGpuStepReceiveComplete(destRank, currentStep);
+        OnGpuStepReceiveComplete(destRank, completedStep);
     }
+}
+
+uint64_t
+RingAllReduce::StepExpectedBytes(uint16_t destRank, uint32_t step) const
+{
+    // Bytes destRank must receive at `step`: the segment the SENDER at
+    // that step holds. The sender is the ring predecessor (RS clockwise
+    // sends; AG counterclockwise sends), so it is the GPU whose step-step
+    // send targets destRank.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (GetSendTarget(gpu, step) == destRank)
+        {
+            return SegmentSizeOf(gpu, step);
+        }
+    }
+    return m_segmentSize;
 }
 
 void

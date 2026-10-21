@@ -6304,6 +6304,107 @@ class RingAllReduceSegmentCoverageTest : public TestCase
     }
 };
 
+// Wire-path receive ledger must be keyed per SENDER step. Codex round 14,
+// finding 3: a single per-dest counter mixed bytes of different steps when
+// pipelined senders drifted ahead of the receiver (or a retransmission
+// delivered a late copy after the counter advanced) — the mixed counter
+// crossed one step's threshold with another step's bytes and starved a
+// later step: 4 GPU / 16 MiB-1 / BER 1e-8 / SACK / 64 retries /
+// timeout retransmit stalled incomplete with ZERO permanent losses and an
+// empty retry store. Regression: the same shape shrunk to 15 B with BER
+// drops and retransmissions must complete.
+class RingAllReduceLossyWireLedgerTest : public TestCase
+{
+  public:
+    RingAllReduceLossyWireLedgerTest()
+        : TestCase("RingAllReduce wire ledger stays per-step under loss") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        const uint16_t numGpus = 4;
+        NodeContainer nodes;
+        for (int i = 0; i < numGpus; ++i)
+        {
+            nodes.Add(CreateObject<Node>());
+        }
+        NodeContainer switchNode;
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r)
+                {
+                    ep->SetRoutingEntry(d, 0);
+                }
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r)
+                {
+                    eps[r]->SetNeighborMac(d, macs[d]);
+                }
+            }
+        }
+        // Deterministic loss: drop the first packet on rank 0's uplink so a
+        // step-0 fragment is lost and recovered by retransmission — the
+        // repair lands while later steps are already flowing, the exact
+        // interleaving that mixed the old single-counter ledger.
+        Ptr<DropFirstErrorModel> err = CreateObject<DropFirstErrorModel>();
+        eps[0]->GetNetDevice(0)->SetAttribute(
+            "ReceiveErrorModel", PointerValue(err));
+        for (auto& ep : eps)
+        {
+            ep->SetLlrEnabled(true);
+            Ptr<LlrManager> llrMgr = ep->GetLlrManager();
+            llrMgr->SetLlrMode(LlrMode::SACK);
+            llrMgr->SetRetryLimit(64);
+            llrMgr->SetRetryTimeout(NanoSeconds(1000));
+            ep->EnableLlrTimeoutRetransmit();
+            ep->Initialize();
+        }
+
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(false));
+        Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+        ring->SetPerStepSwOverhead(NanoSeconds(0));
+        ring->SetStartupDelay(NanoSeconds(0));
+        // 15 B over 4 GPUs: 4+4+4+3 grid — every step boundary carries a
+        // different segment size, so any cross-step ledger mixing shows up
+        // as an early/late completion.
+        ring->Initialize(numGpus, /*dataSize=*/15, eps);
+        ring->Start();
+        Simulator::Stop(MicroSeconds(5000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(ring->IsCompleted(), true,
+            "the lossy 15-B wire ring must complete: per-step ledgers must not "
+            "mix steps (codex round 14, finding 3)");
+        Simulator::Destroy();
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -7091,6 +7192,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new MulticastResultFecExpansionTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclRingChunkCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceSegmentCoverageTest, TestCase::Duration::QUICK);
+    AddTestCase(new RingAllReduceLossyWireLedgerTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);

@@ -6,6 +6,26 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — RingAllReduce wire receive ledger is keyed per sender step
+
+The wire path accumulated received bytes in a single per-destination
+counter, so bytes of DIFFERENT steps mixed whenever the pipelined senders
+ran ahead of the receiver or a retransmission delivered a late copy after
+the counter had advanced — the mixed counter crossed one step's threshold
+with another step's bytes and then starved a later step: 4 GPU / 16 MiB−1
+/ BER 1e-8 / SACK / 64 retries / timeout-retransmit stalled
+`status=incomplete` with zero permanent losses and an empty retry store,
+while the transaction path completed the same inputs (codex round 14,
+finding 3; git-stash round-trip reproduced the stall pre-fix). The ledger
+is now `m_gpuStepReceivedBytes[dest][senderStep]` (step decoded from the
+step-encoded flowId, its own threshold via the new `StepExpectedBytes` —
+the size of the segment the step's sender holds), steps complete in
+order via a while-loop, and malformed flowIds past the step range are
+ignored instead of corrupting ledgers. New regression
+`RingAllReduceLossyWireLedgerTest` (lossy 15-B wire ring with SACK +
+timeout retransmit completes); EXTENSIVE 80 PASS; lossy/GBN/fullmesh
+parity pins unchanged.
+
 ### Fixed — collective spray models the large-transfer coalescing branch
 
 `_spray_fragments` fragmented every multi-lane transfer on the 128-KiB

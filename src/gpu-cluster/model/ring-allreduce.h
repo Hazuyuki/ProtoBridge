@@ -71,11 +71,14 @@ private:
     void SendGpuStepData(uint16_t gpu, uint32_t step);
     void OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step);
     void CheckGlobalCompletion();
-    uint16_t GetSendTarget(uint16_t gpu, uint32_t step);
+    uint16_t GetSendTarget(uint16_t gpu, uint32_t step) const;
     // Segment size (in bytes) that `gpu` transmits at `step`: ownership of
     // segment (g - s) mod N, with the first dataSize % numGpus segments one
     // byte larger so the grid sums to exactly dataSize.
     uint64_t SegmentSizeOf(uint16_t gpu, uint32_t step) const;
+    /// Bytes destRank must receive at `step` (the sender's segment size —
+    /// the GPU whose step-`step` send targets destRank).
+    uint64_t StepExpectedBytes(uint16_t destRank, uint32_t step) const;
     bool IsReduceScatterStep(uint32_t step) const;
     bool IsAllGatherStep(uint32_t step) const;
     void Complete();
@@ -104,7 +107,13 @@ private:
     uint64_t m_sentDataBytes;
 
     std::vector<uint32_t> m_gpuCompletedStep;
-    std::vector<uint64_t> m_gpuStepReceivedBytes;
+    /// Wire-path receive ledger, keyed (dest rank, SENDER step) — the step
+    /// is decoded from the step-encoded flowId, not taken from this
+    /// receiver's own step counter. A single per-dest counter mixed bytes
+    /// of different steps whenever the pipelined senders drifted ahead of
+    /// the receiver, or a retransmission delivered a late copy after the
+    /// counter had already advanced (codex round 14, finding 3).
+    std::vector<std::vector<uint64_t>> m_gpuStepReceivedBytes;
     uint32_t m_gpuDoneCount;
     uint32_t m_permanentLossCount;
     uint32_t m_reduceScatterSteps;
