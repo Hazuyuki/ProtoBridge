@@ -6,6 +6,21 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NcclRing chunk identity follows each channel's ring order
+
+`ChunkSizeOf` indexed the chunk grid by the sender's NUMERIC rank
+(`(rank − step) mod N`), but rotated channels permute the ring: channel 1 of
+2 nodes × 2 GPUs orders 1→0→3→2→1, so the rank that forwards a chunk is not
+its numeric predecessor — individual chunks gained or lost bytes at ring
+boundaries while the global total stayed correct (codex round 13, finding 4:
+rank 3's 1-byte chunk lands on rank 2, which forwards 2 bytes next step).
+Chunk identity now keys on the channel's ring POSITION (`m_ringPos`, computed
+in `BuildRings` by walking `ringNext`): the rank at position p moves chunk
+`(p − s) mod N` at step s, so a chunk keeps its size as it travels the ring.
+The coverage test now asserts the chunk-invariant (a rank forwards at
+step s+1 exactly what it received at step s) across both channels — 10
+mismatches pre-fix, 0 post-fix.
+
 ### Fixed — RingAllReduce segment grid covers the full data size
 
 `RingAllReduce` sized every per-step transfer and the receive-completion

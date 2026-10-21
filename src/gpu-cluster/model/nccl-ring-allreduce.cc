@@ -201,6 +201,7 @@ NcclRingAllReduce::BuildRings()
 {
     const uint32_t g = m_gpusPerNode;
     m_ringNext.assign(m_numChannels, std::vector<uint16_t>(m_numGpus, 0));
+    m_ringPos.assign(m_numChannels, std::vector<uint32_t>(m_numGpus, 0));
     for (uint32_t c = 0; c < m_numChannels; ++c)
     {
         for (uint32_t node = 0; node < m_numNodes; ++node)
@@ -220,6 +221,20 @@ NcclRingAllReduce::BuildRings()
                 m_ringNext[c][rank] = next;
             }
         }
+        // Ring POSITION of each rank (0 at an arbitrary fixed start, following
+        // ringNext around): rotated channels permute ranks, so chunk identity
+        // must key on the position, not the numeric rank (codex round 13,
+        // finding 4) -- channel 1 of 2 nodes x 2 GPUs orders 1->0->3->2, and
+        // a rank-keyed grid hands rank 3 chunk 3 while its ring neighbours
+        // exchange chunk boundaries that no longer line up.
+        uint32_t pos = 0;
+        uint16_t cur = 0;
+        do
+        {
+            m_ringPos[c][cur] = pos;
+            cur = m_ringNext[c][cur];
+            pos++;
+        } while (cur != 0 && pos < m_numGpus);
     }
 }
 
@@ -264,9 +279,12 @@ uint64_t
 NcclRingAllReduce::ChunkSizeOf(uint32_t channel, uint16_t rank, uint32_t step) const
 {
     // Row-major (channel, index) grid: channel c owns indices c*N .. c*N+N-1.
-    // Rank r's step-s send moves chunk (r - s) mod N of the channel.
+    // The chunk's identity keys on the RING POSITION, not the numeric rank:
+    // rotated channels permute ranks (channel 1 of 2x2: 1->0->3->2), so the
+    // rank at ring position p moves chunk (p - s) mod N at step s.
     uint32_t n = m_numGpus;
-    uint32_t idx = (rank + n - (step % n)) % n;
+    uint32_t pos = m_ringPos[channel][rank];
+    uint32_t idx = (pos + n - (step % n)) % n;
     uint64_t chunkIndex = static_cast<uint64_t>(channel) * n + idx;
     uint64_t size = m_chunkSize + (chunkIndex < m_chunkRemainder ? 1 : 0);
     return size;

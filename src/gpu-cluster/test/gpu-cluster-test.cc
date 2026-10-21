@@ -6126,6 +6126,28 @@ class NcclRingChunkCoverageTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(ar->GetSentDataBytes(), 90u,
             "total effective traffic must cover the full data size: "
             "2(N-1)*D = 90 B, not 48 B");
+
+        // R13#4: chunk identity keys on the channel's RING POSITION, not the
+        // numeric rank. Channel 1's ring is 1->0->3->2 (rotated), so at step 0
+        // rank 1 (position 0) carries chunk 4 B, rank 0 (position 1) chunk
+        // 4 B, rank 3 (position 2) chunk 4 B, rank 2 (position 3) chunk 3 B;
+        // at each later step the same chunks advance one position backwards.
+        // Chunk-invariant: a rank forwards at step s+1 exactly what it
+        // received at step s.
+        for (uint32_t step = 0; step + 1 < 6; ++step)
+        {
+            for (uint16_t r = 0; r < numGpus; ++r)
+            {
+                for (uint32_t c = 0; c < 2; ++c)
+                {
+                    NS_TEST_ASSERT_MSG_EQ(
+                        ar->ProbeChunkSizeOf(c, r, step + 1),
+                        ar->ProbeExpectedRecvBytes(r, c, step),
+                        "a rank must forward the chunk it received: ring-order "
+                        "chunk identity (channel rotation respected)");
+                }
+            }
+        }
         Simulator::Destroy();
     }
 };

@@ -72,6 +72,21 @@ public:
      */
     uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
 
+    /// Test probe: the chunk size (bytes) that `rank` transmits on `channel`
+    /// at `step`. Keyed on the channel's RING POSITION (rotated channels
+    /// permute ranks), so a chunk keeps its size as it travels the ring.
+    uint64_t ProbeChunkSizeOf(uint32_t channel, uint16_t rank, uint32_t step) const
+    {
+        return ChunkSizeOf(channel, rank, step);
+    }
+
+    /// Test probe: the byte count `destRank` expects on `channel` at `step`.
+    uint64_t ProbeExpectedRecvBytes(uint16_t destRank, uint32_t channel,
+                                    uint32_t step) const
+    {
+        return ExpectedRecvBytes(destRank, channel, step);
+    }
+
 private:
     void DoDispose() override;
     void BuildRings();
@@ -126,6 +141,10 @@ private:
 
     // Ring successor per channel: m_ringNext[channel][rank]
     std::vector<std::vector<uint16_t>> m_ringNext;
+    // Ring POSITION per channel: m_ringPos[channel][rank] = distance from the
+    // channel's position-0 rank following ringNext. Chunk identity keys on
+    // position (rotated channels permute ranks).
+    std::vector<std::vector<uint32_t>> m_ringPos;
     // Per (rank, channel) pipeline state, indexed rank * m_numChannels + channel
     std::vector<uint32_t> m_completedStep;
     std::vector<uint64_t> m_recvBytes;
