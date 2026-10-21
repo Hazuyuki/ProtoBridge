@@ -6,6 +6,26 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NVLS retry-buffer byte capacity converts at the spray fragment size
+
+`predict(retry_buffer_bytes=...)` / `predict_tail(...)` converted a
+byte-capped buffer into entries with `_packet_bytes_per_transfer` — the
+DATA bulk path's ~932-KiB fragment — for every algorithm. NVLS
+collectives retain the SPRAYED upload fragments (128 × 128 KiB = 16 MiB
+at 4 GPU / 64 MiB AllGather), and the C++ scratch sim converts
+`llrBufferSizeBytes / sprayChunkSize` the same way: a 16-MiB byte cap
+yields `llrBuf=128`, `retryBufferPeak=128`, and ZERO source reloads —
+identical to `--llrBufferSize=128` (an actual 18-entry buffer takes 2
+reloads). The 932-KiB divisor turned the same 16 MiB into 18 entries and
+added a false reload penalty: 484.2529 µs where the equivalent 128-entry
+capacity predicts 483.6896 (codex round 14, finding 6). New
+`_retry_buffer_fragment_bytes` returns the spray upload fragment size
+for NVLS collectives and the DATA-bulk fragment otherwise; both predict
+call sites use it. New regression
+`test_nvls_retry_buffer_byte_capacity_uses_spray_fragment_size` pins
+byte/entry equivalence on predict AND predict_tail for allgather and
+allreduce, plus the non-NVLS passthrough. Full surrogate suite 77 PASS.
+
 ### Fixed — NVLS result reliability uses the switch's retry budget
 
 Both NVLS branches of `expected_permanent_losses` applied

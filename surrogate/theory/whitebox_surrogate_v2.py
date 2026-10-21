@@ -568,6 +568,30 @@ class TheoryDerivedSurrogate:
         return wire_bytes / self._packets_per_transfer(
             data_bytes, num_gpus, algo, collective)
 
+    def _retry_buffer_fragment_bytes(self, data_bytes, num_gpus, algo,
+                                     collective):
+        """Fragment size of the RETAINED packets a retry buffer holds.
+
+        NVLS/SHARP collectives retain SendCollectiveBulk's sprayed upload
+        fragments (one fast-copy entry per fragment — D allreduce, D/N
+        allgather), so the byte->entry conversion must divide by the spray
+        fragment size. Every other algorithm retains the DATA bulk path's
+        fragments, whose size _packet_bytes_per_transfer already models.
+        Dividing an NVLS byte capacity by the DATA bulk fragment (~932 KiB
+        at D=64 MiB) turned a 16-MiB buffer into 18 entries where the C++
+        scratch sim's llrBufferSizeBytes/sprayChunkSize conversion and the
+        required sizing (128 x 128 KiB) both give 128 — predict() then added
+        a source-reload penalty ns-3 does not take (codex round 14,
+        finding 6).
+        """
+        collective = self._validate_collective(collective)
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            upload_bytes = (data_bytes if collective == 'allreduce'
+                            else data_bytes / max(1, num_gpus))
+            return self._spray_fragments(upload_bytes)[1]
+        return self._packet_bytes_per_transfer(
+            data_bytes, num_gpus, algo, collective)
+
     def required_retry_buffer_entries(self, data_bytes, num_gpus, algo,
                                       collective=None):
         """Maximum packets an endpoint may need to retain for one tree step.
@@ -1098,7 +1122,7 @@ class TheoryDerivedSurrogate:
             competing_bw = mem_bw
         retry_buffer_entries = self._retry_buffer_capacity_entries(
             retry_buffer_entries, retry_buffer_bytes,
-            self._packet_bytes_per_transfer(
+            self._retry_buffer_fragment_bytes(
                 data_bytes, num_gpus, algo, collective))
         mean = self.predict(
             data_bytes, num_gpus, algo, credits, ber=ber, mem_bw=mem_bw,
@@ -1207,7 +1231,7 @@ class TheoryDerivedSurrogate:
             competing_bw = mem_bw
         retry_buffer_entries = self._retry_buffer_capacity_entries(
             retry_buffer_entries, retry_buffer_bytes,
-            self._packet_bytes_per_transfer(
+            self._retry_buffer_fragment_bytes(
                 data_bytes, num_gpus, algo, collective))
         optical_fraction = min(1.0, max(0.0, optical_fraction))
         resolved = self._validate_collective(collective)

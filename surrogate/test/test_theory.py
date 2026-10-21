@@ -992,3 +992,52 @@ def test_nvls_retry_buffer_counts_spray_fragments():
     ring = wb.make_h200_ring_theory()
     assert ring.required_retry_buffer_entries(
         16 * 1024 * 1024, 8, "ring", collective="allreduce") == 4
+
+
+def test_nvls_retry_buffer_byte_capacity_uses_spray_fragment_size():
+    """predict(retry_buffer_bytes=...) must convert the byte capacity with
+    the fragment size the transfer actually RETAINS. NVLS collectives
+    retain SendCollectiveBulk's sprayed upload fragments (128 x 128 KiB at
+    4 GPU / 64 MiB AllGather, = 16 MiB), and the C++ scratch sim converts
+    llrBufferSizeBytes / sprayChunkSize the same way — a 16-MiB byte cap
+    gives llrBuf=128 and ns-3 takes ZERO source reloads, identical to
+    --llrBufferSize=128. The pre-fix conversion divided by the DATA bulk
+    fragment (~932 KiB), turning the same 16 MiB into 18 entries and
+    adding a false reload penalty: 484.2529 us where the equivalent
+    128-entry capacity predicts 483.6896 (codex round 14, finding 6)."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 64 * 1024 * 1024, 4
+    kw = dict(ber=1e-8, retry_limit=3, strict_reliability=False,
+              collective="allgather", llr_enabled=True, retry_mode="sack")
+    t_entries = nvls.predict(D, N, "nvls", 128, retry_buffer_entries=128, **kw)
+    t_bytes = nvls.predict(D, N, "nvls", 128,
+                           retry_buffer_bytes=16 * 1024 * 1024, **kw)
+    assert abs(t_entries - 483.6896) < 2e-3
+    assert abs(t_bytes - t_entries) < 1e-9  # same capacity, same latency
+    # The divisor itself is the spray fragment size, not the bulk fragment.
+    assert (nvls._retry_buffer_fragment_bytes(D, N, "nvls", "allgather")
+            == 131072)
+    assert (nvls._retry_buffer_fragment_bytes(D, N, "nvls", "allgather")
+            != nvls._packet_bytes_per_transfer(D, N, "nvls", "allgather"))
+    # predict_tail uses the same conversion (no false penalty on the tail).
+    tail_bytes = nvls.predict_tail(
+        D, N, "nvls", 128, retry_buffer_bytes=16 * 1024 * 1024, **kw)
+    tail_entries = nvls.predict_tail(
+        D, N, "nvls", 128, retry_buffer_entries=128, **kw)
+    assert abs(tail_bytes - tail_entries) < 1e-9
+    # AllReduce uploads carry the full D: 128 frags of 128 KiB = 16 MiB too.
+    t_ar = nvls.predict(16 * 1024 * 1024, 8, "nvls", 128,
+                        retry_buffer_bytes=16 * 1024 * 1024,
+                        ber=1e-10, retry_limit=3, collective="allreduce",
+                        llr_enabled=True, retry_mode="sack")
+    t_ar_e = nvls.predict(16 * 1024 * 1024, 8, "nvls", 128,
+                          retry_buffer_entries=128,
+                          ber=1e-10, retry_limit=3, collective="allreduce",
+                          llr_enabled=True, retry_mode="sack")
+    assert abs(t_ar - t_ar_e) < 1e-9
+    # Non-NVLS algorithms keep the DATA-bulk fragment conversion.
+    ring = wb.make_h200_ring_theory()
+    assert (ring._retry_buffer_fragment_bytes(
+        16 * 1024 * 1024, 8, "ring", "allreduce")
+        == ring._packet_bytes_per_transfer(
+            16 * 1024 * 1024, 8, "ring", "allreduce"))
