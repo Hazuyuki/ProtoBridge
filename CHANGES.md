@@ -6,6 +6,17 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — surrogate predict docstring drops the stale AllGather halving promise
+
+The `predict` docstring's `phase` paragraph promised step-count halving
+for any sub-collective pass, but the implementation (fixed in round 16,
+finding 7) restricts halving to `collective='allreduce'` — ring
+AllGather's step count already IS one pass (N-1), so `phase='ag'` is
+byte-identical to `phase='full'` there (codex round 17, finding 9;
+8-GPU ring AllGather at 8 MiB, credits=128: **59.269 µs** for both).
+The docstring now states the allgather case explicitly (rs/ag accepted
+but inert). Doc-only; all 81 theory tests unchanged.
+
 ### Fixed — p2p-single.cfg documents the actual send path
 
 The cfg header claimed `kind = P2P` "exercises

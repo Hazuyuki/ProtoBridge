@@ -1261,11 +1261,17 @@ class TheoryDerivedSurrogate:
         ``collective='alltoall'`` or ``'sendrecv'`` to model those operations.
 
         ``phase`` (default ``'full'``) selects a sub-collective pass for the
-        hierarchical decomposition: ``'rs'`` (reduce-scatter) / ``'ag'``
-        (allgather) halve the step count (a single pass moves the same total
-        volume over half the steps, so the serial term is unchanged and only
-        the fixed per-step latency halves). ``'full'`` (default) is the
-        two-pass allreduce / allgather -- byte-identical to prior behavior.
+        hierarchical decomposition: for ``collective='allreduce'``,
+        ``'rs'`` (reduce-scatter) / ``'ag'`` (allgather) halve the step count
+        (the allreduce's step count covers its two ring passes; a single
+        pass moves the same total volume over half the steps, so the serial
+        term is unchanged and only the fixed per-step latency halves). For
+        ``collective='allgather'`` the halving does NOT apply: ring
+        AllGather's step count already IS one pass (N-1), so ``phase='ag'``
+        is byte-identical to ``phase='full'`` — passing ``'rs'``/``'ag'``
+        there is accepted but inert. ``'full'`` (default) is the two-pass
+        allreduce / single-pass allgather -- byte-identical to prior
+        behavior.
 
         L = S_startup
             + steps × T_fixed
