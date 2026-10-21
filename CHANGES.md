@@ -6,6 +6,30 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — surrogate coalescing gates on the 512-MiB COALESCE_THRESHOLD
+
+`TheoryDerivedSurrogate._spray_fragments` gated its large-transfer
+coalescing branch on the 500-MiB `OVERFLOW_THRESHOLD_COLLECTIVE` — the
+constant that governs whether a SINGLE-LINK fabric fragments at all —
+where the C++ spray loop uses the separate 512-MiB `COALESCE_THRESHOLD`
+(fabric-endpoint-send.cc). Between the two constants (500–512 MiB) the
+surrogate coalesced transfers the C++ still sprays at 128 KiB. Repro
+(codex round 15, finding 6): 2-GPU / 1008-MiB allgather (504-MiB per-rank
+upload) — the surrogate modeled 72 × 7-MiB upload fragments per rank where
+the C++ emits 4,032 × 128-KiB (~32× too few, ~56× too large), so at BER
+1e-8 / SACK / 3 retries `strict_reliability` returned infinity for a
+config ns-3 completes in 4,251.879 µs with zero permanent losses; post-fix
+the geometry matches (4,032 × 131,072 B) and the strict prediction is
+finite (28,077 µs — conservative, as the lower-bound profile is expected
+to be). The coalescing branch now compares against its own 512-MiB
+`coalesce_threshold`; the 500-MiB overflow gate keeps its single-link role
+unchanged. Boundary pins moved accordingly (511 MiB now sprays to 4,088
+fragments, 513 MiB still coalesces to 72; 499 MiB / 64 MiB unchanged, and
+the round-14 2-GiB → 144-fragment geometry is untouched since 1 GiB >
+512 MiB). New regression
+`test_spray_fragments_coalesce_gate_is_512mib`. Surrogate 79; integration
+PASS; parity 14/14.
+
 ### Fixed — surrogate NVLS result losses are permanent when LLR is off
 
 `TheoryDerivedSurrogate.expected_permanent_losses` granted NVLS multicast

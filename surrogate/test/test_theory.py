@@ -1002,11 +1002,44 @@ def test_spray_fragments_large_transfer_coalescing():
         2 * 1024**3, 2, "nvls", collective="allgather") == 144
     # Below the thresholds nothing changes: the single-link gate uses the
     # 500-MiB OVERFLOW_THRESHOLD_COLLECTIVE and coalescing the separate
-    # 512-MiB COALESCE_THRESHOLD, so 499 MiB sprays, 511 MiB (>500) with
-    # 18 lanes coalesces to 72, and 64 MiB keeps the 128-KiB grid.
+    # 512-MiB COALESCE_THRESHOLD (codex round 15, finding 6 — the pre-fix
+    # gate reused the 500-MiB overflow threshold and coalesced a 504-MiB
+    # upload into 72 x 7-MiB fragments where the C++ emits 4,032 x 128
+    # KiB), so 499 and 511 MiB (>500, <512) both spray at 128 KiB, 513
+    # MiB (>512) coalesces to 72, and 64 MiB keeps the 128-KiB grid.
     assert nvls._spray_fragments(499 * 1024 * 1024)[0] == 3992
-    assert nvls._spray_fragments(511 * 1024 * 1024)[0] == 72
+    assert nvls._spray_fragments(511 * 1024 * 1024)[0] == 4088
+    assert nvls._spray_fragments(513 * 1024 * 1024)[0] == 72
     assert nvls._spray_fragments(64 * 1024 * 1024)[0] == 512
+
+
+def test_spray_fragments_coalesce_gate_is_512mib():
+    """Coalescing must gate on the C++ COALESCE_THRESHOLD (512 MiB), not
+    the 500-MiB OVERFLOW_THRESHOLD_COLLECTIVE that governs whether a
+    single-link fabric fragments at all — two DIFFERENT constants in
+    fabric-endpoint-send.cc. The pre-fix helper reused the overflow
+    threshold for both: a 2-GPU / 1008-MiB AllGather (504-MiB per-rank
+    upload, between the constants) modeled 72 x 7-MiB upload fragments
+    per rank where the C++ emits 4,032 x 128-KiB — ~32x too few and ~56x
+    too large — so at BER 1e-8 / SACK / 3 retries strict_reliability
+    returned infinity for a config ns-3 completes in 4,251.879 us with
+    zero permanent losses (codex round 15, finding 6)."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 1008 * 1024 * 1024, 2
+    upload = D // N  # 504 MiB: between 500 and 512 MiB
+    frags, frag_bytes = nvls._spray_fragments(upload)
+    assert frags == 4032
+    assert frag_bytes == 131072
+    # The un-coalesced 128-KiB geometry keeps the strict prediction finite
+    # (the coalesced 7-MiB fragments made it infinite).
+    t = nvls.predict(D, N, "nvls", 128, ber=1e-8, retry_limit=3,
+                     retry_mode="sack", strict_reliability=True,
+                     collective="allgather", llr_enabled=True)
+    assert math.isfinite(t)
+    # Above the true 512-MiB coalescing threshold the 72-fragment geometry
+    # returns (the round-14 behavior is preserved for genuinely huge
+    # transfers).
+    assert nvls._spray_fragments(513 * 1024 * 1024)[0] == 72
 
 
 def test_nvls_retry_buffer_counts_spray_fragments():

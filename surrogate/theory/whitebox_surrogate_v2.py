@@ -499,6 +499,7 @@ class TheoryDerivedSurrogate:
         if data_bytes <= 0:
             return 1, 1
         overflow_threshold_collective = 500 * 1024 * 1024
+        coalesce_threshold = 512 * 1024 * 1024
         max_chunk_bytes = 8 * 1024 * 1024
         min_chunks = max(1, self.num_lanes)
         if self.num_lanes <= 1 and data_bytes <= overflow_threshold_collective:
@@ -516,8 +517,16 @@ class TheoryDerivedSurrogate:
         # NOT 8,192 x 128 KiB — the un-coalesced helper modeled ~57x too
         # many fragments (0.000582 predicted permanent losses at BER
         # 1e-8 / 3 retries, accepting a strict completion ns-3 rejects
-        # with 13 permanent losses).
-        if data_bytes > overflow_threshold_collective:
+        # with 13 permanent losses). The threshold is the C++
+        # COALESCE_THRESHOLD (512 MiB), DISTINCT from the 500-MiB
+        # OVERFLOW_THRESHOLD_COLLECTIVE above (codex round 15, finding 6:
+        # reusing the 500-MiB overflow threshold coalesced a 504-MiB
+        # 2-GPU / 1008-MiB-AllGather upload into 72 x 7-MiB fragments
+        # where the C++ emits 4,032 x 128-KiB — the modeled fragments
+        # were ~32x too few and ~56x too large, and strict_reliability
+        # returned infinity for a config ns-3 completes in 4,251.879 us
+        # with zero permanent losses).
+        if data_bytes > coalesce_threshold:
             coalesced = math.ceil(data_bytes / max_chunk_bytes)
             if coalesced > min_chunks:
                 path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
