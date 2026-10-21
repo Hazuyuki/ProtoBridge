@@ -715,6 +715,12 @@ FabricEndpoint::SetReceiveCallback(ReceiveCallback cb)
     m_receiveCallback = cb;
 }
 
+FabricEndpoint::ReceiveCallback
+FabricEndpoint::GetReceiveCallback() const
+{
+    return m_receiveCallback;
+}
+
 void
 FabricEndpoint::SetMemoryResponseCallback(ReceiveCallback cb)
 {

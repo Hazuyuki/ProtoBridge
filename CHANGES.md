@@ -6,6 +6,25 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — ProtocolConfigRunner destructor detaches endpoint callbacks
+
+`~ProtocolConfigRunner` was defaulted, leaving the
+`OnPacketReceived` callback registered on every endpoint it had bound.
+The endpoints survive the runner, so a packet delivered after the
+runner's destruction invoked `OnPacketReceived` on freed runner memory
+(codex round 17, finding 4; a 64-B transfer over a 100-µs link with the
+runner destroyed at 1 µs produced valgrind-confirmed invalid reads at
+the `m_executor` guard and the header field loads). The destructor now
+detaches exactly the callback THIS runner installed: a new
+`FabricEndpoint::GetReceiveCallback()` exposes the current callback, the
+destructor identity-compares it against its own `MakeCallback` binding
+and nulls only a match — a later injector or runner that re-bound the
+endpoint is untouched. Verified with a standalone probe (invalid reads
+pre-fix, zero post-fix) and the new `ProtocolConfigRunnerDetachTest`
+(real p2p-single stencil, runner destroyed at 1 µs, run past the
+delivery, assert both endpoints' callbacks are null). Config-mode sim
+round-trips unchanged (p2p-single 1582 ns, p2p-roce 15036 ns).
+
 ### Fixed — LLR manager callbacks and timers detach at endpoint dispose
 
 `FabricEndpoint::DoDispose` dropped `m_llrManager` without detaching its

@@ -336,6 +336,9 @@ class FabricEndpoint : public Application
     typedef Callback<void, uint16_t, uint64_t, MemoryAccessType> MemorySemanticCallback;
 
     void SetReceiveCallback(ReceiveCallback cb);
+    /// Current receive callback (identity comparison lets an owner detach
+    /// exactly the callback IT installed — see ~ProtocolConfigRunner).
+    ReceiveCallback GetReceiveCallback() const;
     void SetMemoryResponseCallback(ReceiveCallback cb);
     void SetMemoryRequestCallback(MemoryRequestCallback cb);
     void SetMemorySemanticCallback(MemorySemanticCallback cb);

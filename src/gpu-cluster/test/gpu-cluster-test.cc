@@ -37,6 +37,7 @@
 #include "ns3/gpu-cluster-helper.h"
 #include "ns3/protocol-profile.h"
 #include "ns3/protocol-config.h"
+#include "ns3/protocol-config-runner.h"
 #include "ns3/flow-control-policy.h"
 #include "ns3/arbiter.h"
 #include "ns3/nvswitch.h"
@@ -73,6 +74,7 @@
 
 #include <fstream>
 #include <functional>
+#include <memory>
 
 using namespace ns3;
 
@@ -5702,6 +5704,104 @@ class LlrManagerDetachedAtDisposeTest : public TestCase
     }
 };
 
+// (R17#4) ~ProtocolConfigRunner leaves the OnPacketReceived callback
+// registered on surviving endpoints. A delivered packet after the runner
+// is destroyed invoked OnPacketReceived on freed runner memory (codex
+// round 17, finding 4 — 64-B transfer over a 100-us link, runner destroyed
+// at 1 us, valgrind-confirmed invalid reads at the m_executor guard and
+// header field loads). The destructor now detaches exactly the callback it
+// installed (identity-compared, so a later re-binding is untouched).
+// Regression: run a P2P stencil through the real runner, destroy it at
+// 1 us, run past the delivery — no freed reads, and the endpoints'
+// callbacks are null afterwards.
+class ProtocolConfigRunnerDetachTest : public TestCase
+{
+  public:
+    ProtocolConfigRunnerDetachTest()
+        : TestCase("ProtocolConfigRunner destructor detaches endpoint callbacks") {}
+
+    static std::unique_ptr<ProtocolConfigRunner>& Runner()
+    {
+        static std::unique_ptr<ProtocolConfigRunner> runner;
+        return runner;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+
+        // Two endpoints over a 100-us link: the 64-B stencil transfer
+        // delivers long after the runner's 1-us destruction.
+        NodeContainer a, b;
+        a.Add(CreateObject<Node>());
+        b.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(MicroSeconds(100)));
+        NetDeviceContainer pair = p2p.Install(a.Get(0), b.Get(0));
+
+        std::vector<Ptr<FabricEndpoint>> eps;
+        Ptr<FabricEndpoint> ep0 = CreateObject<FabricEndpoint>();
+        ep0->SetRank(0);
+        ep0->SetLocalRankRange(0, 1);
+        ep0->AddNetDevice(pair.Get(0));
+        ep0->SetRoutingEntry(1, 0);
+        ep0->SetBypassReorderBuffer(true);
+        ep0->SetNeighborMac(1, Mac48Address::ConvertFrom(pair.Get(1)->GetAddress()));
+        eps.push_back(ep0);
+        Ptr<FabricEndpoint> ep1 = CreateObject<FabricEndpoint>();
+        ep1->SetRank(1);
+        ep1->SetLocalRankRange(1, 1);
+        ep1->AddNetDevice(pair.Get(1));
+        ep1->SetRoutingEntry(0, 0);
+        ep1->SetBypassReorderBuffer(true);
+        ep1->SetNeighborMac(0, Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+        eps.push_back(ep1);
+        for (auto& ep : eps) ep->Initialize();
+
+        // Load the single-P2P stencil (the same one the probe used).
+        ProtocolConfig pconfig;
+        std::string err;
+        NS_TEST_ASSERT_MSG_EQ(
+            pconfig.Load("configs/protocol_configs/p2p-single.cfg", &err), true,
+            "p2p-single.cfg loads: " << err);
+        ProtocolProfile prof;
+        NS_TEST_ASSERT_MSG_EQ(prof.Load(pconfig.GetProfilePath()), true,
+                              "profile loads");
+        for (const auto& kv : pconfig.GetStackValues())
+        {
+            prof.Set(kv.first, kv.second);
+        }
+        ProtocolBundle pbundle = prof.Build();
+        ProtocolConfigRunner::ApplyBundle(eps, pbundle, 65536);
+
+        Runner() = std::make_unique<ProtocolConfigRunner>();
+        NS_TEST_ASSERT_MSG_EQ(
+            Runner()->Initialize(eps, pbundle, pconfig, /*numGpus=*/2,
+                                 /*dataSize=*/64, &err), true,
+            "runner initializes: " << err);
+        Runner()->Start();
+
+        // Destroy the runner at 1 us — before the ~100-us delivery.
+        Simulator::Schedule(MicroSeconds(1), []() { Runner().reset(); });
+
+        Simulator::Stop(MicroSeconds(500)); // past the delivery
+        Simulator::Run();
+
+        // The runner's callbacks must be gone from the surviving endpoints.
+        for (const auto& ep : eps)
+        {
+            NS_TEST_ASSERT_MSG_EQ(ep->GetReceiveCallback().IsNull(), true,
+                                  "endpoint receive callback detached at runner destruction");
+        }
+        Simulator::Destroy();
+        // Reaching this line without reading freed runner memory is the
+        // rest of the assertion (valgrind adjudicates).
+    }
+};
+
 // (1b-3) LLR retry timers must not start while the pacer still holds the
 // packet. Codex round 12, finding 4: StorePacket armed the timeout at
 // ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
@@ -8435,6 +8535,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ZeroChunkBulkTransferTest, TestCase::Duration::QUICK);
     AddTestCase(new MemoryEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrManagerDetachedAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new ProtocolConfigRunnerDetachTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
