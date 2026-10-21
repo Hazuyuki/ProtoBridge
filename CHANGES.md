@@ -6,6 +6,84 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 18: ten defects across endpoint disposal, chunk grids, and the surrogate
+
+1. **Credit manager detached at endpoint dispose** (high). An externally
+   retained `CreditManager` (attribute-supplied) outlives the endpoint;
+   `DoDispose` dropped the reference but left `OnCreditAvailable` bound to
+   the freed endpoint — `ReturnCredits` after disposal read freed memory
+   (valgrind-confirmed in `TrySendQueuedPackets`). New
+   `CreditManager::DetachFromEndpoint()` mirrors the LLR detach. Test:
+   `credit manager callback detached at endpoint dispose`.
+2. **Ring AllToAll carries step-counter overshoot forward** (high). The
+   ring receive path pooled fragments from MULTIPLE steps in one per-dest
+   counter and reset it to zero at a threshold cross, discarding the
+   overshoot — with one lane delayed 100 µs, a dest pooled step-s+1
+   fragments before crossing its step-s threshold and the collective never
+   completed (3 GPU / 300 B / 18 lanes: all 600 bytes sent, status
+   incomplete). The counter now subtracts the threshold (looping when
+   overshoot exceeds a full chunk). Test: `ring alltoall carries
+   step-counter overshoot forward`.
+3. **NVLS AllGather switch waits for each source's full chunk** (high).
+   The switch threshold required only the uniform `dataSize/numGpus` from
+   every source while the injector uploads the frozen chunk grid (first
+   `D%N` ranks carry one extra byte) — a delayed lane let the 4-GPU / 9-B
+   AllGather multicast 8 bytes, retire the ledger, and stall every
+   receiver at 8/9. The per-source expectation is now `chunk +
+   (src < D%N ? 1 : 0)`. Test: `NVLS allgather switch waits for each
+   source's full chunk`.
+4. **Hierarchical AllToAll covers the full data size** (medium). Uniform
+   `D/N` chunks truncated the remainder (2 nodes × 2 GPUs at 15 B sent 36
+   aggregate bytes, not 45) and the degenerate `D < N` grid sent nothing
+   (stall to the 1-hour cap). Now the frozen destination-sized chunk grid
+   with degenerate pre-crediting and a zero-data `Start()` short-circuit.
+   Test: `hierarchical alltoall covers the full data size`.
+5. **Hybrid multi-link gateway routes each fabric on its own device**
+   (medium). Every cross-fabric route used the gateway's LAST attached
+   device, so a gateway with two links routed both remote fabrics over
+   the second link (transfers to the first remote fabric delivered zero
+   bytes). `BuildCrossFabricLinks` now records each link's device index
+   and `PopulateCrossFabricRouting` routes per link. Test: `hybrid
+   multi-link gateway routes each fabric on its own device`.
+6. **Surrogate `_spray_fragments` skips trailing lane-pad fragments**
+   (medium). The helper counted `numChunks = max(lanes, ceil(bytes/
+   chunk))` fragments, but the C++ spray loop skips trailing fragments
+   whose offset is past the wire end — 32 wire bytes over 18 lanes is 16
+   fragments, not 18 (0.506 vs 0.450 expected losses at BER 2.2e-4 /
+   retry 0, crossing the strict-reliability threshold). The returned
+   count is now the fragments actually sent. Tests:
+   `test_spray_fragments_skips_trailing_lane_pad_fragments`.
+7. **Zero-data AllToAll stays completed across `Start()`** (medium).
+   `Initialize(4, 0, ...)` completed during initialization (before the
+   completion callback was registered); `Start()` overwrote COMPLETED
+   with RUNNING and zero-byte sends never completed it again (status
+   incomplete at the 1-hour cap). `Start()` now returns early on a
+   completed collective. Test: `zero-data alltoall stays completed across
+   Start()`.
+8. **Hybrid helper applies its configured degradation model** (medium).
+   `SetLinkDegradationModel` stored a member no build path read — a 0.99
+   packet-loss rate delivered all 4,096 offered bytes and the endpoint
+   attribute stayed null. `Build()` now installs a seeded per-endpoint
+   copy of the shared model (loss-rate only; BER>0 without FEC/LLR stays
+   the pre-existing unrecoverable-config fatal). Test: `hybrid helper
+   applies its configured degradation model`.
+9. **Surrogate permanent-loss estimator grants no retries with LLR off**
+   (medium). The direct `expected_permanent_losses` call granted
+   `retry_limit+1` attempts even for `llr_enabled=False` (6.17 vs 153.48
+   expected losses for a 16-MiB 8-GPU ring AllReduce at BER 1e-7) —
+   `predict()`'s strict-reliability gate already normalized the limit to
+   zero, so the direct call disagreed with the wrapper. The estimator now
+   applies the same one-attempt rule. Test:
+   `test_expected_losses_llr_off_grants_no_retries`.
+10. **Hierarchical docstring states the AllToAll Su volume correctly**
+    (low). The class docstring claimed `D*(n_su-1)/n_su` for the Su stage;
+    the implementation (and the C++ it mirrors) moves `D*(n_su-1)/
+    (n_su*n_so)` per GPU. Doc-only.
+
+Suite state after the round: EXTENSIVE **105 PASS** (7 new tests),
+integration 5 PASS, surrogate pytest **83 passed** (2 new tests), 14/14
+parity scripts, valgrind QUICK zero errors.
+
 ### Fixed — surrogate predict docstring drops the stale AllGather halving promise
 
 The `predict` docstring's `phase` paragraph promised step-count halving

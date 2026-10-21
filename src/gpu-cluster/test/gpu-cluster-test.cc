@@ -41,6 +41,8 @@
 #include "ns3/flow-control-policy.h"
 #include "ns3/arbiter.h"
 #include "ns3/nvswitch.h"
+#include "ns3/hybrid-topology-helper.h"
+#include "ns3/hierarchical-alltoall.h"
 #include "ns3/fabric-switch.h"
 #include "ns3/ethernet-switch.h"
 #include "ns3/object-factory.h"
@@ -5659,6 +5661,446 @@ class AlltoallDegenerateRingModeTest : public TestCase
     }
 };
 
+// (codex round 18, finding 7) Zero-data AllToAll: Initialize(4, 0, ...) hit
+// the Complete() short-circuit BEFORE the completion callback was typically
+// registered; Start() then overwrote COMPLETED with RUNNING, and zero-byte
+// sends are no-ops so nothing ever completed it again — the CLI reported
+// status=incomplete at the 1-hour cap. Start() must respect an already-
+// completed collective.
+class AlltoallZeroDataStartTest : public TestCase
+{
+  public:
+    AlltoallZeroDataStartTest()
+        : TestCase("zero-data alltoall stays completed across Start()") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            eps.push_back(ep);
+        }
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->Initialize(numGpus, 0, eps);
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "zero-data alltoall completes at Initialize (all chunks zero)");
+        bool fired = false;
+        inj->SetCompletionCallback([&](uint64_t) { fired = true; });
+        inj->Start();
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "Start() must not overwrite COMPLETED with RUNNING for a "
+            "zero-data alltoall (nothing will ever complete it again)");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 2) Ring AllToAll pooled different steps'
+// fragments in one per-dest counter and RESET it to zero at a threshold
+// cross, discarding the overshoot. With one lane delayed 100 us, a dest
+// pooled step-s+1 fragments before crossing its step-s threshold; the
+// reset threw those bytes away and the next threshold never accumulated
+// enough — all bytes sent, the collective never completed. The counter now
+// carries the overshoot forward (subtract, not reset).
+class AlltoallRingOvershootCarryTest : public TestCase
+{
+  public:
+    AlltoallRingOvershootCarryTest()
+        : TestCase("ring alltoall carries step-counter overshoot forward") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 3;
+        const uint32_t lanes = 18;
+        const uint64_t dataSize = 300; // grid [100,100,100]
+        NodeContainer nodes;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+
+        // Wire the full mesh; the (0,2) pair's LAST lane gets a 100-us
+        // delay so rank 0's fragments arrive interleaved across steps.
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<std::vector<std::vector<uint32_t>>> routes(
+            numGpus, std::vector<std::vector<uint32_t>>(numGpus));
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            ep->SetBypassReorderBuffer(true);
+            ep->SetNumLanes(lanes);
+            eps.push_back(ep);
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            for (uint16_t q = r + 1; q < numGpus; ++q)
+            {
+                for (uint32_t lane = 0; lane < lanes; ++lane)
+                {
+                    const bool delayed =
+                        (r == 0 && q == 2 && lane == lanes - 2);
+                    p2p.SetChannelAttribute(
+                        "Delay", TimeValue(delayed ? MicroSeconds(100)
+                                                    : NanoSeconds(400)));
+                    NetDeviceContainer pair = p2p.Install(nodes.Get(r), nodes.Get(q));
+                    routes[r][q].push_back(eps[r]->AddNetDevice(pair.Get(0)));
+                    routes[q][r].push_back(eps[q]->AddNetDevice(pair.Get(1)));
+                }
+            }
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            for (uint16_t q = 0; q < numGpus; ++q)
+            {
+                if (r != q) eps[r]->SetRoutingDevices(q, routes[r][q]);
+            }
+            eps[r]->Initialize();
+        }
+
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(500)); // past the 100-us delayed lane
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the delayed-lane ring alltoall must complete — overshoot bytes "
+            "pooled across steps must carry forward, not be discarded by a "
+            "counter reset");
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 2 * dataSize,
+            "ring alltoall still ships (N-1)*D effective bytes");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 1) The credit manager can outlive the endpoint
+// (attribute-supplied, externally retained); DoDispose dropped the endpoint
+// reference but left the manager's OnCreditAvailable callback bound to the
+// freed endpoint — ReturnCredits after disposal fired into freed memory
+// (valgrind-confirmed invalid reads in TrySendQueuedPackets). DoDispose now
+// detaches the callback.
+class CreditManagerDetachedAtDisposeTest : public TestCase
+{
+  public:
+    CreditManagerDetachedAtDisposeTest()
+        : TestCase("credit manager callback detached at endpoint dispose") {}
+
+    static Ptr<CreditManager>& Credits()
+    {
+        static Ptr<CreditManager> cm;
+        return cm;
+    }
+    static Ptr<FabricEndpoint>& Ep()
+    {
+        static Ptr<FabricEndpoint> ep;
+        return ep;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // Externally retained credit manager supplied via the attribute —
+        // it survives the endpoint.
+        Credits() = CreateObject<CreditManager>();
+        Ep() = CreateObject<FabricEndpoint>();
+        Ep()->SetAttribute("CreditManager", PointerValue(Credits()));
+        Credits()->InitializeVc(0, 1);
+        Ep()->Initialize();
+        // Exhaust the one-credit window so the callback matters.
+        Credits()->ConsumeCredit(0, 0);
+        // Dispose and release the endpoint; the manager stays alive.
+        Ep()->Dispose();
+        Ep() = nullptr;
+        // Returning credits would invoke OnCreditAvailable on freed memory
+        // pre-fix (valgrind adjudicates; reaching here without a crash is
+        // the weak form of the assertion).
+        Credits()->ReturnCredits(0, 1);
+        Credits() = nullptr;
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 3) NVLS AllGather's switch threshold required
+// only the uniform dataSize/numGpus from every source, but the injector
+// uploads the frozen chunk grid (first D%N ranks carry one extra byte).
+// With one lane delayed, the switch aggregated a 4-GPU / 9-B AllGather
+// after rank 0's first 2 bytes: the 8-byte multicast retired the ledger
+// and rank 0's third byte started an aggregation that never completed —
+// every receiver stuck at 8/9. The switch now requires each source's FULL
+// chunk (base + remainder byte).
+class NvlsAllGatherRemainderThresholdTest : public TestCase
+{
+  public:
+    NvlsAllGatherRemainderThresholdTest()
+        : TestCase("NVLS allgather switch waits for each source's full chunk") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 9; // grid [3,2,2,2]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        const uint32_t lanes = 18;
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(numGpus);
+        sw->SetAllGatherChunkSize(dataSize / numGpus);
+        sw->SetAllGatherDataSize(dataSize);
+
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            for (uint32_t lane = 0; lane < lanes; ++lane)
+            {
+                // Rank 0's lane 2 is slow: its third byte lags the others.
+                p2p.SetChannelAttribute(
+                    "Delay",
+                    TimeValue((r == 0 && lane == 2) ? MicroSeconds(100)
+                                                    : NanoSeconds(400)));
+                NetDeviceContainer pair =
+                    p2p.Install(nodes.Get(r), switchNode.Get(0));
+                if (lane == 0)
+                {
+                    Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+                    ep->SetRank(r);
+                    ep->SetLocalRankRange(0, numGpus);
+                    ep->SetBypassReorderBuffer(true);
+                    ep->SetNumLanes(lanes);
+                    eps.push_back(ep);
+                }
+                eps[r]->AddNetDevice(pair.Get(0));
+                eps[r]->SetRoutingEntry(0, eps[r]->GetNNetDevices() - 1);
+                sw->AddPort(pair.Get(1));
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<NvlsAllGather> inj = CreateObject<NvlsAllGather>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(500)); // past the 100-us lane
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 9-B NVLS allgather must complete — the switch must wait "
+            "for rank 0's third byte (chunk+remainder), not fire the "
+            "multicast on the uniform floor");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 4) Hierarchical AllToAll truncated the chunk
+// grid like the flat injector did pre-round-17: uniform D/N chunks sent 36
+// aggregate bytes for a 2-node / 2-GPU / 15-B alltoall (45 correct), and
+// the degenerate D=3 grid sent NOTHING (chunkSize=0, expected-bytes hack
+// stalled to the 1-hour cap). It now uses the frozen destination-sized
+// chunk grid with degenerate pre-crediting.
+class HierarchicalAlltoallChunkGridTest : public TestCase
+{
+  public:
+    HierarchicalAlltoallChunkGridTest()
+        : TestCase("hierarchical alltoall covers the full data size") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint64_t dataSize = 15; // grid [4,4,4,3]
+        const uint64_t dataSizeDegenerate = 3; // grid [1,1,1,0]
+
+        for (int variant = 0; variant < 2; ++variant)
+        {
+            const uint64_t d = variant == 0 ? dataSize : dataSizeDegenerate;
+            HybridTopologyHelper helper;
+            helper.AddNvLinkFabric(2, "fullmesh", 0, "200Gbps", "400ns");
+            helper.AddNvLinkFabric(2, "fullmesh", 2, "200Gbps", "400ns");
+            helper.AddCrossFabricLink(0, 1, 0, 2, "100Gbps", "1us");
+            helper.Build();
+            helper.PopulateCrossFabricRouting();
+            auto apps = helper.GetAllEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t r = 0; r < apps.GetN(); ++r)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                ep->SetNumVirtualChannels(1);
+                ep->SetVcCredits(0, 1000000);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+
+            Ptr<HierarchicalAlltoAll> inj = CreateObject<HierarchicalAlltoAll>();
+            inj->SetGpusPerNode(2);
+            inj->SetNumNodes(2);
+            inj->Initialize(4, d, eps);
+            inj->Start();
+            Simulator::Stop(MicroSeconds(2000));
+            Simulator::Run();
+            // Whole-collective payload: every ordered pair (r,s) ships
+            // ChunkSizeOf(s) once — (N-1)*D. Pre-fix: 36 (variant 0) and a
+            // stall (variant 1).
+            NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+                "the hierarchical alltoall must complete (degenerate grid "
+                "ranks pre-credited)");
+            Simulator::Destroy();
+        }
+    }
+};
+
+// (codex round 18, finding 5) Every cross-fabric route used the gateway's
+// LAST attached device, so a gateway with two cross-fabric links routed
+// BOTH remote fabrics over the second link — transfers to the first remote
+// fabric delivered zero bytes. PopulateCrossFabricRouting now uses the
+// per-link device index recorded at build time.
+class HybridCrossFabricRoutingTest : public TestCase
+{
+  public:
+    HybridCrossFabricRoutingTest()
+        : TestCase("hybrid multi-link gateway routes each fabric on its own device") {}
+
+    static uint64_t Got2;
+    static uint64_t Got4;
+    static void Rx(uint16_t rank, Ptr<Packet> p, FabricHeader h)
+    {
+        if (h.GetPacketType() != FabricPacketType::DATA) return;
+        const uint32_t sz = h.GetEffectiveDataSize() ? h.GetEffectiveDataSize()
+                                                     : p->GetSize();
+        if (rank == 2) Got2 += sz;
+        if (rank == 4) Got4 += sz;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        Got2 = Got4 = 0;
+        // Three 2-GPU fabrics; gateway rank 0 is separately linked to
+        // ranks 2 (device 1) and 4 (device 2).
+        HybridTopologyHelper helper;
+        for (uint16_t f = 0; f < 3; ++f)
+        {
+            helper.AddNvLinkFabric(2, "fullmesh", 2 * f, "200Gbps", "400ns");
+        }
+        helper.AddCrossFabricLink(0, 1, 0, 2, "100Gbps", "1us");
+        helper.AddCrossFabricLink(0, 2, 0, 4, "100Gbps", "1us");
+        helper.Build();
+        helper.PopulateCrossFabricRouting();
+        auto apps = helper.GetAllEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t r = 0; r < apps.GetN(); ++r)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 1000000);
+            ep->Initialize();
+            ep->SetReceiveCallback(MakeCallback(&Rx));
+            eps.push_back(ep);
+        }
+        // The two cross-fabric routes from rank 0 must use DIFFERENT devices.
+        NS_TEST_ASSERT_MSG_EQ(eps[0]->GetRoutingDeviceIndex(2) !=
+                                  eps[0]->GetRoutingDeviceIndex(4),
+                              true,
+            "gateway with two cross-fabric links must route each remote "
+            "fabric via its own device, not the last device for both");
+        Simulator::Schedule(MicroSeconds(1), [&]() {
+            eps[0]->SendBulkWireTransferSize(2, 64, 3, 1, 0);
+            eps[0]->SendBulkWireTransferSize(4, 64, 3, 2, 0);
+        });
+        Simulator::Stop(MicroSeconds(1000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(Got2, 64,
+            "64-B transfer to rank 2 must deliver over ITS cross-fabric link");
+        NS_TEST_ASSERT_MSG_EQ(Got4, 64,
+            "64-B transfer to rank 4 must deliver over ITS cross-fabric link");
+        Simulator::Destroy();
+    }
+};
+uint64_t HybridCrossFabricRoutingTest::Got2 = 0;
+uint64_t HybridCrossFabricRoutingTest::Got4 = 0;
+
+// (codex round 18, finding 8) SetLinkDegradationModel stored a member no
+// build path read: a 0.99 packet-loss model delivered all 4,096 offered
+// bytes and the endpoint attribute stayed null. Build() now installs a
+// seeded per-endpoint copy of the shared model (BER must be 0 for a
+// loss-only model — BER>0 without FEC/LLR is the pre-existing
+// unrecoverable-config fatal).
+class HybridLinkDegradationTest : public TestCase
+{
+  public:
+    HybridLinkDegradationTest()
+        : TestCase("hybrid helper applies its configured degradation model") {}
+
+    static uint64_t Got1;
+    static void Rx(uint16_t rank, Ptr<Packet> p, FabricHeader h)
+    {
+        if (h.GetPacketType() != FabricPacketType::DATA) return;
+        const uint32_t sz = h.GetEffectiveDataSize() ? h.GetEffectiveDataSize()
+                                                     : p->GetSize();
+        if (rank == 1) Got1 += sz;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        Got1 = 0;
+        HybridTopologyHelper helper;
+        for (uint16_t f = 0; f < 3; ++f)
+        {
+            helper.AddNvLinkFabric(2, "fullmesh", 2 * f, "200Gbps", "400ns");
+        }
+        helper.AddCrossFabricLink(0, 1, 0, 2, "100Gbps", "1us");
+        helper.AddCrossFabricLink(0, 2, 0, 4, "100Gbps", "1us");
+        Ptr<LinkDegradationModel> degradation = CreateObject<LinkDegradationModel>();
+        degradation->SetBer(0.0); // loss-rate only (BER>0 needs FEC/LLR)
+        degradation->SetPacketLossRate(0.99);
+        helper.SetLinkDegradationModel(degradation);
+        helper.Build();
+        helper.PopulateCrossFabricRouting();
+        auto apps = helper.GetAllEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t r = 0; r < apps.GetN(); ++r)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 1000000);
+            ep->Initialize();
+            ep->SetReceiveCallback(MakeCallback(&Rx));
+            eps.push_back(ep);
+        }
+        PointerValue modelValue;
+        eps[1]->GetAttribute("LinkDegradationModel", modelValue);
+        NS_TEST_ASSERT_MSG_EQ(modelValue.Get<LinkDegradationModel>() != nullptr,
+                              true,
+            "the configured degradation model must be installed on the "
+            "endpoints (it was stored but never applied)");
+        Simulator::Schedule(MicroSeconds(1), [&]() {
+            for (uint16_t i = 0; i < 64; ++i)
+            {
+                eps[0]->SendBulkWireTransferSize(1, 64, 3, 1, 0);
+            }
+        });
+        Simulator::Stop(MicroSeconds(1000));
+        Simulator::Run();
+        // 64 x 64 B offered at loss rate 0.99: essentially nothing may
+        // survive (pre-fix: ALL 4,096 bytes arrived).
+        NS_TEST_ASSERT_MSG_EQ(Got1 < 4096, true,
+            "a 0.99 packet-loss rate must drop (nearly) all offered bytes — "
+            "pre-fix every byte was delivered");
+        Simulator::Destroy();
+    }
+};
+uint64_t HybridLinkDegradationTest::Got1 = 0;
+
 // (codex round 17, finding 1) Zero-sized chunks crashed multi-lane fabrics.
 // The degenerate sub-GPU-count grid gives ranks past dataSize a zero chunk;
 // the zero-byte bulk transfer reached the fragment math, where wireSize=0
@@ -8855,6 +9297,14 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new AlltoallChunkGridCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new AlltoallDegenerateGridTest, TestCase::Duration::QUICK);
     AddTestCase(new AlltoallDegenerateRingModeTest, TestCase::Duration::QUICK);
+    // (codex round 18 responses)
+    AddTestCase(new AlltoallZeroDataStartTest, TestCase::Duration::QUICK);
+    AddTestCase(new AlltoallRingOvershootCarryTest, TestCase::Duration::QUICK);
+    AddTestCase(new CreditManagerDetachedAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new NvlsAllGatherRemainderThresholdTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalAlltoallChunkGridTest, TestCase::Duration::QUICK);
+    AddTestCase(new HybridCrossFabricRoutingTest, TestCase::Duration::QUICK);
+    AddTestCase(new HybridLinkDegradationTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
