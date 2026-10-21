@@ -6,6 +6,39 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NVLS retry-buffer sizing counts the collective spray fragments
+
+`required_retry_buffer_entries` sized the LLR fast-copy store with the
+DATA bulk path's fragment count (`max(lanes, ceil(upload/8 MiB))` = 18 at
+18 lanes), but NVLS uploads move via `SendCollectiveBulk`'s SPRAY: the
+endpoint retains one fast copy per sprayed fragment of its own upload
+(D for allreduce, D/N for allgather) — 128 fragments of 128 KiB at
+4 GPU / 64 MiB AllGather (codex round 13, finding 7). The undercount
+called a 32-entry buffer "sufficient" where ns-3 needs 2 source reloads
+(0 at 128). NVLS collectives now size the store (and
+`required_retry_buffer_bytes`) from `_spray_fragments(upload)`; other
+algorithms keep the DATA-bulk sizing. A regression test pins the 128
+entries / 16 MiB requirement and the reload penalty engaging at 32
+entries but not 128.
+
+### Fixed — collective spray models the single-link single-packet branch
+
+`_spray_fragments` always fragmented (`max(lanes, ceil(bytes/128 KiB))`),
+but the C++ spray loop only fragments when the fabric NEEDS it:
+`needFragmentColl = (spray links > 1) OR (wire > 500 MiB)`
+(fabric-endpoint-send.cc). A single-link (or single-QP) fabric below the
+threshold sends the whole transfer as ONE packet of the full size — a
+4-GPU / 16-MiB AllGather over one link uploads one 4-MiB packet per
+rank, not 32 × 128-KiB fragments (codex round 13, finding 6). The
+always-fragment geometry predicted 0.06285 permanent losses at BER
+1e-7 / 3 retries (finite strict completion) where a 4-MiB packet fails
+with p ≈ 0.965 per attempt and ns-3 reports the collective incomplete
+with 3 permanent losses. The helper now returns the single-packet
+geometry for `num_lanes <= 1` below the 500-MiB threshold (17.35
+expected losses, strict rejected); multi-lane geometries are unchanged.
+This also fixes the NVLS AllReduce/AllGather expected-loss and
+retry-buffer counts on single-link fabrics.
+
 ### Fixed — NVLS AllReduce reliability uses the partitioned result geometry
 
 The NVLS branch of `expected_permanent_losses` mirrored the allgather

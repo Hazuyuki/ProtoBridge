@@ -471,15 +471,29 @@ class TheoryDerivedSurrogate:
     def _spray_fragments(self, data_bytes):
         """(count, bytes) of one SendCollectiveBulk sprayed transfer.
 
-        Mirrors the collective spray loop: numChunks =
-        max(lanes, ceil(bytes/spray_chunk)) (at least one fragment per
-        lane so the transfer uses the aggregate bandwidth), each fragment
-        ceil(bytes/numChunks) — the geometry NvSwitch's result multicast
-        mirrors chunk-for-chunk. Distinct from _bulk_fragment_count, which
-        models the DATA path's bulk_chunk granularity and protocol framing.
+        Mirrors the collective spray loop. The C++ gates fragmentation on
+        NEEDING it (fabric-endpoint-send.cc): needFragmentColl =
+        (spray links > 1) OR (wire size > 500 MiB). A single-link fabric
+        sends the whole transfer as ONE packet of the full size — a 4-GPU /
+        16-MiB AllGather over one link uploads one 4-MiB packet per rank,
+        not 32 x 128-KiB fragments (codex round 13, finding 6: the always-
+        fragment helper predicted 0.06285 permanent losses at BER 1e-7 /
+        3 retries where a 4-MiB packet fails with p ~ 0.965 per attempt and
+        ns-3 reports the collective incomplete with 3 permanent losses).
+        With multiple links, numChunks = max(lanes, ceil(bytes/spray_chunk))
+        (at least one fragment per lane so the transfer uses the aggregate
+        bandwidth), each fragment ceil(bytes/numChunks) — the geometry
+        NvSwitch's result multicast mirrors chunk-for-chunk. Distinct from
+        _bulk_fragment_count, which models the DATA path's bulk_chunk
+        granularity and protocol framing.
         """
         if data_bytes <= 0:
             return 1, 1
+        overflow_threshold_collective = 500 * 1024 * 1024
+        if self.num_lanes <= 1 and data_bytes <= overflow_threshold_collective:
+            # Single-link (or single-QP) fabric below the overflow
+            # threshold: one packet carries the entire transfer.
+            return 1, math.ceil(data_bytes)
         num_chunks = max(self.num_lanes,
                          math.ceil(data_bytes / self.spray_chunk_bytes))
         frag_bytes = math.ceil(data_bytes / num_chunks)
@@ -529,7 +543,22 @@ class TheoryDerivedSurrogate:
 
     def required_retry_buffer_entries(self, data_bytes, num_gpus, algo,
                                       collective=None):
-        """Maximum packets an endpoint may need to retain for one tree step."""
+        """Maximum packets an endpoint may need to retain for one tree step.
+
+        NVLS/SHARP collectives are the exception: their uploads move via
+        SendCollectiveBulk's SPRAY (one retry-buffer fast copy per sprayed
+        fragment of this endpoint's own upload — D for allreduce, D/N for
+        allgather), not the DATA bulk path. At 4 GPU / 64 MiB AllGather an
+        endpoint uploads 128 fragments of 128 KiB, so a 32-entry buffer
+        evicts fast copies and lost fragments need source reloads (ns-3:
+        2 reloads at 32 entries, 0 at 128). The DATA-bulk count of 18
+        wrongly called 32 entries sufficient (codex round 13, finding 7).
+        """
+        collective = self._validate_collective(collective)
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            upload_bytes = (data_bytes if collective == 'allreduce'
+                            else data_bytes / max(1, num_gpus))
+            return self._spray_fragments(upload_bytes)[0]
         packets = self._packets_per_transfer(
             data_bytes, num_gpus, algo, collective)
         return 2 * packets if algo == 'tree' else packets
@@ -537,6 +566,12 @@ class TheoryDerivedSurrogate:
     def required_retry_buffer_bytes(self, data_bytes, num_gpus, algo,
                                     collective=None):
         """Bytes needed to retain the modeled transfer fragments."""
+        collective = self._validate_collective(collective)
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            upload_bytes = (data_bytes if collective == 'allreduce'
+                            else data_bytes / max(1, num_gpus))
+            frags, frag_bytes = self._spray_fragments(upload_bytes)
+            return frags * frag_bytes
         return (
             self.required_retry_buffer_entries(
                 data_bytes, num_gpus, algo, collective)

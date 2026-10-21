@@ -881,3 +881,66 @@ def test_nvls_allreduce_result_partition_geometry():
                      strict_reliability=True, collective="allreduce",
                      llr_enabled=True)
     assert math.isfinite(t)
+
+
+def test_spray_fragments_single_link_single_packet():
+    """SendCollectiveBulk only fragments when the fabric NEEDS the spray:
+    needFragmentColl = (spray links > 1) OR (wire size > 500 MiB). A
+    single-link fabric below the threshold sends the whole transfer as ONE
+    packet of the full size — a 4-GPU / 16-MiB AllGather over one link
+    uploads one 4-MiB packet per rank, not 32 x 128-KiB fragments (codex
+    round 13, finding 6). The always-fragmenting helper predicted 0.06285
+    permanent losses at BER 1e-7 / 3 retries (finite strict completion)
+    where the 4-MiB packet fails with p ~ 0.965 per attempt and ns-3
+    reports the collective incomplete with 3 permanent losses."""
+    one_link = wb.make_h200_nvls_theory(num_lanes=1)
+    D, N = 16 * 1024 * 1024, 4
+    frags, frag_bytes = one_link._spray_fragments(D / N)
+    assert frags == 1 and frag_bytes == D // N  # one 4-MiB packet
+    # 4 uploads + 4 dests * N mirrored result chunks, all at 4 MiB.
+    p = 1 - (1 - 1e-7) ** (D / N * 8)
+    losses = one_link.expected_permanent_losses(
+        D, N, "nvls", 1e-7, 3,
+        optical_fraction=1.0, optical_hops=1, collective="allgather")
+    assert abs(losses - (4 + 16) * p ** 4) < 1e-9
+    assert losses > 1.0  # incompletable: strict must reject
+    t = one_link.predict(D, N, "nvls", 128, ber=1e-7, retry_limit=3,
+                         strict_reliability=True, collective="allgather",
+                         llr_enabled=True)
+    assert not math.isfinite(t)
+    # Multi-lane geometries are unchanged (the spray branch still applies).
+    multi = wb.make_h200_nvls_theory()
+    assert multi._spray_fragments(D / N) == (32, 131072)
+    # A single-link transfer above the 500-MiB overflow threshold still
+    # fragments.
+    huge = one_link._spray_fragments(600 * 1024 * 1024)
+    assert huge[0] > 1
+
+
+def test_nvls_retry_buffer_counts_spray_fragments():
+    """NVLS retry-buffer sizing must count SendCollectiveBulk's sprayed
+    fragments of the endpoint's OWN upload (D for allreduce, D/N for
+    allgather) — the LLR fast-copy store holds one entry per fragment.
+    The DATA-bulk count (max(lanes, ceil(D/N / 8 MiB)) = 18) wrongly
+    called a 32-entry buffer sufficient for 4-GPU / 64-MiB AllGather,
+    where each endpoint uploads 128 fragments and ns-3 needs 2 source
+    reloads at 32 entries and none at 128 (codex round 13, finding 7)."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 64 * 1024 * 1024, 4
+    assert nvls.required_retry_buffer_entries(
+        D, N, "nvls", collective="allgather") == 128
+    assert nvls.required_retry_buffer_bytes(
+        D, N, "nvls", collective="allgather") == D // N  # 128 x 128 KiB
+    # AllReduce uploads carry the full D per rank.
+    assert nvls.required_retry_buffer_entries(
+        16 * 1024 * 1024, 8, "nvls", collective="allreduce") == 128
+    # The source-reload penalty must engage below the required count.
+    pen32 = nvls._source_reload_penalty(
+        D, N, "nvls", 128, 1e-8, True, "sack", 32, "allgather")
+    pen128 = nvls._source_reload_penalty(
+        D, N, "nvls", 128, 1e-8, True, "sack", 128, "allgather")
+    assert pen32 > 0.0 and pen128 == 0.0
+    # Non-NVLS algorithms keep the DATA-bulk sizing.
+    ring = wb.make_h200_ring_theory()
+    assert ring.required_retry_buffer_entries(
+        16 * 1024 * 1024, 8, "ring", collective="allreduce") == 4
