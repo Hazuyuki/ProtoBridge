@@ -4832,6 +4832,72 @@ class EgressDisposeCancelsDeferredSendsTest : public TestCase
     }
 };
 
+// (1b-5) The WFQ backlog-decrement lambdas also capture raw `this`. Codex
+// round 14, finding 1: the three DecrementBacklog schedules in
+// SendPacketOnDevice were NOT tracked in m_deferredEgressEvents, so
+// disposing (and freeing) an endpoint between the deferred send and the
+// backlog callback left the lambda firing on freed memory — valgrind
+// confirmed a use-after-free at the m_contentionModel deref. Regression:
+// FEC + contention model, one paced P2P packet, dispose + drop the
+// reference, run past the backlog callback time. No crash/UAF is the
+// assertion.
+class EgressDisposeCancelsBacklogCallbacksTest : public TestCase
+{
+  public:
+    EgressDisposeCancelsBacklogCallbacksTest()
+        : TestCase("endpoint Dispose cancels deferred backlog callbacks") {}
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1); // rank 1 remote -> direct egress path
+        ep->AddNetDevice(devs.Get(0));
+        ep->SetNeighborMac(1, Mac48Address::Allocate());
+        ep->SetRoutingEntry(1, 0);
+        ep->SetBypassReorderBuffer(true);
+
+        // FEC (encode latency defers the send) + contention model with a
+        // preloaded second class (numActive == 2 takes the WFQ branch).
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        ep->SetFecModel(fec);
+        Ptr<ContentionModel> cm = CreateObject<ContentionModel>();
+        cm->SetBandwidth(1000); // slow -> backlog callback fires ~seconds out
+        cm->IncrementBacklog(TrafficClass::MEMORY);
+        ep->SetContentionModel(cm);
+
+        ep->Initialize();
+
+        Simulator::Schedule(NanoSeconds(100), [ep]() {
+            std::vector<uint8_t> buf(64, 0);
+            ep->SendP2p(1, buf.data(), 64, 1, 0);
+        });
+        Simulator::Schedule(NanoSeconds(300), [ep]() {
+            ep->Dispose();
+        });
+        // Drop the last strong reference; the object is freed unless the
+        // pending backlog callback (wrongly) keeps a raw `this` alive.
+        Simulator::Schedule(NanoSeconds(310), [&ep]() {
+            ep = nullptr;
+        });
+
+        // Run well past the backlog callback time (~7.2 s at 64 B /
+        // (0.1 * 1000 B/s)); the pre-fix lambda dereferenced freed memory
+        // here (valgrind: Invalid read of size 8 at fabric-endpoint.cc).
+        Simulator::Stop(Seconds(10));
+        Simulator::Run();
+        // Reaching this line without a crash is the assertion.
+        Simulator::Destroy();
+    }
+};
+
 // (1b-3) LLR retry timers must not start while the pacer still holds the
 // packet. Codex round 12, finding 4: StorePacket armed the timeout at
 // ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
@@ -6999,6 +7065,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnDisposeCancelsTimersTest, TestCase::Duration::QUICK);
     AddTestCase(new EgressDisposeCancelsDeferredSendsTest, TestCase::Duration::QUICK);
+    AddTestCase(new EgressDisposeCancelsBacklogCallbacksTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

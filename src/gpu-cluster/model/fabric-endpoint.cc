@@ -2729,11 +2729,15 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                         ArmRetryTimeoutOnWire(packet);
                         dev->Send(packet, dest, 0x0800);
                     }));
-                // Decrement backlog after packet finishes transmission (serialization)
+                // Decrement backlog after packet finishes transmission
+                // (serialization). Tracked like the deferred send itself:
+                // the lambda captures raw `this`, so DoDispose must cancel
+                // it or it fires on freed memory (codex round 14, finding 1).
                 Time txDone = totalDelay + serialization;
-                Simulator::Schedule(txDone, [this, tc]() {
-                    m_contentionModel->DecrementBacklog(tc);
-                });
+                m_deferredEgressEvents.push_back(
+                    Simulator::Schedule(txDone, [this, tc]() {
+                        m_contentionModel->DecrementBacklog(tc);
+                    }));
                 return;
             }
         }
@@ -2752,13 +2756,16 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                     ArmRetryTimeoutOnWire(packet);
                     device->Send(packet, dest, 0x0800);
                 }));
-            // Decrement backlog after serialization
+            // Decrement backlog after serialization. Tracked for DoDispose
+            // like the deferred send above (raw-`this` capture; codex round
+            // 14, finding 1).
             if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
             {
                 Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-                Simulator::Schedule(delay + serialization, [this, tc]() {
-                    m_contentionModel->DecrementBacklog(tc);
-                });
+                m_deferredEgressEvents.push_back(
+                    Simulator::Schedule(delay + serialization, [this, tc]() {
+                        m_contentionModel->DecrementBacklog(tc);
+                    }));
             }
             return;
         }
@@ -2784,10 +2791,13 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     }
     if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
     {
+        // Tracked for DoDispose like the deferred sends above (raw-`this`
+        // capture; codex round 14, finding 1).
         Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-        Simulator::Schedule(shapingDelay + serialization, [this, tc]() {
-            m_contentionModel->DecrementBacklog(tc);
-        });
+        m_deferredEgressEvents.push_back(
+            Simulator::Schedule(shapingDelay + serialization, [this, tc]() {
+                m_contentionModel->DecrementBacklog(tc);
+            }));
     }
 }
 

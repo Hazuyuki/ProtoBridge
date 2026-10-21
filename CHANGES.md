@@ -6,6 +6,21 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — endpoint Dispose cancels the WFQ backlog-decrement callbacks
+
+The three `DecrementBacklog` schedules in `SendPacketOnDevice` (WFQ
+service-time branch, FEC-only branch, and the immediate-send tail) captured
+raw `this` but were not tracked in `m_deferredEgressEvents`, so
+`DoDispose` cancelled the deferred sends while their backlog callbacks
+survived — after the endpoint was freed, the callback dereferenced
+`m_contentionModel` on freed memory (codex round 14, finding 1; valgrind:
+Invalid read of size 8 at the `m_contentionModel->DecrementBacklog` line
+with FEC + a contention model and one paced packet). All three sites now
+push their EventId into `m_deferredEgressEvents`, so Dispose cancels them
+with the deferred sends. Regression test
+`EgressDisposeCancelsBacklogCallbacksTest` disposes and frees a paced
+FEC+WFQ endpoint and runs past the backlog callback time.
+
 ### Fixed — NVLS retry-buffer sizing counts the collective spray fragments
 
 `required_retry_buffer_entries` sized the LLR fast-copy store with the
