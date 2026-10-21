@@ -115,6 +115,17 @@ class CreditManager : public Object
     void SetCreditAvailableCallback(CreditAvailableCallback cb);
 
     /**
+     * @brief Detach the credit-available callback from its endpoint owner.
+     *
+     * Called by FabricEndpoint::DoDispose: the manager can outlive the
+     * endpoint when an external holder keeps the (attribute-supplied)
+     * reference, and its m_creditAvailableCallback then still points at
+     * the freed endpoint — a ReturnCredits after endpoint disposal fires
+     * OnCreditAvailable into freed memory (codex round 18, finding 1).
+     */
+    void DetachFromEndpoint();
+
+    /**
      * @brief Traced callback for credit changes
      */
     typedef TracedCallback<uint8_t, uint32_t, uint32_t> CreditChangeTracedCallback;

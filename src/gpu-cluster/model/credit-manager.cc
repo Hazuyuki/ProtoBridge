@@ -214,4 +214,11 @@ CreditManager::SetCreditAvailableCallback(CreditAvailableCallback cb)
     m_creditAvailableCallback = cb;
 }
 
+void
+CreditManager::DetachFromEndpoint()
+{
+    NS_LOG_FUNCTION(this);
+    m_creditAvailableCallback = MakeNullCallback<void, uint8_t>();
+}
+
 } // namespace ns3

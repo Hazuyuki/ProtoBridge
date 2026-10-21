@@ -237,6 +237,15 @@ FabricEndpoint::DoDispose()
         }
     }
     m_devices.clear();
+    // The credit manager can outlive this endpoint when an external holder
+    // kept the (attribute-supplied) reference; its credit-available
+    // callback holds this endpoint's raw `this`, and a ReturnCredits after
+    // disposal fired OnCreditAvailable into freed memory (valgrind-confirmed
+    // invalid reads in TrySendQueuedPackets — codex round 18, finding 1).
+    if (m_creditManager)
+    {
+        m_creditManager->DetachFromEndpoint();
+    }
     m_creditManager = nullptr;
     m_payloadBuilder = nullptr;
     m_protocolModel = nullptr;
