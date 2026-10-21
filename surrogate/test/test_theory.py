@@ -917,6 +917,44 @@ def test_spray_fragments_single_link_single_packet():
     assert huge[0] > 1
 
 
+def test_spray_fragments_large_transfer_coalescing():
+    """Above the 512-MiB COALESCE_THRESHOLD, SendCollectiveBulk caps the
+    event count by coalescing into ~8-MiB path-balanced chunks:
+    numChunks = max(lanes, min(sizeBased, ceil(ceil(wire/8MiB)/lanes)*lanes))
+    — 2 GPUs / 2 GiB AllGather uploads 144 fragments of ~7.46 MiB, not
+    8,192 x 128 KiB (codex round 14, finding 2). The un-coalesced count
+    modeled ~57x too many fragments, predicting 0.000582 permanent losses
+    at BER 1e-8 / 3 retries (finite strict completion) where ns-3 emits
+    the coarser fragments and reports the collective incomplete with 13
+    permanent losses."""
+    nvls = wb.make_h200_nvls_theory()
+    upload = 2 * 1024**3 // 2  # 1 GiB per-rank upload
+    frags, frag_bytes = nvls._spray_fragments(upload)
+    assert frags == 144
+    assert frag_bytes == math.ceil(upload / 144)
+    # At the C++ geometry the 7.46-MiB fragment fails with p ~ 1 per
+    # attempt at BER 1e-8, so the collective is incompletable and strict
+    # must reject — not accept at 64,920 us like the 8,192-fragment count.
+    losses = nvls.expected_permanent_losses(
+        2 * 1024**3, 2, "nvls", 1e-8, 3,
+        optical_fraction=1.0, optical_hops=1, collective="allgather")
+    assert losses > 1.0
+    t = nvls.predict(2 * 1024**3, 2, "nvls", 128, ber=1e-8, retry_limit=3,
+                     strict_reliability=True, collective="allgather",
+                     llr_enabled=True)
+    assert not math.isfinite(t)
+    # Retry-buffer sizing inherits the coalesced fragment count.
+    assert nvls.required_retry_buffer_entries(
+        2 * 1024**3, 2, "nvls", collective="allgather") == 144
+    # Below the thresholds nothing changes: the single-link gate uses the
+    # 500-MiB OVERFLOW_THRESHOLD_COLLECTIVE and coalescing the separate
+    # 512-MiB COALESCE_THRESHOLD, so 499 MiB sprays, 511 MiB (>500) with
+    # 18 lanes coalesces to 72, and 64 MiB keeps the 128-KiB grid.
+    assert nvls._spray_fragments(499 * 1024 * 1024)[0] == 3992
+    assert nvls._spray_fragments(511 * 1024 * 1024)[0] == 72
+    assert nvls._spray_fragments(64 * 1024 * 1024)[0] == 512
+
+
 def test_nvls_retry_buffer_counts_spray_fragments():
     """NVLS retry-buffer sizing must count SendCollectiveBulk's sprayed
     fragments of the endpoint's OWN upload (D for allreduce, D/N for

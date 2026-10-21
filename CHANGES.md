@@ -6,6 +6,23 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — collective spray models the large-transfer coalescing branch
+
+`_spray_fragments` fragmented every multi-lane transfer on the 128-KiB
+spray grid, but above the 512-MiB `COALESCE_THRESHOLD` the C++ caps the
+event count by coalescing into ~8-MiB path-balanced chunks
+(`numChunks = max(lanes, min(sizeBased, ceil(ceil(wire/8 MiB)/lanes)·lanes))`)
+— a 2-GPU / 2-GiB AllGather uploads 144 fragments of ~7.46 MiB, not
+8,192 × 128 KiB (codex round 14, finding 2). The un-coalesced count
+understated each fragment's failure probability by ~57×: 0.000582
+predicted permanent losses at BER 1e-8 / 3 retries accepted a strict
+completion ns-3 rejects with 13 permanent losses. The helper now applies
+the coalescing branch above the threshold (35.2 expected losses, strict
+rejected); NVLS expected-loss and retry-buffer sizing inherit it. A
+regression test pins the 144-fragment geometry, the strict rejection,
+and the threshold boundaries (500-MiB single-link gate vs the separate
+512-MiB coalescing gate).
+
 ### Fixed — endpoint Dispose cancels the WFQ backlog-decrement callbacks
 
 The three `DecrementBacklog` schedules in `SendPacketOnDevice` (WFQ

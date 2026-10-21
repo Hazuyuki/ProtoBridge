@@ -490,12 +490,30 @@ class TheoryDerivedSurrogate:
         if data_bytes <= 0:
             return 1, 1
         overflow_threshold_collective = 500 * 1024 * 1024
+        max_chunk_bytes = 8 * 1024 * 1024
+        min_chunks = max(1, self.num_lanes)
         if self.num_lanes <= 1 and data_bytes <= overflow_threshold_collective:
             # Single-link (or single-QP) fabric below the overflow
             # threshold: one packet carries the entire transfer.
             return 1, math.ceil(data_bytes)
-        num_chunks = max(self.num_lanes,
+        num_chunks = max(min_chunks,
                          math.ceil(data_bytes / self.spray_chunk_bytes))
+        # Large-transfer coalescing (codex round 14, finding 2): above
+        # 512 MiB the C++ caps the event count by coalescing into
+        # ~8 MiB path-balanced chunks — coalesced = ceil(wire/8 MiB),
+        # pathBalanced = ceil(coalesced/minChunks) * minChunks,
+        # numChunks = max(minChunks, min(sizeBased, pathBalanced)). A
+        # 2-GPU / 2-GiB AllGather uploads 144 fragments of ~7.46 MiB,
+        # NOT 8,192 x 128 KiB — the un-coalesced helper modeled ~57x too
+        # many fragments (0.000582 predicted permanent losses at BER
+        # 1e-8 / 3 retries, accepting a strict completion ns-3 rejects
+        # with 13 permanent losses).
+        if data_bytes > overflow_threshold_collective:
+            coalesced = math.ceil(data_bytes / max_chunk_bytes)
+            if coalesced > min_chunks:
+                path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
+                num_chunks = max(min_chunks,
+                                 min(num_chunks, path_balanced))
         frag_bytes = math.ceil(data_bytes / num_chunks)
         return num_chunks, frag_bytes
 
