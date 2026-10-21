@@ -412,13 +412,34 @@ RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step) const
 uint64_t
 RingAllReduce::SegmentSizeOf(uint16_t gpu, uint32_t step) const
 {
-    // Which segment the GPU holds at this step: each step moves the segment
-    // ownership one rank backwards around the ring (RS clockwise sends,
-    // AG counterclockwise sends), so at step s rank g holds segment
-    // (g - s) mod N. The base size is uniform with the first
-    // dataSize % numGpus segments one byte larger.
+    // Which segment the GPU holds at this step. Reduce-Scatter sends run
+    // clockwise (to ring next): ownership of chunk c sits at rank
+    // (c + s) mod N, so rank g holds chunk (g - s) mod N. The AllGather
+    // phase REVERSES the send direction (counterclockwise, to ring prev),
+    // so ownership keeps rotating in the SAME physical direction the bytes
+    // flow: continuing (g - s) mod N across the reversal let the index
+    // drift backwards and chunks changed size as they traveled (codex
+    // round 14, finding 4: at 4 GPUs / 259 B, rank 1 received a 64-B
+    // chunk at step 3 and forwarded 65 B at step 4). From the first AG
+    // step s0 = N-1 the offset advances +1 per step instead:
+    // idx = (g + s - 2(N-1)) mod N, which preserves the chunk invariant —
+    // a rank forwards at step s+1 exactly the chunk it received at step s.
+    // That expression simplifies algebraically to (g + s + 2) mod N; the
+    // simplified form is what gets evaluated because the direct one wraps
+    // in unsigned arithmetic (s - 2(N-1) is negative throughout AG, and
+    // 2^32 mod N != 0 for N = 3 or 5, which silently shifted the index).
+    // The base size is uniform with the first dataSize % numGpus segments
+    // one byte larger.
     const uint32_t n = m_numGpus;
-    const uint32_t idx = (gpu + n - (step % n)) % n;
+    uint32_t idx;
+    if (step < n - 1)
+    {
+        idx = (gpu + n - (step % n)) % n;
+    }
+    else
+    {
+        idx = (gpu + step + 2) % n;
+    }
     return m_segmentSize + (idx < m_segmentRemainder ? 1 : 0);
 }
 

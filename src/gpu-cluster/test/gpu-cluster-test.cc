@@ -6405,6 +6405,83 @@ class RingAllReduceLossyWireLedgerTest : public TestCase
     }
 };
 
+// Chunk identity must rotate consistently across the AllGather direction
+// reversal. Codex round 14, finding 4: SegmentSizeOf kept decrementing the
+// ownership offset (g - s) mod N after the ring reversed at the
+// RS/AG boundary, so a rank's receive/forward segment sizes disagreed in
+// AG steps — at 4 GPUs / 259 B, rank 1 received 64 effective bytes at step 3
+// but "forwarded" 65 at step 4. The invariant a real ring keeps: at every
+// step s, a rank transmits at s+1 exactly the chunk it received at s, i.e.
+// for all g, s: SegmentSizeOf(sendTarget(g, s), s + 1) == SegmentSizeOf(g, s).
+// This test reads the rotation directly through the probe wrappers —
+// independent of simulator plumbing — over N in {2,3,4,5,8} and the codex
+// geometry (4 GPUs / 259 B).
+class RingAllReduceChunkRotationTest : public TestCase
+{
+  public:
+    RingAllReduceChunkRotationTest()
+        : TestCase("RingAllReduce chunk identity is consistent across AG reversal") {}
+    void DoRun() override
+    {
+        ObjectFactory protoFactory("ns3::NcclProtocolModel");
+        Ptr<ProtocolModel> protoModel = protoFactory.Create<ProtocolModel>();
+        protoModel->SetForceProtocolId(static_cast<uint8_t>(3)); // SIMPLE
+        // Initialize() reads endpoints[0]'s protocol model; a single bare
+        // endpoint suffices — nothing is ever sent on this path.
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetProtocolModel(protoModel);
+
+        for (uint16_t numGpus : {2, 3, 4, 5, 8})
+        {
+            const uint64_t dataSize = 100 * numGpus + 7; // uneven remainder
+            Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
+                               BooleanValue(false));
+            Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+            ring->Initialize(numGpus, dataSize, {ep});
+            const uint32_t totalSteps = 2 * (numGpus - 1);
+            for (uint32_t step = 0; step + 1 < totalSteps; ++step)
+            {
+                for (uint16_t gpu = 0; gpu < numGpus; ++gpu)
+                {
+                    const uint64_t sent = ring->ProbeSegmentSizeOf(gpu, step);
+                    const uint16_t target = ring->ProbeSendTarget(gpu, step);
+                    const uint64_t forwarded =
+                        ring->ProbeSegmentSizeOf(target, step + 1);
+                    std::ostringstream oss;
+                    oss << "N=" << numGpus << " gpu=" << gpu
+                        << " step=" << step << ": rank " << gpu << " sends "
+                        << sent << " B but target rank " << target
+                        << " forwards " << forwarded
+                        << " B — chunk identity must survive the step";
+                    NS_TEST_ASSERT_MSG_EQ(forwarded, sent, oss.str());
+                }
+            }
+        }
+
+        // Codex repro geometry: 4 GPUs / 259 B. Old formula had rank 1
+        // receiving 64 B at step 3 (RS boundary) and forwarding 65 B at
+        // step 4 (first AG step).
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
+                           BooleanValue(false));
+        Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+        ring->Initialize(4, /*dataSize=*/259, {ep});
+        const uint32_t totalSteps = 2 * (4 - 1);
+        uint64_t totalGrid = 0;
+        for (uint32_t step = 0; step < totalSteps; ++step)
+        {
+            for (uint16_t gpu = 0; gpu < 4; ++gpu)
+            {
+                totalGrid += ring->ProbeSegmentSizeOf(gpu, step);
+            }
+        }
+        NS_TEST_ASSERT_MSG_EQ(totalGrid, 2 * (4 - 1) * 259u,
+            "the full step grid must still sum to 2(N-1)*D");
+        Simulator::Destroy();
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -7193,6 +7270,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new NcclRingChunkCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceSegmentCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceLossyWireLedgerTest, TestCase::Duration::QUICK);
+    AddTestCase(new RingAllReduceChunkRotationTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);

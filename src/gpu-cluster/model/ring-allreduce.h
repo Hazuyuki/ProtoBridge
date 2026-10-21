@@ -59,6 +59,19 @@ public:
     /// Cumulative effective bytes the wire path sent (coverage probe).
     uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
 
+    /// Test probe: SegmentSizeOf (public wrapper — the chunk-identity
+    /// invariant tests read it without simulating a full collective).
+    uint64_t ProbeSegmentSizeOf(uint16_t gpu, uint32_t step) const
+    {
+        return SegmentSizeOf(gpu, step);
+    }
+
+    /// Test probe: GetSendTarget (public wrapper for the same tests).
+    uint16_t ProbeSendTarget(uint16_t gpu, uint32_t step) const
+    {
+        return GetSendTarget(gpu, step);
+    }
+
 private:
     void DoDispose() override;
     void SetupReceiveCallbacks();
@@ -73,8 +86,10 @@ private:
     void CheckGlobalCompletion();
     uint16_t GetSendTarget(uint16_t gpu, uint32_t step) const;
     // Segment size (in bytes) that `gpu` transmits at `step`: ownership of
-    // segment (g - s) mod N, with the first dataSize % numGpus segments one
-    // byte larger so the grid sums to exactly dataSize.
+    // segment (g - s) mod N in Reduce-Scatter and (g + s - 2(N-1)) mod N in
+    // AllGather (the direction reversal), with the first
+    // dataSize % numGpus segments one byte larger so the grid sums to
+    // exactly dataSize.
     uint64_t SegmentSizeOf(uint16_t gpu, uint32_t step) const;
     /// Bytes destRank must receive at `step` (the sender's segment size —
     /// the GPU whose step-`step` send targets destRank).

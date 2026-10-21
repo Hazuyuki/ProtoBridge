@@ -6,6 +6,31 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — RingAllReduce AG chunk identity after the direction reversal
+
+`SegmentSizeOf` computed the segment a rank holds with
+`(gpu − step) mod N` in BOTH phases. That rotation is only correct while
+bytes flow clockwise in Reduce-Scatter; the AllGather phase reverses the
+send direction (counterclockwise, to ring prev), and the offset must
+ADVANCE +1 per step from the first AG step instead of continuing to
+decrement — otherwise a rank's receive/forward sizes disagree: at
+4 GPU / 259 B, rank 1 received a 64-B chunk at step 3 but forwarded
+65 B at step 4 (codex round 14, finding 4). Correct AG rotation:
+`idx = (gpu + step + 2) mod N` (algebraically `(g + s − 2(N−1)) mod N`;
+the simplified form is evaluated directly because the subtraction wraps
+in unsigned arithmetic — `s − 2(N−1)` is negative throughout AG and
+`2^32 mod N ≠ 0` for N = 3 or 5, which silently shifted the index at
+those ranks; the direct translation of the math only coincided with the
+truth at N ∈ {2, 4, 8}). New regression `RingAllReduceChunkRotationTest`
+asserts the chunk invariant — at every step s, a rank transmits at s+1
+exactly the chunk it received at s, `SegmentSizeOf(sendTarget(g, s),
+s+1) == SegmentSizeOf(g, s)` — over N ∈ {2, 3, 4, 5, 8} plus the codex
+259-B geometry and the 2(N−1)·D aggregate; it is exactly the test that
+caught the unsigned-wrap translation bug. Probe wrappers
+`ProbeSegmentSizeOf`/`ProbeSendTarget` expose the rotation to tests
+without simulating a collective. EXTENSIVE 81 PASS; the 90-B coverage
+pin and So-GBN/lossy/fullmesh parity pins unchanged.
+
 ### Fixed — RingAllReduce wire receive ledger is keyed per sender step
 
 The wire path accumulated received bytes in a single per-destination
