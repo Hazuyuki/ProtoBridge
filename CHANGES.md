@@ -6,6 +6,22 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — p2p-single.cfg documents the actual send path
+
+The cfg header claimed `kind = P2P` "exercises
+`FabricEndpoint::SendP2p` -- the raw single-packet send path", but the
+generic runner routes every SEND_DATA/SEND_P2P action through
+`SendBulkWireTransferSize` (protocol-config-runner.cc `OnAction`) with
+NCCL protocol framing auto-selected from effectiveBytes — at
+`--dataSize=64` the LL framing logs `wireSize=128 efficiency=0.5
+protocol=1` (codex round 17, finding 8). The comment also pointed RoCE
+P2P users at an unwired "follow-up" while `p2p-roce.cfg` already runs
+the inter-node path. Doc-only fix: the header now names the real send
+path and framing behavior and refers RoCE P2P to `p2p-roce.cfg`
+(`SendP2p` remains the background-P2P traffic path). Run behavior is
+unchanged (65536 B switched run: complete, LL128 framing 70016 wire
+bytes at efficiency 0.9375).
+
 ### Fixed — AllToAll chunk grid covers the full data size
 
 `AlltoAllInjector` sized every peer transfer with a uniform
