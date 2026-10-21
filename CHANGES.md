@@ -6,6 +6,22 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — fullmesh reduce-scatter sizes contributions by destination chunk
+
+The FullMeshAllReduce reduce-scatter phase sized each contribution with
+the sender's chunk, but destination `dest` reduces its own chunk: every
+source must send its copy of chunk `dest`, so the per-destination RS
+load is `(N-1)*ChunkSizeOf(dest)`. For the 15-B `[4,4,4,3]` grid the
+correct per-rank load is `[12,12,12,9]`; the old code delivered
+`[11,11,11,12]` — whole-collective traffic still totaled 90 B, so the
+coverage test passed while per-rank load and timing were wrong (codex
+round 16, finding 6). The RS send site now sizes by `ChunkSizeOf(dest)`,
+the RS completion threshold is `(N-1)*ChunkSizeOf(dest)` (the AllGather
+threshold `dataSize - own chunk` is unchanged), and a
+`m_rsReceivedBytes` ledger persists across the phase switch.
+`FullMeshReduceScatterPerDestLoadTest` pins the per-destination load and
+fails on the pre-fix build.
+
 ### Fixed — standalone fullmesh AllGather/ReduceScatter grids cover the full data size
 
 The standalone fullmesh AllGather and ReduceScatter injectors still used

@@ -104,6 +104,7 @@ FullMeshAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     }
 
     m_gpuReceivedBytes.resize(numGpus, 0);
+    m_rsReceivedBytes.resize(numGpus, 0);
     m_gpuSrcDoneCount.resize(numGpus, 0);
     m_reduceScatterDoneCount = 0;
     m_allGatherDoneCount = 0;
@@ -204,13 +205,17 @@ FullMeshAllReduce::TriggerReduceScatterPhase()
                 continue;  // Skip self
             }
 
-            // GPU gpu sends chunk gpu to dest GPU (each GPU gets chunk from each source)
-            const uint64_t chunkBytes = ChunkSizeOf(gpu);
+            // Reduce-scatter: destination dest reduces its OWN chunk, so
+            // every source sends ITS copy of chunk dest. Sizing by the
+            // sender's chunk instead skewed per-rank load: grid [4,4,4,3]
+            // delivered [11,11,11,12] bytes instead of [12,12,12,9]
+            // (codex round 16, finding 6).
+            const uint64_t chunkBytes = ChunkSizeOf(dest);
             m_sentDataBytes += chunkBytes;
             m_endpoints[gpu]->SendBulkWireTransferSize(
                 dest, chunkBytes, m_protocolId, m_flowId, 0);
 
-            NS_LOG_DEBUG("RS: GPU " << gpu << " sending chunk " << gpu
+            NS_LOG_DEBUG("RS: GPU " << gpu << " sending chunk " << dest
                          << " to GPU " << dest << " size=" << chunkBytes);
         }
     }
@@ -273,6 +278,10 @@ FullMeshAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fabric
     }
 
     m_gpuReceivedBytes[destRank] += effectiveSize;
+    if (m_state == FullMeshArState::REDUCE_SCATTER)
+    {
+        m_rsReceivedBytes[destRank] += effectiveSize;
+    }
 
     NS_LOG_DEBUG("Packet: src=" << srcRank << " -> dest=" << destRank
                  << " effectiveSize=" << effectiveSize
@@ -292,11 +301,14 @@ FullMeshAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fabric
 void
 FullMeshAllReduce::CheckReduceScatterComplete()
 {
-    // Each GPU receives the chunks of the other N-1 sources: the grid
-    // total minus its own chunk.
+    // Reduce-scatter: each destination receives the other N-1 sources'
+    // copies of its OWN chunk — (N-1)*ChunkSizeOf(dest), not the grid
+    // total minus its chunk (that is the AllGather threshold; conflating
+    // the two is what skewed per-rank load, codex round 16, finding 6).
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
-        const uint64_t expectedTotal = ExpectedBytesPerDest(gpu);
+        const uint64_t expectedTotal =
+            static_cast<uint64_t>(m_numGpus - 1) * ChunkSizeOf(gpu);
         if (m_gpuSrcDoneCount[gpu] == 0 && m_gpuReceivedBytes[gpu] >= expectedTotal)
         {
             m_gpuSrcDoneCount[gpu] = m_numGpus - 1;

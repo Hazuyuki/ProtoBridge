@@ -5262,6 +5262,86 @@ class FullMeshDegenerateGridTest : public TestCase
     }
 };
 
+// (codex round 16, finding 6) Reduce-scatter sized contributions by the
+// sender's chunk instead of the destination's chunk. Destination dest
+// reduces its OWN chunk, so every source sends its copy of chunk dest and
+// dest receives (N-1)*ChunkSizeOf(dest). For the [4,4,4,3] grid the correct
+// per-rank RS load is [12,12,12,9]; the pre-fix code delivered
+// [11,11,11,12] (whole-collective totals matched, so the coverage test
+// passed while per-rank load and timing were wrong).
+class FullMeshReduceScatterPerDestLoadTest : public TestCase
+{
+  public:
+    FullMeshReduceScatterPerDestLoadTest()
+        : TestCase("fullmesh RS sizes contributions by destination chunk") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 15; // grid [4,4,4,3]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<FullMeshAllReduce> inj = CreateObject<FullMeshAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 15-B allreduce must complete");
+
+        // RS phase: each destination receives (N-1) copies of its OWN chunk.
+        const uint64_t grid[4] = {4, 4, 4, 3};
+        for (uint16_t dest = 0; dest < numGpus; ++dest)
+        {
+            const uint64_t expected = 3 * grid[dest]; // [12,12,12,9]
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeRsExpectedBytes(dest), expected,
+                "RS threshold must be (N-1)*own chunk");
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeRsReceivedBytes(dest), expected,
+                "RS per-destination load must be (N-1)*own chunk "
+                "(the pre-fix code delivered the sender's chunk instead)");
+        }
+        // Whole-collective traffic is unchanged: 2(N-1)*D = 90.
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 90,
+            "RS re-chunking must not change whole-collective traffic");
+        Simulator::Destroy();
+    }
+};
+
 // (codex round 16, finding 3) The injector startup event survives disposal.
 // Start() schedules the first phase with raw `this`; DoDispose must cancel
 // it (via the CollectiveInjector::m_pendingEvents discipline), otherwise a
@@ -8067,6 +8147,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new DeviceCallbackDetachAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new InjectorStartupEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new FullMeshDegenerateGridTest, TestCase::Duration::QUICK);
+    AddTestCase(new FullMeshReduceScatterPerDestLoadTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
