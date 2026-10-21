@@ -6,6 +6,25 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NvSwitch disposal cancels deferred result multicasts
+
+The switch scheduled its deferred collective-result multicasts —
+`MulticastAllReducePartition` (pipelined path), `MulticastAllReduceResult`
+(legacy single multicast), `MulticastAllGatherResult`, and the FEC-coding
+egress hold in `SendMulticastResultOnPort` — as bound member calls on raw
+`this`, while `DoDispose()` cancelled only the arbitration event.
+Completing a 64-B aggregation with a 100-µs aggregation delay, then
+disposing and releasing the switch at 1 µs, let `MulticastAllReduceResult`
+fire into freed memory — valgrind-confirmed UAF at nvswitch.cc:1203 (the
+cleared `m_allReduceBuffer`), SIGSEGV outside valgrind (codex round 15,
+finding 2; git-stash round-trip reproduced the pre-fix invalid reads).
+The four Schedule sites now push their EventIds into a new
+`m_deferredResultEvents` vector that `DoDispose()` cancels before clearing
+any state. New regression `SwitchDisposeCancelsResultMulticastsTest`
+(drives the aggregation via the inject seam, disposes mid-delay, drops the
+last reference, runs past the deadline); the standalone valgrind harness
+is clean post-fix. EXTENSIVE 83 PASS.
+
 ### Fixed — FEC receive continuation is cancelled by endpoint disposal
 
 `ReceiveFromDevice` deferred the rest of receive processing through the

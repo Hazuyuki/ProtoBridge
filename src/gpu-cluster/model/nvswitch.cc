@@ -122,6 +122,19 @@ void
 NvSwitch::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    // Cancel every pending deferred-result event: each targets raw `this`
+    // (bound member call or lambda capture) and dereferences the buffers and
+    // ports cleared below — a survivor fired after disposal crashed in
+    // MulticastAllReduceResult (codex round 15, finding 2, valgrind-confirmed
+    // UAF/SIGSEGV after disposing the switch mid-aggregation-delay).
+    for (const EventId& ev : m_deferredResultEvents)
+    {
+        if (!ev.IsExpired())
+        {
+            Simulator::Cancel(ev);
+        }
+    }
+    m_deferredResultEvents.clear();
     m_ports.clear();
     m_voqs.clear();
     m_portDegradationModels.clear();
@@ -1156,10 +1169,11 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
                 (thisPartitionSize * ratioRemainder +
                  receivedEffectiveBytes - 1) /
                     receivedEffectiveBytes;
-            Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
-                                &NvSwitch::MulticastAllReducePartition, this,
-                                flowId, k, thisPartitionSize, wirePartitionSize,
-                                numPartitions);
+            m_deferredResultEvents.push_back(
+                Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+                                    &NvSwitch::MulticastAllReducePartition, this,
+                                    flowId, k, thisPartitionSize, wirePartitionSize,
+                                    numPartitions));
         }
 
         m_allReduceCompletedPartitions[flowId] = currentCompleted;
@@ -1188,9 +1202,10 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
 
         if (allComplete)
         {
-            Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
-                                &NvSwitch::MulticastAllReduceResult, this,
-                                flowId, sourceCount);
+            m_deferredResultEvents.push_back(
+                Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+                                    &NvSwitch::MulticastAllReduceResult, this,
+                                    flowId, sourceCount));
         }
     }
 }
@@ -1601,9 +1616,10 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
 
     if (allComplete)
     {
-        Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
-                            &NvSwitch::MulticastAllGatherResult, this,
-                            flowId, sourceCount);
+        m_deferredResultEvents.push_back(
+            Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+                                &NvSwitch::MulticastAllGatherResult, this,
+                                flowId, sourceCount));
     }
 }
 
@@ -1753,12 +1769,13 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
 
     if (codingLatency > Seconds(0))
     {
-        Simulator::Schedule(codingLatency, [this, portIdx, pkt]() {
-            if (portIdx < m_ports.size() && m_ports[portIdx])
-            {
-                m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
-            }
-        });
+        m_deferredResultEvents.push_back(
+            Simulator::Schedule(codingLatency, [this, portIdx, pkt]() {
+                if (portIdx < m_ports.size() && m_ports[portIdx])
+                {
+                    m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+                }
+            }));
     }
     else
     {

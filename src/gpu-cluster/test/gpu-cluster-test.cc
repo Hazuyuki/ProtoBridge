@@ -5945,6 +5945,60 @@ NS_OBJECT_ENSURE_REGISTERED(NvSwitchAggHarness);
 // rank 1 sends 64 B. Only 96 unique bytes exist, yet the switch declared the
 // flow complete and multicasted a 128 B result. The dedup gate must leave
 // rank 0's ledger at 32 B so the flow stays incomplete.
+// Switch DoDispose must cancel the deferred collective-result multicasts.
+// Codex round 15, finding 2: ProcessAllReduce scheduled
+// MulticastAllReduceResult (and the partition/allgather variants, plus the
+// FEC-coding egress hold) with raw `this` while DoDispose cancelled only the
+// arbitration event — completing a 64-B aggregation with a 100-µs
+// aggregation delay, then disposing and releasing the switch at 1 µs,
+// produced a valgrind-confirmed UAF/SIGSEGV in MulticastAllReduceResult
+// (nvswitch.cc:1203, the cleared m_allReduceBuffer). Regression: drive the
+// aggregation to completion via the inject seam, dispose mid-delay, drop the
+// last reference, and run past the multicast deadline.
+class SwitchDisposeCancelsResultMulticastsTest : public TestCase
+{
+  public:
+    SwitchDisposeCancelsResultMulticastsTest()
+        : TestCase("switch Dispose cancels deferred result multicasts") {}
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(1));
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        sw->SetAllReduceDataSize(64);
+        sw->SetAllReduceAggregationDelay(100000); // 100 µs
+
+        // Two contributors of the full 64 B each: the aggregation completes
+        // and MulticastAllReduceResult is deferred by the 100-µs delay.
+        Simulator::Schedule(NanoSeconds(100), [sw]() {
+            sw->InjectAggregateUpload(1, 0, 0, 64, false);
+            sw->InjectAggregateUpload(1, 1, 0, 64, false);
+        });
+        Simulator::Schedule(NanoSeconds(1000), [sw]() {
+            sw->Dispose();
+        });
+        // Drop the last strong reference; the pre-fix multicast held only
+        // raw `this` and dereferenced freed state at the delay deadline.
+        Simulator::Schedule(NanoSeconds(1100), [&sw]() {
+            sw = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(300)); // past the 100.1-µs deadline
+        Simulator::Run();
+        // Reaching this line without a crash is the assertion.
+        Simulator::Destroy();
+    }
+};
+
 class SharpUploadDedupTest : public TestCase
 {
   public:
@@ -7339,6 +7393,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SharpAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new NvlsAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new SharpUploadDedupTest, TestCase::Duration::QUICK);
+    AddTestCase(new SwitchDisposeCancelsResultMulticastsTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpUploadDedupSurvivesResultTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastResultFecExpansionTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclRingChunkCoverageTest, TestCase::Duration::QUICK);

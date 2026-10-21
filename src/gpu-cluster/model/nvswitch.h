@@ -519,6 +519,11 @@ class NvSwitch : public FabricSwitch
     uint32_t m_currentArbitrationPort;              ///< Current port for RR arbitration
     std::vector<Time> m_outputBusyUntil;            ///< Per-port egress busy time (serialization)
     Ptr<Arbiter> m_arbiter;                         ///< Crossbar arbitration strategy (default: RoundRobinArbiter)
+    /// Deferred collective-result multicasts (aggregation delay + FEC-coding
+    /// egress holds). Each callback targets raw `this` (bound member call or
+    /// lambda capture) and dereferences state DoDispose clears, so DoDispose
+    /// must cancel whatever is still pending (codex round 15, finding 2).
+    std::vector<EventId> m_deferredResultEvents;
 
     /**
      * @brief Process All-Gather packets (NVLS concatenation + multicast)
