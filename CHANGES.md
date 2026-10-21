@@ -6,6 +6,23 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — zero-sized bulk transfers skip the fragment math (SIGFPE)
+
+The degenerate sub-GPU-count chunk grid (round 16, finding 4) gives the
+ranks past `dataSize` a zero chunk. A zero-byte bulk transfer still
+entered `SendBulkWireTransferSize`'s fragmentation path, where LL
+framing of 0 bytes yields `wireSize = 0`, `numChunks` collapses to 1,
+`wireChunkSize = 0`, and `sentChunks` divides by it — SIGFPE on any
+multi-lane fabric (`--numGpus=4 --dataSize=3 --numLanes=18` crashed
+fullmesh AllReduce, AllGather, and ReduceScatter; gdb backtrace at
+fabric-endpoint.cc:3074 with `dataSize=0`, codex round 17, finding 1).
+A zero-byte transfer now returns early: nothing to send, nothing to
+retry, nothing to ledger. A direct probe (multi-device endpoint +
+`SendBulkWireTransferSize(dest, 0, ...)`) crashed with SIGFPE pre-fix
+and survives post-fix; `ZeroChunkBulkTransferTest` pins the API-level
+guard and the degenerate collective's completion on a multi-device
+endpoint.
+
 ### Fixed — surrogate ring AllGather step count is a single ring pass
 
 `_steps(N, 'ring', 'allgather')` returned the AllReduce's `2(N-1)` —

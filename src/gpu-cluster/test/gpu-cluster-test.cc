@@ -5342,6 +5342,94 @@ class FullMeshReduceScatterPerDestLoadTest : public TestCase
     }
 };
 
+// (codex round 17, finding 1) Zero-sized chunks crashed multi-lane fabrics.
+// The degenerate sub-GPU-count grid gives ranks past dataSize a zero chunk;
+// the zero-byte bulk transfer reached the fragment math, where wireSize=0
+// (LL framing of 0 bytes) makes wireChunkSize=0 and sentChunks divides by
+// it — SIGFPE at --numGpus=4 --dataSize=3 --numLanes=18 for all three
+// fullmesh injectors. SendBulkWireTransferSize now returns early on
+// dataSize==0 (nothing to send, nothing to retry).
+class ZeroChunkBulkTransferTest : public TestCase
+{
+  public:
+    ZeroChunkBulkTransferTest()
+        : TestCase("zero-sized fullmesh chunks skip the bulk fragment math") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        // The pre-fix code divided by wireChunkSize==0 (LL framing of 0
+        // bytes is 0 wire bytes; needFragment triggers on devices.size()>1)
+        // and crashed with SIGFPE before any completion check.
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // degenerate grid [1,1,1,0]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            // Two devices on endpoint 3: the multi-device spray path
+            // (needFragment = devices.size() > 1) is what crashed pre-fix.
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            if (r == 3)
+            {
+                NetDeviceContainer extra = p2p.Install(nodes.Get(r), switchNode.Get(0));
+                ep->AddNetDevice(extra.Get(0));
+                sw->AddPort(extra.Get(1));
+                // Route dest 0 through BOTH devices: the multi-device spray
+                // path (needFragment = devices.size() > 1) is the pre-fix
+                // crash site.
+                ep->SetRoutingDevices(0, {0u, 1u});
+            }
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        // Rank 3 owns the zero chunk: its two phases each call
+        // SendBulkWireTransferSize(dest, 0, ...), which must return early
+        // instead of dividing by wireChunkSize == 0. The multi-device
+        // endpoint takes the fragment path (needFragment = devices > 1),
+        // the exact pre-fix crash site.
+        eps[3]->SendBulkWireTransferSize(0, 0, 1, 1, 0);
+
+        // And the whole degenerate collective completes without crashing.
+        Ptr<FullMeshAllReduce> inj = CreateObject<FullMeshAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the degenerate collective must complete on a multi-lane fabric");
+        Simulator::Destroy();
+    }
+};
+
 // (codex round 16, finding 3) The injector startup event survives disposal.
 // Start() schedules the first phase with raw `this`; DoDispose must cancel
 // it (via the CollectiveInjector::m_pendingEvents discipline), otherwise a
@@ -8148,6 +8236,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new InjectorStartupEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new FullMeshDegenerateGridTest, TestCase::Duration::QUICK);
     AddTestCase(new FullMeshReduceScatterPerDestLoadTest, TestCase::Duration::QUICK);
+    AddTestCase(new ZeroChunkBulkTransferTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

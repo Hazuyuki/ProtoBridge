@@ -2985,6 +2985,18 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
 {
     NS_LOG_FUNCTION(this << destRank << dataSize << static_cast<int>(protocolId) << flowId << vcId);
 
+    // A zero-byte transfer carries nothing: emit no packet and no retry-store
+    // entry. Degenerate chunk grids (dataSize < numGpus) legitimately produce
+    // zero-sized chunks on the ranks past dataSize; letting one reach the
+    // fragment math below divided by wireChunkSize == 0 (LL framing of 0
+    // bytes is 0) and crashed with SIGFPE on multi-lane fabrics
+    // (--numGpus=4 --dataSize=3 --numLanes=18, codex round 17, finding 1).
+    if (dataSize == 0)
+    {
+        NS_LOG_DEBUG("Zero-byte bulk transfer to rank " << destRank << ": skipped");
+        return;
+    }
+
     // So payload-builder seam: when a dedicated So builder is mounted (inline
     // runs opting into the RoCE ECN/DCQCN chain via --dcqcn), remote-dest bulk
     // sends use it together with the So protocol model's own protocol id
