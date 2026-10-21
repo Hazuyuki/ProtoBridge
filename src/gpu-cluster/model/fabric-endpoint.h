@@ -382,6 +382,11 @@ class FabricEndpoint : public Application
     void GetReorderBufferStats(uint32_t& totalReorderEvents, uint32_t& maxOccupancy) const;
     uint32_t GetTxPackets() const { return m_txPackets; }
     uint32_t GetRxPackets() const { return m_rxPackets; }
+    /// Cumulative wire bytes transmitted (payload + framing). Coverage
+    /// probe for collective-injector byte-accounting tests.
+    uint64_t GetTxBytes() const { return m_txBytes; }
+    /// Cumulative wire bytes received (payload + framing).
+    uint64_t GetRxBytes() const { return m_rxBytes; }
     uint64_t GetCnpPacketsSent() const { return m_cnpPacketsSent; }
     uint64_t GetCnpPacketsReceived() const { return m_cnpPacketsReceived; }
 

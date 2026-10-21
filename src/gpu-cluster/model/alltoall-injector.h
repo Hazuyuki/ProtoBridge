@@ -57,6 +57,23 @@ public:
     void SetConcurrentMode(bool concurrent);
     void SetTwoDimensionalRouting(uint32_t rows, uint32_t cols);
 
+    /// Test probe: chunk `gpu`'s size in the coverage grid.
+    uint64_t ProbeChunkSizeOf(uint16_t gpu) const
+    {
+        return ChunkSizeOf(gpu);
+    }
+    /// Cumulative payload bytes the injector has sent (coverage probe).
+    uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
+    /// Per-destination received payload bytes (load probe).
+    uint64_t ProbeReceivedBytes(uint16_t destRank) const
+    {
+        return (destRank < m_gpuReceivedBytes.size())
+                   ? m_gpuReceivedBytes[destRank]
+                   : ((destRank < m_gpuStepReceivedBytes.size())
+                          ? m_gpuStepReceivedBytes[destRank]
+                          : 0);
+    }
+
 private:
     void DoDispose() override;
     void SetupReceiveCallbacks();
@@ -72,9 +89,17 @@ private:
     void CheckGlobalCompletion();
     void Complete();
 
+    // Chunk `gpu` of the coverage grid: base size plus one byte for the
+    // first dataSize % numGpus chunks. Every transfer toward destination
+    // `dest` moves exactly ChunkSizeOf(dest) bytes, so per-destination
+    // load is (N-1)*ChunkSizeOf(dest) and the grid sums to dataSize.
+    uint64_t ChunkSizeOf(uint16_t gpu) const;
+
     uint16_t m_numGpus;
     uint64_t m_dataSize;
-    uint64_t m_chunkSize;  // dataSize / numGpus per destination
+    uint64_t m_chunkSize;       // dataSize / numGpus per destination
+    uint64_t m_chunkRemainder;  // dataSize % numGpus spread one byte each
+    uint64_t m_sentDataBytes;   // cumulative payload bytes sent (coverage)
     uint8_t m_protocolId;
 
     AlltoAllState m_state;

@@ -6,6 +6,36 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — AllToAll chunk grid covers the full data size
+
+`AlltoAllInjector` sized every peer transfer with a uniform
+`m_chunkSize = dataSize/numGpus`, falling back to the WHOLE dataSize when
+that quotient was zero (codex round 17, finding 7). Two defects: 15 B
+over 4 GPUs shipped 3-byte chunks and reported completion after **36
+aggregate effective bytes** instead of the required **45** (9 per
+destination instead of [12,12,12,9]); and the degenerate dataSize <
+numGpus case made every GPU send the whole dataSize per peer — 3 B over
+4 GPUs shipped **36 bytes instead of nine**, with the zero-chunk rank
+receiving traffic it should never see. The injector now applies the
+frozen chunk-grid convention (base `dataSize/numGpus` plus one byte for
+the first `dataSize%numGpus` chunks; degenerate grids put one byte on
+each of the first dataSize ranks, zero on the rest) with
+destination-owned sizing at all three send sites (ring step, concurrent,
+2D forward — the 2D first-hop and ring/concurrent thresholds are
+per-destination too), pre-credits zero-chunk ranks at Initialize, and
+drives the pre-credited ring ranks' send chains directly (their sends
+are otherwise chained off receives they never get, which stalled the
+degenerate ring collective to the 1-hour sim cap — found while
+validating the fix across all topology/mode combinations). New probes
+`ProbeChunkSizeOf`/`GetSentDataBytes`/`ProbeReceivedBytes` and a
+`FabricEndpoint::GetTxBytes/GetRxBytes` pair; three new tests pin the
+15-B grid (aggregate 45, per-dest [12,12,12,9]), the degenerate grid
+(aggregate 9, per-dest [3,3,3,0], zero-chunk rank dark), and the
+degenerate ring completion. Pre-fix proof: a standalone probe on
+pre-existing public API measured 36/36 aggregate bytes where the fix
+delivers 45/9 with the exact per-destination grids. Ring/fullmesh/
+switched/2D alltoall sims complete at dataSize 3, 15, and 1 MiB.
+
 ### Fixed — surrogate NVLS retry latency uses the collective spray geometry
 
 `_retry_overhead` fragmented every algorithm's transfer with the DATA

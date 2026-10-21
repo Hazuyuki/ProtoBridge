@@ -5426,6 +5426,239 @@ class FullMeshRsStandalonePerDestLoadTest : public TestCase
     }
 };
 
+// (codex round 17, finding 7) AllToAll chunked every peer transfer with a
+// uniform `m_chunkSize = dataSize/numGpus` and fell back to the WHOLE
+// dataSize when that quotient was zero. Two defects: 15 B over 4 GPUs sent
+// 3-byte chunks (12 per rank) and reported completion after 36 aggregate
+// payload bytes instead of the required 45; and the degenerate dataSize <
+// numGpus case made every GPU send the whole dataSize (3 B over 4 GPUs
+// sent 36 bytes instead of nine — and the 4th rank, owning a zero chunk,
+// still got traffic it should never see). The injector now applies the
+// frozen chunk-grid convention (base + one byte for the first
+// dataSize%numGpus chunks; degenerate grids put one byte on each of the
+// first dataSize ranks) with destination-owned sizing at all three send
+// sites, per-destination thresholds, and pre-credited zero-chunk ranks.
+class AlltoallChunkGridCoverageTest : public TestCase
+{
+  public:
+    AlltoallChunkGridCoverageTest()
+        : TestCase("alltoall chunk grid covers the full data size") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 15; // grid [4,4,4,3]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->SetConcurrentMode(true);
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 15-B alltoall must complete");
+        Simulator::Destroy();
+
+        // Aggregate payload across the collective is (N-1)*D = 45 (every
+        // ordered pair (r,s) ships chunk s once). Pre-fix the uniform
+        // 3-byte chunks delivered 36.
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 45,
+            "alltoall whole-collective traffic must cover the full data size");
+        // Per-destination load: the grid indexes the DESTINATION (rank r
+        // sends its chunk-for-s to rank s), so destination dest receives
+        // (N-1) copies-sized ChunkSizeOf(dest): (N-1)*grid[dest].
+        const uint64_t grid[4] = {4, 4, 4, 3};
+        for (uint16_t dest = 0; dest < numGpus; ++dest)
+        {
+            const uint64_t expected = 3 * grid[dest]; // [12,12,12,9]
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeReceivedBytes(dest), expected,
+                "alltoall per-destination load must be (N-1)*own chunk "
+                "(the grid indexes the destination)");
+        }
+    }
+};
+
+// (codex round 17, finding 7, degenerate case) 3 B over 4 GPUs: the pre-fix
+// whole-dataSize fallback made every GPU send 3 bytes to each of its 3
+// peers — 36 aggregate bytes where the correct degenerate grid [1,1,1,0]
+// sends 9. The zero-chunk rank receives nothing and is pre-credited so the
+// collective still completes.
+class AlltoallDegenerateGridTest : public TestCase
+{
+  public:
+    AlltoallDegenerateGridTest()
+        : TestCase("alltoall degenerate sub-GPU-count grid sends one byte per rank") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // degenerate grid [1,1,1,0]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->SetConcurrentMode(true);
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the degenerate alltoall must complete (zero-chunk rank pre-credited)");
+        // Grid [1,1,1,0]: aggregate payload is 9, not the pre-fix 36.
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 9,
+            "degenerate alltoall must ship one byte per non-zero chunk, "
+            "not the whole dataSize per peer");
+        // Zero-chunk rank 3 receives nothing; ranks 0-2 each receive the
+        // three other ranks' chunks toward them: dest receives 3 copies of
+        // its own 1-byte chunk (the grid indexes the destination).
+        NS_TEST_ASSERT_MSG_EQ(inj->ProbeReceivedBytes(0), 3,
+            "rank 0 receives three 1-byte chunks (one per source rank)");
+        NS_TEST_ASSERT_MSG_EQ(inj->ProbeReceivedBytes(3), 0,
+            "the zero-chunk rank must receive nothing in the degenerate grid");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 17, finding 7, ring mode) The zero-chunk rank's ring sends
+// are chained off receive-complete events; pre-credited (it receives
+// nothing), its chain never starts and the partners waiting for its chunks
+// stall — the 3-B ring alltoall hung until the 1-hour sim cap. The send
+// chain of a pre-credited rank must be driven directly.
+class AlltoallDegenerateRingModeTest : public TestCase
+{
+  public:
+    AlltoallDegenerateRingModeTest()
+        : TestCase("degenerate alltoall ring drives pre-credited ranks' sends") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // degenerate grid [1,1,1,0]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        // RING_PIPELINE mode (default — no SetConcurrentMode call).
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        // A short stop: the pre-fix stall never completed at any horizon.
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the degenerate RING_PIPELINE alltoall must complete — the "
+            "pre-credited zero-chunk rank's send chain must be driven, not "
+            "chained off receives it never gets");
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 9,
+            "degenerate ring alltoall still ships exactly one byte per "
+            "nonzero chunk (aggregate 9)");
+        Simulator::Destroy();
+    }
+};
+
 // (codex round 17, finding 1) Zero-sized chunks crashed multi-lane fabrics.
 // The degenerate sub-GPU-count grid gives ranks past dataSize a zero chunk;
 // the zero-byte bulk transfer reached the fragment math, where wireSize=0
@@ -8619,6 +8852,9 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new LlrManagerDetachedAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new ProtocolConfigRunnerDetachTest, TestCase::Duration::QUICK);
     AddTestCase(new FullMeshRsStandalonePerDestLoadTest, TestCase::Duration::QUICK);
+    AddTestCase(new AlltoallChunkGridCoverageTest, TestCase::Duration::QUICK);
+    AddTestCase(new AlltoallDegenerateGridTest, TestCase::Duration::QUICK);
+    AddTestCase(new AlltoallDegenerateRingModeTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
