@@ -6,6 +6,23 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — endpoint and switch Dispose detach device promisc callbacks
+
+The promisc receive callbacks installed on NetDevices hold a raw `this`
+pointer of their owner. `FabricEndpoint::DoDispose` cleared `m_devices`
+and `NvSwitch::DoDispose` cleared `m_ports` without detaching those
+callbacks first, so a packet still in flight on the channel after the
+owner was disposed and freed invoked `ReceiveFromDevice` /
+`ReceiveFromPort` on freed memory. Both DoDispose implementations now
+null the callbacks via `MakeNullCallback` with the exact
+`PromiscReceiveCallback` signature before dropping the device/port
+references. Verified with valgrind: the pre-fix build reports invalid
+reads (and, on the switch, invalid writes) when a 64-B packet crosses a
+100-µs-delay link and the receiver is disposed mid-flight; the post-fix
+build is clean (codex round 16, finding 2). A new
+`DeviceCallbackDetachAtDisposeTest` covers both the endpoint-receiver
+and switch-receiver scenarios.
+
 ### Fixed — endpoint Dispose cancels deferred source-reload retransmissions
 
 Both SACK retransmission dispatch sites — `ProcessRetryPacket` (the GBN

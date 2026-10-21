@@ -135,6 +135,20 @@ NvSwitch::DoDispose()
         }
     }
     m_deferredResultEvents.clear();
+    // Detach the port promisc callbacks BEFORE clearing the port list: they
+    // hold raw `this`, so a packet arriving on any port channel after this
+    // switch is gone would invoke ReceiveFromPort on freed memory (codex
+    // round 16, finding 2 — a 64-B packet over a 100-us link, with the
+    // receiving switch disposed and released at 1 us, produced
+    // valgrind-confirmed invalid reads AND writes at the 100-us arrival).
+    for (const auto& port : m_ports)
+    {
+        if (port)
+        {
+            port->SetPromiscReceiveCallback(
+                MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+        }
+    }
     m_ports.clear();
     m_voqs.clear();
     m_portDegradationModels.clear();

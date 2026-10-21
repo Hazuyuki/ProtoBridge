@@ -222,6 +222,20 @@ FabricEndpoint::DoDispose()
         }
     }
     m_deferredEgressEvents.clear();
+    // Detach the promisc callbacks BEFORE dropping the device references:
+    // they hold raw `this`, so a packet arriving on the channel after this
+    // endpoint is gone would invoke ReceiveFromDevice on freed memory
+    // (codex round 16, finding 2 — a 64-B packet over a 100-us link, with
+    // the receiver disposed and released at 1 us, produced
+    // valgrind-confirmed invalid reads at the 100-us arrival).
+    for (const auto& device : m_devices)
+    {
+        if (device)
+        {
+            device->SetPromiscReceiveCallback(
+                MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+        }
+    }
     m_devices.clear();
     m_creditManager = nullptr;
     m_payloadBuilder = nullptr;

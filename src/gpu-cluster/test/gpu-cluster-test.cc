@@ -5084,6 +5084,94 @@ class EgressDisposeCancelsSourceReloadRetransmissionsTest : public TestCase
     }
 };
 
+// Codex round 16, finding 2: DoDispose cleared the device/port lists
+// without detaching the raw-pointer promiscuous callbacks installed on the
+// net devices. A packet in flight over a 100-us link arrives AFTER the
+// receiver was disposed and released, invoking ReceiveFromDevice (endpoint)
+// or ReceiveFromPort (switch) on freed memory — valgrind-confirmed invalid
+// reads on both, plus invalid writes in the switch. Regression for both
+// sides: dispose+release the receiver at 1 us and run past the arrival.
+class DeviceCallbackDetachAtDisposeTest : public TestCase
+{
+  public:
+    DeviceCallbackDetachAtDisposeTest()
+        : TestCase("endpoint and switch Dispose detach device promisc callbacks") {}
+    void DoRun() override
+    {
+        // --- Endpoint side ---
+        {
+            NodeContainer nodes;
+            nodes.Add(CreateObject<Node>());
+            nodes.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(MicroSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes);
+
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(1);
+            ep->SetLocalRankRange(1, 1); // rank 0 remote
+            ep->AddNetDevice(devs.Get(0));
+            ep->SetNeighborMac(0, Mac48Address::Allocate());
+            ep->SetRoutingEntry(0, 0);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+
+            // A 64-B DATA packet from rank 0, sent at t=0, arrives at ~100 us.
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::DATA);
+            h.SetSourceRank(0);
+            h.SetDestRank(1);
+            h.SetSequenceNumber(0);
+            h.SetPayloadSize(64);
+            pkt->AddHeader(h);
+            devs.Get(1)->Send(pkt,
+                              Mac48Address::ConvertFrom(devs.Get(0)->GetAddress()),
+                              0x0800);
+            // Dispose and release the receiver well before the arrival.
+            Simulator::Schedule(NanoSeconds(1000), [ep]() {
+                ep->Dispose();
+            });
+            Simulator::Schedule(NanoSeconds(1100), [&ep]() {
+                ep = nullptr;
+            });
+            Simulator::Stop(MicroSeconds(200)); // past the 100-us arrival
+            Simulator::Run();
+            Simulator::Destroy();
+        }
+        // --- Switch side ---
+        {
+            NodeContainer nodes;
+            nodes.Add(CreateObject<Node>());
+            nodes.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(MicroSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes);
+
+            Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+            sw->AddPort(devs.Get(1));
+
+            // A 64-B packet sent at t=0 arrives at the switch port at ~100 us.
+            Ptr<Packet> pkt = Create<Packet>(64);
+            devs.Get(0)->Send(pkt,
+                              Mac48Address::ConvertFrom(devs.Get(1)->GetAddress()),
+                              0x0800);
+            Simulator::Schedule(NanoSeconds(1000), [sw]() {
+                sw->Dispose();
+            });
+            Simulator::Schedule(NanoSeconds(1100), [&sw]() {
+                sw = nullptr;
+            });
+            Simulator::Stop(MicroSeconds(200)); // past the 100-us arrival
+            Simulator::Run();
+            Simulator::Destroy();
+        }
+        // Reaching this line without a crash is the assertion.
+    }
+};
+
 // (1b-3) LLR retry timers must not start while the pacer still holds the
 // packet. Codex round 12, finding 4: StorePacket armed the timeout at
 // ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
@@ -7801,6 +7889,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new EgressDisposeCancelsBacklogCallbacksTest, TestCase::Duration::QUICK);
     AddTestCase(new EgressDisposeCancelsFecReceiveTest, TestCase::Duration::QUICK);
     AddTestCase(new EgressDisposeCancelsSourceReloadRetransmissionsTest, TestCase::Duration::QUICK);
+    AddTestCase(new DeviceCallbackDetachAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
