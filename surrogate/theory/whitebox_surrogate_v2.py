@@ -940,8 +940,27 @@ class TheoryDerivedSurrogate:
         collective = self._validate_collective(collective)
         if ber <= 0 or not llr_enabled:
             return 0.0
-        packets = self._packets_per_transfer(D, N, algo, collective)
-        packet_bytes = self._packet_bytes_per_transfer(D, N, algo, collective)
+        # NVLS/SHARP uploads and result deliveries move via
+        # SendCollectiveBulk's SPRAY, not the DATA bulk path the generic
+        # helpers model. For H200 NVLS AllGather at 4 GPU / 64 MiB the DATA
+        # path counts 18 fragments of ~932 KB where the actual geometry is
+        # 128 x 128 KiB (the reliability model already uses the spray
+        # geometry; the mean retry latency is the outlier — codex round 17,
+        # finding 6: 1510.95 us pre-fix vs 738.89 us with the real
+        # geometry). Model the UPLOAD side (per-rank D for allreduce, D/N
+        # for allgather) at its spray fragmentation; the per-dest result
+        # stream carries N upload-sized streams at the same chunk sizes,
+        # so the max-of-geometrics over the upload fragment count is the
+        # right "slowest fragment" driver for the step-extension term.
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            upload_bytes = (D if collective == 'allreduce'
+                            else D / max(1, N))
+            packets, packet_bytes = self._spray_fragments(upload_bytes)
+            packets = float(packets)
+        else:
+            packets = self._packets_per_transfer(D, N, algo, collective)
+            packet_bytes = self._packet_bytes_per_transfer(
+                D, N, algo, collective)
         p_packet = self._packet_failure_probability(
             ber, fec_enabled, fec_n, fec_k, fec_t, packet_bytes)
         optical_fraction = min(1.0, max(0.0, optical_fraction))

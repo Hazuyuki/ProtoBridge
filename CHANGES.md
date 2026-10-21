@@ -6,6 +6,26 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — surrogate NVLS retry latency uses the collective spray geometry
+
+`_retry_overhead` fragmented every algorithm's transfer with the DATA
+bulk-path helpers (`_packets_per_transfer` /
+`_packet_bytes_per_transfer`), even for NVLS/SHARP collectives whose
+uploads and result deliveries move via `SendCollectiveBulk`'s spray —
+the geometry the reliability model (`expected_permanent_losses`) and
+the retry-buffer sizing already used. For H200 NVLS AllGather at 4 GPU
+/ 64 MiB / BER 1e-7 / SACK it assumed 18 fragments of ~932 KB where
+the wire carries 128 x 128 KiB, predicting **1510.95 µs**; the same
+retry formula on the actual geometry gives **738.89 µs** (codex round
+17, finding 6). NVLS AllReduce/AllGather now fragment the upload side
+(`D` / `D/N` per rank) at `_spray_fragments`, like the reliability
+model; every other algorithm keeps the DATA-path geometry (its real
+wire path). Pinned `463.0972` in the R14F6 byte-capacity test (the
+byte-vs-entry equality invariants are unchanged); new
+`test_nvls_retry_overhead_uses_spray_geometry` pins the corrected
+prediction and the DATA-path ring baseline. All 81 theory tests pass;
+the parity scripts run at BER=0 where the retry term is zero.
+
 ### Fixed — standalone fullmesh ReduceScatter sizes contributions by destination chunk
 
 `FullMeshReduceScatter::TriggerSends` sized every peer contribution with

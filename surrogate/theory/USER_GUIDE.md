@@ -153,7 +153,7 @@ s.predict(data_bytes, num_gpus, algo, credits, ber=0, ..., topology=None, *, col
 
 | Group | Parameters |
 |---|---|
-| Reliability / retransmission | `ber`, `fec_enabled`, `llr_enabled`, `fec_n`/`fec_k`/`fec_t`, `retry_mode` (`'gobackn'`/`'sack'`), `retry_buffer_entries`/`retry_buffer_bytes`, `retry_limit`, `strict_reliability` |
+| Reliability / retransmission | `ber`, `fec_enabled`, `llr_enabled`, `fec_n`/`fec_k`/`fec_t`, `retry_mode` (`'gobackn'`/`'sack'`), `retry_buffer_entries`/`retry_buffer_bytes`, `retry_limit`, `strict_reliability`. For NVLS/SHARP collectives the retry-latency term fragments at the collective spray geometry (`SendCollectiveBulk`, e.g. 128 x 128 KiB at 4 GPU / 64 MiB AllGather), not the DATA bulk path — matching the reliability model. |
 | Optical links | `optical_fraction`, `optical_hops` |
 | Contention | `competing_bw` (traffic on the shared bottleneck) |
 | Memory | `mem_bw` |

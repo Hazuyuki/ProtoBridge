@@ -1103,7 +1103,9 @@ def test_nvls_retry_buffer_byte_capacity_uses_spray_fragment_size():
     --llrBufferSize=128. The pre-fix conversion divided by the DATA bulk
     fragment (~932 KiB), turning the same 16 MiB into 18 entries and
     adding a false reload penalty: 484.2529 us where the equivalent
-    128-entry capacity predicts 483.6896 (codex round 14, finding 6)."""
+    128-entry capacity predicts 483.6896 (codex round 14, finding 6;
+    superseded value — round 17, finding 6 later corrected _retry_overhead
+    to the spray geometry, moving this config to 463.0972)."""
     nvls = wb.make_h200_nvls_theory()
     D, N = 64 * 1024 * 1024, 4
     kw = dict(ber=1e-8, retry_limit=3, strict_reliability=False,
@@ -1111,7 +1113,7 @@ def test_nvls_retry_buffer_byte_capacity_uses_spray_fragment_size():
     t_entries = nvls.predict(D, N, "nvls", 128, retry_buffer_entries=128, **kw)
     t_bytes = nvls.predict(D, N, "nvls", 128,
                            retry_buffer_bytes=16 * 1024 * 1024, **kw)
-    assert abs(t_entries - 483.6896) < 2e-3
+    assert abs(t_entries - 463.0972) < 2e-3
     assert abs(t_bytes - t_entries) < 1e-9  # same capacity, same latency
     # The divisor itself is the spray fragment size, not the bulk fragment.
     assert (nvls._retry_buffer_fragment_bytes(D, N, "nvls", "allgather")
@@ -1140,3 +1142,47 @@ def test_nvls_retry_buffer_byte_capacity_uses_spray_fragment_size():
         16 * 1024 * 1024, 8, "ring", "allreduce")
         == ring._packet_bytes_per_transfer(
             16 * 1024 * 1024, 8, "ring", "allreduce"))
+
+
+def test_nvls_retry_overhead_uses_spray_geometry():
+    """_retry_overhead must fragment NVLS/SHARP collectives at the collective
+    spray geometry, not the DATA bulk path. For H200 NVLS AllGather at
+    4 GPU / 64 MiB / BER 1e-7 / SACK the DATA path counts 18 fragments of
+    ~932 KB where SendCollectiveBulk sprays 128 x 128 KiB — the reliability
+    model already used the spray geometry, and the mean retry latency was
+    the outlier: 1510.95 us pre-fix vs 738.89 us with the real geometry
+    (codex round 17, finding 6)."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 64 * 1024 * 1024, 4
+    val = nvls.predict(D, N, "nvls", 64, ber=1e-7, llr_enabled=True,
+                       retry_mode="sack", collective="allgather")
+    assert abs(val - 738.8908) < 2e-2
+
+    # The geometry the retry term actually sees: 128 x 128 KiB per upload.
+    upload_frags, upload_frag_bytes = nvls._spray_fragments(D // N)
+    assert (upload_frags, upload_frag_bytes) == (128, 131072)
+
+    # The DATA-path geometry it must NOT use: 18 x ~932 KB.
+    data_packets = nvls._packets_per_transfer(D, N, "nvls", "allgather")
+    assert data_packets == 18
+
+    # AllReduce uploads carry the full D per rank: 512 x 128 KiB.
+    ar_frags, ar_frag_bytes = nvls._spray_fragments(D)
+    assert (ar_frags, ar_frag_bytes) == (512, 131072)
+
+    # Non-NVLS algorithms keep the DATA-bulk geometry in _retry_overhead
+    # (the ring's DATA path IS the real wire path there).
+    ring = wb.make_h200_ring_theory()
+    T = 1.0
+    ring_ro = ring._retry_overhead(
+        T, 2 * (8 - 1), 16 * 1024 * 1024, 8, "ring", 64, 1e-7, True,
+        False, None, None, None, "sack", 1.0, 1.0, "allreduce")
+    ring_packets = ring._packets_per_transfer(
+        16 * 1024 * 1024, 8, "ring", "allreduce")
+    ring_bytes = ring._packet_bytes_per_transfer(
+        16 * 1024 * 1024, 8, "ring", "allreduce")
+    p = ring._packet_failure_probability(1e-7, False, None, None, None,
+                                         ring_bytes)
+    attempts = ring._expected_max_attempts(p, ring_packets)
+    expected = 2 * (8 - 1) * T * max(0.0, attempts - 1.0)
+    assert abs(ring_ro - expected) < 1e-9
