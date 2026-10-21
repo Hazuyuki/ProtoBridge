@@ -61,4 +61,24 @@ CollectiveInjector::LogStepComplete(uint16_t gpu, uint32_t step,
     }
 }
 
+
+void
+CollectiveInjector::DoDispose()
+{
+    // Cancel every deferred event that still targets a member of this
+    // injector: each one captures raw `this`, so letting one fire after
+    // disposal reads freed memory (codex round 16, finding 3 — the
+    // fullmesh-allreduce startup event; the same scheduling pattern exists
+    // in every derived injector, so the fix lives here, in the base).
+    for (const auto& event : m_pendingEvents)
+    {
+        if (!event.IsExpired())
+        {
+            Simulator::Cancel(event);
+        }
+    }
+    m_pendingEvents.clear();
+    Object::DoDispose();
+}
+
 } // namespace ns3

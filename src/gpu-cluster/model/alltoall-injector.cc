@@ -54,6 +54,18 @@ AlltoAllInjector::~AlltoAllInjector()
 void
 AlltoAllInjector::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
@@ -162,11 +174,13 @@ AlltoAllInjector::Start()
     NS_LOG_INFO("Starting AlltoAll with startup delay " << m_startupDelayNs << " ns"
                 << " mode=" << static_cast<int>(m_mode));
 
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs),
-                         m_mode != AlltoAllMode::RING_PIPELINE
-                             ? &AlltoAllInjector::TriggerConcurrentSends
-                             : &AlltoAllInjector::TriggerInitialSends,
-                         this);
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            m_mode != AlltoAllMode::RING_PIPELINE
+                                ? &AlltoAllInjector::TriggerConcurrentSends
+                                : &AlltoAllInjector::TriggerInitialSends,
+                            this));
 }
 
 // --- Ring Pipeline Mode ---
@@ -294,11 +308,12 @@ AlltoAllInjector::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricH
         if (received >= m_chunkSize)
         {
             m_firstHopReceivedBytes.erase(key);
-            Simulator::ScheduleNow(&AlltoAllInjector::ForwardTwoDimensionalChunk,
-                                   this,
-                                   destRank,
-                                   finalDest,
-                                   static_cast<uint16_t>(finalDest + 1));
+            m_pendingEvents.push_back(
+                Simulator::ScheduleNow(&AlltoAllInjector::ForwardTwoDimensionalChunk,
+                                       this,
+                                       destRank,
+                                       finalDest,
+                                       static_cast<uint16_t>(finalDest + 1)));
         }
         return;
     }
@@ -362,7 +377,8 @@ AlltoAllInjector::OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step)
         return;
     }
 
-    Simulator::ScheduleNow(&AlltoAllInjector::SendGpuStepData, this, gpu, step + 1);
+    m_pendingEvents.push_back(
+        Simulator::ScheduleNow(&AlltoAllInjector::SendGpuStepData, this, gpu, step + 1));
 }
 
 void

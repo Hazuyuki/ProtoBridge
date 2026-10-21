@@ -40,6 +40,18 @@ FullMeshAllGather::~FullMeshAllGather() {}
 void
 FullMeshAllGather::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
@@ -107,7 +119,10 @@ FullMeshAllGather::Start()
 {
     m_state = FullMeshAgState::RUNNING;
     m_startTimeNs = Simulator::Now().GetNanoSeconds();
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs), &FullMeshAllGather::TriggerSends, this);
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &FullMeshAllGather::TriggerSends, this));
 }
 
 void

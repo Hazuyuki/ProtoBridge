@@ -188,9 +188,21 @@ void HierarchicalAlltoAll::SetStartupDelay(Time delay)
 
 void HierarchicalAlltoAll::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
-    Object::DoDispose();
+    CollectiveInjector::DoDispose();
 }
 
 void HierarchicalAlltoAll::SetupReceiveCallbacks()
@@ -215,8 +227,9 @@ void HierarchicalAlltoAll::Start()
 
     uint64_t startupNs = GetLocalStartupDelayNs(m_chunkSize);
     uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_chunkSize);
-    Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
-                        &HierarchicalAlltoAll::StartLocalAlltoAll, this);
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
+                            &HierarchicalAlltoAll::StartLocalAlltoAll, this));
 }
 
 // Phase 1: Local alltoall (NVLink/MetaXLink within each node)
@@ -257,8 +270,9 @@ HierarchicalAlltoAll::StartLocalAlltoAll()
     {
         NS_LOG_INFO("Phase1 (local alltoall) trivially complete (one GPU per node)");
         uint64_t interStartup = GetInterNodeStartupDelayNs(m_chunkSize);
-        Simulator::Schedule(NanoSeconds(interStartup),
-                            &HierarchicalAlltoAll::StartInterNodeAlltoAll, this);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(interStartup),
+                                &HierarchicalAlltoAll::StartInterNodeAlltoAll, this));
     }
 }
 
@@ -285,8 +299,9 @@ HierarchicalAlltoAll::CheckLocalAlltoAllComplete(uint16_t gpu)
         {
             NS_LOG_INFO("Phase1 (local alltoall) complete for all GPUs");
             uint64_t interStartup = GetInterNodeStartupDelayNs(m_chunkSize);
-            Simulator::Schedule(NanoSeconds(interStartup),
-                                &HierarchicalAlltoAll::StartInterNodeAlltoAll, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(interStartup),
+                                    &HierarchicalAlltoAll::StartInterNodeAlltoAll, this));
         }
     }
 }

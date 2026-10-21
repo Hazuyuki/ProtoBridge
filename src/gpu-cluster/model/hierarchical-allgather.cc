@@ -198,9 +198,21 @@ void HierarchicalAllGather::SetStartupDelay(Time delay)
 
 void HierarchicalAllGather::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
-    Object::DoDispose();
+    CollectiveInjector::DoDispose();
 }
 
 void HierarchicalAllGather::SetupReceiveCallbacks()
@@ -225,8 +237,9 @@ void HierarchicalAllGather::Start()
 
     uint64_t startupNs = GetLocalStartupDelayNs(m_chunkSize);
     uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_chunkSize);
-    Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
-                        &HierarchicalAllGather::StartLocalAllGather, this);
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
+                            &HierarchicalAllGather::StartLocalAllGather, this));
 }
 
 // Phase 1: Local all-gather (NVLink/MetaXLink within each node)
@@ -268,8 +281,9 @@ HierarchicalAllGather::StartLocalAllGather()
         NS_LOG_INFO("Phase1 (local all-gather) trivially complete (one GPU per node)");
         uint64_t interStartup = GetInterNodeStartupDelayNs(m_nodeChunkSize);
         uint64_t rampDelay = GetInterNodeRampDelayNs(m_nodeChunkSize);
-        Simulator::Schedule(NanoSeconds(interStartup + rampDelay),
-                            &HierarchicalAllGather::StartInterNodeAllGather, this);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(interStartup + rampDelay),
+                                &HierarchicalAllGather::StartInterNodeAllGather, this));
     }
 }
 
@@ -297,8 +311,9 @@ HierarchicalAllGather::CheckLocalAllGatherComplete(uint16_t gpu)
             NS_LOG_INFO("Phase1 (local all-gather) complete for all GPUs");
             uint64_t interStartup = GetInterNodeStartupDelayNs(m_nodeChunkSize);
             uint64_t rampDelay = GetInterNodeRampDelayNs(m_nodeChunkSize);
-            Simulator::Schedule(NanoSeconds(interStartup + rampDelay),
-                                &HierarchicalAllGather::StartInterNodeAllGather, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(interStartup + rampDelay),
+                                    &HierarchicalAllGather::StartInterNodeAllGather, this));
         }
     }
 }

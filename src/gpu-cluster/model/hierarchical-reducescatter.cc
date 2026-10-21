@@ -256,9 +256,21 @@ void HierarchicalReduceScatter::SetStartupDelay(Time delay)
 
 void HierarchicalReduceScatter::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
-    Object::DoDispose();
+    CollectiveInjector::DoDispose();
 }
 
 void HierarchicalReduceScatter::SetupReceiveCallbacks()
@@ -283,8 +295,9 @@ void HierarchicalReduceScatter::Start()
 
     uint64_t startupNs = GetLocalStartupDelayNs(m_segmentSize);
     uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_segmentSize);
-    Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
-                        &HierarchicalReduceScatter::StartLocalReduceScatter, this);
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
+                            &HierarchicalReduceScatter::StartLocalReduceScatter, this));
 }
 
 // Phase 1: Local reduce-scatter (NVLink/MetaXLink within each node)
@@ -371,8 +384,9 @@ HierarchicalReduceScatter::CheckLocalReduceScatterComplete(uint16_t gpu)
             uint64_t computeDelay = GetLocalComputeDelayNs(m_segmentSize);
             uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
             uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
-            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
-                                &HierarchicalReduceScatter::StartInterNodeReduceScatter, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                    &HierarchicalReduceScatter::StartInterNodeReduceScatter, this));
         }
     }
 }
@@ -430,8 +444,9 @@ HierarchicalReduceScatter::CheckInterNodeReduceScatterComplete(uint16_t gpu)
         {
             NS_LOG_INFO("Phase2 (inter-node reduce-scatter) complete — hierarchical ReduceScatter done!");
             uint64_t computeDelay = GetInterNodeComputeDelayNs(m_segmentSize);
-            Simulator::Schedule(NanoSeconds(computeDelay),
-                                &HierarchicalReduceScatter::Complete, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(computeDelay),
+                                    &HierarchicalReduceScatter::Complete, this));
         }
     }
 }

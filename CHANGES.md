@@ -6,6 +6,33 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — injector events and receive callbacks are cancelled at dispose
+
+Every collective injector scheduled its startup phase (and the pipelined
+step continuations) with raw `this`, and installed a receive callback on
+each endpoint holding the same raw pointer, but no DoDispose cancelled
+any of it. Disposing an injector mid-startup left the startup event
+live: when the ~65-µs default startup expired it invoked
+`FullMeshAllReduce::TriggerReduceScatterPhase` on freed memory, which
+valgrind confirmed as invalid reads (codex round 16, finding 3). The
+same scheduling pattern existed in every derived injector, and the same
+stale-callback class as finding 2 existed for the injector receive
+callbacks.
+
+`CollectiveInjector` now owns the fix for all 16 injectors: a protected
+`m_pendingEvents` vector collects every `Simulator::Schedule` /
+`ScheduleNow` event id at the scheduling site, and the base `DoDispose`
+cancels every non-expired entry before the object is freed (mirroring
+`FabricEndpoint::m_deferredEgressEvents`). Each injector's DoDispose
+also detaches its receive callbacks from the endpoints (null
+`ReceiveCallback`) before dropping the endpoint references. The
+hierarchical injectors now chain to `CollectiveInjector::DoDispose`
+instead of `Object::DoDispose`. A new
+`InjectorStartupEventCancelledAtDisposeTest` disposes and releases a
+started FullMeshAllReduce at 1 µs and runs past the startup expiry:
+the pre-fix build reads freed memory under valgrind, the post-fix build
+is clean.
+
 ### Fixed — endpoint and switch Dispose detach device promisc callbacks
 
 The promisc receive callbacks installed on NetDevices hold a raw `this`

@@ -116,6 +116,18 @@ bool NcclRingAllReduce::IsCompleted() const { return m_completed; }
 void
 NcclRingAllReduce::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
@@ -257,8 +269,10 @@ NcclRingAllReduce::Start()
     m_running = true;
     m_startTimeNs = Simulator::Now().GetNanoSeconds();
     NS_LOG_INFO("Starting NcclRingAllReduce with startup delay " << m_startupDelayNs << " ns");
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs),
-                        &NcclRingAllReduce::TriggerInitialSends, this);
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &NcclRingAllReduce::TriggerInitialSends, this));
 }
 
 void
@@ -401,12 +415,14 @@ NcclRingAllReduce::OnStepReceiveComplete(uint16_t gpu, uint32_t channel, uint32_
     uint64_t swOverhead = GetPerStepSwOverheadNs(m_chunkSize);
     if (swOverhead > 0)
     {
-        Simulator::Schedule(NanoSeconds(swOverhead),
-                            &NcclRingAllReduce::SendStepData, this, gpu, channel, step + 1);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(swOverhead),
+                                &NcclRingAllReduce::SendStepData, this, gpu, channel, step + 1));
     }
     else
     {
-        Simulator::ScheduleNow(&NcclRingAllReduce::SendStepData, this, gpu, channel, step + 1);
+        m_pendingEvents.push_back(
+            Simulator::ScheduleNow(&NcclRingAllReduce::SendStepData, this, gpu, channel, step + 1));
     }
 }
 

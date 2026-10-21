@@ -69,6 +69,19 @@ public:
     static void LogStepComplete(uint16_t gpu, uint32_t step,
                                 uint64_t startNs, uint64_t completeNs);
 
+    /**
+     * Deferred-event disposal discipline: every Simulator::Schedule /
+     * ScheduleNow whose target is a member of the injector captures raw
+     * `this`, so DoDispose must be able to cancel anything still pending
+     * before the object is freed. Derived classes push each event id into
+     * m_pendingEvents at the scheduling site; this DoDispose cancels every
+     * non-expired entry (mirrors FabricEndpoint::m_deferredEgressEvents).
+     */
+    void DoDispose() override;
+
+protected:
+    std::vector<EventId> m_pendingEvents;
+
 private:
     static std::string g_stepTraceFile;
     static std::ofstream g_stepTraceStream;

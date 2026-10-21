@@ -5172,6 +5172,85 @@ class DeviceCallbackDetachAtDisposeTest : public TestCase
     }
 };
 
+// Forward declaration: the link-error helper is defined further below.
+static void DisableLinkErrorsGlobally();
+
+// (codex round 16, finding 3) The injector startup event survives disposal.
+// Start() schedules the first phase with raw `this`; DoDispose must cancel
+// it (via the CollectiveInjector::m_pendingEvents discipline), otherwise a
+// disposed-and-released injector is read from freed memory when the default
+// 65-us startup expires. Variant A: dispose mid-startup. Variant B: dispose
+// mid-startup on the ring injector (same scheduling pattern).
+class InjectorStartupEventCancelledAtDisposeTest : public TestCase
+{
+  public:
+    InjectorStartupEventCancelledAtDisposeTest()
+        : TestCase("injector startup event is cancelled at dispose") {}
+
+    Ptr<FullMeshAllReduce> DisposeAt(uint64_t atNs)
+    {
+        Ptr<FullMeshAllReduce> inj = CreateObject<FullMeshAllReduce>();
+        Simulator::Schedule(NanoSeconds(atNs), [inj]() {
+            inj->Dispose();
+        });
+        Simulator::Schedule(NanoSeconds(atNs + 100), [&inj]() {
+            inj = nullptr; // release the last Ptr -> destructor runs
+        });
+        return inj;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<FullMeshAllReduce> inj = DisposeAt(1000);
+        inj->Initialize(numGpus, 15, eps);
+        inj->Start(); // schedules TriggerReduceScatterPhase at the ~65-us startup
+        Simulator::Stop(MicroSeconds(500)); // well past the startup expiry
+        Simulator::Run();
+        Simulator::Destroy();
+        // Reaching this line without reading freed memory is the assertion.
+    }
+};
+
 // (1b-3) LLR retry timers must not start while the pacer still holds the
 // packet. Codex round 12, finding 4: StorePacket armed the timeout at
 // ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
@@ -7890,6 +7969,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new EgressDisposeCancelsFecReceiveTest, TestCase::Duration::QUICK);
     AddTestCase(new EgressDisposeCancelsSourceReloadRetransmissionsTest, TestCase::Duration::QUICK);
     AddTestCase(new DeviceCallbackDetachAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new InjectorStartupEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

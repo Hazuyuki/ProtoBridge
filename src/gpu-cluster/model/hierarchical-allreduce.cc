@@ -294,9 +294,21 @@ HierarchicalAllReduce::SetStartupDelay(Time delay)
 void
 HierarchicalAllReduce::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
-    Object::DoDispose();
+    CollectiveInjector::DoDispose();
 }
 
 void
@@ -324,8 +336,9 @@ HierarchicalAllReduce::Start()
     // Schedule first phase after startup delay based on initial data size
     uint64_t startupNs = GetLocalStartupDelayNs(m_dataSize);
     uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_segmentSize);
-    Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
-                        &HierarchicalAllReduce::StartLocalReduceScatter, this);
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
+                            &HierarchicalAllReduce::StartLocalReduceScatter, this));
 }
 
 // Phase 1: Local reduce-scatter (NVLink/MetaXLink within each node)
@@ -394,8 +407,9 @@ HierarchicalAllReduce::StartLocalReduceScatter()
         uint64_t computeDelay = GetLocalComputeDelayNs(m_segmentSize);
         uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
         uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
-        Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
-                            &HierarchicalAllReduce::StartInterNodeReduceScatter, this);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                &HierarchicalAllReduce::StartInterNodeReduceScatter, this));
     }
 }
 
@@ -434,8 +448,9 @@ HierarchicalAllReduce::CheckLocalReduceScatterComplete(uint16_t gpu)
             uint64_t computeDelay = GetLocalComputeDelayNs(m_segmentSize);
             uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
             uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
-            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
-                                &HierarchicalAllReduce::StartInterNodeReduceScatter, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                    &HierarchicalAllReduce::StartInterNodeReduceScatter, this));
         }
     }
 }
@@ -502,8 +517,9 @@ HierarchicalAllReduce::CheckInterNodeReduceScatterComplete(uint16_t gpu)
             uint64_t computeDelay = GetInterNodeComputeDelayNs(m_segmentSize);
             uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
             uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
-            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
-                                &HierarchicalAllReduce::StartInterNodeAllGather, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                    &HierarchicalAllReduce::StartInterNodeAllGather, this));
         }
     }
 }
@@ -569,8 +585,9 @@ HierarchicalAllReduce::CheckInterNodeAllGatherComplete(uint16_t gpu)
             NS_LOG_INFO("Phase3 (inter-node all-gather) complete for all GPUs");
             uint64_t localStartup = GetLocalStartupDelayNs(m_segmentSize);
             uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_segmentSize);
-            Simulator::Schedule(NanoSeconds(localStartup + fullmeshDelay),
-                                &HierarchicalAllReduce::StartLocalAllGather, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(localStartup + fullmeshDelay),
+                                    &HierarchicalAllReduce::StartLocalAllGather, this));
         }
     }
 }

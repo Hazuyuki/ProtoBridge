@@ -82,6 +82,18 @@ TreeAllReduce::~TreeAllReduce()
 void
 TreeAllReduce::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
@@ -244,7 +256,10 @@ TreeAllReduce::Start()
 
     NS_LOG_INFO("Starting Pipelined Tree AllReduce with startup delay " << m_startupDelayNs << " ns");
 
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs), &TreeAllReduce::TriggerInitialSends, this);
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &TreeAllReduce::TriggerInitialSends, this));
 }
 
 void
@@ -320,8 +335,9 @@ TreeAllReduce::ScheduleOrSend(uint16_t gpu, uint16_t target, uint64_t bytes,
     }
     else
     {
-        Simulator::Schedule(NanoSeconds(delayNs), &TreeAllReduce::DoSend, this,
-                            gpu, target, bytes, flowId);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(delayNs), &TreeAllReduce::DoSend, this,
+                                gpu, target, bytes, flowId));
     }
 }
 

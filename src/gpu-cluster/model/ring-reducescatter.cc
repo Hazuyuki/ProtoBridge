@@ -55,6 +55,18 @@ RingReduceScatter::~RingReduceScatter()
 void
 RingReduceScatter::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Requires a null Callback of
+    // the FabricEndpoint::ReceiveCallback signature.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+        }
+    }
     m_endpoints.clear();
     m_ringPos.clear();
     m_completionCallback = nullptr;
@@ -247,7 +259,10 @@ RingReduceScatter::Start()
 
     NS_LOG_INFO("Starting Ring ReduceScatter with startup delay " << m_startupDelayNs << " ns");
 
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs), &RingReduceScatter::TriggerInitialSends, this);
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &RingReduceScatter::TriggerInitialSends, this));
 }
 
 void
@@ -358,15 +373,17 @@ RingReduceScatter::OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step)
 
     if (m_perStepSwOverheadNs > 0)
     {
-        Simulator::Schedule(NanoSeconds(m_perStepSwOverheadNs),
-                            &RingReduceScatter::SendGpuStepData,
-                            this,
-                            gpu,
-                            step + 1);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(m_perStepSwOverheadNs),
+                                &RingReduceScatter::SendGpuStepData,
+                                this,
+                                gpu,
+                                step + 1));
     }
     else
     {
-        Simulator::ScheduleNow(&RingReduceScatter::SendGpuStepData, this, gpu, step + 1);
+        m_pendingEvents.push_back(
+            Simulator::ScheduleNow(&RingReduceScatter::SendGpuStepData, this, gpu, step + 1));
     }
 }
 
