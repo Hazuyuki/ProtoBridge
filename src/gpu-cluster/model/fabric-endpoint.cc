@@ -2570,6 +2570,11 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     if (deviceIndex >= m_devices.size())
     {
         NS_LOG_ERROR("Invalid device index " << deviceIndex);
+        // The packet will never reach the wire, so ArmRetryTimeoutOnWire
+        // below never runs and an LLR source entry queued for it would keep
+        // no timeout backstop (the retransmission paths cancel the pending
+        // timer until wire transmission). Arm it here as the fallback.
+        ArmRetryTimeoutOnWire(packet);
         return;
     }
 

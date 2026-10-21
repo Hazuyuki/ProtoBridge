@@ -6,6 +6,23 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — retransmission retry countdown starts at its wire transmission
+
+The GBN and SACK retransmission paths armed the source entry's retry timer
+at `readyDelay + retryTimeout` when the repair was queued — but the egress
+pacer/WFQ/FEC gates hold retransmissions exactly as they hold fresh sends,
+so with a 64-B LL packet, 0.1-Gbps per-QP pacing (~13.4-µs slot), 1-µs
+timeout and one retry, the budget expired at ~2 µs while the repair did not
+reach the wire until 13.36 µs: 64 B permanently lost on a link that
+delivers the repair (codex round 13, finding 1). `HandleRetryRequest` and
+`HandleSackRequest` now drop the pending timer and clear `wireArmed`,
+leaving `ArmRetryTimeoutOnWire` (the R12#4 egress hook) to arm at the
+actual transmission; `SendPacketOnDevice`'s invalid-device early-out arms
+there as the fallback so a never-sent entry keeps its backstop.
+Regression test `LlrRetryArmsAtWireOnRetransmitTest` pins loss-free
+delivery of the paced repair. The 2-node lossy GBN parity pins are
+unchanged (their timeout is long relative to the pacing).
+
 ### Docs — retransmission path is topology-capped (like the mean path)
 
 `WHITEBOX_SURROGATE.md` §12 and `USER_GUIDE.md` §8 claimed the `ber > 0`

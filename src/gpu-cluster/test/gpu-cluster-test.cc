@@ -67,11 +67,42 @@
 #include "ns3/point-to-point-helper.h"
 #include "ns3/ppp-header.h"
 #include "ns3/net-device-container.h"
+#include "ns3/error-model.h"
+#include "ns3/string.h"
 
 #include <fstream>
 #include <functional>
 
 using namespace ns3;
+
+// Drops the FIRST packet that crosses the attached device; everything after
+// passes. Used to reproduce one-shot wire loss deterministically (no RNG).
+class DropFirstErrorModel : public ErrorModel
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("DropFirstErrorModel")
+                                .SetParent<ErrorModel>()
+                                .SetGroupName("gpu-cluster-test");
+        return tid;
+    }
+    bool DoCorrupt(Ptr<Packet> p) override
+    {
+        if (m_dropped == 0)
+        {
+            m_dropped++;
+            return true;
+        }
+        return false;
+    }
+    void DoReset() override
+    {
+    }
+
+  private:
+    uint32_t m_dropped = 0;
+};
 
 /**
  * @brief Test case for FabricHeader serialization and deserialization
@@ -4827,6 +4858,95 @@ class LlrTimeoutStartsAtWireTest : public TestCase
     }
 };
 
+// (1b) R13#1: the retransmission's retry countdown must start at its WIRE
+// transmission, not when it is queued. Pre-fix the retransmission armed its
+// timer at readyDelay + timeout, so with a 64-B LL packet, 0.1-Gbps pacer
+// (~13.4-us slot), 1-us timeout and one retry the budget expired while the
+// repair was still queued: permanent loss declared ~2 us, repair transmitted
+// 13.36 us, 64 B lost on a link that delivers the repair.
+class LlrRetryArmsAtWireOnRetransmitTest : public TestCase
+{
+  public:
+    LlrRetryArmsAtWireOnRetransmitTest()
+        : TestCase("LLR retransmission arms its retry timeout at wire transmission") {}
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(false);
+
+        static uint64_t rxBytes = 0;
+        static uint64_t gapBytes = 0;
+        rxBytes = 0;
+        gapBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader h) {
+            if (h.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+            {
+                gapBytes += h.GetEffectiveDataSize();
+            }
+            else
+            {
+                rxBytes += h.GetEffectiveDataSize();
+            }
+        });
+
+        Ptr<LlrManager> llr = tx->GetLlrManager();
+        llr->SetRetryTimeout(NanoSeconds(1000));
+        llr->SetRetryLimit(1);
+        llr->SetLlrMode(LlrMode::SACK);
+        tx->SetLlrEnabled(true);
+        tx->EnableLlrTimeoutRetransmit();
+        rx->SetLlrEnabled(true); // receiver turns deliveries into ACKs
+
+        // Drop exactly the first wire copy (the rate models never see it —
+        // the drop happens on the channel, after egress shaping).
+        Ptr<DropFirstErrorModel> err = CreateObject<DropFirstErrorModel>();
+        devs.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(err));
+
+        Ptr<DcqcnRateMachine> dcqcn = CreateObject<DcqcnRateMachine>();
+        dcqcn->SetAttribute("PerQpCeilingGbps", DoubleValue(0.1));
+        tx->SetDcqcnRateMachine(dcqcn);
+
+        tx->Initialize();
+        rx->Initialize();
+
+        std::vector<uint8_t> buf(64, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 64, NcclProtocol::LL, 1, 0);
+
+        Simulator::Stop(MicroSeconds(3000));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(rxBytes, 64u,
+            "the retransmitted 64-B packet must be delivered in full");
+        NS_TEST_ASSERT_MSG_EQ(gapBytes, 0u,
+            "no PERMANENT_LOSS: the repair reaches the wire before the budget expires");
+        NS_TEST_ASSERT_MSG_EQ(llr->GetPermanentLossCount(), 0u,
+            "zero permanent losses when the retransmission is merely paced");
+        NS_TEST_ASSERT_MSG_EQ(llr->GetRetransmittedPackets(), 1u,
+            "exactly one retransmission (the dropped first copy)");
+        Simulator::Destroy();
+    }
+};
+
 // (1c) RTTCC rate machine: probe cadence, Swift-style MD/AI math, per-flow
 // pacer, and the parity foundation (unknown flow / at-line-rate flow shape
 // nothing). Probe/response timing is driven by scheduled events so the RTT
@@ -6697,6 +6817,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnDisposeCancelsTimersTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
+    AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SoOnlyPredicateTest, TestCase::Duration::QUICK);

@@ -423,25 +423,19 @@ LlrManager::HandleRetryRequest(uint32_t seqNum, uint16_t sourceRank, uint16_t fl
             m_retryMissCount++;
         }
 
-        // Re-arm the SOURCE-entry timeout for the retransmission (one timer
-        // per un-ACKed packet, regardless of retry-buffer residency). A
-        // retransmission is by definition wire-visible (its timer fired or a
-        // NACK referenced it), so the entry counts as wire-armed from here on.
-        sourceIt->second.wireArmed = true;
+        // The retransmission's retry countdown starts when it reaches the
+        // WIRE, not when it is queued (codex round 13, finding 1). The egress
+        // pacer/WFQ/FEC gates hold retransmissions exactly as they hold fresh
+        // sends; arming at readyDelay + timeout let the budget expire while
+        // the repair was still queued (64-B LL packet, 0.1-Gbps pacer, 1-us
+        // timeout, one retry: permanent loss declared at ~2 us while the
+        // repair transmitted at 13.36 us). Drop any pending timer and clear
+        // wireArmed; the wire egress (FabricEndpoint::ArmRetryTimeoutOnWire)
+        // re-arms at the actual transmission.
+        sourceIt->second.wireArmed = false;
         if (!sourceIt->second.timeoutEvent.IsExpired())
         {
             Simulator::Cancel(sourceIt->second.timeoutEvent);
-        }
-        if (m_retryTimeout > Time(0))
-        {
-            sourceIt->second.timeoutEvent = Simulator::Schedule(
-                orderingDelay + m_retryTimeout,
-                &LlrManager::OnRetryTimeout,
-                this,
-                sn,
-                sourceRank,
-                flowId,
-                key.vcId);
         }
 
         m_retryTrace(sn, sourceIt->second.destRank);
@@ -516,30 +510,14 @@ LlrManager::HandleSackRequest(const std::unordered_set<uint32_t>& nackSeqNums,
             m_retryMissCount++;
         }
 
-        // Re-arm the SOURCE-entry timeout (same one-timer-per-packet rule as
-        // the GBN path). Arm at readyDelay + m_retryTimeout, mirroring the
-        // GBN path's orderingDelay + m_retryTimeout: the retransmission is not
-        // on the wire until the reload completes, so a timer at bare
-        // m_retryTimeout fires repeatedly during the reload and exhausts the
-        // retry budget before the retransmission can land (GBN recovers, SACK
-        // degrades to permanent loss under the same loss pattern). A
-        // retransmission is wire-visible by definition, so the entry counts as
-        // wire-armed from here on.
-        sourceIt->second.wireArmed = true;
+        // The retransmission's retry countdown starts when it reaches the
+        // WIRE, not when it is queued (codex round 13, finding 1) — the same
+        // rule the GBN path now follows. Drop any pending timer and clear
+        // wireArmed; the wire egress re-arms at the actual transmission.
+        sourceIt->second.wireArmed = false;
         if (!sourceIt->second.timeoutEvent.IsExpired())
         {
             Simulator::Cancel(sourceIt->second.timeoutEvent);
-        }
-        if (m_retryTimeout > Time(0))
-        {
-            sourceIt->second.timeoutEvent = Simulator::Schedule(
-                retransmission.readyDelay + m_retryTimeout,
-                &LlrManager::OnRetryTimeout,
-                this,
-                seqNum,
-                sourceRank,
-                flowId,
-                key.vcId);
         }
 
         m_retryTrace(seqNum, sourceIt->second.destRank);
