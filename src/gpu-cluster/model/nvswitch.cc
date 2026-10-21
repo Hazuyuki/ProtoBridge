@@ -1606,7 +1606,17 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
                  << " sources=" << sourceCount << "/" << m_allGatherThreshold
                  << " bytes=" << m_allGatherReceivedBytes[flowId][srcRank]);
 
-    // Check if all GPUs have sent their chunk
+    // Check if all GPUs have sent their FULL chunk. The injectors upload the
+    // frozen chunk grid — base dataSize/numGpus plus one extra byte for the
+    // first dataSize%numGpus ranks (NvlsAllGather's TriggerSendPhase) — so a
+    // source's expected bytes are chunk + (src < remainder ? 1 : 0), not the
+    // uniform chunkSize. Requiring only the uniform floor let a 4-GPU / 9-B
+    // AllGather aggregate after the switch saw 2 bytes from rank 0 (its
+    // third byte still in flight on a delayed lane): the multicast carried
+    // 8 bytes, the ledger was retired, and the trailing byte started a new
+    // aggregation that never completed — every receiver stuck at 8/9 (codex
+    // round 18, finding 3). When dataSize was set, derive the per-source
+    // expectation from it; fall back to the uniform chunk otherwise.
     bool allComplete = false;
     if (m_allGatherChunkSize > 0)
     {
@@ -1615,7 +1625,13 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
             allComplete = true;
             for (const auto& src : m_allGatherReceivedBytes[flowId])
             {
-                if (src.second < m_allGatherChunkSize)
+                uint64_t expected = m_allGatherChunkSize;
+                if (m_allGatherDataSize > 0)
+                {
+                    uint64_t numGpus = m_allGatherThreshold;
+                    expected += (src.first < (m_allGatherDataSize % numGpus)) ? 1 : 0;
+                }
+                if (src.second < expected)
                 {
                     allComplete = false;
                     break;
