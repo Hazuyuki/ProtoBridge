@@ -122,6 +122,7 @@ class TheoryDerivedSurrogate:
                  retry_source_bw_bytes_per_us=4_800_000,
                  retry_source_latency_us=0.3,
                  nvls_num_partitions=8,
+                 nvls_switch_result_retry_limit=64,
                  wire_efficiency=1.0):
         # Fixed profile parameters from hardware, ns-3 configuration, or
         # one-time platform calibration.
@@ -153,6 +154,14 @@ class TheoryDerivedSurrogate:
         # allReduceNumPartitions; gpu-cluster-sim's default is 8). The
         # pipelined result path fragments per partition, not over the full D.
         self.nvls_num_partitions = nvls_num_partitions
+        # Switch-side result retransmission budget (nvswitch.h's
+        # SHARP_RESULT_RETRY_LIMIT = 64). Multicast results are repaired by
+        # the SWITCH from its own result store on a receiver NACK, NOT by the
+        # sending endpoint's LLR retry budget: with the endpoint retry limit
+        # at 0, results still get 64 switch retransmissions (+1 for the
+        # original) — attempts on the result side are this constant + 1,
+        # independent of retry_limit (codex round 14, finding 5).
+        self.nvls_switch_result_retry_limit = nvls_switch_result_retry_limit
         # Per-transfer wire efficiency (<1 accounts for L3/L4/transport header
         # overhead, e.g. RoCEv2 Eth+IP+UDP+IB ~0.95). Applied to the serial
         # bandwidth (T_serial /= wire_efficiency); 1.0 is byte-identical to the
@@ -744,7 +753,20 @@ class TheoryDerivedSurrogate:
         # and the ns-3 run completes with zero permanent losses (codex round
         # 12, finding 6).
         if algo == 'nvls' and collective in ('allreduce', 'allgather'):
-            attempts = retry_limit + 1
+            # Uploads and results have DIFFERENT repair budgets. An upload
+            # the switch fails to receive is NACKed back to the endpoint and
+            # retransmitted from its LLR source store — retry_limit + 1
+            # attempts. A multicast RESULT is repaired by the switch itself
+            # from its own result store (NvSwitch::HandleSwitchNack, bounded
+            # by SHARP_RESULT_RETRY_LIMIT = 64), completely independent of
+            # the endpoint's retry limit: with endpoint retry 0, a lost
+            # result still has 64 switch retransmissions available (codex
+            # round 14, finding 5: 8 GPU / 16 MiB allgather / BER 1e-9 /
+            # endpoint retry 0 — ns-3 seed 3 completes at 79.2 us including
+            # one switch result repair, so the loss model must predict
+            # ~0.1342, not the 1.2074 the shared attempts count produced).
+            upload_attempts = retry_limit + 1
+            result_attempts = self.nvls_switch_result_retry_limit + 1
             if collective == 'allgather':
                 upload_bytes = data_bytes / max(1, num_gpus)
                 upload_frags, upload_frag_bytes = (
@@ -756,10 +778,10 @@ class TheoryDerivedSurrogate:
                 p_frag = self._packet_failure_probability(
                     ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
                 p_path_frag = 1.0 - (1.0 - p_frag) ** max(1.0, optical_hops)
-                return ((num_gpus * upload_frags
-                         + num_gpus * result_frags_per_dest)
-                        * min(1.0, max(0.0, optical_fraction))
-                        * p_path_frag ** attempts)
+                return ((num_gpus * upload_frags * p_path_frag ** upload_attempts
+                         + num_gpus * result_frags_per_dest
+                         * p_path_frag ** result_attempts)
+                        * min(1.0, max(0.0, optical_fraction)))
             # AllReduce: full-D uploads + partitioned result multicast.
             upload_frags, upload_frag_bytes = self._spray_fragments(data_bytes)
             num_partitions = max(1, self.nvls_num_partitions)
@@ -775,9 +797,9 @@ class TheoryDerivedSurrogate:
                 1.0, optical_hops)
             p_path_result = 1.0 - (1.0 - p_result_frag) ** max(
                 1.0, optical_hops)
-            return ((num_gpus * upload_frags * p_path_upload ** attempts
+            return ((num_gpus * upload_frags * p_path_upload ** upload_attempts
                      + num_gpus * result_frags_per_dest
-                     * p_path_result ** attempts)
+                     * p_path_result ** result_attempts)
                     * min(1.0, max(0.0, optical_fraction)))
         attempts = retry_limit + 1
         return (transfer_count * packets_per_transfer

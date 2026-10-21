@@ -797,19 +797,27 @@ def test_nvls_expected_losses_count_result_sides():
     stream has N * frag(D/N) packets. The pre-fix model counted 2N transfers
     at the upload's packetization: at N=8/D=16 MiB it counted 288 packets
     where the C++ fabric emits 1,296 (144 upload + 1,152 result), giving
-    0.2683 expected losses at BER 1e-9/0 retries instead of ~1.2074."""
+    0.2683 expected losses at BER 1e-9/0 retries instead of ~1.2074.
+    The two sides also carry DIFFERENT repair budgets (codex round 14,
+    finding 5): uploads retransmit from the endpoint's LLR store
+    (retry_limit + 1 attempts) but results are repaired by the SWITCH from
+    its own result store — SHARP_RESULT_RETRY_LIMIT = 64 retransmissions
+    regardless of the endpoint retry limit (ns-3 seed 3 completes at
+    79.2 us with endpoint retry 0 including one switch result repair), so
+    at retry 0 the allgather predicts 0.1342, not 1.2074."""
     nvls = wb.make_h200_nvls_theory()
     D, N = 16 * 1024 * 1024, 8
     losses = nvls.expected_permanent_losses(
         D, N, "nvls", 1e-9, 0,
         optical_fraction=1.0, optical_hops=1, collective="allgather")
-    assert abs(losses - 1.2074) < 2e-3
+    assert abs(losses - 0.134156) < 2e-3
     # The allreduce branch carries the same both-sides structure (1,024
-    # uploads + 1,152 pipelined result chunks at N=8/D=16 MiB/P=8).
+    # uploads + 1,152 pipelined result chunks at N=8/D=16 MiB/P=8) with the
+    # same split budgets.
     losses_ar = nvls.expected_permanent_losses(
         D, N, "nvls", 1e-9, 0,
         optical_fraction=1.0, optical_hops=1, collective="allreduce")
-    assert abs(losses_ar - 2.1464) < 2e-3
+    assert abs(losses_ar - 1.073179) < 2e-3
 
 
 def test_nvls_expected_losses_use_spray_fragment_geometry():
@@ -831,7 +839,7 @@ def test_nvls_expected_losses_use_spray_fragment_geometry():
     losses = nvls.expected_permanent_losses(
         D, N, "nvls", 5e-8, 3,
         optical_fraction=1.0, optical_hops=1, collective="allgather")
-    assert abs(losses - 0.062731) < 2e-4
+    assert abs(losses - 0.006970) < 2e-4
     # The strict gate must stay finite for this completable config.
     t = nvls.predict(D, N, "nvls", 128, ber=5e-8, retry_limit=3,
                      strict_reliability=True, collective="allgather",
@@ -841,14 +849,14 @@ def test_nvls_expected_losses_use_spray_fragment_geometry():
     losses8 = nvls.expected_permanent_losses(
         D, N, "nvls", 8e-8, 3,
         optical_fraction=1.0, optical_hops=1, collective="allgather")
-    assert abs(losses8 - 0.386322) < 2e-4
+    assert abs(losses8 - 0.042925) < 2e-4
     # Allreduce uploads carry the full D per rank (128 frags of 128 KiB);
     # the result side is PIPELINED over nvlsNumPartitions=8, so each dest
     # gets P * frag(D/P) = 8 * 18 chunks of 116,509 B, not N * frag(D).
     losses_ar = nvls.expected_permanent_losses(
         D, N, "nvls", 5e-8, 3,
         optical_fraction=1.0, optical_hops=1, collective="allreduce")
-    assert abs(losses_ar - 0.111522) < 2e-4
+    assert abs(losses_ar - 0.055761) < 2e-4
 
 
 def test_nvls_allreduce_result_partition_geometry():
@@ -868,10 +876,11 @@ def test_nvls_allreduce_result_partition_geometry():
     result_frags, result_frag_bytes = nvls._spray_fragments(D / 8)
     assert upload_frags == 128 and upload_frag_bytes == 131072
     assert result_frags == 18 and result_frag_bytes == 116509
-    # 8 ranks * 128 uploads + 8 dests * 8 partitions * 18 chunks.
+    # 8 ranks * 128 uploads (endpoint retry 0 -> 1 attempt) + 8 dests * 8
+    # partitions * 18 chunks (switch-side budget: 64 retries + 1 attempt).
     expected = (N * upload_frags * (1 - (1 - 1e-10) ** (upload_frag_bytes * 8))
                 + N * 8 * result_frags
-                * (1 - (1 - 1e-10) ** (result_frag_bytes * 8)))
+                * (1 - (1 - 1e-10) ** (result_frag_bytes * 8)) ** 65)
     losses = nvls.expected_permanent_losses(
         D, N, "nvls", 1e-10, 0,
         optical_fraction=1.0, optical_hops=1, collective="allreduce")
@@ -897,12 +906,13 @@ def test_spray_fragments_single_link_single_packet():
     D, N = 16 * 1024 * 1024, 4
     frags, frag_bytes = one_link._spray_fragments(D / N)
     assert frags == 1 and frag_bytes == D // N  # one 4-MiB packet
-    # 4 uploads + 4 dests * N mirrored result chunks, all at 4 MiB.
+    # 4 uploads (4 attempts: retry 3) + 4 dests * N mirrored result chunks
+    # (switch-side budget: 65 attempts) — all at the one 4-MiB packet size.
     p = 1 - (1 - 1e-7) ** (D / N * 8)
     losses = one_link.expected_permanent_losses(
         D, N, "nvls", 1e-7, 3,
         optical_fraction=1.0, optical_hops=1, collective="allgather")
-    assert abs(losses - (4 + 16) * p ** 4) < 1e-9
+    assert abs(losses - (4 * p ** 4 + 16 * p ** 65)) < 1e-9
     assert losses > 1.0  # incompletable: strict must reject
     t = one_link.predict(D, N, "nvls", 128, ber=1e-7, retry_limit=3,
                          strict_reliability=True, collective="allgather",

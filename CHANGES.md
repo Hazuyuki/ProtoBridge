@@ -6,6 +6,30 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NVLS result reliability uses the switch's retry budget
+
+Both NVLS branches of `expected_permanent_losses` applied
+`retry_limit + 1` attempts to BOTH sides. But an upload the switch
+fails to receive is NACKed back to the sending endpoint and
+retransmitted from its LLR source store (endpoint retry budget), while a
+multicast RESULT is repaired by the switch itself from its own result
+store on the receiver's NACK (DestRank 0xFFFF →
+`NvSwitch::HandleSwitchNack`), bounded by `SHARP_RESULT_RETRY_LIMIT =
+64` retransmissions independent of the endpoint's limit (codex round 14,
+finding 5). At 8 GPU / 16 MiB allgather / BER 1e-9 / endpoint retry 0,
+the shared count predicted 1.2074 losses and strict-rejected a config
+whose ns-3 run (seed 3) completes at 79.3 µs including a switch result
+repair (`Switch retransmit multicast result seq 97 to rank 2` at debug
+level); the split budgets predict 0.1342. The result side now uses
+`nvls_switch_result_retry_limit + 1` (new constructor parameter,
+default 64 mirroring nvswitch.h), the upload side keeps
+`retry_limit + 1`. Moved pins: allgather 16 MiB/retry 0/BER 1e-9
+1.2074 → 0.134156; allreduce 2.1464 → 1.073179; spray-geometry pins
+0.062731 → 0.006970, 0.386322 → 0.042925, 0.111522 → 0.055761;
+partition-geometry expected now raises the result term to ^65;
+single-link pin 17.35 → 5.061 (upload term only). Full surrogate suite
+76 PASS.
+
 ### Fixed — RingAllReduce AG chunk identity after the direction reversal
 
 `SegmentSizeOf` computed the segment a rank holds with
