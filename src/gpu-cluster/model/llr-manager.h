@@ -206,6 +206,20 @@ class LlrManager : public Object
     typedef Callback<void, uint32_t, uint16_t, uint16_t, uint8_t> TimeoutCallback;
     void SetTimeoutCallback(TimeoutCallback cb);
 
+    /**
+     * @brief Sever every endpoint-binding and cancel every armed timer.
+     *
+     * Called by the owning FabricEndpoint::DoDispose BEFORE it drops its
+     * m_llrManager reference. The timeout and permanent-loss callbacks hold
+     * the endpoint's raw `this`, and the per-entry retry timers can outlive
+     * the endpoint when an external holder keeps the manager alive via
+     * GetLlrManager() — a firing timer then invokes OnLlrRetryTimeout on
+     * freed endpoint memory (codex round 17, finding 3). Nulling the
+     * callbacks makes a late OnRetryTimeout a no-op; Clear() cancels the
+     * timers outright.
+     */
+    void DetachFromEndpoint();
+
     // --- Buffer size ---
 
     void SetMaxBufferSize(uint32_t maxSize);

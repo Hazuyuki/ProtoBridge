@@ -6,6 +6,44 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — LLR manager callbacks and timers detach at endpoint dispose
+
+`FabricEndpoint::DoDispose` dropped `m_llrManager` without detaching its
+endpoint bindings: the timeout callback (`OnLlrRetryTimeout`) and the
+permanent-loss callback (`NotifyPermanentLoss`) both hold the endpoint's
+raw `this`, and the per-entry retry timers keep firing as long as the
+manager lives. An external holder that kept the `GetLlrManager()`
+reference therefore kept the manager (and its timers) alive past the
+endpoint's disposal — a firing timer invoked `OnLlrRetryTimeout` on freed
+endpoint memory (codex round 17, finding 3; valgrind-confirmed invalid
+reads at the `m_llrEnabled`/`m_llrManager` guards, fabric-endpoint.cc:1970).
+The manager now exposes `DetachFromEndpoint()`, and `DoDispose` calls it
+before dropping the reference: null both callbacks (a late
+`OnRetryTimeout` becomes a no-op) and `Clear()` every armed timer.
+Verified with a standalone probe (retained manager + wire-armed 100-µs
+retry timer + dispose/release at 1 µs: invalid reads pre-fix, clean
+post-fix) and the new `LlrManagerDetachedAtDisposeTest`. The LLR
+parity pins (test_so_gbn_strict) are byte-identical.
+
+### Fixed — memory-semantic completion and memory-response events are tracked
+
+The memory-semantic completion event
+(`SendMemorySemantic` → `NotifyMemorySemanticComplete`, both the
+credit-blocked queue path and the normal path) and the memory-device
+read-response event (`OnPacketReceived` → `SendMemoryResponse`) captured
+raw `this` without joining `m_deferredEgressEvents`, so `DoDispose`
+never cancelled them. With a 100-µs sync/memory latency and the endpoint
+disposed and released at 1 µs, both fired into freed memory —
+valgrind-confirmed invalid reads in `NotifyMemorySemanticComplete`
+(fabric-endpoint.cc:857/859) and across `SendMemoryResponse`'s member
+accesses (codex round 17, finding 2). All three schedule sites now push
+their EventId into `m_deferredEgressEvents` like every other deferred
+egress. Verified with a standalone probe (43 invalid reads pre-fix, zero
+post-fix, and the completion callback no longer fires after dispose) and
+the new `MemoryEventCancelledAtDisposeTest` (write + read against a
+MEMORY device, dispose+release both endpoints at 1 µs, run past the
+100-µs expiry, assert zero post-dispose completions).
+
 ### Fixed — zero-sized bulk transfers skip the fragment math (SIGFPE)
 
 The degenerate sub-GPU-count chunk grid (round 16, finding 4) gives the

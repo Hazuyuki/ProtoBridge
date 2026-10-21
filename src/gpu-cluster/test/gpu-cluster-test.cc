@@ -5506,6 +5506,202 @@ class InjectorStartupEventCancelledAtDisposeTest : public TestCase
     }
 };
 
+// (R17#2) The memory-semantic completion event and the memory-device read
+// response event both capture raw `this` and must be cancelled at dispose.
+// Codex round 17, finding 2: with a 100-us sync/memory latency and the
+// endpoint disposed AND released at 1 us, valgrind confirmed invalid reads
+// in NotifyMemorySemanticComplete (fabric-endpoint-send.cc:821/841 events)
+// and SendMemoryResponse (fabric-endpoint.cc:2249 event) at the 100-us
+// firing. Regression: fire a memory-semantic write and a memory-semantic
+// read into a MEMORY device, dispose+release the relevant endpoints at
+// 1 us, and run past the 100-us expiry — no freed reads, and the
+// completion callback never fires after dispose.
+class MemoryEventCancelledAtDisposeTest : public TestCase
+{
+  public:
+    MemoryEventCancelledAtDisposeTest()
+        : TestCase("memory-semantic events are cancelled at dispose") {}
+
+    // Static holders so the scheduled release lambdas drop the LAST
+    // reference (the DoRun-local Ptrs are not captured) — the destructor
+    // must actually run before the 100-us events.
+    static Ptr<FabricEndpoint>& Sender()
+    {
+        static Ptr<FabricEndpoint> ep;
+        return ep;
+    }
+    static Ptr<FabricEndpoint>& MemDevice()
+    {
+        static Ptr<FabricEndpoint> ep;
+        return ep;
+    }
+    static int& Completions()
+    {
+        static int n = 0;
+        return n;
+    }
+
+    static void OnSemComplete(uint16_t, uint64_t, MemoryAccessType)
+    {
+        ++Completions();
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        Completions() = 0;
+        NodeContainer a, b;
+        a.Add(CreateObject<Node>());
+        b.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer pair = p2p.Install(a.Get(0), b.Get(0));
+
+        Sender() = CreateObject<FabricEndpoint>();
+        Sender()->SetRank(0);
+        Sender()->SetLocalRankRange(0, 1);
+        Sender()->AddNetDevice(pair.Get(0));
+        Sender()->SetRoutingEntry(1, 0);
+        Sender()->SetBypassReorderBuffer(true);
+        Sender()->SetNeighborMac(1, Mac48Address::ConvertFrom(pair.Get(1)->GetAddress()));
+        // 100-us completion event — far past the 1-us dispose below.
+        Sender()->SetSyncMemLatencyNs(100000);
+        Sender()->SetMemorySemanticCallback(MakeCallback(&OnSemComplete));
+
+        MemDevice() = CreateObject<FabricEndpoint>();
+        MemDevice()->SetRank(1);
+        MemDevice()->SetLocalRankRange(1, 1);
+        MemDevice()->AddNetDevice(pair.Get(1));
+        MemDevice()->SetRoutingEntry(0, 0);
+        MemDevice()->SetBypassReorderBuffer(true);
+        MemDevice()->SetNeighborMac(0, Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+        MemDevice()->SetDeviceType(DeviceType::MEMORY);
+        MemDevice()->SetMemorySize(4096);
+        // 100-us response event — far past the 1-us dispose below.
+        MemDevice()->SetMemoryLatency(MicroSeconds(100));
+
+        Sender()->Initialize();
+        MemDevice()->Initialize();
+
+        // Memory-semantic write (completion event on the sender) and read
+        // (response event on the MEMORY device).
+        Simulator::Schedule(NanoSeconds(0), []() {
+            uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            Sender()->SendMemorySemantic(1, 0, payload, sizeof(payload),
+                                         MemoryAccessType::SYNC_LOAD_STORE);
+            Sender()->SendMemorySemantic(1, 0, nullptr, 8,
+                                         MemoryAccessType::SYNC_LOAD_STORE);
+        });
+
+        // Dispose and release BOTH endpoints at 1 us — before the 100-us
+        // completion and response events.
+        Simulator::Schedule(MicroSeconds(1), []() {
+            Sender()->Dispose();
+            MemDevice()->Dispose();
+            Sender() = nullptr;
+            MemDevice() = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(500)); // well past the 100-us expiry
+        Simulator::Run();
+        Simulator::Destroy();
+        // The completion callback must not fire after dispose...
+        NS_TEST_ASSERT_MSG_EQ(Completions(), 0,
+                              "memory-semantic completion fired after dispose");
+        // ...and reaching this line without reading freed memory is the
+        // rest of the assertion (valgrind adjudicates the response event).
+    }
+};
+
+// (R17#3) FabricEndpoint::DoDispose drops m_llrManager without detaching
+// its endpoint callbacks (OnLlrRetryTimeout / NotifyPermanentLoss) or
+// cancelling its armed retry timers. An external GetLlrManager() holder
+// keeps the manager alive after the endpoint is gone; its 100-us retry
+// timer then invokes OnLlrRetryTimeout on freed endpoint memory (codex
+// round 17, finding 3 — valgrind-confirmed invalid reads at the
+// m_llrEnabled / m_llrManager guards). Regression: retain the manager,
+// store + wire-arm an un-ACKed packet, dispose+release the endpoint at
+// 1 us, and run past the 100-us expiry.
+class LlrManagerDetachedAtDisposeTest : public TestCase
+{
+  public:
+    LlrManagerDetachedAtDisposeTest()
+        : TestCase("LLR manager callbacks and timers detach at dispose") {}
+
+    static Ptr<FabricEndpoint>& Ep()
+    {
+        static Ptr<FabricEndpoint> ep;
+        return ep;
+    }
+    static Ptr<LlrManager>& RetainedLlr()
+    {
+        static Ptr<LlrManager> llr;
+        return llr;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ep() = CreateObject<FabricEndpoint>();
+        Ep()->SetRank(1);
+        Ep()->SetLocalRankRange(1, 1);
+        Ep()->AddNetDevice(devs.Get(0));
+        Ep()->SetNeighborMac(0, Mac48Address::Allocate());
+        Ep()->SetRoutingEntry(0, 0);
+        Ep()->SetBypassReorderBuffer(true);
+
+        // The external holder that outlives the endpoint.
+        RetainedLlr() = Ep()->GetLlrManager();
+        RetainedLlr()->SetLlrMode(LlrMode::SACK);
+        RetainedLlr()->SetRetryLimit(3);
+        RetainedLlr()->SetRetryTimeout(MicroSeconds(100));
+        Ep()->SetLlrEnabled(true);
+        Ep()->EnableLlrTimeoutRetransmit(); // wires OnLlrRetryTimeout (raw this)
+
+        Ep()->Initialize();
+
+        // Store an un-ACKed packet and arm its retry timer the way the
+        // wire-egress path does (ArmRetryTimeoutAtTransmission).
+        Simulator::Schedule(NanoSeconds(0), [&devs]() {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::DATA);
+            h.SetSourceRank(1);
+            h.SetDestRank(0);
+            h.SetSequenceNumber(0);
+            h.SetFlowId(1);
+            h.SetVirtualChannel(0);
+            h.SetPayloadSize(64);
+            pkt->AddHeader(h);
+            RetainedLlr()->StorePacket(0, pkt, 0);
+            RetainedLlr()->ArmRetryTimeoutAtTransmission(0, 0, 1, 0);
+        });
+
+        // Dispose and release the ENDPOINT at 1 us; the retained manager
+        // (and pre-fix, its armed timer) survives.
+        Simulator::Schedule(NanoSeconds(1000), []() { Ep()->Dispose(); });
+        Simulator::Schedule(NanoSeconds(1100), []() { Ep() = nullptr; });
+
+        Simulator::Stop(MicroSeconds(300)); // past the 100-us timer
+        Simulator::Run();
+        Simulator::Destroy();
+        // Reaching this line without reading freed endpoint memory is the
+        // assertion (valgrind adjudicates).
+        RetainedLlr() = nullptr;
+    }
+};
+
 // (1b-3) LLR retry timers must not start while the pacer still holds the
 // packet. Codex round 12, finding 4: StorePacket armed the timeout at
 // ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
@@ -8237,6 +8433,8 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new FullMeshDegenerateGridTest, TestCase::Duration::QUICK);
     AddTestCase(new FullMeshReduceScatterPerDestLoadTest, TestCase::Duration::QUICK);
     AddTestCase(new ZeroChunkBulkTransferTest, TestCase::Duration::QUICK);
+    AddTestCase(new MemoryEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new LlrManagerDetachedAtDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

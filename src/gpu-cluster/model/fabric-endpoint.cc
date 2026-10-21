@@ -241,6 +241,16 @@ FabricEndpoint::DoDispose()
     m_payloadBuilder = nullptr;
     m_protocolModel = nullptr;
     m_interNodeProtocolModel = nullptr;
+    // The LLR manager outlives this endpoint whenever an external holder
+    // kept the GetLlrManager() reference. Its timeout and permanent-loss
+    // callbacks hold this endpoint's raw `this`, and its per-entry retry
+    // timers can fire long after the endpoint is freed — detach both
+    // callbacks and cancel every timer BEFORE dropping our reference
+    // (codex round 17, finding 3).
+    if (m_llrManager)
+    {
+        m_llrManager->DetachFromEndpoint();
+    }
     m_llrManager = nullptr;
     m_gbnNextAckSeq.clear();
     m_gbnPendingAcks.clear();
@@ -2246,10 +2256,18 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
                                      ? std::min(readSize, static_cast<uint32_t>(m_memoryData.size() - address))
                                      : 0;
             const uint8_t* dataPtr = (availSize > 0) ? m_memoryData.data() + address : nullptr;
-            Simulator::Schedule(m_memoryLatency,
-                                &FabricEndpoint::SendMemoryResponse,
-                                this, header.GetSourceRank(),
-                                dataPtr, availSize);
+            // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
+            // bound member call targets raw `this` and fires into freed
+            // memory when the MEMORY endpoint is disposed and released before
+            // the service latency elapses (codex round 17, finding 2 — with a
+            // 100-us memory latency and dispose+release at 1 us, valgrind
+            // confirmed invalid reads in SendMemoryResponse's member access
+            // at the 100-us firing).
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(m_memoryLatency,
+                                    &FabricEndpoint::SendMemoryResponse,
+                                    this, header.GetSourceRank(),
+                                    dataPtr, availSize));
         }
     }
     else if (!duplicate && type == FabricPacketType::MEMORY_WRITE)

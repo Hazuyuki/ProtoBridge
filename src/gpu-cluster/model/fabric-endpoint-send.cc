@@ -818,9 +818,17 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
             m_sendQueue.push(entry);
             TrySendQueuedPackets();
             // Still schedule completion — the packet will be sent when credits arrive
-            Simulator::Schedule(NanoSeconds(latencyNs),
-                                &FabricEndpoint::NotifyMemorySemanticComplete,
-                                this, destRank, address, accessType);
+            // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
+            // bound member call targets raw `this` and fires into freed
+            // memory when the endpoint is disposed and released before the
+            // completion latency elapses (codex round 17, finding 2 — with a
+            // 100-us sync latency and dispose+release at 1 us, valgrind
+            // confirmed invalid reads in NotifyMemorySemanticComplete's
+            // callback member access at the 100-us firing).
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(NanoSeconds(latencyNs),
+                                    &FabricEndpoint::NotifyMemorySemanticComplete,
+                                    this, destRank, address, accessType));
             return;
         }
         m_creditManager->ConsumeCredit(vcId, seqNum);
@@ -837,10 +845,14 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     uint32_t deviceIndex = ResolveDeviceIndex(destRank);
     SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(destRank));
 
-    // Schedule completion callback at the memory-semantic latency
-    Simulator::Schedule(NanoSeconds(latencyNs),
-                        &FabricEndpoint::NotifyMemorySemanticComplete,
-                        this, destRank, address, accessType);
+    // Schedule completion callback at the memory-semantic latency.
+    // Tracked in m_deferredEgressEvents so DoDispose cancels it (same
+    // rationale as the credit-blocked path above — codex round 17,
+    // finding 2).
+    m_deferredEgressEvents.push_back(
+        Simulator::Schedule(NanoSeconds(latencyNs),
+                            &FabricEndpoint::NotifyMemorySemanticComplete,
+                            this, destRank, address, accessType));
 }
 
 void

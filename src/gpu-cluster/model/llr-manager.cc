@@ -573,6 +573,20 @@ LlrManager::SetTimeoutCallback(TimeoutCallback cb)
 }
 
 void
+LlrManager::DetachFromEndpoint()
+{
+    NS_LOG_FUNCTION(this);
+    // Null callbacks first so nothing NEW can bind the endpoint, then
+    // cancel every armed retry timer (Clear() also drops the stores, which
+    // the endpoint's disappearance makes unrecoverable anyway — no ACK can
+    // arrive to purge them, and no retransmission can be dispatched).
+    m_timeoutCallback = MakeNullCallback<void, uint32_t, uint16_t, uint16_t, uint8_t>();
+    m_permanentLossCallback =
+        MakeNullCallback<void, FabricHeader>();
+    Clear();
+}
+
+void
 LlrManager::SetMaxBufferSize(uint32_t maxSize)
 {
     NS_LOG_FUNCTION(this << maxSize);
