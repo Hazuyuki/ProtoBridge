@@ -121,6 +121,7 @@ class TheoryDerivedSurrogate:
                  nvls_startup_us=23.0,
                  retry_source_bw_bytes_per_us=4_800_000,
                  retry_source_latency_us=0.3,
+                 nvls_num_partitions=8,
                  wire_efficiency=1.0):
         # Fixed profile parameters from hardware, ns-3 configuration, or
         # one-time platform calibration.
@@ -148,6 +149,10 @@ class TheoryDerivedSurrogate:
         self.S_nvls_startup = nvls_startup_us
         self.retry_source_bw = retry_source_bw_bytes_per_us
         self.retry_source_latency = retry_source_latency_us
+        # NVLS AllReduce result-multicast partitions (the switch's
+        # allReduceNumPartitions; gpu-cluster-sim's default is 8). The
+        # pipelined result path fragments per partition, not over the full D.
+        self.nvls_num_partitions = nvls_num_partitions
         # Per-transfer wire efficiency (<1 accounts for L3/L4/transport header
         # overhead, e.g. RoCEv2 Eth+IP+UDP+IB ~0.95). Applied to the serial
         # bandwidth (T_serial /= wire_efficiency); 1.0 is byte-identical to the
@@ -655,46 +660,72 @@ class TheoryDerivedSurrogate:
         else:
             transfer_count = num_gpus
         # NVLS/SHARP needs per-SIDE packet counts: uploads and result
-        # deliveries fragment differently. Each rank's upload carries D/N
-        # (allgather) or D (allreduce); each multicast result delivers the
-        # FULL D to every destination, re-fragmented at the upload chunks'
-        # granularity — the switch multicasts each received upload chunk, so
-        # a dest's result stream has N * frag(D/N) packets. Counting both
-        # sides at the upload's packetization understates the result risk:
-        # at N=8/D=16 MiB the surrogate counted 288 packets where the C++
-        # fabric emits 1,296 (144 upload + 1,152 result), so BER 1e-9/0
-        # retries gave 0.2683 expected losses instead of ~1.2074 and
-        # strict_reliability stayed finite for a config that cannot complete.
+        # deliveries fragment differently, and (for allreduce) at DIFFERENT
+        # granularities. The two collectives' C++ geometry (sharp-allreduce /
+        # NvSwitch::MulticastAllReducePartition) differs:
+        #
+        #   allgather: each of the N ranks uploads frag(D/N); the switch
+        #   re-multicasts every received upload chunk to every dest, so a
+        #   dest's result stream carries N * frag(D/N) chunks at the upload
+        #   chunk sizes — 8 GPU / 16 MiB gives 144 upload + 1,152 result
+        #   chunks (9.75x the risk of counting uploads alone).
+        #
+        #   allreduce: every rank uploads the FULL D (frag(D) chunks —
+        #   sharp-allreduce.cc uploads D before any partitioning), and the
+        #   switch's result multicast is PIPELINED over nvlsNumPartitions
+        #   (default 8): each dest receives P partitions of D/P each,
+        #   re-fragmented at frag(D/P) — 8 GPU / 16 MiB / P=8 gives
+        #   1,024 upload chunks + 1,152 result chunks, NOT the naive
+        #   N * N * frag(D) = 8,192 results the upload-mirroring formula
+        #   produced (codex round 13, finding 5). With D=16 MiB the result
+        #   partition fragment (~116.5 KB) also differs from the upload
+        #   fragment (128 KB), so each side needs its own p_frag.
+        #
         # The fragment geometry is SendCollectiveBulk's spray, NOT the DATA
         # bulk path: numChunks = max(lanes, ceil(bytes/spray_chunk)) over the
-        # ACTUAL side size — a rank uploads D/N (allgather) or D (allreduce)
-        # in one sprayed transfer, and each result chunk mirrors one upload
-        # chunk (same wire/effective sizes). Calling _packets_per_transfer
-        # here double-divided by N (it divides internally, and the branch
-        # passed D/N again) and borrowed the DATA path's packet bytes
-        # (~932 KB fragments at D=128 MiB, ~1370x the failure probability of
-        # the real 128 KB spray chunks): 8 GPU / 128 MiB allgather / BER
-        # 5e-8 / retry 3 reported 12.1577 expected losses where the C++
-        # geometry gives 0.0627 and the ns-3 run completes with zero
-        # permanent losses (codex round 12, finding 6).
+        # ACTUAL side size. Calling _packets_per_transfer here double-divided
+        # by N and borrowed the DATA path's packet bytes (~932 KB fragments
+        # at D=128 MiB, ~1370x the failure probability of the real 128 KB
+        # spray chunks): 8 GPU / 128 MiB allgather / BER 5e-8 / retry 3
+        # reported 12.1577 expected losses where the C++ geometry gives 0.0627
+        # and the ns-3 run completes with zero permanent losses (codex round
+        # 12, finding 6).
         if algo == 'nvls' and collective in ('allreduce', 'allgather'):
-            upload_bytes = (data_bytes / max(1, num_gpus)
-                            if collective == 'allgather' else data_bytes)
-            upload_frags, upload_frag_bytes = (
-                self._spray_fragments(upload_bytes))
-            # Result side per destination: the switch re-multicasts every
-            # received upload chunk, so a dest's stream carries N streams of
-            # frag(D/N) chunks at the upload chunk sizes (allreduce results
-            # mirror the D-byte upload chunks the same way).
-            result_frags_per_dest = num_gpus * upload_frags
             attempts = retry_limit + 1
-            p_frag = self._packet_failure_probability(
+            if collective == 'allgather':
+                upload_bytes = data_bytes / max(1, num_gpus)
+                upload_frags, upload_frag_bytes = (
+                    self._spray_fragments(upload_bytes))
+                # Result side per destination: the switch re-multicasts
+                # every received upload chunk, so a dest's stream carries
+                # N streams of frag(D/N) chunks at the upload chunk sizes.
+                result_frags_per_dest = num_gpus * upload_frags
+                p_frag = self._packet_failure_probability(
+                    ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
+                p_path_frag = 1.0 - (1.0 - p_frag) ** max(1.0, optical_hops)
+                return ((num_gpus * upload_frags
+                         + num_gpus * result_frags_per_dest)
+                        * min(1.0, max(0.0, optical_fraction))
+                        * p_path_frag ** attempts)
+            # AllReduce: full-D uploads + partitioned result multicast.
+            upload_frags, upload_frag_bytes = self._spray_fragments(data_bytes)
+            num_partitions = max(1, self.nvls_num_partitions)
+            result_frags, result_frag_bytes = self._spray_fragments(
+                data_bytes / num_partitions)
+            # Each dest receives every partition: P * frag(D/P) chunks.
+            result_frags_per_dest = num_partitions * result_frags
+            p_upload_frag = self._packet_failure_probability(
                 ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
-            p_path_frag = 1.0 - (1.0 - p_frag) ** max(1.0, optical_hops)
-            return ((num_gpus * upload_frags
-                     + num_gpus * result_frags_per_dest)
-                    * min(1.0, max(0.0, optical_fraction))
-                    * p_path_frag ** attempts)
+            p_result_frag = self._packet_failure_probability(
+                ber, fec_enabled, fec_n, fec_k, fec_t, result_frag_bytes)
+            p_path_upload = 1.0 - (1.0 - p_upload_frag) ** max(
+                1.0, optical_hops)
+            p_path_result = 1.0 - (1.0 - p_result_frag) ** max(
+                1.0, optical_hops)
+            return ((num_gpus * upload_frags * p_path_upload ** attempts
+                     + num_gpus * result_frags_per_dest
+                     * p_path_result ** attempts)
+                    * min(1.0, max(0.0, optical_fraction)))
         attempts = retry_limit + 1
         return (transfer_count * packets_per_transfer
                 * min(1.0, max(0.0, optical_fraction))

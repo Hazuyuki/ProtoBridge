@@ -804,11 +804,12 @@ def test_nvls_expected_losses_count_result_sides():
         D, N, "nvls", 1e-9, 0,
         optical_fraction=1.0, optical_hops=1, collective="allgather")
     assert abs(losses - 1.2074) < 2e-3
-    # The allreduce branch carries the same per-side structure.
+    # The allreduce branch carries the same both-sides structure (1,024
+    # uploads + 1,152 pipelined result chunks at N=8/D=16 MiB/P=8).
     losses_ar = nvls.expected_permanent_losses(
         D, N, "nvls", 1e-9, 0,
         optical_fraction=1.0, optical_hops=1, collective="allreduce")
-    assert losses_ar > 4 * losses / 5  # both sides counted, not 2N*frag
+    assert abs(losses_ar - 2.1464) < 2e-3
 
 
 def test_nvls_expected_losses_use_spray_fragment_geometry():
@@ -841,8 +842,42 @@ def test_nvls_expected_losses_use_spray_fragment_geometry():
         D, N, "nvls", 8e-8, 3,
         optical_fraction=1.0, optical_hops=1, collective="allgather")
     assert abs(losses8 - 0.386322) < 2e-4
-    # Allreduce uploads carry the full D per rank: 128 frags of 128 KiB.
+    # Allreduce uploads carry the full D per rank (128 frags of 128 KiB);
+    # the result side is PIPELINED over nvlsNumPartitions=8, so each dest
+    # gets P * frag(D/P) = 8 * 18 chunks of 116,509 B, not N * frag(D).
     losses_ar = nvls.expected_permanent_losses(
         D, N, "nvls", 5e-8, 3,
         optical_fraction=1.0, optical_hops=1, collective="allreduce")
-    assert losses_ar > 2 * losses  # D-byte uploads, N x the upload-side risk
+    assert abs(losses_ar - 0.111522) < 2e-4
+
+
+def test_nvls_allreduce_result_partition_geometry():
+    """NVLS AllReduce results are pipelined over nvlsNumPartitions (default
+    8), not re-multicast at the upload granularity. Every rank uploads the
+    full D (frag(D) chunks), and the switch's result multicast sends each
+    dest P partitions of D/P each, re-fragmented at frag(D/P) — at N=8,
+    D=16 MiB, P=8, 18 lanes that is 1,024 upload chunks + 1,152 result
+    chunks. The pre-fix formula mirrored the allgather branch and counted
+    N * N * frag(D) = 8,192 result chunks, so BER 1e-10/0 retries gave
+    0.9663 expected losses and strict_reliability returned infinity for a
+    config whose ns-3 run completes with zero permanent losses (codex
+    round 13, finding 5)."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 16 * 1024 * 1024, 8
+    upload_frags, upload_frag_bytes = nvls._spray_fragments(D)
+    result_frags, result_frag_bytes = nvls._spray_fragments(D / 8)
+    assert upload_frags == 128 and upload_frag_bytes == 131072
+    assert result_frags == 18 and result_frag_bytes == 116509
+    # 8 ranks * 128 uploads + 8 dests * 8 partitions * 18 chunks.
+    expected = (N * upload_frags * (1 - (1 - 1e-10) ** (upload_frag_bytes * 8))
+                + N * 8 * result_frags
+                * (1 - (1 - 1e-10) ** (result_frag_bytes * 8)))
+    losses = nvls.expected_permanent_losses(
+        D, N, "nvls", 1e-10, 0,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce")
+    assert abs(losses - expected) < 1e-12
+    assert losses < 0.5  # completable: strict must stay finite
+    t = nvls.predict(D, N, "nvls", 128, ber=1e-10, retry_limit=0,
+                     strict_reliability=True, collective="allreduce",
+                     llr_enabled=True)
+    assert math.isfinite(t)

@@ -6,6 +6,29 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — NVLS AllReduce reliability uses the partitioned result geometry
+
+The NVLS branch of `expected_permanent_losses` mirrored the allgather
+formula for allreduce, counting the result side as `N·frag(D)` per
+destination = 8,192 result chunks at N=8/D=16 MiB. But the C++ AllReduce
+result multicast is PIPELINED over `nvlsNumPartitions` (default 8): every
+rank uploads the full D (frag(D) = 128 chunks of 128 KiB → 1,024 uploads)
+and the switch multicasts each dest P partitions of D/P each, re-fragmented
+at frag(D/P) = 18 chunks of 116,509 B → 144 per dest, 1,152 results
+(codex round 13, finding 5). The old count made BER 1e-10/0 retries give
+0.9663 expected losses, so `strict_reliability` returned infinity for a
+config whose ns-3 run completes with zero permanent losses; the corrected
+geometry gives 0.2147 and a finite 86.57 µs. The allreduce arm now counts
+`N·frag(D)` uploads at the upload fragment size plus
+`N·P·frag(D/P)` results at the partition fragment size (a separate
+`p_frag` per side — the 116,509 B result chunk is not the 128 KiB upload
+chunk), with the partition count exposed as `nvls_num_partitions`
+(default 8, matching gpu-cluster-sim's `--nvlsNumPartitions`). Allgather
+keeps its upload-mirroring geometry (its result really is a re-multicast
+of the D/N uploads). Tests pin the 1,024 + 1,152 counts, the
+0.2147-loss / finite-strict codex point, and the allgather value
+unchanged; CHANGES' round-12 entry ("8,192 results") corrected in place.
+
 ### Fixed — NcclRing chunk identity follows each channel's ring order
 
 `ChunkSizeOf` indexed the chunk grid by the sender's NUMERIC rank
@@ -183,7 +206,8 @@ uploads the full D (or D/N for allgather) once, while the switch
 re-multicasts every received chunk to each of the N destinations — at
 N=8/D=16 MiB allgather the C++ truth is 144 upload fragments and 1,152
 result fragments (1,296 total, 9× the upload side); allreduce carries
-1,024 uploads and 8,192 results (9,216 total). The generic
+1,024 uploads and 1,152 results (its result multicast is pipelined over
+8 partitions, see the round-13 entry below). The generic
 multiplier overreported allgather losses by ~4.5× (0.2683 vs the
 measured 1.2074 at BER 1e-9/0 retries; codex round 11, finding 6 —
 count and parameter corrections per round 12, finding 10).
