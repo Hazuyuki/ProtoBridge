@@ -6,6 +6,22 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — standalone fullmesh AllGather/ReduceScatter grids cover the full data size
+
+The standalone fullmesh AllGather and ReduceScatter injectors still used
+`dataSize / numGpus` for every transfer and their completion threshold,
+silently dropping `dataSize % numGpus` bytes — the remainder fix from
+round 15 only covered RingAllGather, RingReduceScatter, and
+FullMeshAllReduce. At 4 GPUs and 15 B each injector reported completion
+after 36 effective bytes instead of the required `(N-1)*D = 45` (codex
+round 16, finding 5). Both injectors now use the same remainder grid
+(rank r's chunk is `dataSize/numGpus` bytes plus one for the first
+`dataSize % numGpus` ranks, degenerate sub-GPU-count sizes degrade to
+one byte per rank), per-destination completion thresholds of
+`dataSize - own chunk`, and a `GetSentDataBytes` coverage probe. The
+`CollectiveInjectorCoverageTest` grid now pins both injectors at
+45 wire bytes and fails on the pre-fix build.
+
 ### Fixed — fullmesh allreduce degenerate sub-GPU-count grid
 
 With `dataSize < numGpus` (4 GPUs, 3 B), the degenerate fallback set

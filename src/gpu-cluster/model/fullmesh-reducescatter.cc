@@ -30,7 +30,8 @@ FullMeshReduceScatter::GetTypeId()
 }
 
 FullMeshReduceScatter::FullMeshReduceScatter()
-    : m_numGpus(0), m_dataSize(0), m_chunkSize(0), m_flowId(1),
+    : m_numGpus(0), m_dataSize(0), m_chunkSize(0), m_chunkRemainder(0),
+      m_flowId(1),
       m_state(FullMeshRsState::IDLE), m_startupDelayNs(0),
       m_doneCount(0), m_startTimeNs(0), m_endTimeNs(0)
 {
@@ -66,8 +67,22 @@ FullMeshReduceScatter::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
+    // Chunk grid: rank r's base chunk is dataSize/numGpus bytes, with the
+    // first dataSize % numGpus chunks carrying one extra byte, so the grid
+    // sums to exactly dataSize (codex round 16, finding 5: plain integer
+    // division silently dropped dataSize % numGpus bytes — 15 B over 4 GPUs
+    // completed after 36 effective bytes instead of the required 45).
     m_chunkSize = dataSize / numGpus;
-    if (m_chunkSize == 0) m_chunkSize = dataSize;
+    m_chunkRemainder = dataSize % numGpus;
+    if (m_chunkSize == 0 && dataSize > 0)
+    {
+        // Degenerate dataSize < numGpus: one byte on each of the first
+        // dataSize ranks, zero on the rest (grid still sums to dataSize).
+        m_chunkSize = 0;
+        m_chunkRemainder = dataSize;
+    }
+
+    m_sentDataBytes = 0;
 
     m_gpuReceivedBytes.resize(numGpus, 0);
     m_gpuSrcDoneCount.resize(numGpus, 0);
@@ -137,8 +152,10 @@ FullMeshReduceScatter::TriggerSends()
         {
             if (dest == gpu) continue;
 
+            const uint64_t chunkBytes = ChunkSizeOf(gpu);
+            m_sentDataBytes += chunkBytes;
             m_endpoints[gpu]->SendBulkWireTransferSize(
-                dest, m_chunkSize, m_protocolId, m_flowId, 0);
+                dest, chunkBytes, m_protocolId, m_flowId, 0);
         }
     }
     NS_LOG_INFO("ReduceScatter: all GPUs sending chunks to all others");
@@ -160,10 +177,11 @@ FullMeshReduceScatter::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fa
 void
 FullMeshReduceScatter::CheckCompletion()
 {
-    uint64_t expectedTotal = (m_numGpus - 1) * m_chunkSize;
-
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
+        // Each destination receives the chunks of all N-1 sources: the
+        // whole grid minus its OWN chunk (which it already holds).
+        const uint64_t expectedTotal = m_dataSize - ChunkSizeOf(gpu);
         if (m_gpuSrcDoneCount[gpu] == 0 && m_gpuReceivedBytes[gpu] >= expectedTotal)
         {
             m_gpuSrcDoneCount[gpu] = m_numGpus - 1;
@@ -175,6 +193,14 @@ FullMeshReduceScatter::CheckCompletion()
     {
         Complete();
     }
+}
+
+uint64_t
+FullMeshReduceScatter::ChunkSizeOf(uint16_t gpu) const
+{
+    // Chunk `gpu` of the grid: base size plus one byte for the first
+    // dataSize % numGpus chunks.
+    return m_chunkSize + (gpu < m_chunkRemainder ? 1 : 0);
 }
 
 CollectiveType

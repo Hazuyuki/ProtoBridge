@@ -56,6 +56,7 @@
 #include "ns3/nvls-allgather.h"
 #include "ns3/fullmesh-allreduce.h"
 #include "ns3/fullmesh-allgather.h"
+#include "ns3/fullmesh-reducescatter.h"
 #include "ns3/alltoall-injector.h"
 #include "ns3/hierarchical-allreduce.h"
 #include "ns3/mccl-payload-builder.h"
@@ -6883,6 +6884,15 @@ class CollectiveInjectorCoverageTest : public TestCase
         RunCoverage<FullMeshAllReduce>(15, 90,
             "FullMeshAllReduce traffic must cover the full data size: "
             "2(N-1)*D = 90 B, not 72 B");
+        // Standalone fullmesh AG/RS: each rank broadcasts its chunk to N-1
+        // peers -> (N-1)*D = 45 wire bytes (the old floor division sent 36,
+        // codex round 16, finding 5).
+        RunCoverage<FullMeshAllGather>(15, 45,
+            "FullMeshAllGather traffic must cover the full data size: "
+            "(N-1)*D = 45 B, not 36 B");
+        RunCoverage<FullMeshReduceScatter>(15, 45,
+            "FullMeshReduceScatter traffic must cover the full data size: "
+            "(N-1)*D = 45 B, not 36 B");
     }
 };
 
