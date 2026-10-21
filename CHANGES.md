@@ -6,6 +6,16 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — documented NVLS parity value refreshed
+
+CONFIG_GUIDE.md's verified-cases table claimed `simTimeNs=27576` for the
+8-GPU / 1-MiB NVLS allreduce; the shipped config and the equivalent inline
+command both reproducibly return **28034 ns** (codex round 15, finding 8 —
+stale pin, no code change). Re-measured via
+`test/parity/test_config_vs_inline_parity.py`, which still passes
+config `==` inline for all six rows; only the nvls row's recorded value
+was updated.
+
 ### Fixed — Ring AG/RS and FullMesh grids cover the full data size
 
 `RingAllGather`, `RingReduceScatter`, and `FullMeshAllReduce` sized every

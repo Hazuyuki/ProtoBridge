@@ -343,7 +343,7 @@ values below):
 | ring | 1 MiB | 4 | 33028 | — |
 | ring | 256 MiB | 4 | 1163404 | — |
 | tree | 1 MiB | 8 | 55148 | — |
-| nvls | 1 MiB | 8 | 27576 | — |
+| nvls | 1 MiB | 8 | 28034 | — |
 
 If you change a sourced profile key, the C++ sourcing block
 (`scratch/gpu-cluster-sim.cc`, after `configMode = true;`), or an injector,
