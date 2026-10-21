@@ -65,6 +65,13 @@ struct CrossFabricLink
     uint16_t gateway2Rank;  ///< Gateway rank in fabric 2
     std::string dataRate;   ///< Link data rate
     std::string delay;      ///< Link delay
+    /// Device index of this link's Ethernet device on gateway 1 (filled by
+    /// BuildCrossFabricLinks). A gateway with several cross-fabric links
+    /// must route each remote fabric via ITS OWN device — "the last device
+    /// added" is only correct for a single link (codex round 18, finding 5).
+    uint32_t gw1DeviceIndex;
+    /// Device index of this link's Ethernet device on gateway 2.
+    uint32_t gw2DeviceIndex;
 
     CrossFabricLink()
         : fabric1Id(0),
@@ -72,7 +79,9 @@ struct CrossFabricLink
           gateway1Rank(0),
           gateway2Rank(0),
           dataRate("100Gbps"),
-          delay("10us")
+          delay("10us"),
+          gw1DeviceIndex(0),
+          gw2DeviceIndex(0)
     {}
 };
 

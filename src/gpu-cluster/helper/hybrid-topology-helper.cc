@@ -10,11 +10,13 @@
 #include "ns3/fabric-endpoint.h"
 #include "ns3/gateway-endpoint.h"
 #include "ns3/hybrid-routing-table.h"
+#include "ns3/link-degradation.h"
 #include "ns3/log.h"
 #include "ns3/string.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/point-to-point-net-device.h"
 #include "ns3/mac48-address.h"
+#include "ns3/random-variable-stream.h"
 
 namespace ns3
 {
@@ -141,6 +143,36 @@ HybridTopologyHelper::Build()
 
     // Configure gateways with cross-fabric routing
     ConfigureGateways();
+
+    // Apply the configured link degradation model to every endpoint. The
+    // member was previously stored but never read by any build path, so a
+    // packet-loss rate of 0.99 still delivered every byte (codex round 18,
+    // finding 8). The endpoints apply the model on both transmit (loss
+    // rate / link-down / BER) and the switch ports mirror it. Each endpoint
+    // gets its own copy so per-link tagging stays independent, seeded from
+    // the shared model exactly like GpuClusterTopologyHelper::MakePortModel.
+    if (m_linkDegradationModel)
+    {
+        for (uint32_t i = 0; i < m_allEndpoints.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_allEndpoints.Get(i));
+            if (!ep)
+            {
+                continue;
+            }
+            Ptr<LinkDegradationModel> portModel = CreateObject<LinkDegradationModel>();
+            portModel->SetBer(m_linkDegradationModel->GetBer());
+            portModel->SetPacketLossRate(m_linkDegradationModel->GetPacketLossRate());
+            portModel->SetErrorMode(m_linkDegradationModel->GetErrorMode());
+            portModel->SetCodewordSize(m_linkDegradationModel->GetCodewordSize());
+            portModel->SetBurstLength(m_linkDegradationModel->GetBurstLength());
+            portModel->SetBurstArrivalRate(m_linkDegradationModel->GetBurstArrivalRate());
+            Ptr<UniformRandomVariable> rng = CreateObject<UniformRandomVariable>();
+            rng->SetStream(-1);
+            portModel->SetRandomStream(rng);
+            ep->SetLinkDegradationModel(portModel);
+        }
+    }
 
     return m_allNodes;
 }
@@ -379,11 +411,19 @@ HybridTopologyHelper::BuildCrossFabricLinks()
         // Install link
         NetDeviceContainer devices = p2p.Install(gateway1, gateway2);
 
-        // Add Ethernet device to each gateway
-        // The device index will be higher than the NVLink devices
+        // Add Ethernet device to each gateway, recording the device index
+        // THIS link occupies. PopulateCrossFabricRouting must route via the
+        // per-link device, not "the last device added" — a gateway with two
+        // cross-fabric links would otherwise route BOTH remote fabrics over
+        // the second link and the first link's remote ranks become
+        // unreachable (64-B transfer to the first remote fabric delivered
+        // zero bytes; codex round 18, finding 5).
+        CrossFabricLink& mutableLink = const_cast<CrossFabricLink&>(link);
+        mutableLink.gw1DeviceIndex = ep1->GetNNetDevices();
         ep1->AddNetDevice(devices.Get(0));
         ep1->SetNeighborMac(link.gateway2Rank, Mac48Address::ConvertFrom(devices.Get(1)->GetAddress()));
 
+        mutableLink.gw2DeviceIndex = ep2->GetNNetDevices();
         ep2->AddNetDevice(devices.Get(1));
         ep2->SetNeighborMac(link.gateway1Rank, Mac48Address::ConvertFrom(devices.Get(0)->GetAddress()));
 
@@ -440,9 +480,12 @@ HybridTopologyHelper::PopulateCrossFabricRouting()
             continue;
         }
 
-        // The gateway's Ethernet device should be the last device added
-        uint32_t gw1EthDevIdx = gw1Ep->GetNNetDevices() - 1;
-        uint32_t gw2EthDevIdx = gw2Ep->GetNNetDevices() - 1;
+        // Route via the device THIS link occupies on each gateway (recorded
+        // at BuildCrossFabricLinks time). The old "last device added" guess
+        // broke gateways with MULTIPLE cross-fabric links: both remote
+        // fabrics routed over the second link (codex round 18, finding 5).
+        uint32_t gw1EthDevIdx = link.gw1DeviceIndex;
+        uint32_t gw2EthDevIdx = link.gw2DeviceIndex;
 
         // Configure gateway 1: route to all ranks in fabric 2 via Ethernet
         for (uint32_t i = 0; i < fabric2->numGpus; ++i)
