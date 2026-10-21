@@ -35,6 +35,7 @@ HierarchicalAlltoAll::HierarchicalAlltoAll()
       m_numNodes(1),
       m_intraNodeAlgorithm("fullmesh"),
       m_chunkSize(0),
+      m_chunkRemainder(0),
       m_state(HierAlltoAllState::IDLE),
       m_currentPhase(HierAlltoAllPhase::LOCAL_ALLTOALL),
       m_startupDelayNs(0),
@@ -169,11 +170,33 @@ HierarchicalAlltoAll::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_numGpus = numGpus;
     m_dataSize = dataSize;
     m_endpoints = endpoints;
+
+    // Frozen chunk-grid convention (codex round 18, finding 4): rank r
+    // owns dataSize/numGpus bytes plus one extra byte when r <
+    // dataSize % numGpus, so the grid sums to exactly dataSize. The
+    // previous uniform m_chunkSize truncated the remainder — 2 nodes x
+    // 2 GPUs at dataSize=15 completed after 36 aggregate bytes instead
+    // of 45 — and in the degenerate dataSize < numGpus case made
+    // m_chunkSize zero (nothing sent, nothing received, stall to the
+    // 1-hour cap: dataSize=3 never moved a byte).
     m_chunkSize = dataSize / numGpus;
+    m_chunkRemainder = dataSize % numGpus;
+    if (m_chunkSize == 0 && dataSize > 0)
+    {
+        // Degenerate dataSize < numGpus: one byte on each of the first
+        // dataSize ranks, zero on the rest (grid still sums to dataSize).
+        m_chunkRemainder = dataSize;
+    }
 
     m_gpuReceivedBytes.resize(numGpus, 0);
     m_gpuPhaseComplete.resize(numGpus, false);
     m_dummyData.resize(dataSize, 0xAB);
+}
+
+uint64_t
+HierarchicalAlltoAll::ChunkSizeOf(uint16_t rank) const
+{
+    return m_chunkSize + (rank < m_chunkRemainder ? 1 : 0);
 }
 
 void HierarchicalAlltoAll::SetCompletionCallback(std::function<void(uint64_t durationNs)> cb)
@@ -223,6 +246,17 @@ void HierarchicalAlltoAll::Start()
     m_state = HierAlltoAllState::RUNNING;
     m_startTimeNs = Simulator::Now().GetNanoSeconds();
 
+    // Zero-data collective: every chunk is zero (no peer sends anything,
+    // no receive ever fires) — complete immediately instead of stalling
+    // to the 1-hour cap (same degenerate-grid rule as AlltoAllInjector's
+    // Initialize short-circuit; codex round 18, finding 4).
+    if (m_dataSize == 0)
+    {
+        Complete();
+        return;
+    }
+
+
     SetupReceiveCallbacks();
 
     uint64_t startupNs = GetLocalStartupDelayNs(m_chunkSize);
@@ -254,9 +288,13 @@ HierarchicalAlltoAll::StartLocalAlltoAll()
             if (peerLocal == localIdx) continue;
             uint16_t peerRank = GetGlobalRank(myNodeId, peerLocal);
 
-            if (m_endpoints[gpu] && m_chunkSize > 0)
+            // DESTINATION-sized chunk (frozen grid convention): the sender
+            // ships the peer's chunk, so per-dest load is
+            // (gpusPerNode-1)*ChunkSizeOf(dest).
+            uint64_t peerChunk = ChunkSizeOf(peerRank);
+            if (m_endpoints[gpu] && peerChunk > 0)
             {
-                m_endpoints[gpu]->SendBulkWireTransfer(peerRank, m_dummyData.data(), m_chunkSize,
+                m_endpoints[gpu]->SendBulkWireTransfer(peerRank, m_dummyData.data(), peerChunk,
                                                         m_protocolId, m_flowId, 0);
             }
         }
@@ -269,6 +307,28 @@ HierarchicalAlltoAll::StartLocalAlltoAll()
     if (m_gpusPerNode <= 1)
     {
         NS_LOG_INFO("Phase1 (local alltoall) trivially complete (one GPU per node)");
+        uint64_t interStartup = GetInterNodeStartupDelayNs(m_chunkSize);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(interStartup),
+                                &HierarchicalAlltoAll::StartInterNodeAlltoAll, this));
+        return;
+    }
+
+    // Degenerate grid: ranks past dataSize hold a zero-sized chunk — no
+    // local peer sends them anything, so no receive will advance them.
+    // Pre-credit them as phase-complete now (same rule the other injectors
+    // apply at Initialize; codex round 18, finding 4).
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (ChunkSizeOf(gpu) == 0 && !m_gpuPhaseComplete[gpu])
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+        }
+    }
+    if (m_completedGpuCount >= m_numGpus)
+    {
+        NS_LOG_INFO("Phase1 (local alltoall) trivially complete (degenerate grid)");
         uint64_t interStartup = GetInterNodeStartupDelayNs(m_chunkSize);
         m_pendingEvents.push_back(
             Simulator::Schedule(NanoSeconds(interStartup),
@@ -286,9 +346,27 @@ HierarchicalAlltoAll::OnLocalAlltoAllChunkReceived(uint16_t destRank, uint32_t s
 void
 HierarchicalAlltoAll::CheckLocalAlltoAllComplete(uint16_t gpu)
 {
-    // Each GPU receives chunkSize from (gpusPerNode-1) local peers
-    uint64_t expectedBytes = m_chunkSize * (m_gpusPerNode - 1);
-    if (expectedBytes == 0) expectedBytes = 1;
+    // Each GPU receives ChunkSizeOf(gpu) from each of its (gpusPerNode-1)
+    // local peers (destination-sized chunks, frozen grid convention). A
+    // zero-chunk rank (degenerate grid) receives nothing and is trivially
+    // complete — the old `expectedBytes==0 -> 1` fallback stalled it forever.
+    uint64_t expectedBytes = ChunkSizeOf(gpu) * (m_gpusPerNode - 1);
+    if (expectedBytes == 0)
+    {
+        if (!m_gpuPhaseComplete[gpu])
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+            if (m_completedGpuCount >= m_numGpus)
+            {
+                uint64_t interStartup = GetInterNodeStartupDelayNs(m_chunkSize);
+                m_pendingEvents.push_back(
+                    Simulator::Schedule(NanoSeconds(interStartup),
+                                        &HierarchicalAlltoAll::StartInterNodeAlltoAll, this));
+            }
+        }
+        return;
+    }
 
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {
@@ -326,12 +404,31 @@ HierarchicalAlltoAll::StartInterNodeAlltoAll()
         {
             if (GetNodeId(remoteRank) == myNodeId) continue;
 
-            if (m_endpoints[gpu] && m_chunkSize > 0)
+            // DESTINATION-sized chunk (frozen grid convention): per-dest
+            // load is gpusPerNode*(numNodes-1)*ChunkSizeOf(dest).
+            uint64_t remoteChunk = ChunkSizeOf(remoteRank);
+            if (m_endpoints[gpu] && remoteChunk > 0)
             {
-                m_endpoints[gpu]->SendBulkWireTransfer(remoteRank, m_dummyData.data(), m_chunkSize,
+                m_endpoints[gpu]->SendBulkWireTransfer(remoteRank, m_dummyData.data(), remoteChunk,
                                                         m_protocolId, m_flowId + 1, 0);
             }
         }
+    }
+
+    // Degenerate grid: zero-chunk ranks receive nothing in this phase
+    // either — pre-credit them (codex round 18, finding 4).
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (ChunkSizeOf(gpu) == 0 && !m_gpuPhaseComplete[gpu])
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+        }
+    }
+    if (m_completedGpuCount >= m_numGpus)
+    {
+        NS_LOG_INFO("Phase2 (inter-node alltoall) trivially complete (degenerate grid)");
+        Complete();
     }
 }
 
@@ -345,9 +442,23 @@ HierarchicalAlltoAll::OnInterNodeAlltoAllChunkReceived(uint16_t destRank, uint32
 void
 HierarchicalAlltoAll::CheckInterNodeAlltoAllComplete(uint16_t gpu)
 {
-    // Each GPU receives chunkSize from all gpusPerNode GPUs on each remote node
-    uint64_t expectedBytes = m_chunkSize * m_gpusPerNode * (m_numNodes - 1);
-    if (expectedBytes == 0) expectedBytes = 1;
+    // Each GPU receives ChunkSizeOf(gpu) from all gpusPerNode GPUs on each
+    // remote node (destination-sized chunks, frozen grid convention). A
+    // zero-chunk rank is trivially complete (see CheckLocalAlltoAllComplete).
+    uint64_t expectedBytes = ChunkSizeOf(gpu) * m_gpusPerNode * (m_numNodes - 1);
+    if (expectedBytes == 0)
+    {
+        if (!m_gpuPhaseComplete[gpu])
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+            if (m_completedGpuCount >= m_numGpus)
+            {
+                Complete();
+            }
+        }
+        return;
+    }
 
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {
