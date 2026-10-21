@@ -1336,9 +1336,17 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         Time decodeLatency = m_fecModel->GetDecodeLatency();
         if (decodeLatency > Seconds(0))
         {
-            // Schedule the rest of receive processing after decode latency
-            Simulator::Schedule(decodeLatency, &FabricEndpoint::ContinueReceiveAfterFec,
-                                this, pkt, header);
+            // Schedule the rest of receive processing after decode latency.
+            // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
+            // bound member call targets raw `this` and fires into freed
+            // memory when the endpoint is disposed and released before the
+            // decode completes (codex round 15, finding 1 — valgrind-confirmed
+            // invalid reads/writes in ContinueReceiveAfterFec's traced-callback
+            // and stats members, which DoDispose nulls).
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(decodeLatency,
+                                    &FabricEndpoint::ContinueReceiveAfterFec,
+                                    this, pkt, header));
             return true;
         }
     }

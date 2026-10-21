@@ -4898,6 +4898,79 @@ class EgressDisposeCancelsBacklogCallbacksTest : public TestCase
     }
 };
 
+// Endpoint Dispose must also cancel the deferred FEC-decode continuation of
+// RECEIVE processing. Codex round 15, finding 1: ReceiveFromDevice scheduled
+// ContinueReceiveAfterFec with raw `this` (bound member call) without
+// tracking the event, so disposing and releasing the endpoint before the
+// decode latency elapsed fired the continuation into freed memory —
+// valgrind-confirmed invalid reads/writes on the traced-callback and stats
+// members DoDispose had nulled. Regression: receive a 64-B packet under FEC
+// with a 100-us decode latency, dispose at 300 ns, drop the last reference
+// at 310 ns, and run past the decode deadline.
+class EgressDisposeCancelsFecReceiveTest : public TestCase
+{
+  public:
+    EgressDisposeCancelsFecReceiveTest()
+        : TestCase("endpoint Dispose cancels deferred FEC receive continuation") {}
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1); // rank 1 remote
+        ep->AddNetDevice(devs.Get(0));
+        ep->SetNeighborMac(1, Mac48Address::Allocate());
+        ep->SetRoutingEntry(1, 0);
+        ep->SetBypassReorderBuffer(true);
+
+        // FEC with a 100-us decode latency: receive processing is deferred
+        // to ~100 us while the endpoint is disposed at 300 ns and released
+        // at 310 ns.
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        fec->SetEnabled(true);
+        fec->SetFecParams(544, 514, 15);
+        fec->SetDecodeLatency(MicroSeconds(100));
+        ep->SetFecModel(fec);
+        ep->SetFecOpticalOnly(false);
+
+        ep->Initialize();
+
+        // A 64-B DATA packet from rank 1 arrives at ~100 ns.
+        Ptr<Packet> pkt = Create<Packet>(64);
+        FabricHeader h;
+        h.SetPacketType(FabricPacketType::DATA);
+        h.SetSourceRank(1);
+        h.SetDestRank(0);
+        h.SetSequenceNumber(0);
+        h.SetPayloadSize(64);
+        pkt->AddHeader(h);
+        Simulator::Schedule(NanoSeconds(100), [&devs, pkt]() {
+            devs.Get(1)->Send(
+                pkt, Mac48Address::ConvertFrom(devs.Get(0)->GetAddress()), 0x0800);
+        });
+        Simulator::Schedule(NanoSeconds(300), [ep]() {
+            ep->Dispose();
+        });
+        // Drop the last strong reference; the pre-fix continuation held only
+        // raw `this` and dereferenced freed memory at the decode deadline.
+        Simulator::Schedule(NanoSeconds(310), [&ep]() {
+            ep = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(200)); // past the 100-us decode deadline
+        Simulator::Run();
+        // Reaching this line without a crash is the assertion.
+        Simulator::Destroy();
+    }
+};
+
 // (1b-3) LLR retry timers must not start while the pacer still holds the
 // packet. Codex round 12, finding 4: StorePacket armed the timeout at
 // ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
@@ -7244,6 +7317,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new DcqcnDisposeCancelsTimersTest, TestCase::Duration::QUICK);
     AddTestCase(new EgressDisposeCancelsDeferredSendsTest, TestCase::Duration::QUICK);
     AddTestCase(new EgressDisposeCancelsBacklogCallbacksTest, TestCase::Duration::QUICK);
+    AddTestCase(new EgressDisposeCancelsFecReceiveTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
     AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);

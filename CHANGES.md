@@ -6,6 +6,24 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — FEC receive continuation is cancelled by endpoint disposal
+
+`ReceiveFromDevice` deferred the rest of receive processing through the
+FEC decode latency with a bound member call on raw `this`
+(`Simulator::Schedule(decodeLatency,
+&FabricEndpoint::ContinueReceiveAfterFec, this, ...)`) without tracking
+the event. Disposing and releasing the endpoint before the decode
+completed let the continuation fire into freed memory — valgrind-confirmed
+invalid reads/writes on the traced-callback and stats members DoDispose
+had nulled (codex round 15, finding 1; repro: a 64-B packet under FEC
+with a 100-µs decode latency, Dispose at 300 ns, release at 310 ns →
+39 valgrind errors at fabric-endpoint.cc:1488/1490). The Schedule's
+EventId is now pushed into `m_deferredEgressEvents`, the same list whose
+DoDispose cancellation already covers the deferred sends and backlog
+callbacks. New regression `EgressDisposeCancelsFecReceiveTest`; the
+standalone valgrind harness is clean post-fix (0 errors). EXTENSIVE
+82 PASS.
+
 ### Fixed — NVLS retry-buffer byte capacity converts at the spray fragment size
 
 `predict(retry_buffer_bytes=...)` / `predict_tail(...)` converted a
