@@ -252,10 +252,27 @@ RingAllReduce::BuildTransactionGraph()
     const uint16_t invalidGpu = std::numeric_limits<uint16_t>::max();
     const uint32_t invalidStep = std::numeric_limits<uint32_t>::max();
 
-    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    // A ring step is a permutation: every GPU receives exactly one transfer
+    // per step (the send whose GetSendTarget IS that GPU). The transaction
+    // graph must gate each GPU's step s+1 send on DELIVERY of its step-s
+    // input — the same receive-driven rule the wire path applies in
+    // OnGpuStepReceiveComplete — not on delivery of the GPU's own outgoing
+    // step-s transfer (codex round 15, finding 3: the old gpu-major loop
+    // chained dependency = own previous wait node, so a rank transmitted at
+    // wire speed regardless of input arrival — with three 1-us links and one
+    // 100-us link, transaction and receive-driven runs disagreed by ~100 us
+    // per slow-link traversal). Step-major construction keeps every input
+    // wait node of step s-1 available when step s's sends are wired.
+    std::vector<ProtocolTransactionNodeId> sendDependency(m_numGpus, startup);
+    const uint64_t swOverheadNs = GetPerStepSwOverheadNs(m_chunkSize);
+
+    for (uint32_t step = 0; step < m_totalSteps; ++step)
     {
-        ProtocolTransactionNodeId dependency = startup;
-        for (uint32_t step = 0; step < m_totalSteps; ++step)
+        // Wait node of the transfer DELIVERED to each GPU at this step
+        // (startUp sentinel for GPUs no transfer targets — a broken ring
+        // embedding — degrades to fire-immediately rather than deadlock).
+        std::vector<ProtocolTransactionNodeId> deliveredTo(m_numGpus, startup);
+        for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             ProtocolTransactionRequest request;
             request.kind = ProtocolTransactionKind::DATA_TRANSFER;
@@ -271,28 +288,43 @@ RingAllReduce::BuildTransactionGraph()
             request.label = "gpu-" + std::to_string(gpu) + "-step-" + std::to_string(step);
 
             const auto wait =
-                protocolModel->AddTransaction(m_transactionGraph, request, {dependency});
+                protocolModel->AddTransaction(m_transactionGraph, request, {sendDependency[gpu]});
             if (m_transactionGpuByNode.size() <= wait)
             {
                 m_transactionGpuByNode.resize(wait + 1, invalidGpu);
                 m_transactionStepByNode.resize(wait + 1, invalidStep);
             }
-            m_transactionGpuByNode[wait] = gpu;
+            // The wait node tracks delivery TO the destination rank: node
+            // completion means that RECEIVER finished the step (the wire
+            // path's LogStepComplete(receiver, ...) semantics).
+            m_transactionGpuByNode[wait] = request.destinationRank;
             m_transactionStepByNode[wait] = step;
+            if (request.destinationRank < m_numGpus)
+            {
+                deliveredTo[request.destinationRank] = wait;
+            }
+        }
 
+        for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+        {
             if (step + 1 < m_totalSteps)
             {
-                dependency = m_transactionGraph.AddDelay(
-                    NanoSeconds(GetPerStepSwOverheadNs(m_chunkSize)),
-                    {wait},
+                // Post-receive software overhead before this GPU's next
+                // send, mirroring OnGpuStepReceiveComplete's scheduled
+                // SendGpuStepData(gpu, step + 1).
+                sendDependency[gpu] = m_transactionGraph.AddDelay(
+                    NanoSeconds(swOverheadNs),
+                    {deliveredTo[gpu]},
                     "gpu-" + std::to_string(gpu) + "-step-delay");
             }
             else
             {
-                dependency = wait;
+                // A GPU is done when its LAST step's input is delivered —
+                // the same condition the wire path counts in
+                // OnGpuStepReceiveComplete.
+                finalSteps.push_back(deliveredTo[gpu]);
             }
         }
-        finalSteps.push_back(dependency);
     }
     m_transactionGraph.AddCompletion(finalSteps);
     m_transactionGpuByNode.resize(m_transactionGraph.GetNodeCount(), invalidGpu);

@@ -209,7 +209,7 @@ t=5 µs; all pinned by `test/parity/test_contention_interference.py`):
 |--------|---------|-----------------|-------------|----------|
 | 2-node RoCE hierarchical | rank 0→4 (cross-node) | 2776201 | 2776201 | 1248928 |
 | 2-node RoCE hierarchical | rank 0→1 (intra-node) | 1330831 | 1315771 | 1248928 |
-| single-node Su ring | rank 0→2 | 450982 | 468378 | 319658 |
+| single-node Su ring | rank 0→2 | 450982 | 405462 | 319658 |
 
 The cross-node +122% is all link sharing (WFQ byte-identical; the bg flow,
 paced at the 800G intra-node rate onto a 400G link, is limited by NIC link
@@ -220,9 +220,12 @@ collective phases): the pre-fix values (1353663/1311031) were corrupted by
 phantom progress — the bg flow's P2P packets incremented the same phase
 counters the collective uses, so runs "completed" early on missing collective
 bytes; the fixed runs wait for real data and show the true (much larger)
-interference cost. The single-node +41% is
-link sharing with a −3.7% WFQ correction on the P2P class — WFQ reshuffles
-who waits rather than adding latency monotonically. The regimes differ in
+interference cost. The single-node weights=1.0 value was re-anchored by the
+ring transaction-graph input-dependency fix (codex round 15, finding 3:
+sends gate on input receipt, matching the wire path; the pre-fix 468378
+recorded sends firing at wire speed without their inputs), so the single-node
++41% is link sharing with a −10% WFQ correction on the P2P class — WFQ
+reshuffles who waits rather than adding latency monotonically. The regimes differ in
 baseline length and link type (credit-gated NVLink vs an over-driven 400G
 NIC), which is what separates their magnitudes, not the WFQ term.
 

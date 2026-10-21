@@ -39,8 +39,12 @@ change, the way ``test_so_hierarchical_regression.py`` pins its parity triple):
   on missing collective bytes. The fixed runs wait for real data, so bg
   interference now shows its true (much larger) cost.
 * single-node, Su ring allreduce 16 MiB: baseline 319658; intra-node bg
-  (rank 0->2) default 450982 vs weights=1.0 468378 (+41% is link sharing; the
-  WFQ penalty on the P2P class is a -3.7% correction).
+  (rank 0->2) default 450982 vs weights=1.0 405462 (+27% is link sharing; the
+  WFQ penalty on the P2P class is a -10% correction). weights=1.0 was
+  re-pinned 468378 -> 405462 after the codex-round-15/finding-3 ring
+  transaction-graph fix (sends now gated on input receipt, matching the wire
+  path exactly); the old 468378 captured the pre-fix graph where sends fired
+  at wire speed without waiting for their inputs.
 
 Note on the single- vs multi-node modeling difference (a design choice, not a
 bug): the single-node ``GpuClusterTopologyHelper`` shares ONE
@@ -131,7 +135,12 @@ SINGLE_BG = SINGLE_BASE + BG_COMMON + ["--bgP2pDst=2"]
 PINNED = {
     "multi-base": 1248928, "multi-bg-cross": 2776201,
     "multi-bg-intra": 1330831, "multi-bg-intra-w1": 1315771,
-    "single-base": 319658, "single-bg": 450982, "single-bg-w1": 468378,
+    # single-bg-w1 re-pinned 468378 -> 405462 (codex round 15, finding 3):
+    # the old pin captured the pre-fix transaction graph, which chained each
+    # rank's next send on its OWN outgoing delivery instead of input receipt.
+    # The wire path (--useTransactionModel=0) always gave 405462; the fixed
+    # transaction path now matches it bit-for-bit (per-step traces identical).
+    "single-base": 319658, "single-bg": 450982, "single-bg-w1": 405462,
 }
 
 

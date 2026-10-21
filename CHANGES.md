@@ -6,6 +6,35 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — ring transaction graph waits on input receipt, not own delivery
+
+`RingAllReduce::BuildTransactionGraph` chained each GPU's step s+1 send on
+DELIVERY OF THE GPU'S OWN step-s transfer (a gpu-major loop whose
+`dependency` was the rank's previous wait node), so every rank transmitted
+at wire speed regardless of input arrival — a ring forwards what it just
+received, so sends must be gated on input receipt, exactly the rule the
+wire path applies in `OnGpuStepReceiveComplete`. Repro (codex round 15,
+finding 3): 4-GPU / 256-B SIMPLE ring over an NvSwitch fabric with three
+1-µs links and one 100-µs link — pre-fix, rank 0's transmit cadence was its
+own slow-link delivery spacing (sends at 1.000 / 101.216 / 202.432 µs) and
+the transaction-path completion (608.296 µs) disagreed with the
+receive-driven wire path (410.296 µs); post-fix both paths are BIT-IDENTICAL
+(duration and every rank-0 transmit instant). The graph is now built
+step-major: each step's sends depend on `deliveredTo[gpu]` — the wait node
+of the transfer whose `GetSendTarget` IS that GPU (a ring step is a
+permutation) — with the per-step software overhead applied after input
+receipt, and a GPU's completion is its LAST step's input delivery. This also
+corrects the node-completion bookkeeping (`m_transactionGpuByNode` now
+records the RECEIVER, matching the wire path's LogStepComplete semantics).
+New regression `RingAllReduceTransactionInputDependencyTest` (runs both
+paths on the identical cluster, asserts equal durations and per-instant
+rank-0 transmit ordering; the cluster keeps the NvSwitch Ptr alive — its
+port promisc callbacks hold raw `this`). Parity fallout: the
+single-bg-w1 contention pin moved 468378 → 405462 ns — the old pin itself
+recorded the pre-fix bug; the wire path (`--useTransactionModel=0`) always
+gave 405462 and the fixed transaction path matches it (per-step traces
+identical). EXTENSIVE 84 PASS; integration PASS; surrogate 77; parity 14/14.
+
 ### Fixed — NvSwitch disposal cancels deferred result multicasts
 
 The switch scheduled its deferred collective-result multicasts —

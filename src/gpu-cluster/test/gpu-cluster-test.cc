@@ -6609,6 +6609,174 @@ class RingAllReduceChunkRotationTest : public TestCase
     }
 };
 
+// Rank-0 transmit instants shared between the trace callback and the
+// transaction-input-dependency test body (trace callbacks take no captures).
+static std::vector<double> g_r15f3_tx0;
+
+// The transaction-graph ring must be RECEIVE-driven, like the wire path.
+// Codex round 15, finding 3: BuildTransactionGraph chained each GPU's step
+// s+1 send on delivery of the GPU's OWN step-s transfer (dependency = own
+// previous wait node in a gpu-major loop), so every rank transmitted at
+// wire speed regardless of input arrival. In a 4-GPU / 256-B SIMPLE ring
+// with three 1-us links and one 100-us link, the transaction-path run
+// disagreed with the receive-driven wire-path run by ~100 us per
+// slow-link traversal (rank 0's send cadence was its own slow-link
+// delivery spacing rather than its input arrival). The corrected graph
+// gates each GPU's step s+1 send on DELIVERY of its step-s input (the
+// send whose GetSendTarget IS that GPU — a ring step is a permutation),
+// the same rule the wire path applies in OnGpuStepReceiveComplete. This
+// test runs BOTH paths on the identical cluster and asserts the durations
+// match and each rank's transmit instants match exactly.
+class RingAllReduceTransactionInputDependencyTest : public TestCase
+{
+    struct RunResult
+    {
+        uint64_t durationNs{0};
+        bool completed{false};
+        std::vector<double> tx0Us; // rank-0 transmit instants, microseconds
+    };
+
+    // Build a 4-GPU switched cluster; rank 0's port is the slow link
+    // (100 us propagation vs 1 us everywhere else). The switch Ptr MUST be
+    // kept for the run's lifetime: the port devices' promisc callbacks hold
+    // raw `this` into the NvSwitch, so dropping the last Ptr before
+    // Simulator::Run() leaves them firing into freed memory.
+    struct Cluster
+    {
+        std::vector<Ptr<FabricEndpoint>> eps;
+        Ptr<NvSwitch> sw;
+    };
+
+    static Cluster BuildSlowLinkCluster()
+    {
+        const uint16_t numGpus = 4;
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("100Gbps")));
+            p2p.SetChannelAttribute("Delay",
+                TimeValue(r == 0 ? MicroSeconds(100) : MicroSeconds(1)));
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        // SIMPLE forced (as in the codex repro and the shared cluster
+        // builder): the 256-B segments must ride one raw SIMPLE transfer per
+        // step, not LL/LL128 framing.
+        ObjectFactory protoFactory("ns3::NcclProtocolModel");
+        Ptr<ProtocolModel> protoModel = protoFactory.Create<ProtocolModel>();
+        protoModel->SetForceProtocolId(static_cast<uint8_t>(3)); // SIMPLE
+        ObjectFactory payloadFactory("ns3::NcclProtocolPayloadBuilder");
+        Ptr<ProtocolPayloadBuilder> payloadBuilder =
+            payloadFactory.Create<ProtocolPayloadBuilder>();
+        for (auto& ep : eps)
+        {
+            ep->SetProtocolModel(protoModel);
+        }
+        (void)payloadBuilder;
+        return {eps, sw};
+    }
+
+    static RunResult RunPath(bool useTransactionModel)
+    {
+        RunResult result;
+        Cluster c = BuildSlowLinkCluster();
+
+        c.eps[0]->TraceConnectWithoutContext(
+            "Tx", MakeCallback(
+                      +[](uint32_t, uint32_t) {
+                          g_r15f3_tx0.push_back(Simulator::Now().GetSeconds() * 1e6);
+                      }));
+        g_r15f3_tx0.clear();
+
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
+                           BooleanValue(useTransactionModel));
+        Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+        // A NONZERO explicit startup delay survives Initialize(); zero would
+        // be replaced by the protocol default (65 us), which dilutes the
+        // 100-us link enough to mask small ordering errors.
+        ring->SetStartupDelay(NanoSeconds(1000));
+        ring->SetPerStepSwOverhead(NanoSeconds(0));
+        bool* completed = &result.completed;
+        uint64_t* duration = &result.durationNs;
+        ring->SetCompletionCallback([completed, duration](uint64_t durNs) {
+            *completed = true;
+            *duration = durNs;
+        });
+        ring->Initialize(4, /*dataSize=*/256, c.eps);
+        ring->Start();
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+        result.tx0Us = g_r15f3_tx0;
+        g_r15f3_tx0.clear();
+        Simulator::Destroy();
+        return result;
+    }
+
+  public:
+    RingAllReduceTransactionInputDependencyTest()
+        : TestCase("Ring transaction graph waits on input receipt, not own delivery") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        const RunResult wire = RunPath(false);
+        NS_TEST_ASSERT_MSG_EQ(wire.completed, true,
+            "the wire-path reference run must complete");
+        const RunResult tx = RunPath(true);
+        NS_TEST_ASSERT_MSG_EQ(tx.completed, true,
+            "the transaction-path run must complete");
+
+        // Pre-fix: 410.296 (wire) vs 608.296 us (transaction). The corrected
+        // graph must reproduce the wire path exactly.
+        NS_TEST_ASSERT_MSG_EQ(tx.durationNs, wire.durationNs,
+            "transaction-path duration must equal the receive-driven wire-path "
+            "duration (codex round 15, finding 3: rank sends must be gated on "
+            "input receipt, not on the rank's own outgoing delivery)");
+
+        NS_TEST_ASSERT_MSG_EQ(tx.tx0Us.size(), wire.tx0Us.size(),
+            "rank 0 must transmit the same number of steps on both paths");
+        for (size_t i = 0; i < wire.tx0Us.size() && i < tx.tx0Us.size(); ++i)
+        {
+            std::ostringstream oss;
+            oss << "rank-0 transmit #" << i << ": transaction path at "
+                << tx.tx0Us[i] << " us vs wire path at " << wire.tx0Us[i]
+                << " us — send ordering must be receive-driven";
+            NS_TEST_ASSERT_MSG_EQ_TOL(tx.tx0Us[i], wire.tx0Us[i], 1e-9, oss.str());
+        }
+
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -7400,6 +7568,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new RingAllReduceSegmentCoverageTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceLossyWireLedgerTest, TestCase::Duration::QUICK);
     AddTestCase(new RingAllReduceChunkRotationTest, TestCase::Duration::QUICK);
+    AddTestCase(new RingAllReduceTransactionInputDependencyTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
     AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
