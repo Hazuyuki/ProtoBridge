@@ -208,6 +208,16 @@ AlltoAllInjector::SetTwoDimensionalRouting(uint32_t rows, uint32_t cols)
 void
 AlltoAllInjector::Start()
 {
+    // Zero-data (or fully pre-credited) collectives completed during
+    // Initialize — BEFORE the completion callback was typically registered.
+    // Overwriting COMPLETED with RUNNING here would stall forever: zero-byte
+    // sends are no-ops (the zero-byte bulk guard), so no receive ever fires
+    // to complete it again (codex round 18, finding 7).
+    if (m_state == AlltoAllState::COMPLETED)
+    {
+        NS_LOG_INFO("AlltoAll already complete at Start() (degenerate grid)");
+        return;
+    }
     m_state = AlltoAllState::RUNNING;
     m_startTimeNs = Simulator::Now().GetNanoSeconds();
 
@@ -440,15 +450,34 @@ AlltoAllInjector::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricH
         // Ring threshold: the chunk destined for this rank this step is
         // ChunkSizeOf(destRank) — the ring's owner-sized chunk (codex
         // round 17, finding 7).
-        if (m_gpuStepReceivedBytes[destRank] >= ChunkSizeOf(destRank))
+        //
+        // CREDIT FORWARD THE OVERSHOOT (codex round 18, finding 2): the
+        // counter pools fragments from MULTIPLE steps (a rank's step-s+1
+        // send fires as soon as its step-s input is delivered, so those
+        // fragments can land at a slow dest before the dest itself crossed
+        // its step-s threshold). Resetting to 0 on a threshold cross
+        // discarded that overshoot: 3 GPU / 300 B / 18 lanes with one lane
+        // delayed 100 us — dest 0 pooled 96 step-0 bytes plus 6 step-1
+        // bytes, crossed at 102, zeroed the counter, and then finished
+        // with 98 < 100 for the next step; all 600 bytes were sent but the
+        // collective never completed. Subtracting the threshold preserves
+        // the excess toward the next step's threshold. Crossing can now
+        // happen more than once per packet when overshoot exceeds a full
+        // chunk, so loop.
+        // Zero-chunk destinations are pre-credited (see Initialize) and
+        // receive nothing; guard the loop so a stray unrelated DATA packet
+        // cannot spin it on a zero threshold.
+        while (ChunkSizeOf(destRank) > 0 &&
+               m_gpuStepReceivedBytes[destRank] >= ChunkSizeOf(destRank))
         {
-            m_gpuStepReceivedBytes[destRank] = 0;
-            m_gpuCompletedStep[destRank] = currentStep + 1;
+            m_gpuStepReceivedBytes[destRank] -= ChunkSizeOf(destRank);
+            m_gpuCompletedStep[destRank] = currentStep;
+            currentStep = m_gpuCompletedStep[destRank] = currentStep + 1;
 
             NS_LOG_INFO("GPU " << destRank << " completed step " << currentStep
                          << " (now at step " << m_gpuCompletedStep[destRank] << ")");
 
-            OnGpuStepReceiveComplete(destRank, currentStep);
+            OnGpuStepReceiveComplete(destRank, currentStep - 1);
         }
     }
 }
