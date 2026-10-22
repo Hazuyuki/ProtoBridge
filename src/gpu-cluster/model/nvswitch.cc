@@ -160,6 +160,7 @@ NvSwitch::DoDispose()
     m_sprayRoundRobin.clear();
     m_allReduceBuffer.clear();
     m_allReduceReceivedBytes.clear();
+    m_allReduceLegacyMulticastDone.clear();
     m_portRankMap.clear();
     m_rankPortMap.clear();
     m_allGatherBuffer.clear();
@@ -1167,11 +1168,14 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
     // each partition as soon as all GPUs have sent enough cumulative bytes.
     // This models real NVLS where the switch reduces data element-by-element
     // as it arrives and starts multicasting reduced partitions immediately.
+    // 0 means SINGLE-MULTICAST (legacy) mode, per the header contract
+    // ("0=old single-multicast mode, >=2=pipelined") — substituting the
+    // threshold here made 0 behave as N partitions, so --nvlsNumPartitions=0
+    // and =N produced identical pipelined runs (34.5 us / 48 switch
+    // transmissions at 4 GPU / 1 MiB / 2 links) while the sim's help text
+    // promised "0=single" (codex round 22, finding 7). 1 is also single
+    // (one partition covers the whole buffer), >= 2 pipelined.
     uint32_t numPartitions = m_allReduceNumPartitions;
-    if (numPartitions == 0 && m_allReduceThreshold > 0)
-    {
-        numPartitions = m_allReduceThreshold; // default: partition by numGpus
-    }
 
     if (numPartitions >= 2 && m_allReduceDataSize > 0 && sourceCount >= m_allReduceThreshold)
     {
@@ -1279,8 +1283,17 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
             allComplete = true;
         }
 
-        if (allComplete)
+        if (allComplete
+            && m_allReduceLegacyMulticastDone.find(flowId)
+                   == m_allReduceLegacyMulticastDone.end())
         {
+            // Mark BEFORE scheduling (codex round 22, finding 1): the
+            // allComplete test re-runs on every later upload — late padding
+            // fragments that land after this multicast clears the buffer
+            // would schedule a SECOND result event onto the cleared buffer
+            // (empty begin() deref, SIGSEGV). The collective is one-shot;
+            // once its result has gone out, later fragments are wire noise.
+            m_allReduceLegacyMulticastDone.insert(flowId);
             m_deferredResultEvents.push_back(
                 Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
                                     &NvSwitch::MulticastAllReduceResult, this,

@@ -10088,6 +10088,261 @@ class RailOptimizedFatTreeCoreTierTest : public TestCase
     }
 };
 
+
+// ---------------------------------------------------------------------------
+// Codex round 22 regressions.
+// ---------------------------------------------------------------------------
+
+// (codex round 22, finding 1) Legacy single-multicast SHARP AllReduce: late
+// padding uploads re-satisfy allComplete after the multicast cleared the
+// buffer, scheduling a SECOND result event that dereferences the empty
+// buffer's begin() — SIGSEGV. The once-per-flow done marker makes the
+// collective one-shot; the delayed lanes here reproduce the late arrivals.
+class SharpLegacyMulticastOnceTest : public TestCase
+{
+  public:
+    SharpLegacyMulticastOnceTest()
+        : TestCase("SHARP legacy multicast result fires once per flow") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 1;
+
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            // Channel-level delay on each GPU's first link: uploads land at
+            // the switch staggered, so padding fragments arrive after the
+            // multicast has already fired.
+            ep->GetNetDevice(0)->GetChannel()->SetAttribute(
+                "Delay", TimeValue(NanoSeconds(500)));
+            eps.push_back(ep);
+        }
+
+        Ptr<NvSwitch> sw;
+        auto swNode = helper.GetSwitchNodes().Get(0);
+        for (uint32_t i = 0; i < swNode->GetNDevices(); ++i)
+        {
+            Ptr<NvSwitch> s = DynamicCast<NvSwitch>(swNode->GetDevice(i));
+            if (s) sw = s;
+        }
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(numGpus);
+        sw->SetAllReduceDataSize(dataSize);
+        sw->SetAllReduceNumPartitions(1);
+        sw->SetAllReduceAggregationDelay(10000);
+
+        Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+        inj->SetAttribute("UseTransactionModel", BooleanValue(false));
+        inj->Initialize(numGpus, dataSize, eps);
+        bool done = false;
+        inj->SetCompletionCallback([&](uint64_t) { done = true; });
+        inj->Start();
+        Simulator::Stop(MilliSeconds(1));
+        Simulator::Run();
+        // Pre-fix this crashed inside MulticastAllReduceResult (empty
+        // begin()); completing at all is the regression assertion.
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "legacy single-multicast SHARP must complete once and survive "
+            "late padding uploads");
+        NS_TEST_ASSERT_MSG_EQ(done, true,
+            "SHARP completion callback must fire");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 22, finding 2) NcclRingAllReduce at dataSize == 0 fell into
+// the degenerate-grid floor (1-byte chunks) and fabricated 48 endpoint
+// transmissions for a zero-byte collective. D=0 now completes trivially
+// with nothing on the wire.
+class NcclRingZeroDataTest : public TestCase
+{
+  public:
+    NcclRingZeroDataTest()
+        : TestCase("NcclRing zero-data allreduce emits no packets") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+
+        // Switched fabric so GetTxPackets reflects real wire attempts
+        // (the pre-fix behavior fabricated 48 transmissions at 2x2/2-channel).
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+
+        Ptr<NcclRingAllReduce> inj = CreateObject<NcclRingAllReduce>();
+        // 2 nodes x 2 GPUs (node-major rank layout), mirroring the CLI repro.
+        inj->SetNumNodes(2);
+        inj->SetGpusPerNode(2);
+        inj->Initialize(numGpus, 0, eps);
+        bool done = false;
+        inj->SetCompletionCallback([&](uint64_t) { done = true; });
+        inj->Start();
+        Simulator::Stop(MicroSeconds(200));
+        Simulator::Run();
+        uint32_t txPackets = 0;
+        for (const auto& ep : eps)
+        {
+            txPackets += ep->GetTxPackets();
+        }
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "zero-data NcclRing must complete trivially");
+        NS_TEST_ASSERT_MSG_EQ(done, true,
+            "zero-data NcclRing must fire its completion callback");
+        NS_TEST_ASSERT_MSG_EQ(txPackets, 0u,
+            "a zero-byte allreduce must not fabricate 1-byte chunks onto "
+            "the wire (was 48 endpoint transmissions at 2x2/2-channel)");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 22, finding 5) The backlog-decrement ledger is pruned of
+// fired entries on each append, so it tracks only in-flight decrements.
+// After a fully-drained burst the accounting is exact (backlog zero) and a
+// following mid-flight disposal still balances the pending entries.
+class ContentionBacklogLedgerPruningTest : public TestCase
+{
+  public:
+    ContentionBacklogLedgerPruningTest()
+        : TestCase("backlog ledger prunes fired entries and stays balanced") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        const uint16_t numGpus = 2;
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(1);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 100000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+        Ptr<ContentionModel> shared = CreateObject<ContentionModel>();
+        shared->SetBandwidth(1000000000);
+        eps[0]->SetContentionModel(shared);
+
+        // Wave 1: 2000 sends, all increment/decrement pairs fire.
+        uint8_t byte = 0xAB;
+        for (int i = 0; i < 2000; ++i)
+        {
+            eps[0]->SendP2p(1, &byte, 1, 1, 0);
+        }
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(shared->GetBacklog(TrafficClass::P2P), 0u,
+            "a fully-drained burst must leave zero backlog — every scheduled "
+            "decrement fired");
+
+        // Wave 2 + mid-flight disposal: the pruned ledger must still carry
+        // the pending entries so DoDispose balances them.
+        for (int i = 0; i < 50; ++i)
+        {
+            eps[0]->SendP2p(1, &byte, 1, 1, 0);
+        }
+        Simulator::Schedule(NanoSeconds(30), [&]() { eps[0]->Dispose(); });
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(shared->GetBacklog(TrafficClass::P2P), 0u,
+            "disposal must balance the pending (pruned-but-in-flight) "
+            "entries after 2000 prior fired cycles");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 22, finding 7) --nvlsNumPartitions=0 is documented (and the
+// header contract states) as the legacy single-multicast mode, but the
+// switch substituted the threshold (N partitions). 0 and 1 must now behave
+// identically (single multicast), and 4 must pipeline differently.
+class NvlsPartitionZeroSemanticsTest : public TestCase
+{
+  public:
+    NvlsPartitionZeroSemanticsTest()
+        : TestCase("NVLS AllReduce partition 0 equals single multicast") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 1048576;
+
+        auto runWith = [&](uint32_t partitions) {
+            GpuClusterTopologyHelper helper(numGpus, 1);
+            helper.SetLinkDataRate("100Gbps");
+            helper.SetLinkDelay("400ns");
+            helper.SetLinksPerGpu(2);
+            helper.BuildFullyConnected();
+            auto apps = helper.GetEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t i = 0; i < apps.GetN(); ++i)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+                ep->SetBypassReorderBuffer(true);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+            Ptr<NvSwitch> sw;
+            auto swNode = helper.GetSwitchNodes().Get(0);
+            for (uint32_t i = 0; i < swNode->GetNDevices(); ++i)
+            {
+                Ptr<NvSwitch> s = DynamicCast<NvSwitch>(swNode->GetDevice(i));
+                if (s) sw = s;
+            }
+            sw->SetAllReduceEnabled(true);
+            sw->SetAllReduceThreshold(numGpus);
+            sw->SetAllReduceDataSize(dataSize);
+            sw->SetAllReduceNumPartitions(partitions);
+
+            Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+            inj->SetAttribute("UseTransactionModel", BooleanValue(false));
+            inj->Initialize(numGpus, dataSize, eps);
+            bool done = false;
+            inj->SetCompletionCallback([&](uint64_t) { done = true; });
+            inj->Start();
+            Simulator::Stop(MilliSeconds(100));
+            Simulator::Run();
+            Simulator::Destroy();
+            return done;
+        };
+
+        NS_TEST_ASSERT_MSG_EQ(runWith(0), true,
+            "partitions=0 (legacy single multicast) must complete");
+        NS_TEST_ASSERT_MSG_EQ(runWith(1), true,
+            "partitions=1 (single multicast) must complete");
+        NS_TEST_ASSERT_MSG_EQ(runWith(4), true,
+            "partitions=4 (pipelined) must complete");
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Codex round 21 regressions.
 // ---------------------------------------------------------------------------
@@ -10661,6 +10916,12 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SingleRankRingReduceScatterTest, TestCase::Duration::QUICK);
     AddTestCase(new SingleRankFullMeshReduceScatterTest, TestCase::Duration::QUICK);
     AddTestCase(new SingleRankAllToAllTest, TestCase::Duration::QUICK);
+
+    // Codex round 22 regressions.
+    AddTestCase(new SharpLegacyMulticastOnceTest, TestCase::Duration::QUICK);
+    AddTestCase(new NcclRingZeroDataTest, TestCase::Duration::QUICK);
+    AddTestCase(new ContentionBacklogLedgerPruningTest, TestCase::Duration::QUICK);
+    AddTestCase(new NvlsPartitionZeroSemanticsTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

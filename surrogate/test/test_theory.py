@@ -1367,3 +1367,91 @@ def test_zero_byte_gbn_llr_finite():
     nz = tree.predict(1024, 4, "tree", 128, collective="allreduce",
                       ber=1e-7, llr_enabled=True)
     assert nz > v
+
+
+# ---- Codex round 22 regressions ----
+
+def test_single_rank_prediction_finite():
+    """N=1 ring AllReduce divided by zero: _steps() returned 2*(N-1) == 0
+    and _per_step() used it as a divisor. A single-rank prediction must be
+    finite (startup + one zero-volume step) for every collective/algorithm
+    combination (codex round 22, finding 3)."""
+    ring = wb.make_h200_ring_theory()
+    for collective in ("allreduce", "allgather", "alltoall", "sendrecv"):
+        for algo in ("ring",):
+            v = ring.predict(65536, 1, algo, 128, collective=collective)
+            assert math.isfinite(v) and v > 0.0, (collective, algo, v)
+    tree = wb.make_h200_tree_theory()
+    v = tree.predict(65536, 1, "tree", 128, collective="allreduce")
+    assert math.isfinite(v) and v > 0.0
+    nvls = wb.make_h200_nvls_theory()
+    v = nvls.predict(65536, 1, "nvls", 128, collective="allreduce")
+    assert math.isfinite(v) and v > 0.0
+    # N=1 must not change neighbors: N=2 predictions are untouched.
+    assert ring.predict(65536, 2, "ring", 128,
+                        collective="allreduce") > 0.0
+
+
+def test_nvls_allgather_retry_buffer_rank_grid():
+    """NVLS AllGather retry-buffer sizing fragmented the uniform D/N
+    instead of the per-rank integer grid: at D=73/N=4/18 lanes the chunks
+    [19,18,18,18] spray [10,18,18,18] fragments, so the busiest endpoint
+    retains 18 — required_retry_buffer_entries returned 10 and a
+    16-entry buffer overflowed in ns-3 across seeds 1-3 (codex round 22,
+    finding 4). All three sizing functions must follow the grid."""
+    nvls = wb.make_h200_nvls_theory(num_lanes=18)
+    assert nvls.required_retry_buffer_entries(
+        73, 4, "nvls", collective="allgather") == 18
+    # Largest retained fragment is rank 0's 2-byte fragment.
+    assert nvls._retry_buffer_fragment_bytes(
+        73, 4, "nvls", "allgather") == 2
+    # Bytes: rank 0's 10x2 = 20 vs rank 1's 18x1 = 18 -> 20.
+    assert nvls.required_retry_buffer_bytes(
+        73, 4, "nvls", collective="allgather") == 20
+    # AllReduce path (full-D upload) is unchanged by the grid fix.
+    assert nvls.required_retry_buffer_entries(
+        73, 4, "nvls", collective="allreduce") == nvls._spray_fragments(73)[0]
+    # Exactly-divisible grid degenerates to the uniform answer.
+    assert nvls.required_retry_buffer_entries(
+        72, 4, "nvls", collective="allgather") == 18
+
+
+def test_gbn_topology_cap_scales_retry_penalty():
+    """Legacy GBN retransmissions serialized at the uncapped BW_link, so a
+    bisection cap left the retry penalty unchanged (2.0435 us at 18 lanes /
+    1 MiB / N=8 / 128 credits / BER 1e-7) while the doc contract and the
+    SACK path cap the retransmission rate (codex round 22, finding 6).
+    Adding a 50-GB/s cap must move the GBN prediction further than the
+    pure-serialization delta alone would explain through the SACK floor."""
+    ring = wb.make_h200_ring_theory(num_lanes=18)
+    kwargs = dict(ber=1e-7, llr_enabled=True, retry_mode="gobackn",
+                  collective="allreduce")
+    no_cap = ring.predict(1024 * 1024, 8, "ring", 128, topology=None,
+                          **kwargs)
+    capped = ring.predict(1024 * 1024, 8, "ring", 128,
+                          topology=wb.make_topology(bisection_gbps=50),
+                          **kwargs)
+    assert capped > no_cap
+    # The legacy cascade term itself must scale with the capped rate.
+    D, N, cr, ber = 1024 * 1024, 8, 128, 1e-7
+    steps = ring._steps(N, "ring", "allreduce")
+    per_step = ring._per_step(D, N, "ring", steps, "allreduce")
+    T_serial = per_step / ring.ring_bw
+    legacy_uncapped = ring._gbn_cascade(
+        ring.lat + T_serial, steps, D, N, "ring", cr, ber, True,
+        "gobackn", None, "allreduce")
+    legacy_capped = ring._gbn_cascade(
+        ring.lat + T_serial, steps, D, N, "ring", cr, ber, True,
+        "gobackn", None, "allreduce",
+        bw_eff=min(ring.BW_link, 50000))
+    assert legacy_capped > legacy_uncapped
+    # SACK control: capped and uncapped differ only via T_serial there,
+    # but must also grow (retransmissions re-serialize at the capped rate).
+    sack_kwargs = dict(ber=1e-7, llr_enabled=True, retry_mode="sack",
+                       collective="allreduce")
+    sack_no = ring.predict(1024 * 1024, 8, "ring", 128, topology=None,
+                           **sack_kwargs)
+    sack_cap = ring.predict(1024 * 1024, 8, "ring", 128,
+                            topology=wb.make_topology(bisection_gbps=50),
+                            **sack_kwargs)
+    assert sack_cap > sack_no

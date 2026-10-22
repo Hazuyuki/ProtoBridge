@@ -134,6 +134,10 @@ private:
     /// short-circuits and Start completes trivially — no ring successor
     /// exists to pipeline to.
     bool m_trivialSingleRank;
+    /// Zero-data degenerate case (codex round 22, finding 2): the chunk
+    /// grid must not fabricate 1-byte chunks at dataSize == 0 — Start
+    /// completes trivially with no wire traffic.
+    bool m_trivialZeroData;
     uint64_t m_startupDelayNs;
     uint64_t m_perStepSwOverheadNs;
     uint64_t m_swOverheadPerByteNs;

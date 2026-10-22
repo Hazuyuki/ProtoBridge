@@ -6,6 +6,84 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 22: seven defects across legacy multicast, degenerate collectives, and surrogate consistency
+
+1. **Legacy SHARP multicast result fires once per flow** (high).
+   `NvSwitch::ProcessAllReduce` (single-multicast branch) re-ran the
+   `allComplete` test on EVERY late upload — padding fragments included —
+   so after the first multicast cleared the buffer, a second
+   `MulticastAllReduceResult` event dereferenced the empty `begin()`:
+   SIGSEGV (codex's probe: 4 GPU / D=1 / two delayed lanes / 10-µs
+   aggregation). The flow is now marked done (`m_allReduceLegacyMulticastDone`,
+   an unordered_set) BEFORE the result event is scheduled, so later
+   fragments are wire noise; DoDispose clears the set with the other
+   per-flow maps. Test: `SHARP legacy multicast result fires once per
+   flow`.
+2. **NcclRingAllReduce zero-data trivial completion** (medium). D=0 fell
+   into the degenerate-grid floor (`m_chunkSize = 1`), fabricating one-
+   byte chunks: the CLI repro (`--numNodes=2 --gpusPerNode=2
+   --algorithm=ncclring --collective=allreduce --dataSize=0`) reported 48
+   endpoint transmissions and a 103-µs completion for a zero-byte
+   operation. The floor now applies only when `dataSize > 0`; a
+   `m_trivialZeroData` flag (set at Initialize, consumed at Start)
+   mirrors the single-rank seam and completes with nothing on the wire
+   (fixed: endpointTxPackets=0, simTimeUs=0). Test: `NcclRing zero-data
+   allreduce emits no packets`.
+3. **Single-rank ring prediction no longer divides by zero** (medium).
+   `_steps()` returned `2*(N-1) == 0` at N=1, which `_per_step()` used as
+   a divisor — `predict(65536, 1, "ring", 128, collective="allreduce")`
+   raised ZeroDivisionError. The ring-allreduce step count is clamped to
+   ≥ 1, so every N=1 prediction (ring/tree/nvls/fullmesh × allreduce/
+   allgather/alltoall/sendrecv) is finite (startup + one zero-volume
+   step). Test: `test_single_rank_prediction_finite`.
+4. **NVLS AllGather retry-buffer sizing follows the rank grid**
+   (medium). `required_retry_buffer_entries` / `..._bytes` /
+   `_retry_buffer_fragment_bytes` fragmented a uniform `D/N` while the
+   loss model (round 21 #6) already fragmented the integer grid: at
+   D=73/N=4/18 lanes the chunks [19,18,18,18] spray [10,18,18,18]
+   fragments, so the busiest endpoint retains 18 — the sizing returned 10
+   and a 16-entry buffer overflowed in ns-3 across seeds 1–3. All three
+   functions now size at the per-rank grid (shared
+   `_rank_upload_chunks` helper); the exactly-divisible regime is
+   unchanged. Tests: `test_nvls_allgather_retry_buffer_rank_grid`.
+5. **Backlog-decrement ledger prunes fired entries** (medium). The
+   round-21 ledger was append-only until disposal: after 10,000 delivered
+   packets it still held 10,000 stale entries (each an EventId + model
+   reference), so memory grew with cumulative traffic — and a fired
+   EventId can alias a reused UID after wraparound, which would break
+   the disposal balance. `TrackBacklogDecrement` (now the single append
+   path for all three increment sites) erases expired entries on every
+   append, keeping the ledger O(in-flight wire depth). Probe: 2,100
+   drained sends leave backlog 0, and a mid-flight disposal still
+   balances the pending entries; valgrind clean. Test: `backlog ledger
+   prunes fired entries and stays balanced`.
+6. **Legacy GBN retransmissions serialize at the topology-capped rate**
+   (low). `_gbn_cascade` used the raw `self.BW_link` for its chunk
+   serialization while the SACK path received the topology-capped
+   `T_serial_step` — adding a 50-GB/s bisection cap left the GBN retry
+   penalty unchanged (2.0435 µs at 18 lanes / 1 MiB / N=8 / BER 1e-7),
+   contradicting WHITEBOX_SURROGATE §12's contract that retransmitted
+   fragments re-serialize at the capped rate. `_gbn_cascade` now takes
+   `bw_eff` (caller passes `min(BW_link, bisection)`); the capped legacy
+   term rises to 7.23 µs. Test:
+   `test_gbn_topology_cap_scales_retry_penalty`.
+7. **`--nvlsNumPartitions=0` selects the single multicast it documents**
+   (low). `NvSwitch::ProcessAllReduce` substituted the threshold for a
+   zero partition count (0 → N partitions), so the sim's documented
+   "0=single, 8=pipelined" knob produced identical pipelined runs for 0
+   and N (4 GPU / 1 MiB / 2 links: 34.5 µs and 48 switch transmissions
+   for both) while 1 gave the single-multicast behavior (36.9 µs / 36).
+   The header contract ("0=old single-multicast mode") is now honored:
+   0 and 1 both run single multicast (36.9 µs / 36), ≥ 2 pipelines.
+   Test: `NVLS AllReduce partition 0 equals single multicast`.
+
+Suite state: EXTENSIVE 135 PASS / 0 FAIL (4 new round-22 tests),
+integration 5 PASS, surrogate pytest 91 passed (3 new round-22 tests),
+14/14 parity scripts, valgrind QUICK exit 0 with zero errors. (The
+round-21 note recorded "132 / 6"; the suite registers 131 cases at
+f83a724 and 5 integration cases — those earlier counts included a stale
+grep match.)
+
 ### Fixed — codex round 21: eight defects across broadcast ledgers, degenerate grids, and surrogate reliability
 
 1. **Legacy SHARP counts each GPU's broadcast completion once** (high).

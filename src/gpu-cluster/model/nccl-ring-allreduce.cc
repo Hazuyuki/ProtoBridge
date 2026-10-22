@@ -45,6 +45,7 @@ NcclRingAllReduce::NcclRingAllReduce()
       m_running(false),
       m_completed(false),
       m_trivialSingleRank(false),
+      m_trivialZeroData(false),
       m_startupDelayNs(0),
       m_perStepSwOverheadNs(0),
       m_swOverheadPerByteNs(0),
@@ -180,14 +181,25 @@ NcclRingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     const uint64_t chunkGrid = static_cast<uint64_t>(m_numChannels) * numGpus;
     m_chunkSize = dataSize / chunkGrid;
     m_chunkRemainder = dataSize % chunkGrid;
-    if (m_chunkSize == 0)
+    if (m_chunkSize == 0 && dataSize > 0)
     {
-        // D < C*N: the grid has more slots than bytes. Keep the legacy floor
-        // (1-byte chunks, no remainder) — a degenerate config where NCCL
-        // itself would collapse channels; over-covering mirrors the old
-        // behavior while still completing.
+        // D < C*N (nonzero): the grid has more slots than bytes. Keep the
+        // legacy floor (1-byte chunks, no remainder) — a degenerate config
+        // where NCCL itself would collapse channels; over-covering mirrors
+        // the old behavior while still completing.
         m_chunkSize = 1;
         m_chunkRemainder = 0;
+    }
+    // Zero-data collective (codex round 22, finding 2): the degenerate
+    // floor above fabricated 1-byte chunks at D=0, sending 2(N-1)*C*N
+    // packets for a zero-byte operation (48 endpoint transmissions at
+    // 2x2/2-channel). The frozen convention is trivial completion with
+    // nothing on the wire.
+    if (dataSize == 0)
+    {
+        m_chunkSize = 0;
+        m_chunkRemainder = 0;
+        m_trivialZeroData = true;
     }
 
     BuildRings();
@@ -282,6 +294,14 @@ NcclRingAllReduce::Start()
 {
     m_running = true;
     m_startTimeNs = Simulator::Now().GetNanoSeconds();
+    // Zero-data short-circuit (codex round 22, finding 2): nothing to
+    // reduce, nothing to send — trivial completion, no wire traffic.
+    if (m_trivialZeroData)
+    {
+        NS_LOG_INFO("NcclRingAllReduce trivially complete (zero data)");
+        Complete();
+        return;
+    }
     // Single-rank short-circuit (codex round 21, finding 8): no ring
     // successor, no peer receives — complete immediately.
     if (m_trivialSingleRank)

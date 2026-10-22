@@ -220,7 +220,11 @@ class TheoryDerivedSurrogate:
             # every other rank's segment once). The allreduce's second pass
             # is the reduce-scatter half, which allgather does not have.
             return max(1, N - 1)
-        return 2 * (N - 1)
+        # Ring AllReduce 2(N-1), clamped to >= 1 so N=1 degenerates to a
+        # single (zero-volume) step instead of dividing by zero in
+        # ``_per_step`` — a single-rank prediction is startup + one step
+        # latency, all finite (codex round 22, finding 3).
+        return max(1, 2 * (N - 1))
 
     @staticmethod
     def _tree_trunk_load(N):
@@ -624,6 +628,24 @@ class TheoryDerivedSurrogate:
             return 1.0
         return wire_bytes / packets
 
+    def _rank_upload_chunks(self, data_bytes, num_gpus):
+        """Per-rank upload chunk sizes of an NVLS AllGather (codex round 22,
+        finding 4).
+
+        The switch allgathers rank r's ``D//N + (r < D%N)`` bytes, so the
+        upload grid is heterogeneous: D=73/N=4 sends chunks [19,18,18,18],
+        not four uniform 18.25s. Retained-fragment counts, sizes, and retry
+        budgets must fragment each rank's ACTUAL integer chunk — the
+        uniform D/N undercounts (10 entries where the busiest rank retains
+        18, so a 16-entry buffer overflows in ns-3 across seeds 1-3).
+        """
+        if data_bytes <= 0:
+            return []
+        base = data_bytes // max(1, num_gpus)
+        remainder = data_bytes % max(1, num_gpus)
+        return [base + (1 if r < remainder else 0)
+                for r in range(num_gpus)]
+
     def _retry_buffer_fragment_bytes(self, data_bytes, num_gpus, algo,
                                      collective):
         """Fragment size of the RETAINED packets a retry buffer holds.
@@ -642,9 +664,18 @@ class TheoryDerivedSurrogate:
         """
         collective = self._validate_collective(collective)
         if algo == 'nvls' and collective in ('allreduce', 'allgather'):
-            upload_bytes = (data_bytes if collective == 'allreduce'
-                            else data_bytes / max(1, num_gpus))
-            return self._spray_fragments(upload_bytes)[1]
+            if collective == 'allreduce':
+                return self._spray_fragments(data_bytes)[1]
+            # AllGather: each endpoint retains fragments of its OWN grid
+            # chunk (codex round 22, finding 4). Report the largest fragment
+            # any uploading rank retains — the same conservative size the
+            # expected-loss model uses for per-fragment failure probability.
+            frag_bytes = 1
+            for chunk in self._rank_upload_chunks(data_bytes, num_gpus):
+                if chunk <= 0:
+                    continue
+                frag_bytes = max(frag_bytes, self._spray_fragments(chunk)[1])
+            return frag_bytes
         return self._packet_bytes_per_transfer(
             data_bytes, num_gpus, algo, collective)
 
@@ -663,9 +694,20 @@ class TheoryDerivedSurrogate:
         """
         collective = self._validate_collective(collective)
         if algo == 'nvls' and collective in ('allreduce', 'allgather'):
-            upload_bytes = (data_bytes if collective == 'allreduce'
-                            else data_bytes / max(1, num_gpus))
-            return self._spray_fragments(upload_bytes)[0]
+            if collective == 'allreduce':
+                return self._spray_fragments(data_bytes)[0]
+            # AllGather: the retry buffer holds THIS endpoint's own sprayed
+            # upload fragments, so the requirement is the busiest rank's
+            # fragment count over the integer chunk grid — D=73/N=4/18 lanes
+            # gives per-rank counts [10,18,18,18], so 18 entries (the old
+            # uniform D/N returned 10 and a 16-entry buffer overflowed,
+            # codex round 22, finding 4).
+            entries = 1
+            for chunk in self._rank_upload_chunks(data_bytes, num_gpus):
+                if chunk <= 0:
+                    continue
+                entries = max(entries, self._spray_fragments(chunk)[0])
+            return entries
         packets = self._packets_per_transfer(
             data_bytes, num_gpus, algo, collective)
         return 2 * packets if algo == 'tree' else packets
@@ -675,10 +717,18 @@ class TheoryDerivedSurrogate:
         """Bytes needed to retain the modeled transfer fragments."""
         collective = self._validate_collective(collective)
         if algo == 'nvls' and collective in ('allreduce', 'allgather'):
-            upload_bytes = (data_bytes if collective == 'allreduce'
-                            else data_bytes / max(1, num_gpus))
-            frags, frag_bytes = self._spray_fragments(upload_bytes)
-            return frags * frag_bytes
+            if collective == 'allreduce':
+                frags, frag_bytes = self._spray_fragments(data_bytes)
+                return frags * frag_bytes
+            # AllGather: bytes the busiest endpoint must retain for its own
+            # grid-chunk fragments (codex round 22, finding 4).
+            required = 1
+            for chunk in self._rank_upload_chunks(data_bytes, num_gpus):
+                if chunk <= 0:
+                    continue
+                frags, frag_bytes = self._spray_fragments(chunk)
+                required = max(required, frags * frag_bytes)
+            return required
         return (
             self.required_retry_buffer_entries(
                 data_bytes, num_gpus, algo, collective)
@@ -1070,7 +1120,7 @@ class TheoryDerivedSurrogate:
 
     def _gbn_cascade(self, T_step, steps, D, N, algo, cr, ber, llr_enabled,
                      retry_mode='gobackn', retry_buffer_entries=None,
-                     collective=None):
+                     collective=None, bw_eff=None):
         """Link-retry overhead (additive, in microseconds).
 
         Only applies when llr_enabled=True AND ber>0 (after FEC reduction).
@@ -1130,7 +1180,17 @@ class TheoryDerivedSurrogate:
         if window <= 0:
             return float('inf')
 
-        chunk_serial = self.chunk_size / self.BW_link  # time to send one chunk
+        # Serialize retransmitted chunks at the TOPOLOGY-CAPPED rate when a
+        # bisection cap is in play (codex round 22, finding 6): a fabric whose
+        # bisection bottlenecks the schedule bandwidth bottlenecks a
+        # retransmission just the same — the doc contract says retransmitted
+        # fragments re-serialize at the capped rate, and the SACK path already
+        # receives the capped T_serial_step. Using the raw BW_link here left
+        # the legacy-GBN retry penalty unchanged (2.0435 µs) when a 50-GB/s
+        # cap was added.
+        if bw_eff is None:
+            bw_eff = self.BW_link
+        chunk_serial = self.chunk_size / bw_eff  # time to send one chunk
 
         if retry_mode.lower() == 'sack':
             retransmitted_chunks = 1.0
@@ -1490,7 +1550,8 @@ class TheoryDerivedSurrogate:
                 T_gbn_legacy = self._gbn_cascade(
                     T_step, steps, data_bytes, num_gpus, algo, credits,
                     effective_ber, llr_enabled, retry_mode,
-                    retry_buffer_entries, collective)
+                    retry_buffer_entries, collective,
+                    bw_eff=min(self.BW_link, bsec))
                 sack_floor = self._retry_overhead(
                     T_serial_step, steps, data_bytes, num_gpus, algo, credits,
                     ber, llr_enabled, fec_enabled and include_fec,

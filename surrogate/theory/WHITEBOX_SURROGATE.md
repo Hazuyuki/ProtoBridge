@@ -389,7 +389,9 @@ unchanged. The bisection cap applies to the serialization rate itself, and
 every term built on that rate follows it: the mean serialization term
 (`T_serial`) **and** the `ber > 0` retransmission overhead, whose
 retransmitted fragments re-serialize at the same capped rate
-(`_retry_overhead` receives the topology-capped `T_serial_step`). At
+(`_retry_overhead` receives the topology-capped `T_serial_step`, and
+`_gbn_cascade` serializes its retransmitted chunks at
+`min(BW_link, bisection)` — codex round 22, finding 6). At
 16 MiB / 8-GPU ring / BER 1e-7 / retry limit 3 / LLR-SACK, adding a
 50-GB/s bisection cap moves the prediction from ~223 µs to ~737 µs — the
 retransmissions serialize at the capped rate. The two physical numbers can

@@ -22,6 +22,7 @@
 
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <queue>
 #include <deque>
 #include <set>
@@ -613,6 +614,12 @@ class NvSwitch : public FabricSwitch
     uint32_t m_allReduceNumPartitions;              ///< Number of partitions for pipelined multicast (0=single)
     // FlowID -> count of completed partitions (for pipelined multicast)
     std::unordered_map<uint16_t, uint32_t> m_allReduceCompletedPartitions;
+    /// Flows whose legacy single-multicast result already went out (codex
+    /// round 22, finding 1). The allComplete test re-runs on every upload —
+    /// including late padding fragments that land after the multicast
+    /// cleared the buffer — and without this marker a second result event
+    /// was scheduled onto a cleared buffer (empty begin() deref).
+    std::unordered_set<uint16_t> m_allReduceLegacyMulticastDone;
     // Multicast result seqnums are PER (DESTINATION, FLOW): endpoint reorder
     // buffers (the module default, SetBypassReorderBuffer(false)) key on
     // (vc, flow, source) and expect each stream to start at 0 — a counter

@@ -721,8 +721,18 @@ class FabricEndpoint : public Application
     /// ContentionModel keeps a phantom backlog forever and later traffic
     /// draws an artificial contention penalty (codex round 21, finding 4).
     /// Entries whose event already fired decremented on schedule and are
-    /// left alone (IsExpired test).
+    /// left alone (IsExpired test). Fired entries are pruned on each append
+    /// (TrackBacklogDecrement) so the ledger tracks only IN-FLIGHT
+    /// decrements and stays O(wire depth), not O(cumulative packets) —
+    /// unpruned it grew by one ~40-byte entry per transmitted packet
+    /// (codex round 22, finding 5).
     std::vector<std::tuple<EventId, Ptr<ContentionModel>, TrafficClass>> m_pendingBacklogDecrements;
+
+    /// Register a scheduled backlog decrement and prune entries whose event
+    /// already fired (their DecrementBacklog landed on schedule — keeping
+    /// them only leaks memory, codex round 22, finding 5).
+    void TrackBacklogDecrement(const EventId& ev, const Ptr<ContentionModel>& model,
+                               TrafficClass tc);
 
     // Configuration
     uint8_t m_numVcs;                               ///< Number of virtual channels

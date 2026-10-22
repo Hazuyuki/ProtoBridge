@@ -2916,7 +2916,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                     }
                 });
                 m_deferredEgressEvents.push_back(decrEv);
-                m_pendingBacklogDecrements.push_back({decrEv, model, tc});
+                TrackBacklogDecrement(decrEv, model, tc);
                 return;
             }
         }
@@ -2950,7 +2950,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                     }
                 });
                 m_deferredEgressEvents.push_back(decrEv);
-                m_pendingBacklogDecrements.push_back({decrEv, model, tc});
+                TrackBacklogDecrement(decrEv, model, tc);
             }
             return;
         }
@@ -2988,8 +2988,27 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             }
         });
         m_deferredEgressEvents.push_back(decrEv);
-        m_pendingBacklogDecrements.push_back({decrEv, model, tc});
+        TrackBacklogDecrement(decrEv, model, tc);
     }
+}
+
+void
+FabricEndpoint::TrackBacklogDecrement(const EventId& ev,
+                                       const Ptr<ContentionModel>& model,
+                                       TrafficClass tc)
+{
+    // Prune entries whose decrement already fired (IsExpired): those
+    // balanced on schedule and retain nothing but ~40 bytes each. Without
+    // pruning the ledger grows monotonically with cumulative traffic —
+    // 10,000 delivered packets leave 10,000 stale entries pinning EventId +
+    //  model references until disposal (codex round 22, finding 5). A fired
+    //  EventId may also alias a REUSED UID after wraparound, which would
+    //  make the disposal balance skip a genuinely pending decrement.
+    std::erase_if(m_pendingBacklogDecrements,
+                  [](const auto& entry) {
+                      return std::get<0>(entry).IsExpired();
+                  });
+    m_pendingBacklogDecrements.push_back({ev, model, tc});
 }
 
 void
