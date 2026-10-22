@@ -6,6 +6,109 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 20: twelve defects across result ledgers, callback ownership, and hierarchical grids
+
+1. **SHARP/NVLS result receive paths count effective bytes only** (high).
+   Both `SharpAllReduce::OnPacketReceived` and `NvlsAllGather`'s result
+   accounting fell back to `packet->GetSize()` when
+   `effectiveDataSize == 0` — multicast result padding fragments
+   (retransmits excepted, which stamp the field) were credited as real
+   data, so receivers could complete before every rank's EFFECTIVE result
+   bytes arrived. The ledgers are effective-bytes-only now, matching the
+   round-19 switch-side convention. Test: `SHARP result receive counts
+   effective bytes only`.
+2. **Hierarchical AllGather phase-2 pre-credit keys on remote
+   obligation** (medium). The zero-expectation shortcut keyed on the
+   rank's OWN node chunk, so ranks on the NON-degenerate node (nonzero
+   own chunk, zero REMOTE receive obligation) waited for bytes nobody
+   sends — 2×2 AllGather at D=1/2/4 stalled to the 1-hour cap. The
+   pre-credit now sums the REMOTE nodes' chunk obligations, and the
+   phase-2 threshold drops its 0→1 clamp (the pre-credit covers the zero
+   case). Test: `hierarchical allgather degenerate 2x2 grid completes`.
+3. **Hierarchical AR/RS grids are remainder-aware at both levels**
+   (medium). Flat floor division truncated sends AND thresholds: 2×2 at
+   D=15 moved 80 (AR) / 40 (RS) bytes where the grid tiles D exactly —
+   90 / 45. `HierarchicalAllReduce` now uses a two-level grid
+   (`LocalSegmentOf(l) = D/g + (l < D%g)`,
+   `InterChunkOf(n,l) = seg(l)/N + (n < seg(l)%N)`) with
+   destination-sized phase-1 fullmesh sends, phase-2/3 sends paired with
+   matching thresholds, and ring volumes sized to the successor's chunk;
+   `HierarchicalReduceScatter` uses a flat per-rank `ChunkOf(r)` grid the
+   same way. Phase-2's reduce-scatter threshold is the receiver's OWN
+   share × (N−1) (sends are destination-sized), while phase-3's all-gather
+   threshold sums the remote shares (sends are own-share). Test:
+   `hierarchical AR and RS remainder grids tile dataSize exactly`.
+4. **CreditManager replacement drains the queued sends** (medium).
+   `SetCreditManager` installed the binding on the new manager but never
+   re-ran the deferred-send path, so swapping a BLOCKED manager for a
+   credited one left queued sends stranded until another credit event.
+   The setter now calls `TrySendQueuedPackets()` after installing. Test:
+   `credit manager swap drains the queued sends`.
+5. **ProtocolConfigRunner teardown is ownership-checked** (medium). The
+   destructor tested `ep->GetReceiveCallback().IsEqual(ours)` — `IsEqual`
+   dereferences both callbacks' `m_impl` (via `Ptr::operator->`
+   NS_ASSERT), aborting when the endpoint's callback had already been
+   cleared (any injector dispose path). Teardown now uses the new
+   null-safe `FabricEndpoint::DetachReceiveCallbackIfOwner`.
+6. **Injector dispose detaches only its own receive binding** (medium).
+   All 17 injector `DoDispose` methods cleared the endpoint receive
+   callback UNCONDITIONALLY — disposing injector A after injector B
+   initialized clobbered B's binding (packets into a null callback =
+   silent data loss). All converted to
+   `DetachReceiveCallbackIfOwner(MakeCallback(&Self::OnPacketReceived,
+   this))`, which clears only when the stored binding is still ours.
+   Tests: `injector dispose detaches only its own receive binding`.
+7. **Deferred backlog decrements hold the ContentionModel** (medium).
+   The WFQ/FEC/immediate shaping branches' deferred
+   `DecrementBacklog` lambdas captured `this` (the endpoint) and read
+   `m_contentionModel` at fire time — replacing or clearing the model
+   between schedule and fire dereferenced the stale member (use-after-
+   free-class). The lambdas now capture `Ptr<ContentionModel> model` at
+   schedule time. Test: `contention backlog decrement survives model
+   replacement`.
+8. **Hierarchical injectors honor the startupDelay override** (medium).
+   `Start()` unconditionally used the size-derived model delay, so the
+   `--startupDelay` CLI knob (written into `m_startupDelayNs`) never
+   affected hierarchical AR/AG/RS timing. The override now wins whenever
+   set (0 = auto). Test: `hierarchical startupDelay override shifts
+   completion`.
+9. **Hierarchical ReduceScatter handles gpusPerNode=1** (medium).
+   `StartLocalReduceScatter` unconditionally drove the g>1 local-phase
+   machinery (zero peers, threshold clamped 0→1 with no sender) — the
+   collective stalled at the 1-hour cap. The g≤1 shortcut now schedules
+   the inter-node phase directly (same seam as the AR fix).
+10. **Zero-data collectives complete trivially** (medium). Beyond the
+    round-19 fullmesh coverage: ring/SHARP AllReduce built transaction
+    graphs whose wait nodes got zero completion thresholds (Validate
+    aborts "wait node has no completion threshold"); ring AG/RS,
+    fullmesh RS, tree, ring reduce/broadcast, hierarchical AR/AG/RS, and
+    the bare p2p/fanout/incast sim patterns stalled with nothing to
+    send. Every injector now short-circuits `dataSize == 0` to
+    `Complete()` at its first trigger point. Test: `zero-data ring tree
+    and fullmesh collectives complete trivially`.
+11. **Surrogate NVLS AllGather loss model counts uploading ranks**
+    (medium). `expected_permanent_losses` multiplied the FULL GPU count
+    into both the upload and the result-multicast arms — at 1 B / 4 GPUs /
+    FEC RS(544,514,15) / BER 1.8e-3 it predicted 8p vs the exact 5p =
+    0.1903 (the 1-GPU degenerate collective has one uploading rank, not
+    four) with infinite strict latency while ns-3 completes. The
+    uploading-rank count (`min(N, ceil(D))`, 0 when D=0) now scales both
+    arms; the many-rank regime (8 GPUs / 16 MiB / BER 1e-9, ~1.08e-10)
+    is unchanged. Test: `test_nvls_allgather_loss_counts_uploading_ranks`.
+12. **Surrogate zero-byte predict no longer divides by zero** (medium).
+    `make_h200_tree_theory().predict(0, 4, "tree", 128,
+    collective="allreduce")` raised ZeroDivisionError at BER 0: the tree
+    packet count is 0 and `_packet_bytes_per_transfer` divided 0/0.
+    Zero-byte transfers now yield zero tree packets, a trivial fragment
+    size (1) for retry-buffer sizing, and an unclamped entry count (a
+    zero-size fragment can evict nothing). predict/predict_tail/strict
+    paths all return finite values at D=0 for every algorithm. Test:
+    `test_zero_byte_predict_is_finite_everywhere`.
+
+Suite state: EXTENSIVE 120 PASS / 0 FAIL (9 new round-20 tests),
+integration 6 PASS, surrogate pytest 86 passed (2 new round-20 tests),
+14/14 parity scripts, valgrind QUICK exit 0 with zero errors.
+
 ### Fixed — codex round 19: nine defects across credit ownership, ring volumes, and degenerate grids
 
 1. **CreditManager attribute swap detaches the old binding** (high). The

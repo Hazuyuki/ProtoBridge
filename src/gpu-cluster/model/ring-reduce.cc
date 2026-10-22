@@ -76,13 +76,15 @@ RingReduce::DoDispose()
     // Detach the receive callbacks BEFORE dropping the endpoint references:
     // they hold raw `this`, so a packet still in flight after this injector
     // is disposed would invoke OnPacketReceived on freed memory (same class
-    // of defect as codex round 16, finding 2). Requires a null Callback of
-    // the FabricEndpoint::ReceiveCallback signature.
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
     for (auto& ep : m_endpoints)
     {
         if (ep)
         {
-            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&RingReduce::OnPacketReceived, this));
         }
     }
     m_endpoints.clear();
@@ -172,6 +174,16 @@ RingReduce::Start()
     m_startTimeNs = Simulator::Now().GetNanoSeconds();
 
     NS_LOG_INFO("Starting Ring Reduce (root=" << m_rootRank << ") with startup delay " << m_startupDelayNs << " ns");
+
+    // Zero-data collective (codex round 20, finding 10): no send ever fires
+    // a receive to advance the ring — complete immediately instead of
+    // stalling to the 1-hour cap.
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("Ring Reduce trivially complete (zero data)");
+        Complete();
+        return;
+    }
 
     // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
     m_pendingEvents.push_back(

@@ -223,13 +223,15 @@ void HierarchicalAllGather::DoDispose()
     // Detach the receive callbacks BEFORE dropping the endpoint references:
     // they hold raw `this`, so a packet still in flight after this injector
     // is disposed would invoke OnPacketReceived on freed memory (same class
-    // of defect as codex round 16, finding 2). Requires a null Callback of
-    // the FabricEndpoint::ReceiveCallback signature.
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
     for (auto& ep : m_endpoints)
     {
         if (ep)
         {
-            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&HierarchicalAllGather::OnPacketReceived, this));
         }
     }
     m_endpoints.clear();
@@ -267,7 +269,13 @@ void HierarchicalAllGather::Start()
         return;
     }
 
-    uint64_t startupNs = GetLocalStartupDelayNs(m_chunkSize);
+    // An explicit SetStartupDelay OVERRIDES the protocol-derived delay
+    // (codex round 20, finding 8): the override member was written but
+    // never consumed, so --startupDelay=1000000000 left AllGather timing
+    // identical to the auto value.
+    uint64_t startupNs = (m_startupDelayNs > 0)
+                             ? m_startupDelayNs
+                             : GetLocalStartupDelayNs(m_chunkSize);
     uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_chunkSize);
     m_pendingEvents.push_back(
         Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
@@ -417,18 +425,33 @@ HierarchicalAllGather::StartInterNodeAllGather()
         }
     }
 
-    // Degenerate grid: a rank whose node holds only zero-chunk ranks sends
-    // and receives nothing inter-node — pre-credit every rank on such a
-    // node so the phase cannot stall to the 3600s cap.
+    // Degenerate grid: pre-credit every rank whose REMOTE receive
+    // obligation is zero — i.e. every OTHER node holds only zero-chunk
+    // ranks, so no remote peer will ever send this rank anything (codex
+    // round 20, finding 2). The old pre-credit keyed on the rank's OWN
+    // node chunk being zero, which is the SEND side: at 2 nodes x 2 GPUs
+    // with dataSize=1 or 2 the grid is [1,0]/[0,0]-style, node 0's ranks
+    // have a zero REMOTE obligation (node 1 holds nothing to send) but a
+    // nonzero own chunk — the receive threshold clamped 0 -> 1 with no
+    // sender, and node 0 stalled to the 1-hour cap. Keying on the remote
+    // obligation covers both directions: a rank on an all-zero node also
+    // has zero remote obligation.
     for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
     {
-        uint32_t nodeId = GetNodeId(gpu);
-        uint64_t nodeChunk = 0;
-        for (uint16_t l = 0; l < m_gpusPerNode; ++l)
+        if (m_gpuPhaseComplete[gpu])
         {
-            nodeChunk += ChunkSizeOf(GetGlobalRank(nodeId, l));
+            continue;
         }
-        if (nodeChunk == 0 && !m_gpuPhaseComplete[gpu])
+        uint64_t remoteObligation = 0;
+        for (uint32_t node = 0; node < m_numNodes; ++node)
+        {
+            if (node == GetNodeId(gpu)) continue;
+            for (uint16_t l = 0; l < m_gpusPerNode; ++l)
+            {
+                remoteObligation += ChunkSizeOf(GetGlobalRank(node, l));
+            }
+        }
+        if (remoteObligation == 0)
         {
             m_gpuPhaseComplete[gpu] = true;
             m_completedGpuCount++;
@@ -465,8 +488,10 @@ HierarchicalAllGather::CheckInterNodeAllGatherComplete(uint16_t gpu)
             expectedBytes += ChunkSizeOf(GetGlobalRank(node, l));
         }
     }
-    if (expectedBytes == 0) expectedBytes = 1;
-
+    // A zero obligation (every remote node all-zero-chunk) is pre-credited
+    // in StartInterNodeAllGather rather than clamped here — a fake 1-byte
+    // threshold with no sender stalls exactly the degenerate grids the
+    // pre-credit exists for (codex round 20, finding 2).
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {
         m_gpuPhaseComplete[gpu] = true;

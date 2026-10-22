@@ -1261,3 +1261,56 @@ def test_expected_losses_llr_off_grants_no_retries():
     with_llr = ring.expected_permanent_losses(
         D, N, "ring", 1e-7, 3, collective="allreduce", llr_enabled=True)
     assert with_llr < one_attempt
+
+
+def test_nvls_allgather_loss_counts_uploading_ranks():
+    """The NVLS AllGather loss estimator multiplied the FULL GPU count into
+    both the upload and the result-multicast arms: at 1 GPU / 4 B / BER
+    1.8e-3 it predicted 0.761 vs the exact 5p = 0.190 (4x over) with
+    infinite strict latency while ns-3 completes (codex round 20, finding
+    11). The uploading-rank count min(N, ceil(D)) — 1 here — must scale
+    both arms."""
+    nvls = wb.make_h200_nvls_theory()
+    nvls.num_lanes = 18
+    # 1 B / 4 GPUs / FEC RS(544,514,15) / BER 1.8e-3 / LLR off: one
+    # uploading rank (min(N, ceil(D)) = 1) ships 1 upload fragment and
+    # every rank receives 1 result fragment, so exactly 5 one-attempt
+    # fragments carry the collective — 5p for the post-FEC packet failure
+    # probability. The pre-fix full-N count gave 8p (4x over) and infinite
+    # strict latency while ns-3 completes.
+    p = nvls.expected_permanent_losses(
+        1, 4, "nvls", 1.8e-3, 5, collective="allgather", llr_enabled=False,
+        fec_enabled=True, fec_n=544, fec_k=514, fec_t=15)
+    p_frag = nvls._packet_failure_probability(
+        1.8e-3, True, 544, 514, 15, packet_bytes=1)
+    assert p == pytest.approx(5 * p_frag, rel=1e-9)
+    # The many-rank regime is unchanged: 8 GPUs / 16 MiB at BER 1e-9 /
+    # retry 3 still predicts ~1.08e-10 (uploading_ranks == N there).
+    p8 = nvls.expected_permanent_losses(
+        16 * 1024 * 1024, 8, "nvls", 1e-9, 3, collective="allgather",
+        llr_enabled=True)
+    assert p8 == pytest.approx(1.08e-10, rel=0.2)
+
+
+def test_zero_byte_predict_is_finite_everywhere():
+    """Zero-byte predict previously raised ZeroDivisionError in the tree
+    branch (0/0 fragment size at _packet_bytes_per_transfer) and in the
+    retry-buffer byte-capacity conversion (floor division by a zero-size
+    fragment). Every algorithm/collective must return a finite value at
+    D=0 (codex round 20, finding 12)."""
+    for make in (wb.make_h200_tree_theory, wb.make_h200_ring_theory,
+                 wb.make_h200_nvls_theory, wb.make_h200_fullmesh_theory):
+        t = make()
+        for algo in ("tree", "ring", "nvls", "fullmesh"):
+            for coll in ("allreduce", "allgather", "alltoall", "sendrecv"):
+                v = t.predict(0, 4, algo, 128, collective=coll)
+                assert math.isfinite(v) and v > 0.0, (algo, coll, v)
+        # Byte-capped retry buffers (the capacity conversion) and the
+        # strict-reliability path with BER stay finite too.
+        tail = t.predict_tail(0, 4, "tree", 128, retry_buffer_bytes=1 << 20,
+                              collective="allreduce")
+        assert math.isfinite(tail)
+        strict = t.predict(0, 4, "tree", 128, ber=1e-4,
+                           strict_reliability=True, retry_limit=3,
+                           collective="allreduce")
+        assert math.isfinite(strict)

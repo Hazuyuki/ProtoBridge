@@ -729,6 +729,14 @@ FabricEndpoint::SetCreditManager(Ptr<CreditManager> manager)
     {
         m_creditManager->SetCreditAvailableCallback(
             MakeCallback(&FabricEndpoint::OnCreditAvailable, this));
+        // Drain the queue the swap may have stranded (codex round 20,
+        // finding 4): replacing a BLOCKED manager leaves queued sends with
+        // no availability transition to wake them — the new manager may
+        // hold credits, but nothing ever calls OnCreditAvailable, so the
+        // queue never empties and delivery stays at zero. Re-run the drain
+        // here; it is a no-op when the queue is empty or credits are still
+        // exhausted.
+        TrySendQueuedPackets();
     }
 }
 
@@ -768,6 +776,31 @@ FabricEndpoint::ReceiveCallback
 FabricEndpoint::GetReceiveCallback() const
 {
     return m_receiveCallback;
+}
+
+bool
+FabricEndpoint::DetachReceiveCallbackIfOwner(ReceiveCallback owner)
+{
+    // Ownership-checked detach (codex round 20, findings 5 and 6): clear the
+    // stored binding ONLY when it is the callback `owner` installed. An
+    // unconditional clear in DoDispose/~Runner stomps a LATER owner's
+    // binding (initialize injector A, then B, on the same endpoints; A's
+    // teardown must not null B's callbacks), and the reverse order leaves
+    // A's own callback live on freed memory. IsEqual dereferences both
+    // impls, so short-circuit the null cases first (a null stored binding
+    // can never match a non-null owner; a null owner means plain cleanup
+    // and is rejected — callers that want unconditional clearing pass
+    // SetReceiveCallback(MakeNullCallback...) directly).
+    if (owner.IsNull() || m_receiveCallback.IsNull())
+    {
+        return false;
+    }
+    if (!m_receiveCallback.IsEqual(owner))
+    {
+        return false;
+    }
+    m_receiveCallback = MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>();
+    return true;
 }
 
 void
@@ -2842,10 +2875,20 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 // (serialization). Tracked like the deferred send itself:
                 // the lambda captures raw `this`, so DoDispose must cancel
                 // it or it fires on freed memory (codex round 14, finding 1).
+                // Capture the model the INCREMENT ran on (codex round 20,
+                // finding 7): reading m_contentionModel at fire time
+                // dereferences whatever is installed THEN — a mid-flight
+                // SetContentionModel(nullptr) aborts on the null pointer and
+                // a replacement model gets debited for backlog it never
+                // accrued.
+                Ptr<ContentionModel> model = m_contentionModel;
                 Time txDone = totalDelay + serialization;
                 m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(txDone, [this, tc]() {
-                        m_contentionModel->DecrementBacklog(tc);
+                    Simulator::Schedule(txDone, [model, tc]() {
+                        if (model)
+                        {
+                            model->DecrementBacklog(tc);
+                        }
                     }));
                 return;
             }
@@ -2867,13 +2910,18 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 }));
             // Decrement backlog after serialization. Tracked for DoDispose
             // like the deferred send above (raw-`this` capture; codex round
-            // 14, finding 1).
+            // 14, finding 1). Capture the model the increment ran on
+            // (codex round 20, finding 7 — see the WFQ branch above).
             if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
             {
+                Ptr<ContentionModel> model = m_contentionModel;
                 Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
                 m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(delay + serialization, [this, tc]() {
-                        m_contentionModel->DecrementBacklog(tc);
+                    Simulator::Schedule(delay + serialization, [model, tc]() {
+                        if (model)
+                        {
+                            model->DecrementBacklog(tc);
+                        }
                     }));
             }
             return;
@@ -2901,11 +2949,16 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
     {
         // Tracked for DoDispose like the deferred sends above (raw-`this`
-        // capture; codex round 14, finding 1).
+        // capture; codex round 14, finding 1). Capture the model the
+        // increment ran on (codex round 20, finding 7 — see the WFQ branch).
+        Ptr<ContentionModel> model = m_contentionModel;
         Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
         m_deferredEgressEvents.push_back(
-            Simulator::Schedule(shapingDelay + serialization, [this, tc]() {
-                m_contentionModel->DecrementBacklog(tc);
+            Simulator::Schedule(shapingDelay + serialization, [model, tc]() {
+                if (model)
+                {
+                    model->DecrementBacklog(tc);
+                }
             }));
     }
 }

@@ -37,15 +37,16 @@ ProtocolConfigRunner::~ProtocolConfigRunner()
     // and nulling its callback would silently drop its deliveries.
     const FabricEndpoint::ReceiveCallback ours =
         MakeCallback(&ProtocolConfigRunner::OnPacketReceived, this);
-    const FabricEndpoint::ReceiveCallback nullCb =
-        MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>();
     for (const auto& ep : m_endpoints)
     {
         if (!ep) continue;
-        if (ep->GetReceiveCallback().IsEqual(ours))
-        {
-            ep->SetReceiveCallback(nullCb);
-        }
+        // Null-safe ownership check (codex round 20, finding 5): a cleared
+        // endpoint (SetReceiveCallback(MakeNullCallback(...)) after init)
+        // stores a null binding, and Callback::IsEqual dereferences both
+        // impls — comparing against it aborted with "Attempted to
+        // dereference zero pointer" during runner teardown. The endpoint's
+        // ownership-checked helper short-circuits null on either side.
+        ep->DetachReceiveCallbackIfOwner(ours);
     }
 }
 

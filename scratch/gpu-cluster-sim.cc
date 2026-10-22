@@ -2534,6 +2534,14 @@ main(int argc, char* argv[])
         g_patternExpectedBytes = static_cast<uint64_t>(flows.size()) * dataSize;
         g_patternReceivedBytes = 0;
         g_patternStartNs = Simulator::Now().GetNanoSeconds();
+        // Zero-byte pattern (codex round 20, finding 10): SendBulkWire-
+        // TransferSize emits nothing at dataSize == 0, so no receive ever
+        // fires and the pattern stalls to the 1-hour cap. A zero-byte
+        // transfer is trivially complete.
+        if (dataSize == 0)
+        {
+            OnCollectiveComplete(0);
+        }
         for (auto& ep : endpoints)
         {
             ep->SetReceiveCallback(MakeCallback(&PatternReceive));

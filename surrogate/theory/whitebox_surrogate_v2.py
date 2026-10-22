@@ -581,6 +581,14 @@ class TheoryDerivedSurrogate:
         """
         collective = self._validate_collective(collective)
         if algo == 'tree' and collective == 'allreduce':
+            # Zero-byte transfer (codex round 20, finding 12): the loop
+            # below emits no fragments (there is nothing to send), and the
+            # division in _packet_bytes_per_transfer then hits
+            # ZeroDivisionError during retry-buffer sizing. A zero-byte
+            # collective transfers nothing — report zero packets (callers
+            # already treat a zero-byte budget as trivially sufficient).
+            if data_bytes <= 0:
+                return 0
             pipe = self._tree_pipe_chunk(data_bytes, num_gpus)
             per_rank = max(1, data_bytes // max(1, num_gpus))
             if data_bytes < num_gpus:
@@ -605,8 +613,16 @@ class TheoryDerivedSurrogate:
                                    collective=None):
         wire_bytes = self._wire_bytes_per_transfer(
             data_bytes, num_gpus, algo, collective)
-        return wire_bytes / self._packets_per_transfer(
+        packets = self._packets_per_transfer(
             data_bytes, num_gpus, algo, collective)
+        # Zero-byte transfer (codex round 20, finding 12): no packets are
+        # emitted, so wire bytes are zero too and the fragment size is 0/0.
+        # No fragment is ever retained, so any size trivially suffices;
+        # return 1 so the byte->entry conversion stays finite instead of
+        # raising ZeroDivisionError.
+        if packets <= 0:
+            return 1.0
+        return wire_bytes / packets
 
     def _retry_buffer_fragment_bytes(self, data_bytes, num_gpus, algo,
                                      collective):
@@ -686,6 +702,11 @@ class TheoryDerivedSurrogate:
         if retry_buffer_bytes is None:
             return retry_buffer_entries
         frag = self.chunk_size if fragment_bytes is None else fragment_bytes
+        # Zero-byte transfer (codex round 20, finding 12): the fragment size
+        # is 0 (nothing is in flight), so no byte cap can evict anything —
+        # the entry count stands unclamped instead of dividing by zero.
+        if frag <= 0:
+            return retry_buffer_entries
         byte_limited_entries = max(0, int(retry_buffer_bytes // frag))
         if retry_buffer_entries is None:
             return byte_limited_entries
@@ -854,17 +875,30 @@ class TheoryDerivedSurrogate:
             result_attempts = (self.nvls_switch_result_retry_limit + 1
                                if llr_enabled else 1)
             if collective == 'allgather':
+                # Uploads come only from ranks holding a NONZERO chunk on
+                # the frozen grid (codex round 20, finding 11): rank r owns
+                # D/N bytes plus one extra when r < D%N, so D < N leaves
+                # ranks past D with zero bytes — NvlsAllGather's send loop
+                # skips them (a zero-chunk rank uploads nothing). The old
+                # uniform D/N attribution invented an upload from EVERY
+                # rank: at D=1/N=4 it counted 20 packets (4 invented uploads
+                # + 16 result fragments) where ns-3 sends 1 upload + 4
+                # one-chunk results, inflating expected losses 0.7613 vs
+                # the true 0.1903 and wrongly reporting infinite strict
+                # latency for a run ns-3 completes.
+                uploading_ranks = min(num_gpus, math.ceil(data_bytes)) if data_bytes > 0 else 0
                 upload_bytes = data_bytes / max(1, num_gpus)
                 upload_frags, upload_frag_bytes = (
                     self._spray_fragments(upload_bytes))
                 # Result side per destination: the switch re-multicasts
-                # every received upload chunk, so a dest's stream carries
-                # N streams of frag(D/N) chunks at the upload chunk sizes.
-                result_frags_per_dest = num_gpus * upload_frags
+                # every RECEIVED upload chunk, so a dest's stream carries
+                # uploading_ranks streams of frag(D/N) chunks at the upload
+                # chunk sizes.
+                result_frags_per_dest = uploading_ranks * upload_frags
                 p_frag = self._packet_failure_probability(
                     ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
                 p_path_frag = 1.0 - (1.0 - p_frag) ** max(1.0, optical_hops)
-                return ((num_gpus * upload_frags * p_path_frag ** upload_attempts
+                return ((uploading_ranks * upload_frags * p_path_frag ** upload_attempts
                          + num_gpus * result_frags_per_dest
                          * p_path_frag ** result_attempts)
                         * min(1.0, max(0.0, optical_fraction)))

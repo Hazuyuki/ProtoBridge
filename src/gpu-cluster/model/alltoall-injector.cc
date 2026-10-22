@@ -59,13 +59,15 @@ AlltoAllInjector::DoDispose()
     // Detach the receive callbacks BEFORE dropping the endpoint references:
     // they hold raw `this`, so a packet still in flight after this injector
     // is disposed would invoke OnPacketReceived on freed memory (same class
-    // of defect as codex round 16, finding 2). Requires a null Callback of
-    // the FabricEndpoint::ReceiveCallback signature.
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
     for (auto& ep : m_endpoints)
     {
         if (ep)
         {
-            ep->SetReceiveCallback(MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>());
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&AlltoAllInjector::OnPacketReceived, this));
         }
     }
     m_endpoints.clear();

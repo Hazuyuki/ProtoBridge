@@ -348,6 +348,12 @@ class FabricEndpoint : public Application
     /// Current receive callback (identity comparison lets an owner detach
     /// exactly the callback IT installed — see ~ProtocolConfigRunner).
     ReceiveCallback GetReceiveCallback() const;
+    /// Ownership-checked detach: clears the receive binding only when it is
+    /// the callback `owner` installed (codex round 20, findings 5 and 6 —
+    /// injector DoDispose / runner teardown must not null a later owner's
+    /// binding). Returns whether the binding was cleared. A null `owner`
+    /// never matches; unconditional clearing stays SetReceiveCallback(null).
+    bool DetachReceiveCallbackIfOwner(ReceiveCallback owner);
     void SetMemoryResponseCallback(ReceiveCallback cb);
     void SetMemoryRequestCallback(MemoryRequestCallback cb);
     void SetMemorySemanticCallback(MemorySemanticCallback cb);
