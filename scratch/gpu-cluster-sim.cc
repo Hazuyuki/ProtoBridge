@@ -2189,6 +2189,18 @@ main(int argc, char* argv[])
             {
                 a2a->SetLocalStartupDelays(NanoSeconds(localStartupLLNs), NanoSeconds(localStartupLL128Ns), NanoSeconds(localStartupSIMPLENs));
             }
+            // --startupDelay/--startupAlltoAll override the protocol-derived
+            // local startup, exactly as in the plain AlltoAllInjector branch
+            // below (codex round 21, finding 3 — this wiring was missing, and
+            // the injector itself ignored the override).
+            if (startupAlltoAllNs > 0)
+            {
+                a2a->SetStartupDelay(NanoSeconds(startupAlltoAllNs));
+            }
+            else if (startupDelayNs > 0)
+            {
+                a2a->SetStartupDelay(NanoSeconds(startupDelayNs));
+            }
             a2a->Start();
             injector = a2a;
         }

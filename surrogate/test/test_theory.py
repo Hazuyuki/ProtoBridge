@@ -1314,3 +1314,56 @@ def test_zero_byte_predict_is_finite_everywhere():
                            strict_reliability=True, retry_limit=3,
                            collective="allreduce")
         assert math.isfinite(strict)
+
+
+def test_nvls_allgather_remainder_grid_fragments():
+    """NVLS allgather loss counting must fragment at the ACTUAL per-rank
+    integer chunk sizes, not the uniform D/N: the [2,1,1,1] grid at D=5/N=4
+    sends 5 upload fragments and mirrors 5 result fragments to each of the
+    4 dests (25 fragments total), where the uniform-D/N estimator counted
+    40 and predicted 0.6042 expected losses at BER 0.0016 / RS(544,514,15)
+    / LLR off — strict latency went infinite for a run ns-3 seeds 1-3 all
+    complete (codex round 21, finding 6)."""
+    nvls = wb.make_h200_nvls_theory()
+    got = nvls.expected_permanent_losses(
+        5, 4, "nvls", 0.0016, 3, collective="allgather", llr_enabled=False,
+        fec_enabled=True, fec_n=544, fec_k=514, fec_t=15)
+    p_frag = nvls._packet_failure_probability(
+        0.0016, True, 544, 514, 15, packet_bytes=1)
+    assert got == pytest.approx(25 * p_frag, rel=1e-9)
+    # The round-20 anchors still hold: D=1/N=4 is 5 fragments.
+    p1 = nvls.expected_permanent_losses(
+        1, 4, "nvls", 1.8e-3, 5, collective="allgather", llr_enabled=False,
+        fec_enabled=True, fec_n=544, fec_k=514, fec_t=15)
+    assert p1 == pytest.approx(
+        5 * nvls._packet_failure_probability(
+            1.8e-3, True, 544, 514, 15, packet_bytes=1),
+        rel=1e-9)
+    # Many-rank regime unchanged (D%N == 0: uniform and grid coincide).
+    p8 = nvls.expected_permanent_losses(
+        16 * 1024 * 1024, 8, "nvls", 1e-9, 3, collective="allgather",
+        llr_enabled=True)
+    assert p8 == pytest.approx(1.08e-10, rel=0.2)
+
+
+def test_zero_byte_gbn_llr_finite():
+    """Zero-byte tree predictions stayed infinite with Go-Back-N LLR: the
+    zero packet count produced window==0 and _gbn_cascade returned
+    infinity despite zero transfer work (codex round 21, finding 7). D=0
+    with llr_enabled=True and BER>0 must be finite in predict,
+    predict_tail, and strict mode."""
+    tree = wb.make_h200_tree_theory()
+    v = tree.predict(0, 4, "tree", 128, collective="allreduce", ber=1e-7,
+                     llr_enabled=True)
+    assert math.isfinite(v) and v > 0.0
+    tail = tree.predict_tail(0, 4, "tree", 128, collective="allreduce",
+                             ber=1e-7, llr_enabled=True)
+    assert math.isfinite(tail) and tail > 0.0
+    strict = tree.predict(0, 4, "tree", 128, collective="allreduce",
+                          ber=1e-7, llr_enabled=True, strict_reliability=True,
+                          retry_limit=3)
+    assert math.isfinite(strict) and strict > 0.0
+    # Nonzero control: the GBN overhead path still engages.
+    nz = tree.predict(1024, 4, "tree", 128, collective="allreduce",
+                      ber=1e-7, llr_enabled=True)
+    assert nz > v

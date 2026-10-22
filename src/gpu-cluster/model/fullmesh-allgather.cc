@@ -156,6 +156,17 @@ FullMeshAllGather::TriggerSends()
         return;
     }
 
+    // Single-rank collective (codex round 21, finding 8): N=1 has no peers
+    // to broadcast to and no receives will ever fire — the rank already
+    // holds the entire gathered buffer. Complete now instead of stalling
+    // to the cap.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("FullMesh AllGather trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
         if (gpu >= m_endpoints.size() || !m_endpoints[gpu]) continue;

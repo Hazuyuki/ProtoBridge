@@ -103,6 +103,7 @@ SharpAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_endpoints = endpoints;
 
     m_gpuBroadcastReceivedBytes.resize(numGpus, 0);
+    m_gpuBroadcastDone.assign(numGpus, false);
     m_reduceDoneCount = 0;
     m_broadcastDoneCount = 0;
 
@@ -334,6 +335,19 @@ SharpAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHea
 void
 SharpAllReduce::OnGpuBroadcastReceiveComplete(uint16_t gpu)
 {
+    // Once-per-GPU guard (codex round 21, finding 1): every fragment that
+    // arrives after the threshold already crossed — padding fragments
+    // (zero effective bytes, totalReceived unchanged) included — re-fires
+    // this check, so a GPU could be counted into m_broadcastDoneCount
+    // MULTIPLE times. With one slow GPU a single late padding fragment at
+    // a fast GPU completed the collective with the slow GPU's result
+    // totals still at zero. The per-GPU done flag makes the count
+    // count DISTINCT GPUs.
+    if (m_gpuBroadcastDone[gpu])
+    {
+        return;
+    }
+    m_gpuBroadcastDone[gpu] = true;
     m_broadcastDoneCount++;
 
     NS_LOG_INFO("GPU " << gpu << " received SHARP broadcast result"

@@ -261,7 +261,13 @@ void HierarchicalAlltoAll::Start()
 
     SetupReceiveCallbacks();
 
-    uint64_t startupNs = GetLocalStartupDelayNs(m_chunkSize);
+    // An explicit SetStartupDelay OVERRIDES the protocol-derived delay, so
+    // --startupDelay/--startupAlltoAll actually move the completion time
+    // (same rule as hierarchical allreduce/reducescatter/allgather; codex
+    // round 20, finding 8 — the alltoall path was missed there).
+    uint64_t startupNs = (m_startupDelayNs > 0)
+                             ? m_startupDelayNs
+                             : GetLocalStartupDelayNs(m_chunkSize);
     uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_chunkSize);
     m_pendingEvents.push_back(
         Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),

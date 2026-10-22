@@ -203,6 +203,16 @@ FullMeshAllReduce::TriggerReduceScatterPhase()
         return;
     }
 
+    // Single-rank collective (codex round 21, finding 8): N=1 has no peers
+    // to send to and no receives will ever fire — the buffer reduced over
+    // one rank is itself. Complete now instead of stalling to the cap.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("FullMesh AllReduce trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
     // Each GPU sends its chunk to all N-1 other GPUs simultaneously
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {

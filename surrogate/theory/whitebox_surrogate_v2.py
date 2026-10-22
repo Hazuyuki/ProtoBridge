@@ -887,18 +887,40 @@ class TheoryDerivedSurrogate:
                 # the true 0.1903 and wrongly reporting infinite strict
                 # latency for a run ns-3 completes.
                 uploading_ranks = min(num_gpus, math.ceil(data_bytes)) if data_bytes > 0 else 0
-                upload_bytes = data_bytes / max(1, num_gpus)
-                upload_frags, upload_frag_bytes = (
-                    self._spray_fragments(upload_bytes))
+                # Fragment at the ACTUAL per-rank integer chunk sizes, not
+                # the uniform D/N (codex round 21, finding 6): the grid is
+                # [D/N + 1] x (D%N) then [D/N] x (N - D%N), and each rank
+                # sprays ITS OWN chunk. The old uniform-D/N fragmentation
+                # invented fractional bytes: at D=5/N=4/18 lanes it counted
+                # 8 upload + 32 result fragments (p x 40) where the [2,1,1,1]
+                # grid sends 5 upload fragments and mirrors 5 result
+                # fragments to each of the 4 dests (p x 25 = 0.3776 at BER
+                # 0.0016 / RS(544,514,15) / LLR off, vs 0.6042 predicted) —
+                # strict latency went infinite for a run ns-3 seeds 1-3 all
+                # complete.
+                base_chunk = data_bytes // max(1, num_gpus)
+                remainder = data_bytes % max(1, num_gpus)
+                upload_frags = 0
+                upload_frag_bytes = 1
+                for r in range(uploading_ranks):
+                    chunk = base_chunk + (1 if r < remainder else 0)
+                    if chunk <= 0:
+                        continue
+                    frags, frag_bytes = self._spray_fragments(chunk)
+                    upload_frags += frags
+                    # Conservative fragment size: the largest fragment any
+                    # uploading rank sends (per-fragment failure probability
+                    # is monotonically increasing in size).
+                    upload_frag_bytes = max(upload_frag_bytes, frag_bytes)
                 # Result side per destination: the switch re-multicasts
                 # every RECEIVED upload chunk, so a dest's stream carries
-                # uploading_ranks streams of frag(D/N) chunks at the upload
-                # chunk sizes.
-                result_frags_per_dest = uploading_ranks * upload_frags
+                # upload_frags fragments in total (mirroring the
+                # heterogeneous upload streams chunk-for-chunk).
+                result_frags_per_dest = upload_frags
                 p_frag = self._packet_failure_probability(
                     ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
                 p_path_frag = 1.0 - (1.0 - p_frag) ** max(1.0, optical_hops)
-                return ((uploading_ranks * upload_frags * p_path_frag ** upload_attempts
+                return ((upload_frags * p_path_frag ** upload_attempts
                          + num_gpus * result_frags_per_dest
                          * p_path_frag ** result_attempts)
                         * min(1.0, max(0.0, optical_fraction)))
@@ -1085,6 +1107,16 @@ class TheoryDerivedSurrogate:
         else:
             total_chunks = D * (N - 1) / N / self.chunk_size
         P_error_total = total_chunks * P_chunk
+
+        # Zero transfer work (D=0): no chunks are in flight, so no error can
+        # occur and there is no Go-Back-N overhead — return BEFORE the
+        # window computation. The packet count is also 0 at D=0, so the
+        # window<=0 branch below would otherwise report infinity for a
+        # transfer with literally nothing to retransmit (codex round 21,
+        # finding 7: predict/predict_tail returned inf for D=0/tree/BER
+        # 1e-7/LLR on where ns-3's zero-data guard completes trivially).
+        if P_error_total <= 0:
+            return 0.0
 
         bdp = self._bdp(N, algo, collective)
         if bdp == float('inf'):

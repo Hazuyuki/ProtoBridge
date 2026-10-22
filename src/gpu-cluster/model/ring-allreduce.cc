@@ -306,6 +306,17 @@ RingAllReduce::Start()
         return;
     }
 
+    // Single-rank collective (codex round 21, finding 8): N=1 has no ring
+    // successor, no peer receives, and the transaction graph degenerates to
+    // nodes that cannot affect completion (Validate aborts). The reduction
+    // of one rank's buffer is that buffer — trivially complete.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("Ring AllReduce trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
     if (m_useTransactionModel)
     {
         BuildTransactionGraph();

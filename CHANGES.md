@@ -6,6 +6,101 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 21: eight defects across broadcast ledgers, degenerate grids, and surrogate reliability
+
+1. **Legacy SHARP counts each GPU's broadcast completion once** (high).
+   `SharpAllReduce::OnGpuBroadcastReceiveComplete` re-fired its threshold
+   check on EVERY result fragment after the threshold crossed — padding
+   fragments with zero effective bytes included — so one GPU could be
+   counted multiple times (`m_broadcastDoneCount` advancing past
+   `numGpus` on a single rank). With one slow GPU, a late padding
+   fragment completed the collective with the slow GPU's totals still at
+   zero (probe: completion at 71.3 µs with GPU 0 counted twice; the fixed
+   build completes at 166 µs after GPU 3's 100-µs-delayed stream lands).
+   A once-per-GPU guard (`m_gpuBroadcastDone`) now short-circuits every
+   fragment after the first completion. Test: `SHARP broadcast completion
+   counts each GPU once`.
+2. **Hierarchical AR/RS pre-credit degenerate ranks at every phase**
+   (medium). The remaining 0→1 expected-byte clamps (hierarchical
+   allreduce phases 1–4, hierarchical reducescatter phases 1–2, and the
+   ring-branch volume clamp) had no sender at degenerate grids — ranks
+   with zero-sized chunks stalled the collective to the 3600-s cap at
+   2×2/D=1..15. The frozen convention is now pre-crediting:
+   zero-obligation ranks are marked complete at each phase START (local
+   segment, inter-node chunk, remote-obligation sum, or flat chunk ==
+   0), with no clamps anywhere. Test: `hierarchical AR and RS degenerate
+   grids complete`.
+3. **Hierarchical AllToAll honors the startup override** (medium).
+   `Start()` used the protocol-model delay unconditionally AND the sim's
+   hierarchical-alltoall branch never called `SetStartupDelay` at all, so
+   `--startupDelay`/`--startupAlltoAll` left the completion time frozen
+   (2×2/D=65536: 118.4 µs with or without a 1-s override). The override
+   now wins whenever set (mirroring the round-20 #8 rule), and the sim
+   wires both knobs into the injector (fixed: 1000053.4 µs). Test:
+   `hierarchical alltoall startupDelay override shifts completion`.
+4. **Endpoint disposal balances the contention-backlog ledger**
+   (medium). `DoDispose` canceled the scheduled `DecrementBacklog` events
+   without balancing their already-counted increments — a SHARED
+   `ContentionModel` kept a phantom P2P backlog of 1 forever, drawing an
+   artificial contention penalty for all later traffic. Pending
+   decrements are now tracked (event, model, class) alongside the
+   deferred egress events, and disposal applies every still-pending
+   decrement before canceling (entries whose event already fired are
+   skipped; the balance runs BEFORE the cancel loop because Cancel marks
+   an EventId expired). Test: `endpoint disposal balances pending
+   contention backlog`.
+5. **Credit-window shrink clamps pending, not available** (medium).
+   `SetTotalCredits` adjusted `available` by the window diff and clamped
+   it to the new total — shrinking below the OUTSTANDING count granted
+   phantom available credits (10→5 with 8 outstanding: available=5 while
+   8 are in flight, letting the sender double-spend) and broke the
+   `available + pending == total` invariant so the next `ReturnCredits`
+   aborted (probe: NS_ASSERT at credit-manager.cc). The overdraft case
+   now clamps PENDING to the new total and zeroes available; returned
+   credits drain the overdraft as they arrive. Non-overdraft shrink and
+   grow keep the arithmetic identity. Test: `credit window shrink clamps
+   pending not available`.
+6. **Surrogate NVLS AllGather fragments at the remainder grid** (medium).
+   `expected_permanent_losses` fragmented a uniform `D/N` per rank: at
+   D=5/N=4/18 lanes it counted 40 fragments (8 upload + 32 result)
+   where the `[2,1,1,1]` grid sends 5 uploads and mirrors 5 result
+   fragments to each of the 4 dests (25 total) — 0.6042 predicted
+   expected losses at BER 0.0016 / RS(544,514,15) / LLR off vs the exact
+   0.3776, so strict latency went infinite for a run ns-3 seeds 1–3 all
+   complete. The estimator now fragments each uploading rank's ACTUAL
+   integer chunk (`D/N + (r < D%N)`), sizes the failure probability at
+   the largest fragment, and mirrors the summed upload fragments per
+   dest. The many-rank regime (D%N == 0) is unchanged. Test:
+   `test_nvls_allgather_remainder_grid_fragments`.
+7. **Zero-byte tree predictions finite under Go-Back-N LLR** (medium).
+   `_gbn_cascade` returned infinity when the (zero) packet count drove
+   `window == 0` — despite zero transfer work. A `P_error_total <= 0`
+   early return now precedes the window computation, so D=0 with
+   `llr_enabled=True` and BER>0 is finite in predict, predict_tail, and
+   strict mode (matching the ns-3 zero-data trivial completion). Test:
+   `test_zero_byte_gbn_llr_finite`.
+8. **Single-rank collectives complete trivially** (medium). N=1 with
+   nonzero D: ring AllReduce's transaction graph failed validation
+   ("node that cannot affect completion" abort), NcclRingAllReduce
+   aborted at Initialize, and fullmesh AR plus ring/fullmesh AG/RS and
+   AllToAll waited for receives that cannot occur to the 3600-s cap.
+   Every injector now short-circuits N≤1 (pre-credit at Initialize for
+   AlltoAll; guard at Start for the rest; Initialize+Start flag for
+   NcclRingAllReduce). CLI sweep: all 7 algorithms × 6 collectives
+   status=complete at N=1. Tests: `single-rank <injector> completes
+   trivially` (7 cases). Also: `StartApplication` on an endpoint whose
+   application start was scheduled before a mid-window `Dispose` now
+   returns early instead of dereferencing the nulled managers.
+9. **Test-name hygiene** (round-21 follow-on). One registered test name
+   contained `/` ("Ring AG/RS and FullMesh grids cover the full data
+   size"), which broke `test-runner --test-name` filtering (names cannot
+   contain `/\|?"`). Renamed to "Ring AG-RS and FullMesh grids cover
+   the full data size" — no behavioral change.
+
+Suite state: EXTENSIVE 132 PASS / 0 FAIL (12 new round-21 tests),
+integration 6 PASS, surrogate pytest 88 passed (2 new round-21 tests),
+14/14 parity scripts, valgrind QUICK exit 0 with zero errors.
+
 ### Fixed — codex round 20: twelve defects across result ledgers, callback ownership, and hierarchical grids
 
 1. **SHARP/NVLS result receive paths count effective bytes only** (high).

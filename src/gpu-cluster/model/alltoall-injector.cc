@@ -132,6 +132,20 @@ AlltoAllInjector::Initialize(uint16_t numGpus, uint64_t dataSize,
         }
     }
 
+    // Single-rank collective (codex round 21, finding 8): N=1 has no peers
+    // to send to and no receive will ever fire, so the source-tracking
+    // completion condition can never advance. The one rank already holds
+    // its own chunk — the exchange is trivially complete.
+    if (numGpus <= 1)
+    {
+        for (uint16_t rank = 0; rank < numGpus; rank++)
+        {
+            m_gpuSourcesReceived[rank] = numGpus - 1;
+            m_gpuCompletedStep[rank] = m_totalSteps;
+            m_totalCompletedGpus++;
+        }
+    }
+
     Ptr<ProtocolModel> protoModel = m_endpoints[0]->GetProtocolModel();
     NcclProtocol startupProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_dataSize));
     if (m_startupDelayNs == 0)

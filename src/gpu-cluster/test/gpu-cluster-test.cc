@@ -8032,7 +8032,7 @@ class CollectiveInjectorCoverageTest : public TestCase
 {
   public:
     CollectiveInjectorCoverageTest()
-        : TestCase("Ring AG/RS and FullMesh grids cover the full data size") {}
+        : TestCase("Ring AG-RS and FullMesh grids cover the full data size") {}
 
     template <typename InjectorT>
     void RunCoverage(uint64_t dataSize, uint64_t expectedBytes,
@@ -8548,6 +8548,8 @@ class HierarchicalAllReduceCorrectnessTest : public TestCase
 };
 
 // ---------------------------------------------------------------------------
+
+
 // P1: NvSwitch microarchitecture.
 // ---------------------------------------------------------------------------
 
@@ -10086,6 +10088,441 @@ class RailOptimizedFatTreeCoreTierTest : public TestCase
     }
 };
 
+// ---------------------------------------------------------------------------
+// Codex round 21 regressions.
+// ---------------------------------------------------------------------------
+
+// Returns true iff the single-rank collective completed (and its callback
+// fired); the CALLER asserts, so this helper works at file scope where the
+// NS_TEST_ASSERT macros (which need `this`) cannot live.
+template <typename InjectorT>
+bool
+RunSingleRankTrivial()
+{
+    DisableLinkErrorsGlobally();
+    Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+    const uint16_t numGpus = 1;
+    const uint64_t dataSize = 1024;
+
+    // No fabric needed: N=1 never transmits (the trivial-completion paths
+    // fire before any send), so a bare endpoint with a protocol model
+    // suffices — BuildFullMesh aborts below 2 nodes.
+    NodeContainer node = NodeContainer();
+    node.Create(1);
+    Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+    ep->SetNode(node.Get(0));
+    ep->SetRank(0);
+    ep->SetVcCredits(0, 10000);
+    ep->SetBypassReorderBuffer(true);
+    ep->Initialize();
+    std::vector<Ptr<FabricEndpoint>> eps{ep};
+    Ptr<InjectorT> inj = CreateObject<InjectorT>();
+    inj->Initialize(numGpus, dataSize, eps);
+    bool done = false;
+    inj->SetCompletionCallback([&](uint64_t) { done = true; });
+    inj->Start();
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+    bool ok = inj->IsCompleted() && done;
+    Simulator::Destroy();
+    return ok;
+}
+
+
+// (codex round 21, finding 1) Legacy SHARP counted one GPU's completion
+// repeatedly: every result fragment after the threshold crossed (padding
+// with zero effective bytes included) re-fired the completion check, so a
+// GPU could be counted multiple times. With one slow GPU a late padding
+// fragment completed the collective with the slow GPU's totals still at
+// zero. The guard is once-per-GPU.
+class SharpBroadcastOncePerGpuTest : public TestCase
+{
+  public:
+    SharpBroadcastOncePerGpuTest()
+        : TestCase("SHARP broadcast completion counts each GPU once") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 8;
+
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+
+        Ptr<NvSwitch> sw;
+        auto swNode = helper.GetSwitchNodes().Get(0);
+        for (uint32_t i = 0; i < swNode->GetNDevices(); ++i)
+        {
+            Ptr<NvSwitch> s = DynamicCast<NvSwitch>(swNode->GetDevice(i));
+            if (s) sw = s;
+        }
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(numGpus);
+        sw->SetAllReduceDataSize(dataSize);
+        sw->SetAllReduceNumPartitions(8);
+
+        Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+        inj->SetAttribute("UseTransactionModel", BooleanValue(false));
+        inj->Initialize(numGpus, dataSize, eps);
+        bool done = false;
+        inj->SetCompletionCallback([&](uint64_t) { done = true; });
+        // Wrap the receive callbacks AFTER Start (SetupReceiveCallbacks
+        // overwrites earlier wraps): delay GPU 3's whole stream by 100 us
+        // and GPU 0's first fragment (padding, zero effective bytes) by
+        // 5 us. Pre-fix, GPU 0's late padding fragment double-counted GPU 0
+        // and completed the collective before GPU 3's data arrived.
+        inj->Start();
+        for (uint32_t i = 0; i < eps.size(); ++i)
+        {
+            FabricEndpoint::ReceiveCallback cb = eps[i]->GetReceiveCallback();
+            uint32_t delayUs = (i == 3) ? 100 : (i == 0 ? 5 : 0);
+            eps[i]->SetReceiveCallback(
+                [cb, i, delayUs](uint16_t rank, Ptr<Packet> p, FabricHeader h) {
+                    if (delayUs > 0)
+                    {
+                        Simulator::Schedule(MicroSeconds(delayUs), [cb, rank, p, h]() {
+                            cb(rank, p, h);
+                        });
+                        return;
+                    }
+                    cb(rank, p, h);
+                });
+        }
+        Simulator::Stop(MilliSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the SHARP allreduce must complete even with one slow GPU");
+        NS_TEST_ASSERT_MSG_EQ(done, true,
+            "SHARP completion callback must fire");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 21, finding 2) Hierarchical AR/RS at degenerate data sizes
+// (D < N*g) leave ranks with zero-sized chunks: with the old 0->1 threshold
+// clamps nobody sent them anything and the collective stalled to the cap.
+// The pre-credit convention marks zero-obligation ranks complete at each
+// phase start instead.
+class HierarchicalDegeneratePreCreditTest : public TestCase
+{
+  public:
+    HierarchicalDegeneratePreCreditTest()
+        : TestCase("hierarchical AR and RS degenerate grids complete") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 2;
+        const uint32_t numNodes = 2;
+
+        // Two separate fabrics (single receive slot per endpoint): AR
+        // round then RS round, each with every degenerate size.
+        for (int round = 0; round < 2; ++round)
+        {
+            for (uint64_t dataSize : {1ULL, 2ULL, 3ULL, 5ULL})
+            {
+                HybridTopologyHelper helper;
+                helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+                helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+                helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+                helper.Build();
+                helper.PopulateCrossFabricRouting();
+                auto apps = helper.GetAllEndpoints();
+                std::vector<Ptr<FabricEndpoint>> eps;
+                for (uint32_t r = 0; r < apps.GetN(); ++r)
+                {
+                    Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                    ep->SetNumVirtualChannels(1);
+                    ep->SetVcCredits(0, 1000000);
+                    ep->Initialize();
+                    eps.push_back(ep);
+                }
+                bool done = false;
+                if (round == 0)
+                {
+                    Ptr<HierarchicalAllReduce> ar = CreateObject<HierarchicalAllReduce>();
+                    ar->SetGpusPerNode(gpusPerNode);
+                    ar->SetNumNodes(numNodes);
+                    ar->Initialize(numNodes * gpusPerNode, dataSize, eps);
+                    ar->SetCompletionCallback([&](uint64_t) { done = true; });
+                    ar->Start();
+                    Simulator::Stop(MilliSeconds(200));
+                    Simulator::Run();
+                    NS_TEST_ASSERT_MSG_EQ(ar->IsCompleted(), true,
+                        "hierarchical allreduce 2x2 must complete at every degenerate D");
+                    NS_TEST_ASSERT_MSG_EQ(done, true,
+                        "hierarchical allreduce completion callback must fire");
+                }
+                else
+                {
+                    Ptr<HierarchicalReduceScatter> rs = CreateObject<HierarchicalReduceScatter>();
+                    rs->SetGpusPerNode(gpusPerNode);
+                    rs->SetNumNodes(numNodes);
+                    rs->Initialize(numNodes * gpusPerNode, dataSize, eps);
+                    rs->SetCompletionCallback([&](uint64_t) { done = true; });
+                    rs->Start();
+                    Simulator::Stop(MilliSeconds(200));
+                    Simulator::Run();
+                    NS_TEST_ASSERT_MSG_EQ(rs->IsCompleted(), true,
+                        "hierarchical reducescatter 2x2 must complete at every degenerate D");
+                    NS_TEST_ASSERT_MSG_EQ(done, true,
+                        "hierarchical reducescatter completion callback must fire");
+                }
+                Simulator::Destroy();
+            }
+        }
+    }
+};
+
+// (codex round 21, finding 3) Hierarchical AllToAll ignored the startup
+// override: Start() used the protocol-model delay unconditionally (and the
+// sim's wiring never called SetStartupDelay on the injector at all). The
+// override now wins whenever set — a 100-ms override shifts the completion
+// timestamp well past the baseline.
+class HierarchicalAlltoAllStartupOverrideTest : public TestCase
+{
+  public:
+    HierarchicalAlltoAllStartupOverrideTest()
+        : TestCase("hierarchical alltoall startupDelay override shifts completion") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 2;
+        const uint32_t numNodes = 2;
+        const uint64_t dataSize = 65536;
+        const uint64_t overrideNs = 100000000ULL; // 100 ms
+
+        uint64_t durations[2] = {};
+        for (int withOverride = 0; withOverride <= 1; ++withOverride)
+        {
+            HybridTopologyHelper helper;
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+            helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+            helper.Build();
+            helper.PopulateCrossFabricRouting();
+            auto apps = helper.GetAllEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t r = 0; r < apps.GetN(); ++r)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                ep->SetNumVirtualChannels(1);
+                ep->SetVcCredits(0, 1000000);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+            Ptr<HierarchicalAlltoAll> inj = CreateObject<HierarchicalAlltoAll>();
+            inj->SetGpusPerNode(gpusPerNode);
+            inj->SetNumNodes(numNodes);
+            inj->Initialize(numNodes * gpusPerNode, dataSize, eps);
+            if (withOverride)
+            {
+                inj->SetStartupDelay(NanoSeconds(overrideNs));
+            }
+            durations[withOverride] = 0;
+            inj->SetCompletionCallback([&durations, withOverride](uint64_t d) {
+                durations[withOverride] = d;
+            });
+            inj->Start();
+            Simulator::Stop(Seconds(1));
+            Simulator::Run();
+            Simulator::Destroy();
+        }
+        NS_TEST_ASSERT_MSG_EQ(durations[1] > durations[0] + overrideNs / 2, true,
+            "the 100-ms startup override must shift the alltoall completion "
+            "by at least 50 ms (baseline "
+            << durations[0] << " ns, override " << durations[1] << " ns)");
+    }
+};
+
+// (codex round 21, finding 4) Disposing an endpoint cancels the scheduled
+// contention-backlog decrements; the increments already counted, so a
+// SHARED ContentionModel kept a phantom backlog forever. Disposal now
+// balances the ledger for the still-pending decrements.
+class ContentionBacklogDisposalBalanceTest : public TestCase
+{
+  public:
+    ContentionBacklogDisposalBalanceTest()
+        : TestCase("endpoint disposal balances pending contention backlog") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        const uint16_t numGpus = 2;
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+        Ptr<ContentionModel> shared = CreateObject<ContentionModel>();
+        shared->SetBandwidth(1000000000);
+        eps[0]->SetContentionModel(shared);
+        // Remote-dest P2P bypasses the credit gate and drives straight into
+        // SendPacketOnDevice (increment + scheduled decrement).
+        uint8_t byte = 0xAB;
+        eps[0]->SendP2p(1, &byte, 1, 1, 0);
+        // Dispose BEFORE the serialization decrement fires.
+        eps[0]->Dispose();
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(shared->GetBacklog(TrafficClass::P2P), 0u,
+            "disposal must balance the pending backlog increment — a shared "
+            "model otherwise keeps a phantom P2P backlog forever");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 21, finding 5) Shrinking a credit window below the number
+// of OUTSTANDING credits granted phantom available credits and broke the
+// invariant so the next ReturnCredits aborted. The shrink now clamps
+// pending (the overdraft drains as credits return), never grants.
+class CreditWindowShrinkTest : public TestCase
+{
+  public:
+    CreditWindowShrinkTest()
+        : TestCase("credit window shrink clamps pending not available") {}
+    void DoRun() override
+    {
+        Ptr<CreditManager> cm = CreateObject<CreditManager>();
+        cm->InitializeVc(0, 10);
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            NS_TEST_ASSERT_MSG_EQ(cm->ConsumeCredit(0, i), true,
+                "consuming from a 10-credit window must succeed");
+        }
+        cm->SetTotalCredits(0, 5);
+        NS_TEST_ASSERT_MSG_EQ(cm->GetAvailableCredits(0), 0u,
+            "a shrink below the outstanding count must NOT grant available "
+            "credits (8 outstanding in a 5-credit window)");
+        // The next return must survive the invariant and land as available.
+        cm->ReturnCredits(0, 1);
+        NS_TEST_ASSERT_MSG_EQ(cm->GetAvailableCredits(0), 1u,
+            "the overdraft must absorb the returned credit");
+        // Non-overdraft shrink keeps the arithmetic identity.
+        Ptr<CreditManager> cm2 = CreateObject<CreditManager>();
+        cm2->InitializeVc(0, 10);
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            cm2->ConsumeCredit(0, i);
+        }
+        cm2->SetTotalCredits(0, 6);
+        NS_TEST_ASSERT_MSG_EQ(cm2->GetAvailableCredits(0), 2u,
+            "4 outstanding in a shrunk 6-credit window leaves 2 available");
+    }
+};
+
+// (codex round 21, finding 8) Single-rank collectives (N=1, nonzero D):
+// ring AllReduce built a graph that failed validation; fullmesh AR and
+// ring/fullmesh AG/RS plus AllToAll stalled to the cap. Every injector now
+// trivially completes the degenerate single-rank case.
+class SingleRankRingAllReduceTest : public TestCase
+{
+  public:
+    SingleRankRingAllReduceTest()
+        : TestCase("single-rank ring allreduce completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<RingAllReduce>(), true,
+            "ring allreduce must complete trivially at N=1");
+    }
+};
+
+class SingleRankFullMeshAllReduceTest : public TestCase
+{
+  public:
+    SingleRankFullMeshAllReduceTest()
+        : TestCase("single-rank fullmesh allreduce completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<FullMeshAllReduce>(), true,
+            "fullmesh allreduce must complete trivially at N=1");
+    }
+};
+
+class SingleRankRingAllGatherTest : public TestCase
+{
+  public:
+    SingleRankRingAllGatherTest()
+        : TestCase("single-rank ring allgather completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<RingAllGather>(), true,
+            "ring allgather must complete trivially at N=1");
+    }
+};
+
+class SingleRankFullMeshAllGatherTest : public TestCase
+{
+  public:
+    SingleRankFullMeshAllGatherTest()
+        : TestCase("single-rank fullmesh allgather completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<FullMeshAllGather>(), true,
+            "fullmesh allgather must complete trivially at N=1");
+    }
+};
+
+class SingleRankRingReduceScatterTest : public TestCase
+{
+  public:
+    SingleRankRingReduceScatterTest()
+        : TestCase("single-rank ring reducescatter completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<RingReduceScatter>(), true,
+            "ring reducescatter must complete trivially at N=1");
+    }
+};
+
+class SingleRankFullMeshReduceScatterTest : public TestCase
+{
+  public:
+    SingleRankFullMeshReduceScatterTest()
+        : TestCase("single-rank fullmesh reducescatter completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<FullMeshReduceScatter>(), true,
+            "fullmesh reducescatter must complete trivially at N=1");
+    }
+};
+
+class SingleRankAllToAllTest : public TestCase
+{
+  public:
+    SingleRankAllToAllTest()
+        : TestCase("single-rank alltoall completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<AlltoAllInjector>(), true,
+            "alltoall must complete trivially at N=1");
+    }
+};
+
 GpuClusterTestSuite::GpuClusterTestSuite()
     : TestSuite("gpu-cluster", Type::UNIT)
 {
@@ -10208,6 +10645,22 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new HierarchicalStartupDelayOverrideTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalReduceScatterSingleNodeGpuTest, TestCase::Duration::QUICK);
     AddTestCase(new ZeroDataCollectiveCompletionTest, TestCase::Duration::QUICK);
+
+
+// ---------------------------------------------------------------------------
+    // Codex round 21 regressions.
+    AddTestCase(new SharpBroadcastOncePerGpuTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalDegeneratePreCreditTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalAlltoAllStartupOverrideTest, TestCase::Duration::QUICK);
+    AddTestCase(new ContentionBacklogDisposalBalanceTest, TestCase::Duration::QUICK);
+    AddTestCase(new CreditWindowShrinkTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankRingAllReduceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankFullMeshAllReduceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankRingAllGatherTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankFullMeshAllGatherTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankRingReduceScatterTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankFullMeshReduceScatterTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankAllToAllTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

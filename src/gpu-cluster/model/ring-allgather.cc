@@ -274,6 +274,17 @@ RingAllGather::Start()
         return;
     }
 
+    // Single-rank collective (codex round 21, finding 8): N=1 has no ring
+    // successor — nothing is ever sent or received, and the rank already
+    // holds the entire gathered buffer. Complete now instead of stalling
+    // to the cap.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("Ring AllGather trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
     // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
     m_pendingEvents.push_back(
         Simulator::Schedule(NanoSeconds(m_startupDelayNs),

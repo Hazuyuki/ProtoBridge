@@ -272,6 +272,16 @@ RingReduceScatter::Start()
         return;
     }
 
+    // Single-rank collective (codex round 21, finding 8): N=1 has no ring
+    // successor — the rank owns the whole (only) chunk after reducing its
+    // own buffer. Complete now instead of stalling to the cap.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("Ring ReduceScatter trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
     // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
     m_pendingEvents.push_back(
         Simulator::Schedule(NanoSeconds(m_startupDelayNs),

@@ -157,6 +157,16 @@ FullMeshReduceScatter::TriggerSends()
         return;
     }
 
+    // Single-rank collective (codex round 21, finding 8): N=1 has no peers
+    // to send to — the rank owns the whole (only) chunk after reducing its
+    // own buffer. Complete now instead of stalling to the cap.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("FullMesh ReduceScatter trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
         if (gpu >= m_endpoints.size() || !m_endpoints[gpu]) continue;

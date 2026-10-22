@@ -215,6 +215,22 @@ FabricEndpoint::DoDispose()
     // after disposal crashed on the cleared member (codex round 13,
     // finding 2) — SIGSEGV when a paced send's callback landed after the
     // endpoint was disposed and released.
+    // Balance the contention-backlog ledger FIRST — cancelling an EventId
+    // marks it expired, so the IsExpired test below would otherwise see every
+    // entry as already-fired. Every entry still pending at disposal had its
+    // IncrementBacklog counted on its captured model, so a to-be-canceled
+    // decrement must be applied HERE or a shared ContentionModel keeps a
+    // phantom backlog forever (artificial contention penalty for every later
+    // packet; codex round 21, finding 4). Entries whose event already fired
+    // decremented on schedule and are skipped by the IsExpired test.
+    for (const auto& [ev, model, tc] : m_pendingBacklogDecrements)
+    {
+        if (model && !ev.IsExpired())
+        {
+            model->DecrementBacklog(tc);
+        }
+    }
+    m_pendingBacklogDecrements.clear();
     for (const EventId& ev : m_deferredEgressEvents)
     {
         if (!ev.IsExpired())
@@ -323,6 +339,16 @@ void
 FabricEndpoint::StartApplication()
 {
     NS_LOG_FUNCTION(this);
+
+    // A disposed endpoint can still have a pending Start scheduled (the
+    // helper schedules app starts at t=0; Dispose runs earlier when a test
+    // tears an endpoint down inside the same scheduling window). DoDispose
+    // nulls the managers, so re-running the startup here would dereference
+    // them — a disposed endpoint stays inert.
+    if (m_creditManager == nullptr)
+    {
+        return;
+    }
 
     // Validate: unrecoverable lossy link (BER>0 with no FEC and no LLR) is impossible
     if (m_linkDegradationModel && m_linkDegradationModel->GetBer() > 0.0 &&
@@ -2883,13 +2909,14 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 // accrued.
                 Ptr<ContentionModel> model = m_contentionModel;
                 Time txDone = totalDelay + serialization;
-                m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(txDone, [model, tc]() {
-                        if (model)
-                        {
-                            model->DecrementBacklog(tc);
-                        }
-                    }));
+                EventId decrEv = Simulator::Schedule(txDone, [model, tc]() {
+                    if (model)
+                    {
+                        model->DecrementBacklog(tc);
+                    }
+                });
+                m_deferredEgressEvents.push_back(decrEv);
+                m_pendingBacklogDecrements.push_back({decrEv, model, tc});
                 return;
             }
         }
@@ -2916,13 +2943,14 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             {
                 Ptr<ContentionModel> model = m_contentionModel;
                 Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-                m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(delay + serialization, [model, tc]() {
-                        if (model)
-                        {
-                            model->DecrementBacklog(tc);
-                        }
-                    }));
+                EventId decrEv = Simulator::Schedule(delay + serialization, [model, tc]() {
+                    if (model)
+                    {
+                        model->DecrementBacklog(tc);
+                    }
+                });
+                m_deferredEgressEvents.push_back(decrEv);
+                m_pendingBacklogDecrements.push_back({decrEv, model, tc});
             }
             return;
         }
@@ -2953,13 +2981,14 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // increment ran on (codex round 20, finding 7 — see the WFQ branch).
         Ptr<ContentionModel> model = m_contentionModel;
         Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-        m_deferredEgressEvents.push_back(
-            Simulator::Schedule(shapingDelay + serialization, [model, tc]() {
-                if (model)
-                {
-                    model->DecrementBacklog(tc);
-                }
-            }));
+        EventId decrEv = Simulator::Schedule(shapingDelay + serialization, [model, tc]() {
+            if (model)
+            {
+                model->DecrementBacklog(tc);
+            }
+        });
+        m_deferredEgressEvents.push_back(decrEv);
+        m_pendingBacklogDecrements.push_back({decrEv, model, tc});
     }
 }
 

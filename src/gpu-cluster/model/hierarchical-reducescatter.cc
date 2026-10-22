@@ -401,7 +401,6 @@ HierarchicalReduceScatter::StartLocalReduceScatter()
             // Destination-sized: the successor's remainder-aware chunk,
             // shipped (g-1) times (codex round 20, finding 3).
             uint64_t ringVolume = ChunkOf(nextRank) * (m_gpusPerNode - 1);
-            if (ringVolume == 0) ringVolume = 1;
 
             if (m_endpoints[gpu])
             {
@@ -409,6 +408,29 @@ HierarchicalReduceScatter::StartLocalReduceScatter()
                     nextRank, ringVolume, m_protocolId, m_flowId, 0);
             }
         }
+    }
+
+    // Degenerate grid pre-credit (codex round 21, finding 2): a rank whose
+    // own chunk is zero receives nothing from its local peers — the 0->1
+    // threshold clamp left it waiting for a byte nobody sends (2x2 grids
+    // at D=1/2/3 stalled to the 3600s cap). Pre-credit such ranks here.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (!m_gpuPhaseComplete[gpu] && ChunkOf(gpu) == 0)
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+        }
+    }
+    if (m_completedGpuCount >= m_numGpus)
+    {
+        NS_LOG_INFO("Phase1 (local reduce-scatter) trivially complete (degenerate grid)");
+        uint64_t computeDelay = GetLocalComputeDelayNs(m_segmentSize);
+        uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
+        uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                &HierarchicalReduceScatter::StartInterNodeReduceScatter, this));
     }
 }
 
@@ -424,9 +446,10 @@ HierarchicalReduceScatter::CheckLocalReduceScatterComplete(uint16_t gpu)
 {
     // Each GPU receives its OWN remainder-aware chunk from each of its
     // (gpusPerNode-1) local peers (codex round 20, finding 3) — fullmesh
-    // sends destination-sized chunks and the ring aggregate matches.
+    // sends destination-sized chunks and the ring aggregate matches. A
+    // zero-chunk rank is pre-credited at the phase start (codex round 21,
+    // finding 2).
     uint64_t expectedBytes = ChunkOf(gpu) * (m_gpusPerNode - 1);
-    if (expectedBytes == 0) expectedBytes = 1;
 
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {
@@ -478,6 +501,26 @@ HierarchicalReduceScatter::StartInterNodeReduceScatter()
             }
         }
     }
+
+    // Degenerate grid pre-credit (codex round 21, finding 2): a rank whose
+    // own chunk is zero receives nothing in phase 2 either — pre-credit it
+    // instead of clamping the threshold 0 -> 1 with no sender.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (!m_gpuPhaseComplete[gpu] && ChunkOf(gpu) == 0)
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+        }
+    }
+    if (m_completedGpuCount >= m_numGpus)
+    {
+        NS_LOG_INFO("Phase2 (inter-node reduce-scatter) trivially complete (degenerate grid)");
+        uint64_t computeDelay = GetInterNodeComputeDelayNs(m_segmentSize);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(computeDelay),
+                                &HierarchicalReduceScatter::Complete, this));
+    }
 }
 
 void
@@ -495,9 +538,9 @@ HierarchicalReduceScatter::CheckInterNodeReduceScatterComplete(uint16_t gpu)
     // expected volume is the receiver's own chunk times (numNodes-1)
     // (codex round 20, finding 3). Summing the REMOTE nodes' chunks here
     // mismatches under the remainder — at 2x2/D=15 rank 3 (chunk 3B)
-    // received its 3B but waited for rank 2's 4B.
+    // received its 3B but waited for rank 2's 4B. A zero chunk is
+    // pre-credited at the phase start (codex round 21, finding 2).
     uint64_t expectedBytes = ChunkOf(gpu) * (m_numNodes - 1);
-    if (expectedBytes == 0) expectedBytes = 1;
 
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {

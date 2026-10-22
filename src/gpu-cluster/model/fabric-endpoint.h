@@ -714,6 +714,16 @@ class FabricEndpoint : public Application
     /// survivor fires into cleared state (codex round 13, finding 2).
     std::vector<EventId> m_deferredEgressEvents;
 
+    /// Pending contention-backlog decrements: one entry per in-flight
+    /// IncrementBacklog whose matching DecrementBacklog event is still
+    /// scheduled. DoDispose cancels the event; each entry whose event had NOT
+    /// yet fired must still decrement its (captured) model here, or a shared
+    /// ContentionModel keeps a phantom backlog forever and later traffic
+    /// draws an artificial contention penalty (codex round 21, finding 4).
+    /// Entries whose event already fired decremented on schedule and are
+    /// left alone (IsExpired test).
+    std::vector<std::tuple<EventId, Ptr<ContentionModel>, TrafficClass>> m_pendingBacklogDecrements;
+
     // Configuration
     uint8_t m_numVcs;                               ///< Number of virtual channels
     uint64_t m_launchDelayNs;                       ///< NCCL launch delay

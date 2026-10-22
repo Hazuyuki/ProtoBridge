@@ -44,6 +44,7 @@ NcclRingAllReduce::NcclRingAllReduce()
       m_protocolId(static_cast<uint8_t>(NcclProtocol::SIMPLE)),
       m_running(false),
       m_completed(false),
+      m_trivialSingleRank(false),
       m_startupDelayNs(0),
       m_perStepSwOverheadNs(0),
       m_swOverheadPerByteNs(0),
@@ -139,6 +140,17 @@ void
 NcclRingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
                               const std::vector<Ptr<FabricEndpoint>>& endpoints)
 {
+    // Single-rank collective (codex round 21, finding 8): a one-rank ring
+    // has no successor to pipeline to — the reduction of the rank's own
+    // buffer is itself, so trivially complete instead of aborting.
+    if (numGpus <= 1)
+    {
+        m_numGpus = numGpus;
+        m_dataSize = dataSize;
+        m_endpoints = endpoints;
+        m_trivialSingleRank = true;
+        return;
+    }
     NS_ABORT_MSG_IF(numGpus < 2, "NcclRingAllReduce needs at least 2 ranks");
     NS_ABORT_MSG_IF(m_numNodes * m_gpusPerNode != numGpus,
                     "NcclRingAllReduce needs numGpus == numNodes * gpusPerNode "
@@ -270,6 +282,14 @@ NcclRingAllReduce::Start()
 {
     m_running = true;
     m_startTimeNs = Simulator::Now().GetNanoSeconds();
+    // Single-rank short-circuit (codex round 21, finding 8): no ring
+    // successor, no peer receives — complete immediately.
+    if (m_trivialSingleRank)
+    {
+        NS_LOG_INFO("NcclRingAllReduce trivially complete (single rank)");
+        Complete();
+        return;
+    }
     NS_LOG_INFO("Starting NcclRingAllReduce with startup delay " << m_startupDelayNs << " ns");
     // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
     m_pendingEvents.push_back(

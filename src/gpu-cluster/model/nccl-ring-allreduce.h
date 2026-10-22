@@ -130,6 +130,10 @@ private:
 
     bool m_running;
     bool m_completed;
+    /// Single-rank degenerate case (codex round 21, finding 8): Initialize
+    /// short-circuits and Start completes trivially — no ring successor
+    /// exists to pipeline to.
+    bool m_trivialSingleRank;
     uint64_t m_startupDelayNs;
     uint64_t m_perStepSwOverheadNs;
     uint64_t m_swOverheadPerByteNs;
