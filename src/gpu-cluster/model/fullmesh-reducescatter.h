@@ -44,17 +44,42 @@ public:
 
     FullMeshRsState GetState() const { return m_state; }
 
+    /// Test probe: chunk `gpu`'s size in the coverage grid.
+    uint64_t ProbeChunkSizeOf(uint16_t gpu) const
+    {
+        return ChunkSizeOf(gpu);
+    }
+    /// Cumulative effective bytes the wire path sent (coverage probe).
+    uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
+    /// Per-destination received bytes (load probe — the RS threshold ledger).
+    uint64_t ProbeReceivedBytes(uint16_t destRank) const
+    {
+        return (destRank < m_gpuReceivedBytes.size()) ? m_gpuReceivedBytes[destRank] : 0;
+    }
+    /// The RS completion threshold for destination `destRank`:
+    /// (N-1)*ChunkSizeOf(destRank).
+    uint64_t ProbeExpectedBytesPerDest(uint16_t destRank) const
+    {
+        return static_cast<uint64_t>(m_numGpus - 1) * ChunkSizeOf(destRank);
+    }
+
 private:
     void DoDispose() override;
     void SetupReceiveCallbacks();
     void OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header);
     void TriggerSends();
     void CheckCompletion();
+    // Chunk `gpu` of the grid: base dataSize/numGpus bytes plus one byte
+    // for the first dataSize % numGpus chunks, so the grid sums to exactly
+    // dataSize.
+    uint64_t ChunkSizeOf(uint16_t gpu) const;
     void Complete();
 
     uint16_t m_numGpus;
     uint64_t m_dataSize;
     uint64_t m_chunkSize;
+    uint64_t m_chunkRemainder;
+    uint64_t m_sentDataBytes;
     uint16_t m_flowId;
     uint8_t m_protocolId;
 

@@ -2,12 +2,18 @@
  * SPDX-License-Identifier: GPL-2.0-only
  * ring-broadcast.cc
  *
- * Pipelined Ring Broadcast with protocol-aware sending.
- * Root rank has dataSize data. N-1 steps clockwise:
- * Step 0: root sends to (root+1)%N
- * Step k: (root+k)%N forwards to (root+k+1)%N
- * After N-1 steps all GPUs have root's data.
- * The last receiver does NOT forward.
+ * Chunk-pipelined Ring Broadcast carrying the FULL data size D over every
+ * ring edge (see ring-broadcast.h for the volume model).
+ *
+ * Mechanics:
+ * - The root streams D toward its ring successor in m_pipeChunkSize quanta;
+ *   each non-root GPU forwards received bytes to its own successor, except
+ *   the GPU whose successor is the root (end of the chain).
+ * - Forwarding is quantized to m_pipeChunkSize = clamp(D/(32*(N-1)), 64 KiB,
+ *   8 MiB): pipeline-fill error <= ~(N-2)*chunk/D, bounded event count.
+ *   Sub-chunk tails are held until the flow end.
+ * - Progress is byte-counted per GPU; packet order never matters.
+ * - Completion: every non-root GPU has received D.
  */
 
 #include "ring-broadcast.h"
@@ -16,12 +22,21 @@
 #include "nccl-protocol.h"
 #include "protocol-model.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
 NS_LOG_COMPONENT_DEFINE("RingBroadcast");
 
 NS_OBJECT_ENSURE_REGISTERED(RingBroadcast);
+
+namespace
+{
+constexpr uint16_t NO_RANK = 0xFFFF;
+constexpr uint64_t PIPE_CHUNK_MIN = 64ULL * 1024;
+constexpr uint64_t PIPE_CHUNK_MAX = 8ULL * 1024 * 1024;
+} // namespace
 
 TypeId
 RingBroadcast::GetTypeId()
@@ -36,16 +51,14 @@ RingBroadcast::GetTypeId()
 RingBroadcast::RingBroadcast()
     : m_numGpus(0),
       m_dataSize(0),
-      m_segmentSize(0),
+      m_chunkSize(0),
+      m_pipeChunkSize(0),
       m_flowId(1),
       m_rootRank(0),
+      m_protocolId(0),
       m_state(BroadcastState::IDLE),
       m_startupDelayNs(0),
-      m_currentSenderRank(0),
-      m_currentStep(0),
-      m_senderReceivedBytes(0),
       m_gpuDoneCount(0),
-      m_totalSteps(0),
       m_startTimeNs(0),
       m_endTimeNs(0)
 {
@@ -58,6 +71,20 @@ RingBroadcast::~RingBroadcast()
 void
 RingBroadcast::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&RingBroadcast::OnPacketReceived, this));
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
@@ -71,13 +98,20 @@ RingBroadcast::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
-    m_segmentSize = dataSize / numGpus;
-    if (m_segmentSize == 0)
+    // D/N, kept only for protocol-threshold selection (same per-step payload
+    // granularity the ring collectives use to pick LL/LL128/SIMPLE).
+    m_chunkSize = dataSize / numGpus;
+    if (m_chunkSize == 0)
     {
-        m_segmentSize = dataSize;
+        m_chunkSize = dataSize;
     }
 
-    m_totalSteps = numGpus - 1;
+    uint64_t hops = (numGpus > 1) ? static_cast<uint64_t>(numGpus - 1) : 1;
+    m_pipeChunkSize = std::clamp<uint64_t>(dataSize / (32ULL * hops),
+                                           PIPE_CHUNK_MIN, PIPE_CHUNK_MAX);
+
+    m_recvBytes.assign(numGpus, 0);
+    m_fwdBytes.assign(numGpus, 0);
     m_gpuDoneCount = 0;
 
     m_flowId = 1;
@@ -89,16 +123,14 @@ RingBroadcast::Initialize(uint16_t numGpus, uint64_t dataSize,
     {
         m_startupDelayNs = protoModel->GetStartupDelayNs(static_cast<uint8_t>(startupProto), m_numGpus);
     }
-    NcclProtocol wireProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_segmentSize));
+    NcclProtocol wireProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_chunkSize));
     m_protocolId = static_cast<uint8_t>(wireProto);
-
 
     SetupReceiveCallbacks();
 
     NS_LOG_INFO("RingBroadcast initialized: numGpus=" << numGpus
-                << " dataSize=" << dataSize << " segmentSize=" << m_segmentSize
+                << " dataSize=" << dataSize << " pipeChunk=" << m_pipeChunkSize
                 << " rootRank=" << m_rootRank
-                << " totalSteps=" << m_totalSteps
                 << " protocol=" << static_cast<int>(wireProto)
                 << " startupDelay=" << m_startupDelayNs << "ns");
 }
@@ -139,97 +171,117 @@ RingBroadcast::Start()
 {
     m_state = BroadcastState::RUNNING;
     m_startTimeNs = Simulator::Now().GetNanoSeconds();
-    m_currentSenderRank = m_rootRank;
-    m_currentStep = 0;
 
     NS_LOG_INFO("Starting Ring Broadcast (root=" << m_rootRank << ") with startup delay " << m_startupDelayNs << " ns");
 
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs), &RingBroadcast::TriggerInitialSends, this);
+    // Zero-data collective (codex round 20, finding 10): no send ever fires
+    // a receive to advance the ring — complete immediately instead of
+    // stalling to the 1-hour cap.
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("Ring Broadcast trivially complete (zero data)");
+        Complete();
+        return;
+    }
+
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &RingBroadcast::TriggerInitialSends, this));
 }
 
 void
 RingBroadcast::TriggerInitialSends()
 {
-    // Root sends step 0 to (root+1)%N
-    SendStepData(m_currentSenderRank, m_currentStep);
+    if (m_numGpus <= 1)
+    {
+        Complete();
+        return;
+    }
+    // The root has all of D locally: start its forward flow.
+    PumpForward(m_rootRank);
+}
+
+uint16_t
+RingBroadcast::RingNextOf(uint16_t gpu) const
+{
+    // Clockwise. Prefer topology-embedded next neighbor, fall back to rank
+    // arithmetic when no embedding is installed.
+    uint16_t next = m_endpoints[gpu]->GetRingNext();
+    return (next != NO_RANK) ? next : (gpu + 1) % m_numGpus;
 }
 
 void
-RingBroadcast::SendStepData(uint16_t sender, uint32_t step)
+RingBroadcast::PumpForward(uint16_t gpu)
 {
-    if (sender >= m_endpoints.size() || !m_endpoints[sender])
+    if (gpu >= m_endpoints.size() || !m_endpoints[gpu])
     {
         return;
     }
 
-    // Broadcast: clockwise. Prefer topology-embedded next neighbor, fall back
-    // to rank arithmetic when no embedding is installed.
-    uint16_t next = m_endpoints[sender]->GetRingNext();
-    uint16_t target = (next != 0xFFFF) ? next : (sender + 1) % m_numGpus;
-    std::vector<uint8_t> data(m_segmentSize, 0xAB);
+    uint16_t target = RingNextOf(gpu);
+    if (target == m_rootRank)
+    {
+        return;  // end of the chain: the root needs nothing back
+    }
 
-    uint16_t stepFlowId = m_flowId + step;
-
-    m_endpoints[sender]->SendDataWithProtocol(target, data.data(), m_segmentSize, m_protocolId, stepFlowId, 0);
-
-    NS_LOG_INFO("GPU " << sender << " sending step " << step
-                 << " to GPU " << target
-                 << " flowId=" << stepFlowId);
+    uint64_t ready = (gpu == m_rootRank)
+                         ? m_dataSize
+                         : std::min(m_recvBytes[gpu], m_dataSize);
+    while (m_fwdBytes[gpu] < ready)
+    {
+        uint64_t remaining = ready - m_fwdBytes[gpu];
+        if (remaining < m_pipeChunkSize && ready < m_dataSize)
+        {
+            break;  // hold the sub-chunk tail until more bytes (or flow end)
+        }
+        uint64_t chunk = std::min(remaining, m_pipeChunkSize);
+        NS_LOG_DEBUG("GPU " << gpu << " -> " << target << " " << chunk << " bytes");
+        m_endpoints[gpu]->SendBulkWireTransferSize(target, chunk, m_protocolId, m_flowId, 0);
+        m_fwdBytes[gpu] += chunk;
+    }
 }
 
 void
 RingBroadcast::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
 {
+    // NOTE: the callback's first argument is the RECEIVING endpoint's rank
+    // (FabricEndpoint passes m_rank); the sender would be header.GetSourceRank().
     if (header.GetPacketType() != FabricPacketType::DATA)
     {
         return;
     }
 
-    uint16_t actualSrc = header.GetSourceRank();
     uint16_t destRank = header.GetDestRank();
-
-    // Only process packets destined for the current step's target
-    uint16_t expectedTarget = (m_currentSenderRank + 1) % m_numGpus;
-    if (destRank != expectedTarget)
+    if (destRank >= m_numGpus || destRank == m_rootRank ||
+        m_state != BroadcastState::RUNNING)
     {
-        NS_LOG_INFO("Ignoring packet: dest=" << destRank << " expected=" << expectedTarget);
         return;
     }
 
-    uint32_t effectiveSize = header.GetEffectiveDataSize();
+    uint64_t effectiveSize = header.GetEffectiveDataSize();
     if (effectiveSize == 0)
     {
         effectiveSize = packet->GetSize();
     }
 
-    m_senderReceivedBytes += effectiveSize;
+    bool wasDone = m_recvBytes[destRank] >= m_dataSize;
+    m_recvBytes[destRank] += effectiveSize;
 
-    NS_LOG_INFO("Packet: src=" << actualSrc << " -> dest=" << destRank
-                 << " effectiveSize=" << effectiveSize
-                 << " totalReceived=" << m_senderReceivedBytes
-                 << " step=" << m_currentStep);
+    NS_LOG_DEBUG("GPU " << destRank << " received " << effectiveSize
+                 << " (total " << m_recvBytes[destRank] << "/" << m_dataSize << ")");
 
-    if (m_senderReceivedBytes >= m_segmentSize)
+    PumpForward(destRank);
+
+    if (!wasDone && m_recvBytes[destRank] >= m_dataSize)
     {
-        m_senderReceivedBytes = 0;
         m_gpuDoneCount++;
-
-        NS_LOG_INFO("GPU " << destRank << " received step " << m_currentStep
-                     << " (done=" << m_gpuDoneCount << "/" << (m_numGpus - 1) << ")");
-
-        // Advance: next step's sender is the GPU that just received
-        m_currentSenderRank = destRank;
-        m_currentStep++;
-
-        if (m_currentStep >= m_totalSteps)
+        NS_LOG_INFO("GPU " << destRank << " received full broadcast (done="
+                     << m_gpuDoneCount << "/" << (m_numGpus - 1) << ")");
+        if (m_gpuDoneCount >= static_cast<uint32_t>(m_numGpus - 1))
         {
-            // All N-1 non-root GPUs have received the data
             Complete();
-            return;
         }
-
-        // This GPU now forwards to the next one
-        Simulator::ScheduleNow(&RingBroadcast::SendStepData, this, destRank, m_currentStep);
     }
 }
 

@@ -117,6 +117,9 @@ private:
     uint32_t GetNodeId(uint16_t rank) const;
     uint16_t GetLocalIdx(uint16_t globalRank) const;
     uint16_t GetGlobalRank(uint32_t nodeId, uint16_t localIdx) const;
+    /// Remainder-aware chunk of rank r (frozen grid: D/N + (r < D%N);
+    /// codex round 20, finding 3) — the grid sums to exactly dataSize.
+    uint64_t ChunkOf(uint16_t rank) const;
     uint64_t GetPhaseStartupDelayNs(uint64_t chunkSize) const;
 
     uint16_t m_numGpus;

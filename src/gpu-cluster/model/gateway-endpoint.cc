@@ -154,6 +154,51 @@ GatewayEndpoint::GetNFabrics() const
     return static_cast<uint32_t>(m_fabricDeviceMap.size());
 }
 
+bool
+GatewayEndpoint::TryForwardReceivedPacket(Ptr<Packet> pkt, FabricHeader& header)
+{
+    NS_LOG_FUNCTION(this << pkt << header.GetDestRank());
+
+    const uint16_t destRank = header.GetDestRank();
+    if (destRank == GetRank())
+    {
+        return false; // local delivery — the base receive path handles it
+    }
+
+    // Cross-fabric routes live ONLY in the hybrid table (the base class's
+    // m_routingTable never sees them, which is why the base forwarding path
+    // either delivered transit packets locally or ignored the gateway —
+    // codex round 24, finding 6). Consult it FIRST; fall back to the base
+    // same-fabric forward when the hybrid table has no opinion.
+    if (!m_hybridRoutingTable)
+    {
+        return FabricEndpoint::TryForwardReceivedPacket(pkt, header);
+    }
+    auto route = m_hybridRoutingTable->LookupRoute(destRank);
+    if (!route)
+    {
+        return FabricEndpoint::TryForwardReceivedPacket(pkt, header);
+    }
+
+    // Re-target the header's DestMac for THIS hop (the base forwarding
+    // branch's rule: switches route on the FabricHeader's MACs, so a stale
+    // first-hop DestMac floods every port at the destination node).
+    Mac48Address destMac = GetNeighborMac(destRank);
+    if (destMac == Mac48Address())
+    {
+        destMac = ResolveDestMac(destRank);
+    }
+    header.SetDestMac(destMac);
+    // Re-serialize: the receive path peeled the header before calling us,
+    // and ForwardToFabric expects it back on the packet.
+    pkt->AddHeader(header);
+
+    // Route through the gateway-delayed path — the base class's immediate
+    // SendPacketOnDevice ignored GatewayDelay entirely.
+    ScheduleForwarding(pkt, header, route->fabric, route->deviceIndex);
+    return true;
+}
+
 void
 GatewayEndpoint::ProcessDataPacketWithForwarding(Ptr<Packet> packet, const FabricHeader& header,
                                                    FabricType incomingFabric)
@@ -210,9 +255,6 @@ GatewayEndpoint::ForwardToFabric(Ptr<Packet> packet, FabricHeader header,
     NS_LOG_FUNCTION(this << static_cast<int>(outFabric) << outDeviceIndex);
 
     // Update fabric type in header
-    header.SetFabricType(outFabric);
-
-    // Re-serialize the header
     packet->RemoveHeader(header);
     header.SetFabricType(outFabric);
     packet->AddHeader(header);

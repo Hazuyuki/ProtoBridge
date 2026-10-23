@@ -17,7 +17,7 @@ ib_write_lat(S) = 1.45 + 0.001654 * S**0.669  (sublinear NIC pipeline; ns-3 is l
 in S, so the 1-4 KB transition undershoots where ib_write_lat is sublinear -- the same
 divergence the analytical surrogate shows).
 
-Run:  python3 configs/calibration/roce_p2p_ns3_sweep.py
+Run:  python3 examples/gpu-cluster/roce_p2p_ns3_sweep.py
 """
 
 from __future__ import annotations

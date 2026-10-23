@@ -30,12 +30,25 @@ EthernetSwitch::GetTypeId()
                                           "marks the SoHeader ECN bit on enqueue",
                                           UintegerValue(8),
                                           MakeUintegerAccessor(&EthernetSwitch::m_ecnThreshold),
-                                          MakeUintegerChecker<uint32_t>(0));
+                                          MakeUintegerChecker<uint32_t>(0))
+            .AddAttribute("VoqDropThreshold",
+                          "VOQ depth (packets) at which a data packet is "
+                          "tail-dropped with a NACK to the source (lossy "
+                          "fabric). Must be < NvSwitch::VoqDepth, else "
+                          "the base hard-cap drop preempts the NACK path. "
+                          "Plain-Ethernet and RoCE packets alike: 0 = "
+                          "lossless (RoCE falls through to ECN marking), "
+                          "> 0 opts the fabric into the lossy/no-PFC "
+                          "regime with LLR retransmit.",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&EthernetSwitch::m_voqDropThreshold),
+                          MakeUintegerChecker<uint32_t>(0));
     return tid;
 }
 
 EthernetSwitch::EthernetSwitch()
-    : m_ecnThreshold(8)
+    : m_ecnThreshold(8),
+      m_voqDropThreshold(0)
 {
 }
 
@@ -45,18 +58,68 @@ EthernetSwitch::GetVendorName() const
     return "Ethernet-RoCEv2";
 }
 
-void
+bool
 EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
-                                size_t voqDepth)
+                                uint32_t inPort, size_t voqDepth)
 {
     (void)outPort;
-    MarkEcnIfCongested(packet, voqDepth);
+    if (!packet)
+    {
+        return true;
+    }
+    FabricHeader fh;
+    packet->PeekHeader(fh);
+
+    // Lossy drop: a DATA packet (plain-Ethernet, or RoCE when
+    // --voqDropThreshold > 0 opts into the lossy-RoCE/no-PFC regime) that
+    // meets the VOQ drop threshold is tail-dropped with a NACK back to the
+    // source, so the sender retransmits via the existing LLR/SACK path.
+    // Control and retry packets bypass (matching the BER bypass) -- dropping
+    // them would deadlock the credit/feedback loop. Default threshold 0
+    // keeps BOTH fabrics lossless (RoCE falls through to ECN below).
+    if (!fh.IsControlPacket() && !fh.IsRetryPacket()
+        && (fh.GetFabricType() == FabricType::ETHERNET
+            || (fh.GetFabricType() == FabricType::ROCE && m_voqDropThreshold > 0)))
+    {
+        // 0 = lossless (disable the lossy drop): the documented "0=off".
+        // Without this guard `voqDepth >= 0` is always true and every
+        // Ethernet DATA packet would be tail-dropped -- a total-stall
+        // foot-gun (the opposite of the documented "off").
+        if (m_voqDropThreshold == 0)
+        {
+            return true;
+        }
+        if (voqDepth >= m_voqDropThreshold)
+        {
+            EmitNackBack(fh, inPort, fh.GetSourceMac());
+            return false; // drop: caller skips the push + counts m_voqDrops
+        }
+        if (fh.GetFabricType() == FabricType::ETHERNET)
+        {
+            return true; // admit; plain Ethernet carries no SoHeader to ECN-mark
+        }
+        // Lossy RoCE: fall through to ECN marking (ecnThreshold < drop
+        // threshold gives mark-before-drop, the real RoCEv2 ordering).
+    }
+
+    // RoCE lossless path: mark the inner SoHeader ECN bit when congested.
+    if (MarkEcnIfCongested(packet, voqDepth))
+    {
+        m_ecnMarkedPackets++;
+    }
+    return true;
 }
 
 bool
 EthernetSwitch::MarkEcnIfCongested(Ptr<Packet> packet, size_t voqDepth) const
 {
-    if (!packet || voqDepth < m_ecnThreshold)
+    // 0 = off (disable ECN marking): the CLI's documented contract
+    // (gpu-cluster-sim "0=off; Phase-B reaction pending"). Without this
+    // guard `voqDepth < 0` is never true, so even a quiescent VOQ (depth
+    // 0) would satisfy `0 < 0 == false` and mark every RoCE data packet
+    // -- one ECN mark + CNP on an otherwise idle link (codex round 24,
+    // finding 7).
+    if (!packet || m_ecnThreshold == 0 || voqDepth < m_ecnThreshold)
     {
         return false;
     }

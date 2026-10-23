@@ -41,7 +41,9 @@ enum class FabricPacketType : uint8_t
     RETRY_REQUEST = 13,
     RETRY_ACK = 14,
     PERMANENT_LOSS = 15,
-    CNP = 16 ///< Congestion Notification Packet (RoCEv2 ECN echo, scale-out only)
+    CNP = 16, ///< Congestion Notification Packet (RoCEv2 ECN echo, scale-out only)
+    RTT_PROBE = 17,   ///< RTTCC RTT probe (scale-out only; receiver reflects it)
+    RTT_RESPONSE = 18 ///< RTTCC probe reflection (echoes the probe's sequence number)
 };
 
 /**
@@ -140,6 +142,20 @@ class FabricHeader : public Header
     // Virtual lane (for deadlock-free routing in nD topologies)
     uint8_t GetVirtualLane() const;
     void SetVirtualLane(uint8_t lane);
+
+    // Protocol-framed flag: the sender stamped a vendor payload-builder
+    // header (SoHeader / UB transaction header / NCCL LL line) inside the
+    // packet body, so the receiver must run ExtractData before delivery.
+    // This is a WIRE property (did the sender frame?), not a model property
+    // (is the model's efficiency < 1.0?): several send paths legitimately
+    // emit raw packets under an efficiency<1.0 model (public SendData,
+    // SendP2p, collective uploads, switch multicast results, and
+    // SendBulkWireTransferSize chunks too small to hold a header), and
+    // inferring framing from efficiency wrongly strips a header that was
+    // never stamped. Packed into bit 7 of the virtualLane byte, so the
+    // 39-byte wire layout is unchanged.
+    bool IsProtocolFramed() const;
+    void SetProtocolFramed(bool framed);
 
   private:
     // Header fields (total: 39 bytes)

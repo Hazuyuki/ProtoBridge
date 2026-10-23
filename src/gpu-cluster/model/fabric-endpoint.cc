@@ -21,6 +21,8 @@
 #include "ns3/pointer.h"
 #include "ns3/enum.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
@@ -73,7 +75,8 @@ FabricEndpoint::GetTypeId()
         .AddAttribute("CreditManager",
                       "Credit manager for flow control",
                       PointerValue(),
-                      MakePointerAccessor(&FabricEndpoint::m_creditManager),
+                      MakePointerAccessor(&FabricEndpoint::SetCreditManager,
+                                          &FabricEndpoint::GetCreditManager),
                       MakePointerChecker<CreditManager>())
         .AddAttribute("LinkDegradationModel",
                       "Link degradation model for this endpoint",
@@ -179,7 +182,9 @@ FabricEndpoint::FabricEndpoint()
       m_txBytes(0),
       m_rxBytes(0),
       m_txPackets(0),
-      m_rxPackets(0)
+      m_rxPackets(0),
+      m_cnpPacketsSent(0),
+      m_cnpPacketsReceived(0)
 {
     NS_LOG_FUNCTION(this);
 
@@ -205,11 +210,78 @@ void
 FabricEndpoint::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    // Cancel every pending deferred-egress event: each captures raw `this`
+    // and dereferences m_devices, which is cleared below. A survivor fired
+    // after disposal crashed on the cleared member (codex round 13,
+    // finding 2) — SIGSEGV when a paced send's callback landed after the
+    // endpoint was disposed and released.
+    // Balance the contention-backlog ledger FIRST — cancelling an EventId
+    // marks it expired, so the IsExpired test below would otherwise see every
+    // entry as already-fired. Every entry still pending at disposal had its
+    // IncrementBacklog counted on its captured model, so a to-be-canceled
+    // decrement must be applied HERE or a shared ContentionModel keeps a
+    // phantom backlog forever (artificial contention penalty for every later
+    // packet; codex round 21, finding 4). Entries whose event already fired
+    // decremented on schedule and are skipped by the IsExpired test.
+    for (const auto& [ev, model, tc] : m_pendingBacklogDecrements)
+    {
+        if (model && !ev.IsExpired())
+        {
+            model->DecrementBacklog(tc);
+        }
+    }
+    m_pendingBacklogDecrements.clear();
+    for (const EventId& ev : m_deferredEgressEvents)
+    {
+        if (!ev.IsExpired())
+        {
+            Simulator::Cancel(ev);
+        }
+    }
+    m_deferredEgressEvents.clear();
+    // Detach the promisc callbacks BEFORE dropping the device references:
+    // they hold raw `this`, so a packet arriving on the channel after this
+    // endpoint is gone would invoke ReceiveFromDevice on freed memory
+    // (codex round 16, finding 2 — a 64-B packet over a 100-us link, with
+    // the receiver disposed and released at 1 us, produced
+    // valgrind-confirmed invalid reads at the 100-us arrival).
+    for (const auto& device : m_devices)
+    {
+        if (device)
+        {
+            device->SetPromiscReceiveCallback(
+                MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+        }
+    }
     m_devices.clear();
+    // The credit manager can outlive this endpoint when an external holder
+    // kept the (attribute-supplied) reference; its credit-available
+    // callback holds this endpoint's raw `this`, and a ReturnCredits after
+    // disposal fired OnCreditAvailable into freed memory (valgrind-confirmed
+    // invalid reads in TrySendQueuedPackets — codex round 18, finding 1).
+    if (m_creditManager)
+    {
+        // Identity-detach (codex round 19, finding 7): clear only the
+        // binding THIS endpoint installed. If a later owner re-bound the
+        // callback after our Initialize/StartApplication, its binding
+        // survives this endpoint's disposal.
+        m_creditManager->DetachFromEndpoint(
+            MakeCallback(&FabricEndpoint::OnCreditAvailable, this));
+    }
     m_creditManager = nullptr;
     m_payloadBuilder = nullptr;
     m_protocolModel = nullptr;
     m_interNodeProtocolModel = nullptr;
+    // The LLR manager outlives this endpoint whenever an external holder
+    // kept the GetLlrManager() reference. Its timeout and permanent-loss
+    // callbacks hold this endpoint's raw `this`, and its per-entry retry
+    // timers can fire long after the endpoint is freed — detach both
+    // callbacks and cancel every timer BEFORE dropping our reference
+    // (codex round 17, finding 3).
+    if (m_llrManager)
+    {
+        m_llrManager->DetachFromEndpoint();
+    }
     m_llrManager = nullptr;
     m_gbnNextAckSeq.clear();
     m_gbnPendingAcks.clear();
@@ -217,6 +289,12 @@ FabricEndpoint::DoDispose()
     m_linkDegradationModel = nullptr;
     m_fecModel = nullptr;
     m_latencyStatistics = nullptr;
+    // The DCQCN machine owns armed recovery timers that capture its raw
+    // `this` (FastRecovery/AdditiveIncrease). Drop the reference so the
+    // machine is destroyed here, while its timers can still be cancelled
+    // by its own DoDispose — a surviving ref would fire into freed memory
+    // once the endpoint is gone.
+    SetDcqcnRateMachine(nullptr);
     m_sendQueue = std::queue<SendQueueEntry>();
     m_routingTable.clear();
     m_neighborMacTable.clear();
@@ -232,7 +310,8 @@ FabricEndpoint::Initialize()
     // Initialize credit manager for VCs not already initialized
     for (uint8_t vc = 0; vc < m_numVcs; ++vc)
     {
-        if (m_creditManager->GetAvailableCredits(vc) == 0)
+        if (m_creditManager->GetAvailableCredits(vc) == 0
+            && m_configuredVcs.find(vc) == m_configuredVcs.end())
         {
             m_creditManager->InitializeVc(vc, 64);
         }
@@ -261,6 +340,16 @@ FabricEndpoint::StartApplication()
 {
     NS_LOG_FUNCTION(this);
 
+    // A disposed endpoint can still have a pending Start scheduled (the
+    // helper schedules app starts at t=0; Dispose runs earlier when a test
+    // tears an endpoint down inside the same scheduling window). DoDispose
+    // nulls the managers, so re-running the startup here would dereference
+    // them — a disposed endpoint stays inert.
+    if (m_creditManager == nullptr)
+    {
+        return;
+    }
+
     // Validate: unrecoverable lossy link (BER>0 with no FEC and no LLR) is impossible
     if (m_linkDegradationModel && m_linkDegradationModel->GetBer() > 0.0 &&
         !m_llrEnabled && !LinkUsesFec())
@@ -271,9 +360,12 @@ FabricEndpoint::StartApplication()
     }
 
     // Only initialize VCs that weren't already initialized via SetVcCredits
+    // (m_configuredVcs exemption: an exhausted-but-configured window must
+    // NOT be reset to the 64-credit default here — see SetVcCredits).
     for (uint8_t vc = 0; vc < m_numVcs; ++vc)
     {
-        if (m_creditManager->GetAvailableCredits(vc) == 0)
+        if (m_creditManager->GetAvailableCredits(vc) == 0
+            && m_configuredVcs.find(vc) == m_configuredVcs.end())
         {
             m_creditManager->InitializeVc(vc, 64);
         }
@@ -404,7 +496,12 @@ FabricEndpoint::GetTreeRightChild() const
 FabricType
 FabricEndpoint::GetFabricTypeForDest(uint16_t destRank) const
 {
-    if (!IsLocalRank(destRank) && m_localRankCount > 1)
+    // IsLocalRank alone decides Su vs So — no m_localRankCount > 1 gate:
+    // with one GPU per node the only local rank is this endpoint itself, and
+    // the old count gate would wrongly push remote traffic onto the Su
+    // fabric. Single-node setups set a range covering every rank, so
+    // IsLocalRank is always true there and behavior is unchanged.
+    if (!IsLocalRank(destRank))
     {
         return static_cast<FabricType>(m_interNodeFabricType);
     }
@@ -583,13 +680,24 @@ FabricEndpoint::GetNeighborMac(uint16_t rank) const
 uint32_t
 FabricEndpoint::ResolveDeviceIndex(uint16_t destRank)
 {
-    // For spraying: use round-robin from routing devices table
+    // For spraying: round-robin over THIS DESTINATION's permitted devices
+    // (m_routingDevicesTable[destRank]), not over every attached device.
+    // GetNextDeviceIndex() rotates over all of m_devices — on a multi-node
+    // endpoint that set mixes the dest's links with unrelated scale-out
+    // ports, and a sprayed packet would leave on a port that never reaches
+    // the dest. No routing-devices entry (single-device dests, e.g. the
+    // inter-node NICs set up via SetRoutingEntry) falls through to the plain
+    // routing table below, so single-path dests keep exact device selection.
     if (m_sprayingEnabled)
     {
         auto devicesIt = m_routingDevicesTable.find(destRank);
-        if (devicesIt != m_routingDevicesTable.end() && devicesIt->second.size() > 0)
+        if (devicesIt != m_routingDevicesTable.end() && devicesIt->second.size() > 1)
         {
-            return GetNextDeviceIndex();
+            const std::vector<uint32_t>& devs = devicesIt->second;
+            uint32_t index = devs[m_currentDeviceIndex % devs.size()];
+            m_currentDeviceIndex =
+                (m_currentDeviceIndex + 1) % m_devices.size();
+            return index;
         }
     }
 
@@ -623,9 +731,59 @@ FabricEndpoint::SetNumVirtualChannels(uint8_t numVcs)
 }
 
 void
+FabricEndpoint::SetCreditManager(Ptr<CreditManager> manager)
+{
+    NS_LOG_FUNCTION(this << manager);
+    // Attribute swap (codex round 19, finding 1): the manager being replaced
+    // may carry the credit-available binding this endpoint installed in
+    // Initialize()/StartApplication(). Leaving it bound lets a later
+    // ReturnCredits on the old manager fire OnCreditAvailable into freed
+    // memory once this endpoint is disposed. Detach only OUR binding — a
+    // different owner that re-bound the callback keeps its notifications
+    // (the ownership check mirrors round-19 finding 7).
+    if (m_creditManager && m_creditManager != manager)
+    {
+        m_creditManager->DetachFromEndpoint(
+            MakeCallback(&FabricEndpoint::OnCreditAvailable, this));
+    }
+    m_creditManager = manager;
+    // Install OUR binding on the new manager immediately: Initialize()/
+    // StartApplication() rebind only when they run AFTER the swap, and a
+    // swap after initialization would otherwise leave the endpoint with no
+    // credit notifications at all.
+    if (m_creditManager)
+    {
+        m_creditManager->SetCreditAvailableCallback(
+            MakeCallback(&FabricEndpoint::OnCreditAvailable, this));
+        // Drain the queue the swap may have stranded (codex round 20,
+        // finding 4): replacing a BLOCKED manager leaves queued sends with
+        // no availability transition to wake them — the new manager may
+        // hold credits, but nothing ever calls OnCreditAvailable, so the
+        // queue never empties and delivery stays at zero. Re-run the drain
+        // here; it is a no-op when the queue is empty or credits are still
+        // exhausted.
+        TrySendQueuedPackets();
+    }
+}
+
+Ptr<CreditManager>
+FabricEndpoint::GetCreditManager() const
+{
+    return m_creditManager;
+}
+
+void
 FabricEndpoint::SetVcCredits(uint8_t vcId, uint32_t credits)
 {
     m_creditManager->InitializeVc(vcId, credits);
+    // Mark the VC as explicitly configured so the lazy default init in
+    // Initialize()/StartApplication() cannot clobber a legitimately
+    // exhausted window back to 64 credits (a window fully consumed before
+    // StartApplication runs is a working sliding window, not an unset VC).
+    if (credits > 0)
+    {
+        m_configuredVcs.insert(vcId);
+    }
 }
 
 void
@@ -638,6 +796,37 @@ void
 FabricEndpoint::SetReceiveCallback(ReceiveCallback cb)
 {
     m_receiveCallback = cb;
+}
+
+FabricEndpoint::ReceiveCallback
+FabricEndpoint::GetReceiveCallback() const
+{
+    return m_receiveCallback;
+}
+
+bool
+FabricEndpoint::DetachReceiveCallbackIfOwner(ReceiveCallback owner)
+{
+    // Ownership-checked detach (codex round 20, findings 5 and 6): clear the
+    // stored binding ONLY when it is the callback `owner` installed. An
+    // unconditional clear in DoDispose/~Runner stomps a LATER owner's
+    // binding (initialize injector A, then B, on the same endpoints; A's
+    // teardown must not null B's callbacks), and the reverse order leaves
+    // A's own callback live on freed memory. IsEqual dereferences both
+    // impls, so short-circuit the null cases first (a null stored binding
+    // can never match a non-null owner; a null owner means plain cleanup
+    // and is rejected — callers that want unconditional clearing pass
+    // SetReceiveCallback(MakeNullCallback...) directly).
+    if (owner.IsNull() || m_receiveCallback.IsNull())
+    {
+        return false;
+    }
+    if (!m_receiveCallback.IsEqual(owner))
+    {
+        return false;
+    }
+    m_receiveCallback = MakeNullCallback<void, uint16_t, Ptr<Packet>, FabricHeader>();
+    return true;
 }
 
 void
@@ -703,10 +892,13 @@ FabricEndpoint::SetInterNodeProtocolModel(Ptr<ProtocolModel> model)
 Ptr<ProtocolModel>
 FabricEndpoint::GetProtocolModelForDest(uint16_t destRank) const
 {
-    // Use the inter-node (So) protocol model only for remote destinations on a
-    // multi-node fabric; otherwise fall back to the scale-up (Su) model so
-    // single-node and no-So-model behavior is byte-identical (parity-safe).
-    if (m_interNodeProtocolModel && !IsLocalRank(destRank) && m_localRankCount > 1)
+    // Use the inter-node (So) protocol model for remote destinations; otherwise
+    // fall back to the scale-up (Su) model. IsLocalRank alone decides — no
+    // m_localRankCount > 1 gate: with one GPU per node the only local rank is
+    // this endpoint itself, and the old count gate would wrongly run remote
+    // traffic on the Su model. Single-node setups cover every rank with the
+    // local range, so behavior there is unchanged.
+    if (m_interNodeProtocolModel && !IsLocalRank(destRank))
     {
         return m_interNodeProtocolModel;
     }
@@ -722,6 +914,26 @@ FabricEndpoint::SetProtocolPayloadBuilder(Ptr<ProtocolPayloadBuilder> builder)
 Ptr<ProtocolPayloadBuilder>
 FabricEndpoint::GetProtocolPayloadBuilder() const
 {
+    return m_payloadBuilder;
+}
+
+void
+FabricEndpoint::SetSoPayloadBuilder(Ptr<ProtocolPayloadBuilder> builder)
+{
+    m_soPayloadBuilder = builder;
+}
+
+Ptr<ProtocolPayloadBuilder>
+FabricEndpoint::GetPayloadBuilderForRank(uint16_t rank) const
+{
+    // Mirrors GetProtocolModelForDest's Su/So split: the So builder (when
+    // mounted) frames inter-node traffic; Su traffic keeps the vendor builder.
+    // IsLocalRank alone decides (see GetProtocolModelForDest — one GPU per
+    // node still has remote ranks).
+    if (m_soPayloadBuilder && !IsLocalRank(rank))
+    {
+        return m_soPayloadBuilder;
+    }
     return m_payloadBuilder;
 }
 
@@ -783,6 +995,123 @@ FabricEndpoint::SetBulkChunkSize(uint32_t bytes)
 {
     NS_ABORT_MSG_IF(bytes == 0, "Bulk chunk size must be greater than zero");
     m_bulkChunkSize = bytes;
+}
+
+void
+FabricEndpoint::SetSoTxWindow(uint32_t chunks)
+{
+    m_soTxWindow = chunks;
+}
+
+void
+FabricEndpoint::SetSoGbnStrict(bool enable)
+{
+    m_soGbnStrict = enable;
+}
+
+bool
+FabricEndpoint::IsStrictGbnFlow(const FabricHeader& header) const
+{
+    if (!m_soGbnStrict || !m_llrEnabled || !m_llrManager || !m_bypassReorderBuffer)
+    {
+        return false;
+    }
+    if (m_llrManager->GetLlrMode() != LlrMode::GO_BACK_N)
+    {
+        return false;
+    }
+    // So-only: never touch the sprayed Su fabric, where out-of-order arrival
+    // is normal (the reorder/dedup layer's job) and a gap does not mean loss.
+    return !IsLocalRank(header.GetSourceRank());
+}
+
+void
+FabricEndpoint::SendStrictGbnNak(const FabricHeader& dataHeader, uint32_t expectedSeq)
+{
+    FabricHeader nackHeader;
+    nackHeader.SetPacketType(FabricPacketType::NACK);
+    nackHeader.SetFabricType(GetFabricTypeForDest(dataHeader.GetSourceRank()));
+    nackHeader.SetSourceRank(dataHeader.GetDestRank());
+    nackHeader.SetDestRank(dataHeader.GetSourceRank());
+    nackHeader.SetSequenceNumber(expectedSeq);
+    nackHeader.SetFlowId(dataHeader.GetFlowId());
+    nackHeader.SetVirtualChannel(dataHeader.GetVirtualChannel());
+    nackHeader.SetSourceMac(m_address);
+    nackHeader.SetDestMac(ResolveDestMac(dataHeader.GetSourceRank()));
+
+    Ptr<Packet> nackPkt = Create<Packet>(0);
+    nackPkt->AddHeader(nackHeader);
+
+    uint32_t deviceIndex = ResolveDeviceIndex(dataHeader.GetSourceRank());
+    SendPacketOnDevice(nackPkt, deviceIndex, ResolveDestMac(dataHeader.GetSourceRank()));
+}
+
+void
+FabricEndpoint::PumpBulkTxWindow()
+{
+    const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
+    while (!m_bulkTxQueue.empty() && m_bulkTxInflight < m_soTxWindow)
+    {
+        BulkTxChunk desc = m_bulkTxQueue.front();
+        m_bulkTxQueue.pop_front();
+
+        uint64_t seqKey = MakeSeqKey(desc.destRank, desc.vcId, desc.flowId);
+        uint32_t seqNum = m_nextSeqNum[seqKey]++;
+
+        const bool stamp = desc.stamp && (desc.wireChunk > soHeaderSize);
+        Ptr<Packet> chunkPacket = stamp
+            ? Create<Packet>(desc.wireChunk - soHeaderSize)
+            : Create<Packet>(desc.wireChunk);
+        if (stamp)
+        {
+            SoHeader soHeader;
+            soHeader.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+            soHeader.SetEcn(false); // marked in-flight by the So switch on congestion
+            soHeader.SetDataSize(desc.fragmentDataSize);
+            soHeader.SetChunkIndex(desc.chunkIndex);
+            chunkPacket->AddHeader(soHeader);
+        }
+
+        FabricHeader header;
+        header.SetPacketType(FabricPacketType::DATA);
+        header.SetFabricType(GetFabricTypeForDest(desc.destRank));
+        header.SetFlowId(desc.flowId);
+        header.SetSequenceNumber(seqNum);
+        header.SetVirtualChannel(desc.vcId);
+        header.SetSourceRank(m_rank);
+        header.SetDestRank(desc.destRank);
+        header.SetPayloadSize(desc.wireChunk);
+        header.SetSourceMac(m_address);
+        header.SetDestMac(ResolveDestMac(desc.destRank));
+        header.SetProtocol(stamp ? desc.protocolId : 0);
+        header.SetProtocolFramed(stamp);
+        header.SetEffectiveDataSize(desc.fragmentDataSize);
+        header.SetTtl(64);
+        chunkPacket->AddHeader(header);
+
+        m_bulkTxInflight++;
+        // Register window membership so the release paths can release a slot
+        // exactly once and only for packets that actually held one: ACK /
+        // permanent-loss handling sees LLR store entries from ALL send
+        // paths (small unfragmented remote sends, local Su packets), which
+        // must not free a bulk window slot they never consumed.
+        m_bulkTxWindowSeqs.emplace(desc.destRank, desc.vcId, desc.flowId, seqNum);
+        SendPacketOnDevice(chunkPacket, desc.deviceIndex, ResolveDestMac(desc.destRank));
+
+        m_txTrace(chunkPacket->GetSize(), seqNum);
+        m_txPackets++;
+        m_txBytes += chunkPacket->GetSize();
+    }
+}
+
+void
+FabricEndpoint::ReleaseBulkTxSlot()
+{
+    if (m_bulkTxInflight > 0)
+    {
+        m_bulkTxInflight--;
+    }
+    PumpBulkTxWindow();
 }
 
 bool
@@ -928,9 +1257,14 @@ FabricEndpoint::GetAsyncMemLatencyNs() const
 }
 
 Ptr<ReorderBuffer>
-FabricEndpoint::GetOrCreateReorderBuffer(uint8_t vcId, uint16_t flowId)
+FabricEndpoint::GetOrCreateReorderBuffer(uint8_t vcId, uint16_t flowId, uint16_t sourceRank)
 {
-    uint32_t key = (static_cast<uint32_t>(vcId) << 16) | (flowId & 0xFFFF);
+    // Key includes the SOURCE rank: sequence numbers are per-sender, so two
+    // senders hitting the same (vc, flow) on one receiver would otherwise
+    // share a reorder buffer and each discard the other's seq 0 as a
+    // duplicate.
+    uint64_t key = (static_cast<uint64_t>(sourceRank) << 32) |
+                   (static_cast<uint32_t>(vcId) << 16) | (flowId & 0xFFFF);
     auto it = m_reorderBuffers.find(key);
     if (it != m_reorderBuffers.end())
     {
@@ -1013,7 +1347,17 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
             if (lossSample < m_linkDegradationModel->GetPacketLossRate())
             {
                 NS_LOG_DEBUG("Packet dropped by loss rate, FEC can't help");
-                if (m_llrEnabled && m_llrManager)
+                // NACK only lost DATA packets. A dropped control/retry packet
+                // (ACK, NACK, CREDIT, RETRY_ACK, ...) must be dropped silently:
+                // NACKing it makes the peer treat the control seqNum as an
+                // unACKed data seq (NACK-of-NACK -> retryMisses, duplicate
+                // retransmits, false timeouts). Real link protocols recover
+                // lost acks via the sender's retry timer, not via NACK.
+                // Strict So GBN flows are also silent here: a real receiver
+                // never sees the dropped packet — the gap is detected on the
+                // next in-flight arrival (or the sender's retry timer).
+                if (m_llrEnabled && m_llrManager && !isProtocolControl &&
+                    !IsStrictGbnFlow(header))
                 {
                     FabricHeader nackHeader;
                     nackHeader.SetPacketType(FabricPacketType::NACK);
@@ -1086,8 +1430,11 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
             }
             else
             {
-                // No FEC: use link degradation's per-packet BER sampling
-                if (!m_linkDegradationModel->ProcessPacket(pkt))
+                // No FEC: use link degradation's per-packet BER sampling.
+                // ProcessPacketBerOnly (not ProcessPacket): the loss-rate
+                // draw already happened above — ProcessPacket would draw the
+                // loss rate a second time, compounding the effective loss.
+                if (!m_linkDegradationModel->ProcessPacketBerOnly(pkt))
                 {
                     packetCorrupted = true;
                     packetSurvived = false;
@@ -1127,9 +1474,17 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         Time decodeLatency = m_fecModel->GetDecodeLatency();
         if (decodeLatency > Seconds(0))
         {
-            // Schedule the rest of receive processing after decode latency
-            Simulator::Schedule(decodeLatency, &FabricEndpoint::ContinueReceiveAfterFec,
-                                this, pkt, header);
+            // Schedule the rest of receive processing after decode latency.
+            // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
+            // bound member call targets raw `this` and fires into freed
+            // memory when the endpoint is disposed and released before the
+            // decode completes (codex round 15, finding 1 — valgrind-confirmed
+            // invalid reads/writes in ContinueReceiveAfterFec's traced-callback
+            // and stats members, which DoDispose nulls).
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(decodeLatency,
+                                    &FabricEndpoint::ContinueReceiveAfterFec,
+                                    this, pkt, header));
             return true;
         }
     }
@@ -1141,19 +1496,8 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
     uint16_t destRank = header.GetDestRank();
 
     // Check if this packet is destined for us or needs forwarding
-    if (destRank != m_rank && !m_routingTable.empty())
+    if (TryForwardReceivedPacket(pkt, header))
     {
-        // Forward the packet to its destination
-        NS_LOG_DEBUG("Forwarding packet from " << header.GetSourceRank()
-                     << " to " << destRank << " at node " << m_rank);
-
-        // Re-add the header and forward
-        pkt->AddHeader(header);
-
-        uint32_t deviceIndex = ResolveDeviceIndex(destRank);
-        Mac48Address destMac = ResolveDestMac(destRank);
-        SendPacketOnDevice(pkt, deviceIndex, destMac);
-
         return true;
     }
 
@@ -1177,15 +1521,7 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         // PERMANENT_LOSS from sender: mark seqNum as permanently lost.
         // Sender already returned the credit in NotifyPermanentLoss, so
         // we do NOT call ProcessCreditPacket here (no credit to return).
-        // Pass the PERMANENT_LOSS header (which carries original metadata:
-        // effectiveDataSize, flowId, etc.) to the reorder buffer so the
-        // permanent-gap callback can propagate terminal progress.
-        uint8_t vcId = header.GetVirtualChannel();
-        uint16_t flowId = header.GetFlowId();
-        uint32_t lostSeqNum = header.GetSequenceNumber();
-        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
-        rb->MarkPermanentGap(lostSeqNum, header);
-        rb->DeliverReadyPackets();
+        ProcessPermanentLossNotice(header);
     }
     else if (header.GetPacketType() == FabricPacketType::CNP)
     {
@@ -1193,6 +1529,17 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         // is control traffic but must not be consumed as a credit, so it is
         // intercepted before the generic control (ProcessCreditPacket) branch.
         ProcessCnpPacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::RTT_PROBE)
+    {
+        // RTTCC probe: reflect it straight back to the prober. Intercepted
+        // before the generic control branch (a probe is not a credit).
+        SendRttResponsePacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::RTT_RESPONSE)
+    {
+        // RTTCC echo: turn it into an RTT sample for the rate machine.
+        ProcessRttResponsePacket(header);
     }
     else if (header.IsControlPacket())
     {
@@ -1211,6 +1558,87 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
 }
 
 void
+FabricEndpoint::ProcessPermanentLossNotice(const FabricHeader& header)
+{
+    // PERMANENT_LOSS from sender: the retransmit budget for this sequence
+    // number is exhausted and the sender has already returned the credit in
+    // NotifyPermanentLoss, so there is no credit to hand back here. Advance
+    // terminal progress so the receiver does not stall waiting for a seq that
+    // will never arrive.
+    uint8_t vcId = header.GetVirtualChannel();
+    uint16_t flowId = header.GetFlowId();
+    uint32_t lostSeqNum = header.GetSequenceNumber();
+    if (IsStrictGbnFlow(header))
+    {
+        // Strict So GBN keeps its own per-flow expected counter instead of a
+        // reorder buffer: advance past the lost seq (or park it for
+        // consumption when expected catches up).
+        uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
+                           (static_cast<uint64_t>(flowId) << 32) |
+                           header.GetSourceRank();
+        uint32_t& expected = m_strictNextExpected[flowKey];
+        if (lostSeqNum == expected)
+        {
+            expected++;
+            auto pl = m_strictPermLost.find(flowKey);
+            if (pl != m_strictPermLost.end())
+            {
+                while (pl->second.erase(expected) > 0)
+                {
+                    expected++;
+                }
+                if (pl->second.empty())
+                {
+                    m_strictPermLost.erase(pl);
+                }
+            }
+            m_strictNakPending.erase(flowKey);
+        }
+        else if (lostSeqNum > expected)
+        {
+            m_strictPermLost[flowKey].insert(lostSeqNum);
+        }
+    }
+    else
+    {
+        // Reorder-buffer flows: mark the gap and release everything below it
+        // that is still parked. The header carries the original data packet's
+        // metadata (effectiveDataSize, flowId, ...) so the permanent-gap
+        // callback can propagate terminal progress.
+        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                         header.GetSourceRank());
+        rb->MarkPermanentGap(lostSeqNum, header);
+        rb->DeliverReadyPackets();
+    }
+}
+
+bool
+FabricEndpoint::TryForwardReceivedPacket(Ptr<Packet> pkt, FabricHeader& header)
+{
+    const uint16_t destRank = header.GetDestRank();
+    if (destRank == m_rank || m_routingTable.empty())
+    {
+        return false;
+    }
+
+    // Forward the packet to its destination
+    NS_LOG_DEBUG("Forwarding packet from " << header.GetSourceRank()
+                 << " to " << destRank << " at node " << m_rank);
+
+    uint32_t deviceIndex = ResolveDeviceIndex(destRank);
+    Mac48Address destMac = ResolveDestMac(destRank);
+    // Re-target the header's DestMac for THIS hop: switches route on the
+    // FabricHeader's MACs (nvswitch.cc), so a stale first-hop DestMac is
+    // unknown at the destination node's switch and floods every port --
+    // each non-target GPU then re-forwards the flooded copy, storming at
+    // high radix (gateway topologies: ring/torus2d/dragonfly).
+    header.SetDestMac(destMac);
+    pkt->AddHeader(header);
+    SendPacketOnDevice(pkt, deviceIndex, destMac);
+    return true;
+}
+
+void
 FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
 {
     // Continue receive processing after FEC decode latency
@@ -1218,14 +1646,8 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
     m_rxPackets++;
     m_rxBytes += pkt->GetSize();
 
-    uint16_t destRank = header.GetDestRank();
-
-    if (destRank != m_rank && !m_routingTable.empty())
+    if (TryForwardReceivedPacket(pkt, header))
     {
-        pkt->AddHeader(header);
-        uint32_t deviceIndex = ResolveDeviceIndex(destRank);
-        Mac48Address destMac = ResolveDestMac(destRank);
-        SendPacketOnDevice(pkt, deviceIndex, destMac);
         return;
     }
 
@@ -1243,15 +1665,10 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
     }
     else if (header.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
     {
-        // Sender already returned the credit in NotifyPermanentLoss.
-        // Pass the PERMANENT_LOSS header with original metadata for
-        // terminal progress propagation.
-        uint8_t vcId = header.GetVirtualChannel();
-        uint16_t flowId = header.GetFlowId();
-        uint32_t lostSeqNum = header.GetSequenceNumber();
-        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
-        rb->MarkPermanentGap(lostSeqNum, header);
-        rb->DeliverReadyPackets();
+        // Sender already returned the credit in NotifyPermanentLoss. Shared
+        // with the non-FEC receive path: strict GBN advances its expected
+        // counter, reorder-buffer flows mark a permanent gap.
+        ProcessPermanentLossNotice(header);
     }
     else if (header.GetPacketType() == FabricPacketType::CNP)
     {
@@ -1259,6 +1676,17 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
         // is control traffic but must not be consumed as a credit, so it is
         // intercepted before the generic control (ProcessCreditPacket) branch.
         ProcessCnpPacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::RTT_PROBE)
+    {
+        // RTTCC probe: reflect it straight back to the prober. Intercepted
+        // before the generic control branch (a probe is not a credit).
+        SendRttResponsePacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::RTT_RESPONSE)
+    {
+        // RTTCC echo: turn it into an RTT sample for the rate machine.
+        ProcessRttResponsePacket(header);
     }
     else if (header.IsControlPacket())
     {
@@ -1279,9 +1707,22 @@ FabricEndpoint::ProcessDataPacket(Ptr<Packet> packet, const FabricHeader& header
 {
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
 
-    // Check if this is a protocol-aware packet
-    NcclProtocol protocol = header.GetNcclProtocol();
-    if (protocol != NcclProtocol::NONE && protocol != NcclProtocol::SIMPLE)
+    // Check if this is a protocol-aware packet. The gate is the WIRE-level
+    // protocol-framed flag the sender stamped when it framed the payload
+    // through a vendor payload builder (SendDataInternal's BuildChunks, the
+    // SoHeader stamp in SendBulkWireTransferSize) — NOT an inference from
+    // the handling model's efficiency and NOT an NcclProtocol enum
+    // interpretation of the protocol byte. Both inferences misfire:
+    // (a) efficiency < 1.0 does NOT guarantee the sender framed a header —
+    // public SendData, SendP2p, collective uploads, switch multicast results
+    // and sub-header-size bulk chunks all send raw under an efficiency<1.0
+    // model, and the receiver would strip (RoCE: a 10 B SoHeader deserialize
+    // off a 9 B payload aborts; UB: a 16 B strip delivers 64 B as 48 B);
+    // (b) vendor protocol ids are not NCCL ids — UB's MEM_SYNC is 0 (NCCL
+    // NONE) yet frames a 16-byte transaction header. The flag is set exactly
+    // where a builder header is stamped, so send and receive gates provably
+    // match; unframed packets keep the raw path regardless of model.
+    if (header.IsProtocolFramed())
     {
         // Delegate to protocol-aware processing
         ProcessProtocolDataPacket(packet, header);
@@ -1294,53 +1735,133 @@ FabricEndpoint::ProcessDataPacket(Ptr<Packet> packet, const FabricHeader& header
     // Bypass reorder buffer for direct links (no multi-path reordering needed)
     if (m_bypassReorderBuffer)
     {
-        // Track out-of-order arrivals even in bypass mode
-        uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
-                           (static_cast<uint64_t>(flowId) << 32) |
-                           header.GetSourceRank();
-        auto it = m_bypassNextExpectedSeq.find(flowKey);
-        if (it != m_bypassNextExpectedSeq.end())
+        DeliverBypassDataPacket(packet, header);
+    }
+    else
+    {
+        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                         header.GetSourceRank());
+        bool inserted = rb->Insert(header.GetSequenceNumber(), packet, header);
+        rb->DeliverReadyPackets();
+        if (!inserted && rb->IsDuplicate(header.GetSequenceNumber()))
         {
-            if (header.GetSequenceNumber() != it->second)
+            // A rejected DUPLICATE (retransmission of an already-delivered
+            // seq, or of one still parked in the buffer): the original
+            // delivery's ACK may have been lost, and without this re-ACK
+            // the sender's LLR store entry is never purged — the
+            // retry-timer backstop retransmits forever and the entry turns
+            // into a false permanent loss for data the receiver already
+            // holds. Mirrors the bypass path's duplicate branch. A
+            // capacity-rejected FUTURE seq is not a duplicate: it rides
+            // the sender's retry timer instead (ACKing it would purge the
+            // store entry for data the receiver never got).
+            SendLlrAckPacket(header, false);
+        }
+    }
+
+}
+
+bool
+FabricEndpoint::DeliverBypassDataPacket(Ptr<Packet> packet, const FabricHeader& header)
+{
+    uint8_t vcId = header.GetVirtualChannel();
+    uint16_t flowId = header.GetFlowId();
+    uint64_t flowKey = (static_cast<uint64_t>(vcId) << 48) |
+                       (static_cast<uint64_t>(flowId) << 32) |
+                       header.GetSourceRank();
+
+    // Strict So go-back-N: in-order-only acceptance, like a real IB
+    // responder in GBN mode. Exactly one NAK per gap; everything after
+    // the gap is discarded (no delivery, no ACK, no state), so blanket
+    // retransmits are real work, not cheap duplicates. Lost NAKs are
+    // covered by the sender's retry-timer backstop.
+    if (IsStrictGbnFlow(header))
+    {
+        uint32_t seq = header.GetSequenceNumber();
+        uint32_t& expected = m_strictNextExpected[flowKey];
+        if (seq == expected)
+        {
+            expected++;
+            // Consume any permanently-lost seqs immediately following
+            auto pl = m_strictPermLost.find(flowKey);
+            if (pl != m_strictPermLost.end())
             {
-                m_bypassReorderEvents++;
+                while (pl->second.erase(expected) > 0)
+                {
+                    expected++;
+                }
+                if (pl->second.empty())
+                {
+                    m_strictPermLost.erase(pl);
+                }
+            }
+            m_strictNakPending.erase(flowKey);
+            OnPacketDelivered(packet, seq, header);
+        }
+        else if (seq < expected)
+        {
+            // Duplicate of an already-delivered seq: its ACK may have
+            // been lost, so re-ACK (So flows owe no credit, task #29).
+            SendLlrAckPacket(header, false);
+        }
+        else
+        {
+            // Gap: discard, and NAK the missing seq once per gap.
+            m_bypassReorderEvents++;
+            auto nak = m_strictNakPending.find(flowKey);
+            if (nak == m_strictNakPending.end() || nak->second != expected)
+            {
+                m_strictNakPending[flowKey] = expected;
+                SendStrictGbnNak(header, expected);
             }
         }
-        m_bypassNextExpectedSeq[flowKey] = header.GetSequenceNumber() + 1;
+        return true;
+    }
 
-        // Skip duplicate delivery from GBN retransmission
-        auto deliveredKey = std::make_pair(flowKey, header.GetSequenceNumber());
-        if (m_bypassDelivered.count(deliveredKey))
+    // Track out-of-order arrivals even in bypass mode
+    auto it = m_bypassNextExpectedSeq.find(flowKey);
+    if (it != m_bypassNextExpectedSeq.end())
+    {
+        if (header.GetSequenceNumber() != it->second)
         {
-            NS_LOG_DEBUG("Bypass mode: skipping duplicate seq=" << header.GetSequenceNumber()
-                         << " flowKey=" << flowKey);
-            SendLlrAckPacket(header, false);
-            // Still return credit for the retransmitted packet
+            m_bypassReorderEvents++;
+        }
+    }
+    m_bypassNextExpectedSeq[flowKey] = header.GetSequenceNumber() + 1;
+
+    // Skip duplicate delivery from GBN retransmission
+    auto deliveredKey = std::make_pair(flowKey, header.GetSequenceNumber());
+    if (m_bypassDelivered.count(deliveredKey))
+    {
+        NS_LOG_DEBUG("Bypass mode: skipping duplicate seq=" << header.GetSequenceNumber()
+                     << " flowKey=" << flowKey);
+        SendLlrAckPacket(header, false);
+        // Still return credit for the retransmitted packet — but only if the
+        // send consumed one. OnPacketDelivered's credit return is guarded by
+        // IsLocalRank(sourceRank) (So sends bypass the gate), so the duplicate
+        // branch must mirror it or an So retransmit duplicate would grow the
+        // sender's VC pool it never drew from.
+        if (IsLocalRank(header.GetSourceRank()))
+        {
             FabricPacketType pktType = header.GetPacketType();
             if (pktType == FabricPacketType::DATA ||
                 pktType == FabricPacketType::P2P ||
                 header.IsCollectivePacket())
             {
                 SendCreditPacket(header.GetSourceRank(),
-                                 vcId,
-                                 1,
-                                 header.GetSequenceNumber(),
-                                 header.GetFlowId());
+                                  vcId,
+                                  1,
+                                  header.GetSequenceNumber(),
+                                  header.GetFlowId());
             }
-            return;
         }
-        m_bypassDelivered.insert(deliveredKey);
-
-        // Deliver packet directly to callback
-        OnPacketDelivered(packet, header.GetSequenceNumber(), header);
+        return true;
     }
-    else
-    {
-        Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
-        rb->Insert(header.GetSequenceNumber(), packet, header);
-        rb->DeliverReadyPackets();
-    }
+    m_bypassDelivered.insert(deliveredKey);
 
+    // Deliver packet directly to callback
+    OnPacketDelivered(packet, header.GetSequenceNumber(), header);
+    return true;
 }
 
 void
@@ -1352,12 +1873,53 @@ FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
 
     NS_LOG_FUNCTION(this << seqNum << destRank << static_cast<int>(vcId));
 
-    // Return the consumed credit for the permanently lost packet (sender-side)
-    if (m_creditManager)
+    // A permanently lost chunk will never be ACKed: free its TX-window slot
+    // so the window can't leak closed. Gate on window MEMBERSHIP, not just
+    // m_soTxWindow > 0: local (Su) packets and small unfragmented remote
+    // sends also suffer permanent losses, but they never held a window slot
+    // (only PumpBulkTxWindow dispatches occupy one) — releasing for them
+    // would dispatch an extra bulk fragment while one is still in flight.
+    // The store entry is already purged by the LlrManager before this
+    // callback fires, so a late ACK can't double-release.
+    if (m_soTxWindow > 0 &&
+        m_bulkTxWindowSeqs.erase({destRank, vcId,
+                                  originalHeader.GetFlowId(), seqNum}) > 0)
     {
-        m_creditManager->ReturnCredits(vcId, 1);
-        NS_LOG_DEBUG("Returned credit for permanently lost seqNum " << seqNum
-                     << " on VC " << static_cast<int>(vcId));
+        ReleaseBulkTxSlot();
+    }
+
+    // Return the consumed credit for the permanently lost packet (sender-side).
+    // Only if the send actually consumed one: So (remote-dest) bulk packets
+    // bypass the credit gate (SendBulkWireTransferSize's IsLocalRank guard),
+    // so returning a credit for one would grow the pool it never drew from
+    // and let an unrelated local send through early. IsLocalRank(destRank) is
+    // the mirror of the send-side guard; single-node (m_localRankCount==1)
+    // keeps every dest local -> unchanged.
+    if (m_creditManager && IsLocalRank(destRank))
+    {
+        // Credit-bypass types (NVLS/SHARP uploads) consumed no credit on
+        // send — none is owed back here (mirror of the ProcessAckPacket gate).
+        bool creditBypass = originalHeader.GetPacketType() == FabricPacketType::ALLREDUCE ||
+                            originalHeader.GetPacketType() == FabricPacketType::ALLGATHER;
+        if (!creditBypass)
+        {
+            // Record the return in the shared CREDIT/ACK ledger (same key space
+            // as the ProcessAckPacket recovery): the receiver still emits a
+            // CREDIT for this sequence number if the packet arrives late (after
+            // the retry limit declared it permanently lost), and without a
+            // ledger entry that late CREDIT would return a second credit for a
+            // slot that was already freed here — growing the pool beyond total.
+            // insert().second false means this seq was already accounted (e.g.
+            // the ACK raced ahead of the permanent-loss declaration).
+            uint64_t ackKey = MakeSeqKey(originalHeader.GetDestRank(), vcId,
+                                         originalHeader.GetFlowId());
+            if (m_creditsReturned.insert({ackKey, seqNum}).second)
+            {
+                m_creditManager->ReturnCredits(vcId, 1);
+                NS_LOG_DEBUG("Returned credit for permanently lost seqNum " << seqNum
+                             << " on VC " << static_cast<int>(vcId));
+            }
+        }
     }
 
     // Notify the receiver to advance its reorder buffer past the lost sequence number.
@@ -1410,15 +1972,25 @@ FabricEndpoint::ProcessRetryPacket(Ptr<Packet> packet, const FabricHeader& heade
         {
             // Go-Back-N: retransmit all packets from seqNum onwards for this peer
             std::vector<LlrManager::Retransmission> retransmissions =
-                m_llrManager->HandleRetryRequest(seqNum, sourceRank, flowId);
+                m_llrManager->HandleRetryRequest(seqNum, sourceRank, flowId,
+                                                 header.GetVirtualChannel());
             for (const auto& retransmission : retransmissions)
             {
                 if (retransmission.readyDelay > Time(0))
                 {
-                    Simulator::Schedule(retransmission.readyDelay,
-                                        [this, retransmission]() {
-                                            SendRetransmission(retransmission);
-                                        });
+                    // Tracked in m_deferredEgressEvents so DoDispose cancels
+                    // it: the lambda captures raw `this` and a source-reload
+                    // delay can be far in the future (codex round 16,
+                    // finding 1 — with SACK, a one-entry retry buffer, and a
+                    // 100-us reload latency, a NACK for the evicted first
+                    // packet left the deferred SendRetransmission firing
+                    // into freed memory at the 100-us mark after the
+                    // endpoint was disposed and released at 1 us).
+                    m_deferredEgressEvents.push_back(
+                        Simulator::Schedule(retransmission.readyDelay,
+                                            [this, retransmission]() {
+                                                SendRetransmission(retransmission);
+                                            }));
                 }
                 else
                 {
@@ -1438,7 +2010,11 @@ FabricEndpoint::ProcessRetryPacket(Ptr<Packet> packet, const FabricHeader& heade
 
         if (m_llrEnabled && m_llrManager)
         {
-            m_llrManager->RemovePacketsUpTo(seqNum, sourceRank, flowId);
+            // The VC-qualified key: without it the call defaults to VC0 and a
+            // VC0/VC1 pair with matching (seq, flow) would purge the wrong
+            // VC's recovery state.
+            m_llrManager->RemovePacketsUpTo(seqNum, sourceRank, flowId,
+                                            header.GetVirtualChannel());
         }
     }
 }
@@ -1451,6 +2027,7 @@ FabricEndpoint::ProcessNackPacket(Ptr<Packet> packet, const FabricHeader& header
     uint32_t seqNum = header.GetSequenceNumber();
     uint16_t sourceRank = header.GetSourceRank();
     uint16_t flowId = header.GetFlowId();
+    uint8_t vcId = header.GetVirtualChannel();
 
     NS_LOG_INFO("Received NACK for seqNum=" << seqNum << " from rank=" << sourceRank);
 
@@ -1462,29 +2039,85 @@ FabricEndpoint::ProcessNackPacket(Ptr<Packet> packet, const FabricHeader& header
         {
             // SACK: retransmit only the NACKed packet
             std::unordered_set<uint32_t> nackSet{seqNum};
-            retransmissions = m_llrManager->HandleSackRequest(nackSet, sourceRank, flowId);
+            retransmissions = m_llrManager->HandleSackRequest(nackSet, sourceRank,
+                                                              flowId, vcId);
         }
         else
         {
             // Go-Back-N: retransmit from NACK point onward
-            retransmissions = m_llrManager->HandleRetryRequest(seqNum, sourceRank, flowId);
+            retransmissions = m_llrManager->HandleRetryRequest(seqNum, sourceRank,
+                                                               flowId, vcId);
         }
 
-        for (const auto& retransmission : retransmissions)
+        DispatchRetransmissions(retransmissions);
+    }
+}
+
+void
+FabricEndpoint::DispatchRetransmissions(
+    const std::vector<LlrManager::Retransmission>& retransmissions)
+{
+    for (const auto& retransmission : retransmissions)
+    {
+        if (retransmission.readyDelay > Time(0))
         {
-            if (retransmission.readyDelay > Time(0))
-            {
+            // Tracked in m_deferredEgressEvents so DoDispose cancels it:
+            // the lambda captures raw `this` and a source-reload delay can
+            // be far in the future (codex round 16, finding 1 — see the
+            // matching comment in ProcessRetryPacket).
+            m_deferredEgressEvents.push_back(
                 Simulator::Schedule(retransmission.readyDelay,
                                     [this, retransmission]() {
                                         SendRetransmission(retransmission);
-                                    });
-            }
-            else
-            {
-                SendRetransmission(retransmission);
-            }
+                                    }));
+        }
+        else
+        {
+            SendRetransmission(retransmission);
         }
     }
+}
+
+void
+FabricEndpoint::EnableLlrTimeoutRetransmit()
+{
+    if (m_llrManager)
+    {
+        m_llrManager->SetTimeoutCallback(
+            MakeCallback(&FabricEndpoint::OnLlrRetryTimeout, this));
+    }
+}
+
+void
+FabricEndpoint::OnLlrRetryTimeout(uint32_t seqNum, uint16_t destRank,
+                                  uint16_t flowId, uint8_t vcId)
+{
+    NS_LOG_FUNCTION(this << seqNum << destRank << flowId << static_cast<int>(vcId));
+
+    if (!m_llrEnabled || !m_llrManager)
+    {
+        return;
+    }
+
+    // Sender-side timeout backstop: the entry is still un-ACKed when its
+    // retry timer fires, so retransmit it exactly as a NACK would have.
+    // The Handle*Request paths re-arm the timer and enforce the retry limit,
+    // so a persistently-lost packet still degrades to permanent loss instead
+    // of looping forever. destRank plays the role of the NACK's sourceRank
+    // (both name the flow's remote end); vcId is the timed entry's VC.
+    std::vector<LlrManager::Retransmission> retransmissions;
+    if (m_llrManager->GetLlrMode() == LlrMode::SACK)
+    {
+        std::unordered_set<uint32_t> nackSet{seqNum};
+        retransmissions = m_llrManager->HandleSackRequest(nackSet, destRank,
+                                                          flowId, vcId);
+    }
+    else
+    {
+        retransmissions = m_llrManager->HandleRetryRequest(seqNum, destRank,
+                                                           flowId, vcId);
+    }
+    DispatchRetransmissions(retransmissions);
 }
 
 void
@@ -1502,7 +2135,8 @@ FabricEndpoint::SendRetransmission(LlrManager::Retransmission retransmission)
     uint16_t destRank = oldHeader.GetDestRank();
     uint16_t flowId = oldHeader.GetFlowId();
 
-    if (!m_llrManager->HasOutstandingPacket(seqNum, destRank, flowId))
+    if (!m_llrManager->HasOutstandingPacket(seqNum, destRank, flowId,
+                                            oldHeader.GetVirtualChannel()))
     {
         return;
     }
@@ -1525,6 +2159,7 @@ FabricEndpoint::SendRetransmission(LlrManager::Retransmission retransmission)
     retryHeader.SetPayloadSize(oldHeader.GetPayloadSize());
     retryHeader.SetEffectiveDataSize(oldHeader.GetEffectiveDataSize());
     retryHeader.SetProtocol(oldHeader.GetProtocol());
+    retryHeader.SetProtocolFramed(oldHeader.IsProtocolFramed());
     retryHeader.SetTtl(64);
     packet->AddHeader(retryHeader);
 
@@ -1540,9 +2175,75 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
     if (m_llrEnabled && m_llrManager)
     {
-        m_llrManager->RemovePacket(header.GetSequenceNumber(),
-                                   header.GetSourceRank(),
-                                   header.GetFlowId());
+        // Release a TX-window slot exactly once per chunk: the exact
+        // window-membership set (destRank, seqNum) says whether this ACK is
+        // for a PumpBulkTxWindow-dispatched bulk fragment. The old
+        // remoteness + LLR-outstanding heuristic also matched small
+        // unfragmented remote sends (they share the LLR store but never
+        // held a window slot), releasing a slot that belonged to an
+        // in-flight bulk fragment — with soTxWindow=1 the next fragment
+        // dispatched while the previous one was still outstanding. The key
+        // carries the full (dest, vc, flow) identity because seq counters
+        // are allocated per (dest, vc, flow): an ACK from an unwindowed
+        // flow sharing only (dest, seq) must not release another flow's
+        // bulk slot.
+        const bool heldWindowSlot =
+            m_soTxWindow > 0 &&
+            m_bulkTxWindowSeqs.erase({header.GetSourceRank(),
+                                      header.GetVirtualChannel(),
+                                      header.GetFlowId(),
+                                      header.GetSequenceNumber()}) > 0;
+        // Peek the stored entry's type BEFORE RemovePacket destroys it:
+        // credit-bypass types (NVLS/SHARP uploads — the switch's LLR ack for
+        // them lands here too) consumed no credit on send, so none is owed
+        // back; returning one would grow the VC pool past its total.
+        uint8_t storedType = 0;
+        const bool creditBypassEntry =
+            !m_llrManager->PeekOutstandingPacketType(header.GetSequenceNumber(),
+                                                     header.GetSourceRank(),
+                                                     header.GetFlowId(),
+                                                     header.GetVirtualChannel(),
+                                                     storedType) ||
+            storedType == static_cast<uint8_t>(FabricPacketType::ALLREDUCE) ||
+            storedType == static_cast<uint8_t>(FabricPacketType::ALLGATHER);
+        const bool removed =
+            m_llrManager->RemovePacket(header.GetSequenceNumber(),
+                                       header.GetSourceRank(),
+                                       header.GetFlowId(),
+                                       header.GetVirtualChannel());
+        if (heldWindowSlot)
+        {
+            ReleaseBulkTxSlot();
+        }
+        if (removed && !creditBypassEntry)
+        {
+            // R9#2: the ACK proves the receiver got the packet, so the send's
+            // consumed credit is owed back even if the receiver's CREDIT
+            // packet was lost in flight (CREDIT is BER-exempt but still drawn
+            // against the loss rate). Without this backstop the ACK purges
+            // the retry entry — nothing ever re-sends that CREDIT — and the
+            // VC permanently loses the credit (the next send on the VC
+            // queues forever). The insert shares m_creditsReturned with
+            // ProcessCreditPacket so the credit is returned EXACTLY once per
+            // seq whichever arrives first: ACK first marks the seq credited
+            // and the receiver's genuine CREDIT lands in the phantom bucket;
+            // CREDIT first returns it and the ACK-side insert fails. A
+            // duplicate ACK (removed=false) never reaches here. So
+            // (remote-dest) sends never consumed a credit, so only local
+            // dests are owed one — mirror of every send-side guard.
+            uint64_t ackKey = MakeSeqKey(header.GetSourceRank(),
+                                         header.GetVirtualChannel(),
+                                         header.GetFlowId());
+            if (IsLocalRank(header.GetSourceRank()) &&
+                m_creditsReturned.insert({ackKey,
+                                          header.GetSequenceNumber()}).second)
+            {
+                m_creditManager->ReturnCredits(header.GetVirtualChannel(), 1);
+                NS_LOG_DEBUG("ACK-side credit recovery for seq "
+                             << header.GetSequenceNumber() << " vc="
+                             << static_cast<int>(header.GetVirtualChannel()));
+            }
+        }
     }
 }
 
@@ -1554,14 +2255,39 @@ FabricEndpoint::ProcessCreditPacket(Ptr<Packet> packet, const FabricHeader& head
     uint8_t vcId = header.GetVirtualChannel();
     uint16_t credits = header.GetCreditCount();
 
-    m_creditManager->ReturnCredits(vcId, credits);
+    // Dedup per seq: the receiver re-credits a duplicate delivery (the
+    // duplicate branch of DeliverBypassDataPacket / the MEMORY_* path) in
+    // case the original CREDIT was lost — CREDIT is BER-exempt but still
+    // drawn against the loss rate. When the original CREDIT also arrives,
+    // the duplicate's credit is phantom: the send consumed exactly one
+    // credit and the first CREDIT already returned it. Counting both grows
+    // the VC pool beyond its budget and releases queued packets early.
+    // The first CREDIT for a seq wins; a genuinely lost CREDIT never
+    // enters the set, so its late twin is still accepted.
+    uint64_t ackKey = MakeSeqKey(header.GetSourceRank(),
+                                 header.GetVirtualChannel(),
+                                 header.GetFlowId());
+    bool phantomCredit = false;
+    if (!m_creditsReturned.insert({ackKey, header.GetSequenceNumber()}).second)
+    {
+        phantomCredit = true;
+        NS_LOG_DEBUG("Ignoring duplicate credit for seq="
+                     << header.GetSequenceNumber() << " vc="
+                     << static_cast<int>(vcId));
+    }
+
+    if (!phantomCredit)
+    {
+        m_creditManager->ReturnCredits(vcId, credits);
+    }
     if (m_llrEnabled && m_llrManager)
     {
         if (m_llrManager->GetLlrMode() == LlrMode::SACK)
         {
             m_llrManager->RemovePacket(header.GetSequenceNumber(),
                                        header.GetSourceRank(),
-                                       header.GetFlowId());
+                                       header.GetFlowId(),
+                                       header.GetVirtualChannel());
         }
         else
         {
@@ -1582,7 +2308,8 @@ FabricEndpoint::ProcessCreditPacket(Ptr<Packet> packet, const FabricHeader& head
             {
                 m_llrManager->RemovePacketsUpTo(nextAck - 1,
                                                 header.GetSourceRank(),
-                                                header.GetFlowId());
+                                                header.GetFlowId(),
+                                                header.GetVirtualChannel());
             }
         }
     }
@@ -1596,7 +2323,27 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
 
     FabricPacketType type = header.GetPacketType();
 
-    if (type == FabricPacketType::MEMORY_READ)
+    // Duplicate suppression for ALL memory packet types, not just responses:
+    // a retransmitted MEMORY_WRITE whose ACK was lost must not execute a
+    // second time (write 1, lose its ACK, write 2 — the retry would revert
+    // memory back to 1), and a retransmitted MEMORY_READ must not schedule a
+    // second response (the fresh response sequence number would defeat the
+    // receiver-side response dedup below). A duplicate is still ACKed and
+    // credit-returned at the bottom of this function so the sender purges
+    // its LLR store entry — only the execution is skipped.
+    uint64_t flowKey = (static_cast<uint64_t>(header.GetVirtualChannel()) << 48) |
+                       (static_cast<uint64_t>(header.GetFlowId()) << 32) |
+                       header.GetSourceRank();
+    auto deliveredKey = std::make_pair(flowKey, header.GetSequenceNumber());
+    bool duplicate = !m_memoryDelivered.insert(deliveredKey).second;
+    if (duplicate)
+    {
+        NS_LOG_DEBUG("Memory packet duplicate: type="
+                     << static_cast<int>(type) << " seq="
+                     << header.GetSequenceNumber() << " — ACK but don't execute");
+    }
+
+    if (!duplicate && type == FabricPacketType::MEMORY_READ)
     {
         // Extract address and size from payload
         uint32_t pktSize = packet->GetSize();
@@ -1626,13 +2373,21 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
                                      ? std::min(readSize, static_cast<uint32_t>(m_memoryData.size() - address))
                                      : 0;
             const uint8_t* dataPtr = (availSize > 0) ? m_memoryData.data() + address : nullptr;
-            Simulator::Schedule(m_memoryLatency,
-                                &FabricEndpoint::SendMemoryResponse,
-                                this, header.GetSourceRank(),
-                                dataPtr, availSize);
+            // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
+            // bound member call targets raw `this` and fires into freed
+            // memory when the MEMORY endpoint is disposed and released before
+            // the service latency elapses (codex round 17, finding 2 — with a
+            // 100-us memory latency and dispose+release at 1 us, valgrind
+            // confirmed invalid reads in SendMemoryResponse's member access
+            // at the 100-us firing).
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(m_memoryLatency,
+                                    &FabricEndpoint::SendMemoryResponse,
+                                    this, header.GetSourceRank(),
+                                    dataPtr, availSize));
         }
     }
-    else if (type == FabricPacketType::MEMORY_WRITE)
+    else if (!duplicate && type == FabricPacketType::MEMORY_WRITE)
     {
         uint32_t pktSize = packet->GetSize();
         if (pktSize < 8)
@@ -1650,8 +2405,12 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
         {
             uint32_t writeSize = pktSize - 8;
 
-            // Direct write to backing store
-            if (!m_memoryData.empty() && address + writeSize <= m_memoryData.size())
+            // Direct write to backing store. The bounds check must not form
+            // address + writeSize: at address = UINT64_MAX-7 with a 16-byte
+            // write the sum wraps to 8, passes the check, and memcpy writes
+            // eight bytes BEFORE the allocation (ASan heap-buffer-overflow).
+            if (!m_memoryData.empty() && address <= m_memoryData.size() &&
+                writeSize <= m_memoryData.size() - address)
             {
                 std::vector<uint8_t> writeData(pktSize);
                 packet->CopyData(writeData.data(), pktSize);
@@ -1660,8 +2419,13 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
             }
         }
     }
-    else if (type == FabricPacketType::MEMORY_RESP)
+    else if (!duplicate && type == FabricPacketType::MEMORY_RESP)
     {
+        // (Duplicate suppression already ran at the top of this function —
+        // GO_BACK_N's blanket retransmit can redeliver a response whose
+        // sibling was also outstanding, and the memory delivery path has no
+        // reorder buffer to swallow it. A duplicate is ACKed below but its
+        // payload reaches the application only once.)
         if (!m_memoryResponseCallback.IsNull())
         {
             m_memoryResponseCallback(m_rank, packet, header);
@@ -1672,19 +2436,39 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
         }
     }
 
-    // Return credits for MEMORY_READ, MEMORY_WRITE, and MEMORY_RESP.
-    // All three consume fabric bandwidth and credits on the send side.
+    // Return credits for MEMORY_READ, MEMORY_WRITE, and MEMORY_RESP — only
+    // when the sender actually consumed one. Local (Su) sources consume a
+    // credit on send; remote (So) memory packets bypass the credit gate
+    // (SendMemoryWrite/SendMemoryResponse's IsLocalRank guard), so returning
+    // a credit for one would grow the remote sender's pool it never drew
+    // from — and an over-returned credit releases an unrelated queued local
+    // packet early. IsLocalRank(sourceRank) is the mirror of the send-side
+    // guards; single-node endpoints keep every source local -> unchanged.
     if (type == FabricPacketType::MEMORY_READ ||
         type == FabricPacketType::MEMORY_WRITE ||
         type == FabricPacketType::MEMORY_RESP)
     {
-        uint8_t vcId = header.GetVirtualChannel();
-        SendCreditPacket(header.GetSourceRank(),
-                         vcId,
-                         1,
-                         header.GetSequenceNumber(),
-                         header.GetFlowId());
+        if (IsLocalRank(header.GetSourceRank()))
+        {
+            uint8_t vcId = header.GetVirtualChannel();
+            SendCreditPacket(header.GetSourceRank(),
+                             vcId,
+                             1,
+                             header.GetSequenceNumber(),
+                             header.GetFlowId());
+        }
     }
+
+    // LLR ACK for every memory packet: unlike DATA (whose delivery paths all
+    // funnel through OnPacketDelivered -> SendLlrAckPacket), memory packets
+    // are processed here directly. The sender stores memory packets in its
+    // LLR retry buffer (SendPacketOnDevice's store filter passes them), so
+    // without an ACK the store entry is never purged: the retry-timer
+    // backstop retransmits forever, duplicating the delivery at every
+    // timeout, and the entry degrades into a false permanent loss once the
+    // retry limit is hit. SendLlrAckPacket is a no-op when LLR is off, so
+    // non-LLR endpoints are unchanged.
+    SendLlrAckPacket(header, false);
 }
 
 void
@@ -1720,6 +2504,20 @@ void
 FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumulative)
 {
     if (!m_llrEnabled || !m_llrManager || m_devices.empty())
+    {
+        return;
+    }
+
+    // Never ack a switch-sourced multicast result (SourceRank 0xFFFF): the
+    // switch runs no LLR manager, so nobody consumes the ack — and the ack
+    // resolves the sentinel rank to the broadcast MAC, which the switch
+    // floods to every port. Each flooded copy lands on endpoints that match
+    // nothing (retry misses) while burning egress on all links — with LLR
+    // on, an 8-GPU NVLS allgather amplified 64 result deliveries into ~1700
+    // switch transmissions even at zero loss. Lost results are recovered by
+    // the receiver's NACK (DestRank 0xFFFF), which the switch intercepts and
+    // services from its own result store — not by acks.
+    if (receivedHeader.GetSourceRank() == 0xFFFF)
     {
         return;
     }
@@ -1763,6 +2561,7 @@ FabricEndpoint::SendCnpPacket(const FabricHeader& markedHeader)
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(markedHeader.GetSourceRank()));
     packet->AddHeader(header);
+    m_cnpPacketsSent++;
 
     if (!m_devices.empty())
     {
@@ -1776,18 +2575,23 @@ void
 FabricEndpoint::ProcessCnpPacket(const FabricHeader& cnpHeader)
 {
     NS_LOG_FUNCTION(this << cnpHeader.GetSourceRank());
+    m_cnpPacketsReceived++;
 
     // A CNP echoes the original flow back to its source. The CNP's source is
-    // the receiver, so at the source endpoint the flow key (destRank=receiver,
-    // vc, flowId) maps to MakeSeqKey(cnpHeader.GetSourceRank(), vc, flowId).
+    // the receiver, so at the source endpoint the flow coordinates are
+    // (source=this rank, dest=cnp source, vc, flowId). The rate key carries
+    // the SENDER rank too: two senders sharing (dest, vc, flow) coordinates
+    // must keep independent pacing/congestion state (codex round 23,
+    // finding 1) — the old dest-only key merged them onto one pacer.
     if (!m_dcqcnRate)
     {
         // Dormant baseline: no machine mounted (--dcqcn off). CNP is a no-op.
         return;
     }
-    uint64_t flowKey = MakeSeqKey(cnpHeader.GetSourceRank(),
-                                 cnpHeader.GetVirtualChannel(),
-                                 cnpHeader.GetFlowId());
+    uint64_t flowKey = MakeRateFlowKey(m_rank,
+                                       cnpHeader.GetSourceRank(),
+                                       cnpHeader.GetVirtualChannel(),
+                                       cnpHeader.GetFlowId());
     m_dcqcnRate->OnCnp(flowKey);
 }
 
@@ -1804,6 +2608,102 @@ FabricEndpoint::GetDcqcnRateMachine() const
 }
 
 void
+FabricEndpoint::SendRttProbePacket(uint16_t destRank, uint8_t vcId, uint16_t flowId,
+                                   uint32_t probeSeq)
+{
+    NS_LOG_FUNCTION(this << destRank << probeSeq);
+
+    // An RTT probe is a control packet: it rides the same VOQ queues and
+    // links as the data it accompanies (so the measured RTT includes the
+    // queueing the flow experiences) but bypasses BER sampling, lossy
+    // tail-drop, LLR retry state, and the rate machines themselves (a probe
+    // must never be paced by the rate it is measuring). The send timestamp
+    // stays sender-local in the RttccRateMachine, keyed by probeSeq — no
+    // timestamp goes on the wire; the response only echoes probeSeq.
+    Ptr<Packet> packet = Create<Packet>();
+    FabricHeader header;
+    header.SetPacketType(FabricPacketType::RTT_PROBE);
+    header.SetFabricType(GetFabricTypeForDest(destRank));
+    header.SetVirtualChannel(vcId);
+    header.SetSequenceNumber(probeSeq);
+    header.SetFlowId(flowId);
+    header.SetSourceRank(m_rank);
+    header.SetDestRank(destRank);
+    header.SetSourceMac(m_address);
+    header.SetDestMac(ResolveDestMac(destRank));
+    packet->AddHeader(header);
+
+    if (!m_devices.empty())
+    {
+        uint32_t deviceIndex = ResolveDeviceIndex(destRank);
+        SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(destRank));
+    }
+}
+
+void
+FabricEndpoint::SendRttResponsePacket(const FabricHeader& probeHeader)
+{
+    NS_LOG_FUNCTION(this << probeHeader.GetSourceRank());
+
+    // Hardware-style immediate reflection: echo the probe's sequence number
+    // (and flow coordinates) straight back to the prober. Unconditional — a
+    // receiver needs no rate machine to reflect; with --rttcc off no probes
+    // exist, so this path never fires on the baseline (parity-safe).
+    Ptr<Packet> packet = Create<Packet>();
+    FabricHeader header;
+    header.SetPacketType(FabricPacketType::RTT_RESPONSE);
+    header.SetFabricType(GetFabricTypeForDest(probeHeader.GetSourceRank()));
+    header.SetVirtualChannel(probeHeader.GetVirtualChannel());
+    header.SetSequenceNumber(probeHeader.GetSequenceNumber());
+    header.SetFlowId(probeHeader.GetFlowId());
+    header.SetSourceRank(m_rank);
+    header.SetDestRank(probeHeader.GetSourceRank());
+    header.SetSourceMac(m_address);
+    header.SetDestMac(ResolveDestMac(probeHeader.GetSourceRank()));
+    packet->AddHeader(header);
+
+    if (!m_devices.empty())
+    {
+        uint32_t deviceIndex = ResolveDeviceIndex(probeHeader.GetSourceRank());
+        SendPacketOnDevice(packet, deviceIndex,
+                           ResolveDestMac(probeHeader.GetSourceRank()));
+    }
+}
+
+void
+FabricEndpoint::ProcessRttResponsePacket(const FabricHeader& respHeader)
+{
+    NS_LOG_FUNCTION(this << respHeader.GetSourceRank());
+
+    // The response's source is the flow's receiver, so at the prober the
+    // flow coordinates are (source=this rank, dest=response source, vc,
+    // flowId) — the same key the send path used (mirrors ProcessCnpPacket;
+    // sender-ranked for independent per-sender state, codex round 23,
+    // finding 1).
+    if (!m_rttccRate)
+    {
+        return; // dormant baseline: no machine mounted (--rttcc off)
+    }
+    uint64_t flowKey = MakeRateFlowKey(m_rank,
+                                       respHeader.GetSourceRank(),
+                                       respHeader.GetVirtualChannel(),
+                                       respHeader.GetFlowId());
+    m_rttccRate->OnProbeResponse(flowKey, respHeader.GetSequenceNumber());
+}
+
+void
+FabricEndpoint::SetRttccRateMachine(Ptr<RttccRateMachine> machine)
+{
+    m_rttccRate = machine;
+}
+
+Ptr<RttccRateMachine>
+FabricEndpoint::GetRttccRateMachine() const
+{
+    return m_rttccRate;
+}
+
+void
 FabricEndpoint::TrySendQueuedPackets()
 {
     NS_LOG_FUNCTION(this);
@@ -1812,13 +2712,20 @@ FabricEndpoint::TrySendQueuedPackets()
     {
         SendQueueEntry& entry = m_sendQueue.front();
 
-        if (!m_creditManager->HasCredits(entry.vcId))
+        // Credit gate — Su (local-dest) entries only. So (remote-dest) entries
+        // bypass credits entirely: the receiver never returns credits for a
+        // remote source (OnPacketDelivered's IsLocalRank guard), so consuming
+        // one here would strand it. Entries reach this queue from send paths
+        // whose own gates were bypassed under the same predicate, so the split
+        // here mirrors the send side exactly.
+        const bool destIsLocal = IsLocalRank(entry.header.GetDestRank());
+        if (destIsLocal && !m_creditManager->HasCredits(entry.vcId))
         {
             NS_LOG_DEBUG("No credits for VC " << static_cast<int>(entry.vcId));
             break;
         }
 
-        if (!m_creditManager->ConsumeCredit(entry.vcId, entry.seqNum))
+        if (destIsLocal && !m_creditManager->ConsumeCredit(entry.vcId, entry.seqNum))
         {
             break;
         }
@@ -1856,27 +2763,87 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     if (deviceIndex >= m_devices.size())
     {
         NS_LOG_ERROR("Invalid device index " << deviceIndex);
+        // The packet will never reach the wire, so ArmRetryTimeoutOnWire
+        // below never runs and an LLR source entry queued for it would keep
+        // no timeout backstop (the retransmission paths cancel the pending
+        // timer until wire transmission). Arm it here as the fallback.
+        ArmRetryTimeoutOnWire(packet);
         return;
     }
+
+    // Prune fired deferred-egress events so the tracking vector stays
+    // bounded (each egress schedules at most one; DoDispose cancels what is
+    // still pending).
+    m_deferredEgressEvents.erase(
+        std::remove_if(m_deferredEgressEvents.begin(), m_deferredEgressEvents.end(),
+                       [](const EventId& ev) { return ev.IsExpired(); }),
+        m_deferredEgressEvents.end());
 
     // DCQCN shaping: fold the per-flow rate-backoff delay into the egress
     // chokepoint. So-only (efficiency < 1.0) data/collective traffic; control,
     // memory, retry, and scale-up traffic are untouched. At alpha=0 (no CNP)
     // ShapingDelay is zero, so the baseline is byte-identical (parity-safe).
+    // ORIGIN-guarded (codex round 24, finding 2): the per-QP pacer/ceiling is
+    // a property of the SENDING NIC. A FORWARDING endpoint re-sends packets
+    // whose SourceRank is the original sender's; keying those on its own
+    // m_rank merges transit traffic onto the forwarder's pacer — on routes
+    // 0->1->2 and 1->2 (shared dest/vc/flow, 49-Gbps ceiling) source 0
+    // finished at 1434 us where the true independent time is 714 us.
+    // ProcessCnpPacket keys on the flow's ORIGIN, so forwarded packets (which
+    // can never receive a CNP for the forwarder's key) are skipped entirely.
     Time shapingDelay = Time(0);
     if (m_dcqcnRate)
     {
         FabricHeader hdr;
         packet->PeekHeader(hdr);
-        if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket())
+        if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket()
+            && hdr.GetSourceRank() == m_rank)
         {
             double eff = GetProtocolModelForDest(hdr.GetDestRank())->GetEfficiency(hdr.GetProtocol());
             if (eff < 1.0)
             {
-                uint64_t flowKey = MakeSeqKey(hdr.GetDestRank(),
-                                             hdr.GetVirtualChannel(),
-                                             hdr.GetFlowId());
+                uint64_t flowKey = MakeRateFlowKey(m_rank,
+                                                  hdr.GetDestRank(),
+                                                  hdr.GetVirtualChannel(),
+                                                  hdr.GetFlowId());
                 shapingDelay = m_dcqcnRate->ShapingDelay(packet->GetSize(), flowKey);
+            }
+        }
+    }
+
+    // RTTCC shaping: RTT-probe-based rate control for So (inter-node) data
+    // traffic, fabric-agnostic — it also covers the plain lossy Ethernet
+    // fabric, whose WireEfficiency==1.0 makes the DCQCN eff<1.0 gate above
+    // unusable and which has no ECN/CNP loop at all. Gated on the dest being
+    // a REMOTE rank (the honest So predicate). The pacer delay composes with
+    // DCQCN via max (both are earliest-egress constraints on the same chunk).
+    // At the line rate (the initial state, before any over-target RTT sample)
+    // ShapingDelay is zero, so the baseline is byte-identical (parity-safe).
+    // Same ORIGIN guard as DCQCN above (codex round 24, finding 2): forwarded
+    // packets carry the original sender's rank, and ProcessRttResponsePacket
+    // samples only self-originated probes — a transit packet must not touch
+    // (or be paced by) the forwarder's per-flow state.
+    if (m_rttccRate)
+    {
+        FabricHeader hdr;
+        packet->PeekHeader(hdr);
+        if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket() &&
+            !IsLocalRank(hdr.GetDestRank()) && hdr.GetSourceRank() == m_rank)
+        {
+            uint64_t flowKey = MakeRateFlowKey(m_rank,
+                                              hdr.GetDestRank(),
+                                              hdr.GetVirtualChannel(),
+                                              hdr.GetFlowId());
+            shapingDelay = std::max(shapingDelay,
+                                    m_rttccRate->ShapingDelay(packet->GetSize(), flowKey));
+            // At most one probe per ProbeInterval rides ahead of the data
+            // chunk it accompanies (probe = control packet: the recursive
+            // SendPacketOnDevice call skips both rate machines).
+            uint32_t probeSeq = 0;
+            if (m_rttccRate->MaybeStartProbe(flowKey, probeSeq))
+            {
+                SendRttProbePacket(hdr.GetDestRank(), hdr.GetVirtualChannel(),
+                                   hdr.GetFlowId(), probeSeq);
             }
         }
     }
@@ -1896,19 +2863,21 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
 
     // Store in LLR retry buffer only for data/collective packets.
     // Control/retry/permanent-loss packets must not pollute retry state.
-    // NVLS/SHARP packets (ALLREDUCE/ALLGATHER) use credit bypass — the
-    // receiver never sends RETRY_ACK, so storing them would leak memory
-    // at 2+ GB/s (256MB × BER retransmissions, never freed). The switch's
-    // SHARP engine handles its own reliability for these packet types.
+    // NVLS/SHARP uploads (ALLREDUCE/ALLGATHER) ARE stored: the switch
+    // consumes them, so the only recovery for a switch-side BER drop is a
+    // retransmission from this endpoint (the switch NACKs the drop and the
+    // sender re-sends from this store; the switch also LLR-acks accepted
+    // uploads so the entry is purged on success). The old exclusion left a
+    // dropped upload unrecoverable — the collective never completed.
+    // Credit accounting is unaffected: these types bypass credit on send,
+    // and the ack-side recovery gate (IsLocalRank of the ack's source) keeps
+    // the credit pool untouched for them.
     if (m_llrEnabled && m_llrManager && !m_isRetransmitting)
     {
         FabricHeader hdr;
         packet->PeekHeader(hdr);
-        FabricPacketType ptype = hdr.GetPacketType();
         if (hdr.GetSourceRank() == m_rank &&
-            !hdr.IsControlPacket() && !hdr.IsRetryPacket() &&
-            ptype != FabricPacketType::ALLREDUCE &&
-            ptype != FabricPacketType::ALLGATHER)
+            !hdr.IsControlPacket() && !hdr.IsRetryPacket())
         {
             m_llrManager->StorePacket(hdr.GetSequenceNumber(), packet, hdr.GetDestRank());
         }
@@ -1947,15 +2916,32 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                              << " numActive=" << numActive
                              << " serviceTime=" << serviceTime.GetNanoSeconds() << "ns"
                              << " encodeLatency=" << encodeLatency.GetNanoSeconds() << "ns");
-                Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, tc]() {
-                    Ptr<NetDevice> dev = m_devices[deviceIndex];
-                    dev->Send(packet, dest, 0x0800);
-                });
-                // Decrement backlog after packet finishes transmission (serialization)
+                m_deferredEgressEvents.push_back(
+                    Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, tc]() {
+                        Ptr<NetDevice> dev = m_devices[deviceIndex];
+                        ArmRetryTimeoutOnWire(packet);
+                        dev->Send(packet, dest, 0x0800);
+                    }));
+                // Decrement backlog after packet finishes transmission
+                // (serialization). Tracked like the deferred send itself:
+                // the lambda captures raw `this`, so DoDispose must cancel
+                // it or it fires on freed memory (codex round 14, finding 1).
+                // Capture the model the INCREMENT ran on (codex round 20,
+                // finding 7): reading m_contentionModel at fire time
+                // dereferences whatever is installed THEN — a mid-flight
+                // SetContentionModel(nullptr) aborts on the null pointer and
+                // a replacement model gets debited for backlog it never
+                // accrued.
+                Ptr<ContentionModel> model = m_contentionModel;
                 Time txDone = totalDelay + serialization;
-                Simulator::Schedule(txDone, [this, tc]() {
-                    m_contentionModel->DecrementBacklog(tc);
+                EventId decrEv = Simulator::Schedule(txDone, [model, tc]() {
+                    if (model)
+                    {
+                        model->DecrementBacklog(tc);
+                    }
                 });
+                m_deferredEgressEvents.push_back(decrEv);
+                TrackBacklogDecrement(decrEv, model, tc);
                 return;
             }
         }
@@ -1968,17 +2954,28 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         Time delay = encodeLatency + shapingDelay;
         if (delay > Seconds(0))
         {
-            Simulator::Schedule(delay, [this, packet, deviceIndex, dest]() {
-                Ptr<NetDevice> device = m_devices[deviceIndex];
-                device->Send(packet, dest, 0x0800);
-            });
-            // Decrement backlog after serialization
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(delay, [this, packet, deviceIndex, dest]() {
+                    Ptr<NetDevice> device = m_devices[deviceIndex];
+                    ArmRetryTimeoutOnWire(packet);
+                    device->Send(packet, dest, 0x0800);
+                }));
+            // Decrement backlog after serialization. Tracked for DoDispose
+            // like the deferred send above (raw-`this` capture; codex round
+            // 14, finding 1). Capture the model the increment ran on
+            // (codex round 20, finding 7 — see the WFQ branch above).
             if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
             {
+                Ptr<ContentionModel> model = m_contentionModel;
                 Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-                Simulator::Schedule(delay + serialization, [this, tc]() {
-                    m_contentionModel->DecrementBacklog(tc);
+                EventId decrEv = Simulator::Schedule(delay + serialization, [model, tc]() {
+                    if (model)
+                    {
+                        model->DecrementBacklog(tc);
+                    }
                 });
+                m_deferredEgressEvents.push_back(decrEv);
+                TrackBacklogDecrement(decrEv, model, tc);
             }
             return;
         }
@@ -1989,23 +2986,82 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     // (parity-identical to the unmounted baseline).
     if (shapingDelay > Time(0))
     {
-        Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest]() {
-            Ptr<NetDevice> dev = m_devices[deviceIndex];
-            dev->Send(packet, dest, 0x0800);
-        });
+        m_deferredEgressEvents.push_back(
+            Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest]() {
+                Ptr<NetDevice> dev = m_devices[deviceIndex];
+                ArmRetryTimeoutOnWire(packet);
+                dev->Send(packet, dest, 0x0800);
+            }));
     }
     else
     {
         Ptr<NetDevice> dev = m_devices[deviceIndex];
+        ArmRetryTimeoutOnWire(packet);
         dev->Send(packet, dest, 0x0800);
     }
     if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
     {
+        // Tracked for DoDispose like the deferred sends above (raw-`this`
+        // capture; codex round 14, finding 1). Capture the model the
+        // increment ran on (codex round 20, finding 7 — see the WFQ branch).
+        Ptr<ContentionModel> model = m_contentionModel;
         Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-        Simulator::Schedule(shapingDelay + serialization, [this, tc]() {
-            m_contentionModel->DecrementBacklog(tc);
+        EventId decrEv = Simulator::Schedule(shapingDelay + serialization, [model, tc]() {
+            if (model)
+            {
+                model->DecrementBacklog(tc);
+            }
         });
+        m_deferredEgressEvents.push_back(decrEv);
+        TrackBacklogDecrement(decrEv, model, tc);
     }
+}
+
+void
+FabricEndpoint::TrackBacklogDecrement(const EventId& ev,
+                                       const Ptr<ContentionModel>& model,
+                                       TrafficClass tc)
+{
+    // Prune entries whose decrement already fired (IsExpired): those
+    // balanced on schedule and retain nothing but ~40 bytes each. Without
+    // pruning the ledger grows monotonically with cumulative traffic —
+    // 10,000 delivered packets leave 10,000 stale entries pinning EventId +
+    //  model references until disposal (codex round 22, finding 5). A fired
+    //  EventId may also alias a REUSED UID after wraparound, which would
+    //  make the disposal balance skip a genuinely pending decrement.
+    std::erase_if(m_pendingBacklogDecrements,
+                  [](const auto& entry) {
+                      return std::get<0>(entry).IsExpired();
+                  });
+    m_pendingBacklogDecrements.push_back({ev, model, tc});
+}
+
+void
+FabricEndpoint::ArmRetryTimeoutOnWire(Ptr<Packet> packet)
+{
+    NS_LOG_FUNCTION(this << packet);
+    // The packet is only now leaving the endpoint. Any LLR retry timer armed
+    // at StorePacket (enqueue) time measured the pacing/contention/FEC hold,
+    // not the network — re-arm so the timeout window starts at first wire
+    // transmission (see ArmRetryTimeoutAtTransmission). No-op for control
+    // packets (never stored) and for entries already ACKed.
+    if (!m_llrEnabled || !m_llrManager)
+    {
+        return;
+    }
+    FabricHeader hdr;
+    if (!packet->PeekHeader(hdr) || hdr.IsControlPacket() || hdr.IsRetryPacket())
+    {
+        return;
+    }
+    if (hdr.GetSourceRank() != m_rank)
+    {
+        return;
+    }
+    m_llrManager->ArmRetryTimeoutAtTransmission(hdr.GetSequenceNumber(),
+                                                hdr.GetDestRank(),
+                                                hdr.GetFlowId(),
+                                                hdr.GetVirtualChannel());
 }
 
 uint32_t
@@ -2042,10 +3098,17 @@ FabricEndpoint::OnPacketDelivered(Ptr<Packet> packet, uint32_t seqNum, FabricHea
 
     FabricPacketType packetType = header.GetPacketType();
     SendLlrAckPacket(header, false);
+    // Return credits only for intra-node (Su) traffic. Scale-out (So) packets
+    // bypassed credit on send (SendBulkWireTransferSize's IsLocalRank guard),
+    // so there is no credit owed back. Returning one for an So packet would
+    // corrupt the Su credit bookkeeping it never consumed from. The
+    // IsLocalRank(sourceRank) predicate is the mirror of the send-side guard;
+    // single-node (m_localRankCount==1) keeps all sources local -> unchanged.
     if ((packetType == FabricPacketType::DATA
          || packetType == FabricPacketType::P2P
          || header.IsCollectivePacket())
-        && header.GetSourceRank() != 0xFFFF)
+        && header.GetSourceRank() != 0xFFFF
+        && IsLocalRank(header.GetSourceRank()))
     {
         SendCreditPacket(header.GetSourceRank(),
                          header.GetVirtualChannel(),
@@ -2108,9 +3171,10 @@ FabricEndpoint::SendDataWithProtocol(uint16_t destRank, const uint8_t* data, uin
 }
 
 void
-FabricEndpoint::SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uint32_t dataSize,
+FabricEndpoint::SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uint64_t dataSize,
                                       uint8_t protocolId, uint16_t flowId, uint8_t vcId)
 {
+    // (data is advisory — the 64-bit path sends dummy bytes by design.)
     (void)data;
     SendBulkWireTransferSize(destRank, dataSize, protocolId, flowId, vcId);
 }
@@ -2120,6 +3184,30 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                                           uint8_t protocolId, uint16_t flowId, uint8_t vcId)
 {
     NS_LOG_FUNCTION(this << destRank << dataSize << static_cast<int>(protocolId) << flowId << vcId);
+
+    // A zero-byte transfer carries nothing: emit no packet and no retry-store
+    // entry. Degenerate chunk grids (dataSize < numGpus) legitimately produce
+    // zero-sized chunks on the ranks past dataSize; letting one reach the
+    // fragment math below divided by wireChunkSize == 0 (LL framing of 0
+    // bytes is 0) and crashed with SIGFPE on multi-lane fabrics
+    // (--numGpus=4 --dataSize=3 --numLanes=18, codex round 17, finding 1).
+    if (dataSize == 0)
+    {
+        NS_LOG_DEBUG("Zero-byte bulk transfer to rank " << destRank << ": skipped");
+        return;
+    }
+
+    // So payload-builder seam: when a dedicated So builder is mounted (inline
+    // runs opting into the RoCE ECN/DCQCN chain via --dcqcn), remote-dest bulk
+    // sends use it together with the So protocol model's own protocol id
+    // (RoceProtocol::SIMPLE) so the wire protocol matches the SoHeader framing
+    // that the switch ECN-mark and receiver CNP-echo guards key on. Su
+    // (local-rank) sends keep the caller's protocol id and the Su builder.
+    Ptr<ProtocolPayloadBuilder> payloadBuilder = GetPayloadBuilderForRank(destRank);
+    if (payloadBuilder != m_payloadBuilder)
+    {
+        protocolId = GetProtocolModelForDest(destRank)->GetProtocolId(dataSize);
+    }
 
     const double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
     const uint64_t wireSize = GetProtocolModelForDest(destRank)->GetWireSize(dataSize, protocolId);
@@ -2139,12 +3227,16 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
     // EthernetSwitch::MarkEcnIfCongested (guard GetProtocol()==SIMPLE),
     // SoHeader::PeekEcn, and SendCnpPacket on real So bulk traffic.
     // NOTE: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1) on the
-    // receive dispatch; the efficiency<1.0 gate in ProcessProtocolDataPacket
-    // keeps Su NVLink LL packets out of this path, so the two byte-1
-    // populations never cross-fire.
+    // receive dispatch; the protocol-framed wire flag stamped only when a
+    // SoHeader is actually present keeps Su NVLink LL packets (framed by the
+    // Su builder but byte-1) out of the So extraction path, so the two
+    // byte-1 populations never cross-fire. Chunks too small to hold the
+    // 10-byte header (wireChunk <= soHeaderSize) stay raw + unframed — the
+    // receiver delivers them through the raw path instead of aborting on a
+    // header deserialize that cannot fit.
     const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
-    const bool stampSoHeader = (efficiency < 1.0) && m_payloadBuilder &&
-        (m_payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
+    const bool stampSoHeader = (efficiency < 1.0) && payloadBuilder &&
+        (payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
 
     std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
     const uint64_t MAX_CHUNK_BYTES = m_bulkChunkSize;
@@ -2161,24 +3253,117 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
 
         uint64_t minChunks = sendDevices.size();
         uint64_t sizeBasedChunks = (wireSize + m_sprayChunkSize - 1) / m_sprayChunkSize;
-        uint64_t numChunks = std::max(minChunks, sizeBasedChunks);
         // Coalesce bulk transfers while retaining at least one chunk per path.
         // Total wire bytes and path striping are unchanged. Queue and credit
         // events occur at this coarser granularity, so this API is reserved for
         // bulk-transfer timing rather than fine-grained contention tests.
+        // numChunks = max(one chunk per path, chunks needed to honor the
+        // bulk cap): a count below memCapChunks emits fragments above
+        // MAX_CHUNK_BYTES, which is how bulkChunkSize < sprayChunkSize broke
+        // the cap (58 KiB fragments over a 4 KiB bulk cap). With the default
+        // bulkChunkSize (8 MiB) > sprayChunkSize this is one chunk per path,
+        // the same coarsening as before. numChunks is bounded above by
+        // wireSize: one 1-byte chunk per wire byte — otherwise trailing
+        // per-lane fragments compute sizes past the transfer end
+        // (wireSize - offset underflows) and emit zero/phantom data bytes.
         uint64_t memCapChunks = (wireSize + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
-        numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
+        uint64_t numChunks = std::max(minChunks, memCapChunks);
+        (void)sizeBasedChunks;
+        numChunks = std::min(numChunks, std::max<uint64_t>(wireSize, 1));
         uint64_t wireChunkSize = (wireSize + numChunks - 1) / numChunks;
-        uint64_t dataChunkSize = (dataSize + numChunks - 1) / numChunks;
+        // Only the first sentChunks fragments are actually emitted (the loops
+        // below skip trailing lane-pad fragments once wireOffset >= wireSize).
+        // Split the data over the fragments that are sent, not over numChunks:
+        // splitting over numChunks can assign trailing data bytes to fragments
+        // that are never emitted (dataSize=400 over 8 GPUs -> 50 B ring
+        // chunks; LL wireSize=128 over numChunks=18 lanes sends 16 fragments
+        // but ceil(50/18)=3 B each -> 48 of 50 effective bytes delivered,
+        // stalling the receiver). dataSize <= wireSize (efficiency <= 1)
+        // keeps dataChunkSize <= wireChunkSize, so the last sent fragment
+        // still fits its wire budget, and skipped fragments get zero data.
+        // Identical to the old numChunks split whenever every fragment is
+        // sent (the regime all calibrated runs live in).
+        uint64_t sentChunks = (wireSize + wireChunkSize - 1) / wireChunkSize;
+        uint64_t dataChunkSize = (dataSize + sentChunks - 1) / sentChunks;
 
+        // So TX window (perftest tx_depth analog): bound the number of
+        // in-flight chunks instead of dispatching the whole message
+        // synchronously at t=0. Chunk descriptors queue here; seqNums are
+        // assigned at dispatch (FIFO, so send order == seq order). The window
+        // is ACK-clocked: ProcessAckPacket releases a slot when the per-packet
+        // LLR ACK purges the retry store. So-only (remote rank, no credit
+        // interaction); 0 = legacy unbounded path below (parity default).
+        // This also moves StorePacket (and its retry-timer arming) to the
+        // window-gated dispatch instant, so the LLR retry timeout can be
+        // RTT-scale instead of whole-transfer-scale.
+        if (m_soTxWindow > 0 && !IsLocalRank(destRank))
+        {
+            // Only fragments that still carry data bytes are emitted. The two
+            // skips below are load-bearing in opposite directions:
+            // - wireOffset >= wireSize: trailing lane-pad fragment past the
+            //   wire end (wireSize - wireOffset would underflow).
+            // - dataOffset >= dataSize: trailing wire-padding fragment. It
+            //   carries zero effective bytes, and a zero-effectiveDataSize
+            //   header is NOT inert on the receive side — receivers read
+            //   effectiveDataSize==0 as "the whole packet" (protocol-config-
+            //   runner.cc / the collective injectors), so a padding-only
+            //   fragment over-counts and can complete a transfer early. Its
+            //   wire bytes are pure protocol padding; dropping the fragment
+            //   keeps the effective-byte ledger exact and the wire smaller.
+            //   dataSize <= wireSize guarantees at least one fragment carries
+            //   data, so this never skips the whole transfer.
+            for (uint64_t i = 0; i < numChunks; i++)
+            {
+                uint64_t wireOffset = i * wireChunkSize;
+                if (wireOffset >= wireSize)
+                {
+                    continue; // trailing lane-pad fragment past the wire end
+                }
+                uint64_t dataOffset = i * dataChunkSize;
+                if (dataOffset >= dataSize)
+                {
+                    break; // wire-padding fragment: no data bytes left to send
+                }
+                BulkTxChunk desc;
+                desc.destRank = destRank;
+                desc.flowId = flowId;
+                desc.vcId = vcId;
+                desc.protocolId = protocolId;
+                desc.wireChunk = static_cast<uint32_t>(
+                    std::min(wireChunkSize, wireSize - wireOffset));
+                desc.fragmentDataSize = static_cast<uint32_t>(
+                    std::min(dataChunkSize, dataSize - dataOffset));
+                desc.chunkIndex = static_cast<uint32_t>(i);
+                desc.deviceIndex = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
+                desc.stamp = stampSoHeader && (desc.wireChunk > soHeaderSize);
+                m_bulkTxQueue.push_back(desc);
+            }
+            m_globalSprayOffset = static_cast<uint32_t>(
+                (m_globalSprayOffset + numChunks) % sendDevices.size());
+            PumpBulkTxWindow();
+            return;
+        }
+
+        // Same fragment skips as the windowed path above: stop at the first
+        // fragment past the data end (wire padding carries no bytes and a
+        // zero-effectiveDataSize header over-counts on the receive side), and
+        // skip fragments past the wire end.
         for (uint64_t i = 0; i < numChunks; i++)
         {
             uint64_t wireOffset = i * wireChunkSize;
+            if (wireOffset >= wireSize)
+            {
+                continue; // trailing lane-pad fragment past the transfer end
+            }
             uint32_t thisWireChunk = static_cast<uint32_t>(
                 std::min(wireChunkSize, wireSize - wireOffset));
 
             // Ensure fragment effectiveDataSize sums to original dataSize
             uint64_t dataOffset = i * dataChunkSize;
+            if (dataOffset >= dataSize)
+            {
+                break; // wire-padding fragment: no data bytes left to send
+            }
             uint32_t fragmentDataSize = static_cast<uint32_t>(
                 std::min(dataChunkSize, dataSize - dataOffset));
 
@@ -2211,11 +3396,19 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             header.SetSourceMac(m_address);
             header.SetDestMac(ResolveDestMac(destRank));
             header.SetProtocol(stamp ? protocolId : 0);
+            header.SetProtocolFramed(stamp);
             header.SetEffectiveDataSize(fragmentDataSize);
             header.SetTtl(64);
 
-            // Credit-based flow control: check and consume credits before sending
-            if (m_creditManager && !m_creditManager->HasCredits(vcId))
+            // Credit-based flow control: check and consume credits before sending.
+            // Scale-out (So) traffic bypasses credit: inter-node fabric uses
+            // ECN/DCQCN (RoCE) or VOQ tail-drop + LLR retransmit (Ethernet) for
+            // flow control, not per-packet credits. The Su/So split mirrors
+            // GetProtocolModelForDest's IsLocalRank() predicate. So packets
+            // never queue on credit (they'd deadlock since no credit is ever
+            // returned for So -- see OnPacketDelivered). Su (local rank)
+            // keeps full credit gating, unchanged.
+            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
             {
                 NS_LOG_DEBUG("No credits for BULK chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -2231,9 +3424,17 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                 for (uint64_t j = i + 1; j < numChunks; j++)
                 {
                     uint64_t remWireOffset = j * wireChunkSize;
+                    if (remWireOffset >= wireSize)
+                    {
+                        continue; // trailing lane-pad fragment past the transfer end
+                    }
                     uint32_t remWireChunk = static_cast<uint32_t>(
                         std::min(wireChunkSize, wireSize - remWireOffset));
                     uint64_t remDataOffset = j * dataChunkSize;
+                    if (remDataOffset >= dataSize)
+                    {
+                        break; // wire-padding fragment: no data bytes left to send
+                    }
                     uint32_t remFragmentData = static_cast<uint32_t>(
                         std::min(dataChunkSize, dataSize - remDataOffset));
                     uint64_t remSeqKey = MakeSeqKey(destRank, vcId, flowId);
@@ -2255,6 +3456,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     remHeader.SetSourceMac(m_address);
                     remHeader.SetDestMac(ResolveDestMac(destRank));
                     remHeader.SetProtocol(remStamp ? protocolId : 0);
+                    remHeader.SetProtocolFramed(remStamp);
                     remHeader.SetEffectiveDataSize(remFragmentData);
                     remHeader.SetTtl(64);
 
@@ -2279,7 +3481,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                 TrySendQueuedPackets();
                 break;
             }
-            if (m_creditManager)
+            if (m_creditManager && IsLocalRank(destRank))
             {
                 m_creditManager->ConsumeCredit(vcId, seqNum);
             }
@@ -2330,11 +3532,14 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         header.SetSourceMac(m_address);
         header.SetDestMac(ResolveDestMac(destRank));
         header.SetProtocol(stamp ? protocolId : 0);
+        header.SetProtocolFramed(stamp);
         header.SetEffectiveDataSize(static_cast<uint32_t>(dataSize));
         header.SetTtl(64);
 
-        // Credit-based flow control: check and consume credits before sending
-        if (m_creditManager && !m_creditManager->HasCredits(vcId))
+        // Credit-based flow control: check and consume credits before sending.
+        // So (inter-node) traffic bypasses credit (see multi-chunk branch
+        // above for the rationale); Su (local rank) keeps full gating.
+        if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
         {
             NS_LOG_DEBUG("No credits for BULK single packet on VC " << static_cast<int>(vcId));
             SendQueueEntry entry;
@@ -2346,7 +3551,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             TrySendQueuedPackets();
             return;
         }
-        if (m_creditManager)
+        if (m_creditManager && IsLocalRank(destRank))
         {
             m_creditManager->ConsumeCredit(vcId, seqNum);
         }
@@ -2388,11 +3593,43 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
                  << " wireSize=" << packet->GetSize()
                  << " effectiveSize=" << effectiveSize);
 
-    // Check if this protocol has no overhead
-    double efficiency = GetProtocolModelForDest(header.GetSourceRank())->GetEfficiency(protocolId);
-    if (efficiency >= 1.0)
+    // Check if this packet actually carries a framed payload. Deliver
+    // directly through the receive pipeline (reorder buffer / bypass
+    // delivery) when it does not — do NOT recurse through ProcessDataPacket:
+    // it dispatches on the same wire flag and would route straight back
+    // here, recursing until the stack overflows. The efficiency re-check the
+    // flag replaced had exactly this shape: a framed-marked packet from an
+    // efficiency-1.0 model (MCCL SIMPLE with WireEfficiency=1.0, raw NCCL
+    // NONE) takes this direct-delivery arm; framed packets (efficiency<1.0
+    // models, a stamped builder header) fall through to ExtractData.
+    if (!header.IsProtocolFramed())
     {
-        ProcessDataPacket(packet, header);
+        uint8_t vcId = header.GetVirtualChannel();
+        uint16_t flowId = header.GetFlowId();
+        if (m_bypassReorderBuffer)
+        {
+            DeliverBypassDataPacket(packet, header);
+        }
+        else
+        {
+            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                             header.GetSourceRank());
+            bool inserted = rb->Insert(header.GetSequenceNumber(), packet, header);
+            rb->DeliverReadyPackets();
+            if (!inserted && rb->IsDuplicate(header.GetSequenceNumber()))
+            {
+                // A rejected DUPLICATE (a retransmission of an
+                // already-delivered seq, or of one still parked in the
+                // reorder buffer): the original delivery's ACK may have been
+                // lost, and without this re-ACK the sender's LLR store entry
+                // is never purged — the retry-timer backstop retransmits
+                // forever and the entry degrades into a false permanent loss
+                // for data the receiver already holds. Same gate as the raw
+                // DATA reorder path: a capacity-rejected FUTURE seq is not a
+                // duplicate and rides the sender's retry timer instead.
+                SendLlrAckPacket(header, false);
+            }
+        }
         return;
     }
 
@@ -2402,9 +3639,9 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
     // outermost and PeekEcn reads it directly. Peek (non-mutating) so the
     // SoHeader is still present for ExtractData below. The fabric-type gate is
     // load-bearing: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1),
-    // and Su LL/LL128 packets (efficiency<1.0, no SoHeader) would otherwise
-    // reach here and PeekEcn would read 10 B of NCCL payload as a SoHeader
-    // (spurious CNP). Only RoCE-fabric (So) packets carry a SoHeader.
+    // and Su LL/LL128 packets (framed, but not SoHeader-framed) would
+    // otherwise reach here and PeekEcn would read 10 B of NCCL payload as a
+    // SoHeader (spurious CNP). Only RoCE-fabric (So) packets carry a SoHeader.
     if (header.GetFabricType() == FabricType::ROCE &&
         protocolId == static_cast<uint8_t>(RoceProtocol::SIMPLE) &&
         SoHeader::PeekEcn(packet))
@@ -2412,10 +3649,12 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
         SendCnpPacket(header);
     }
 
-    // Extract pure data from protocol-aware payload
+    // Extract pure data from protocol-aware payload (So sources use the So
+    // builder when one is mounted -- matches the send-side framing split)
     std::vector<uint8_t> extractedData(effectiveSize);
-    uint64_t extracted = m_payloadBuilder->ExtractData(packet, protocolId,
-                                                        extractedData.data(), effectiveSize);
+    uint64_t extracted = GetPayloadBuilderForRank(header.GetSourceRank())
+                             ->ExtractData(packet, protocolId,
+                                           extractedData.data(), effectiveSize);
 
     if (extracted > 0)
     {
@@ -2428,15 +3667,29 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
 
         if (m_bypassReorderBuffer)
         {
-            // Deliver directly
-            OnPacketDelivered(dataPacket, header.GetSequenceNumber(), header);
+            // Same bypass pipeline as raw DATA packets: strict-GBN acceptance
+            // and duplicate suppression (a retransmitted So segment must not
+            // deliver twice).
+            DeliverBypassDataPacket(dataPacket, header);
         }
         else
         {
             // Use reorder buffer
-            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId);
-            rb->Insert(header.GetSequenceNumber(), dataPacket, header);
+            Ptr<ReorderBuffer> rb = GetOrCreateReorderBuffer(vcId, flowId,
+                                                             header.GetSourceRank());
+            bool inserted = rb->Insert(header.GetSequenceNumber(), dataPacket, header);
             rb->DeliverReadyPackets();
+            if (!inserted && rb->IsDuplicate(header.GetSequenceNumber()))
+            {
+                // Re-ACK a rejected duplicate exactly like the raw DATA
+                // reorder path (above) and ProcessDataPacket: a retransmitted
+                // LL/LL128 segment whose original delivery's ACK was lost
+                // must still purge the sender's LLR store entry, or the retry
+                // timer runs out and records a false permanent loss for data
+                // the receiver already delivered. A capacity-rejected future
+                // seq is not a duplicate and is not ACKed.
+                SendLlrAckPacket(header, false);
+            }
         }
 
     }

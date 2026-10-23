@@ -19,9 +19,11 @@
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/mccl-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
+#include "ns3/ethernet-protocol-model.h"
 #include "ns3/roce-payload-builder.h"
 #include "ns3/so-header.h"
 #include "ns3/dcqcn-rate-machine.h"
+#include "ns3/rttcc-rate-machine.h"
 #include "ns3/nccl-protocol-payload-builder.h"
 #include "ns3/protocol-transaction.h"
 #include "ns3/packet.h"
@@ -35,9 +37,12 @@
 #include "ns3/gpu-cluster-helper.h"
 #include "ns3/protocol-profile.h"
 #include "ns3/protocol-config.h"
+#include "ns3/protocol-config-runner.h"
 #include "ns3/flow-control-policy.h"
 #include "ns3/arbiter.h"
 #include "ns3/nvswitch.h"
+#include "ns3/hybrid-topology-helper.h"
+#include "ns3/hierarchical-alltoall.h"
 #include "ns3/fabric-switch.h"
 #include "ns3/ethernet-switch.h"
 #include "ns3/object-factory.h"
@@ -45,6 +50,7 @@
 #include "ns3/protocol-model.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/ring-allreduce.h"
+#include "ns3/nccl-ring-allreduce.h"
 #include "ns3/ring-allgather.h"
 #include "ns3/ring-reducescatter.h"
 #include "ns3/ring-broadcast.h"
@@ -53,8 +59,11 @@
 #include "ns3/nvls-allgather.h"
 #include "ns3/fullmesh-allreduce.h"
 #include "ns3/fullmesh-allgather.h"
+#include "ns3/fullmesh-reducescatter.h"
 #include "ns3/alltoall-injector.h"
 #include "ns3/hierarchical-allreduce.h"
+#include "ns3/hierarchical-allgather.h"
+#include "ns3/hierarchical-reducescatter.h"
 #include "ns3/mccl-payload-builder.h"
 #include "ns3/ub-payload-builder.h"
 #include "ns3/ub-protocol-model.h"
@@ -64,11 +73,44 @@
 #include "ns3/point-to-point-helper.h"
 #include "ns3/ppp-header.h"
 #include "ns3/net-device-container.h"
+#include "ns3/error-model.h"
+#include "ns3/string.h"
 
+#include <array>
 #include <fstream>
 #include <functional>
+#include <memory>
 
 using namespace ns3;
+
+// Drops the FIRST packet that crosses the attached device; everything after
+// passes. Used to reproduce one-shot wire loss deterministically (no RNG).
+class DropFirstErrorModel : public ErrorModel
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("DropFirstErrorModel")
+                                .SetParent<ErrorModel>()
+                                .SetGroupName("gpu-cluster-test");
+        return tid;
+    }
+    bool DoCorrupt(Ptr<Packet> p) override
+    {
+        if (m_dropped == 0)
+        {
+            m_dropped++;
+            return true;
+        }
+        return false;
+    }
+    void DoReset() override
+    {
+    }
+
+  private:
+    uint32_t m_dropped = 0;
+};
 
 /**
  * @brief Test case for FabricHeader serialization and deserialization
@@ -144,6 +186,22 @@ FabricHeaderTest::TestHeaderSerialization()
     // Verify MAC addresses
     NS_TEST_EXPECT_MSG_EQ(receivedHeader.GetSourceMac(), Mac48Address("00:11:22:33:44:55"), "Source MAC mismatch");
     NS_TEST_EXPECT_MSG_EQ(receivedHeader.GetDestMac(), Mac48Address("66:77:88:99:AA:BB"), "Dest MAC mismatch");
+
+    // The protocol-framed flag rides bit 7 of the virtualLane byte and must
+    // survive serialization; the low bits (the lane itself) are untouched.
+    header.SetProtocolFramed(true);
+    NS_TEST_EXPECT_MSG_EQ(header.GetSerializedSize(), 39,
+                          "Framed flag must not change the 39-byte wire layout");
+    Ptr<Packet> framedPacket = Create<Packet>();
+    framedPacket->AddHeader(header);
+    FabricHeader framedHeader;
+    framedPacket->RemoveHeader(framedHeader);
+    NS_TEST_EXPECT_MSG_EQ(framedHeader.IsProtocolFramed(), true,
+                          "Framed flag must survive serialization");
+    framedHeader.SetProtocolFramed(false);
+    NS_TEST_EXPECT_MSG_EQ(framedHeader.IsProtocolFramed(), false,
+                          "Framed flag must clear cleanly");
+    NS_TEST_EXPECT_MSG_EQ(header.GetVirtualChannel(), 3, "VC unchanged by framed flag");
 }
 
 void
@@ -259,6 +317,17 @@ FabricHeaderTest::TestPacketTypeClassification()
     NS_TEST_EXPECT_MSG_EQ(header.GetVirtualLane(), 0, "Default virtual lane is 0");
     header.SetVirtualLane(3);
     NS_TEST_EXPECT_MSG_EQ(header.GetVirtualLane(), 3, "Virtual lane set to 3");
+
+    // The protocol-framed flag (bit 7 of the lane byte) coexists with the
+    // low lane bits and defaults to false.
+    header.SetVirtualLane(0);
+    NS_TEST_EXPECT_MSG_EQ(header.IsProtocolFramed(), false, "Framed flag defaults false");
+    header.SetProtocolFramed(true);
+    NS_TEST_EXPECT_MSG_EQ(header.GetVirtualLane(), 0,
+                          "Framed flag must not disturb the lane value");
+    header.SetVirtualLane(3);
+    NS_TEST_EXPECT_MSG_EQ(header.IsProtocolFramed(), true,
+                          "Lane set must not disturb the framed flag");
 }
 
 /**
@@ -1129,6 +1198,67 @@ class RoceProtocolModelTest : public TestCase
 };
 
 /**
+ * @brief Test case for the plain (non-RoCE) Ethernet protocol model constants.
+ *
+ * Mirrors RoceProtocolModelTest. The defining contrast is WireEfficiency=1.0
+ * (no SoHeader, no wire expansion -- vs RoCE's 0.95/1053) and protocol id 0
+ * (NONE -- no EthernetProtocol enum, so the non-bulk SendDataAutoProtocol path
+ * stamps protocol=0 and cannot collide with NcclProtocol::LL=1).
+ */
+class EthernetProtocolModelTest : public TestCase
+{
+  public:
+    EthernetProtocolModelTest()
+        : TestCase("Plain Ethernet protocol parameters")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<EthernetProtocolModel> model = CreateObject<EthernetProtocolModel>();
+        const uint8_t none = 0; // no EthernetProtocol enum; id is always NONE
+
+        // Spec/NIC-derived defaults (uncalibrated: no perftest ground truth for
+        // plain Ethernet, unlike RoCE's ib_write_lat).
+        NS_TEST_EXPECT_MSG_EQ(model->GetProtocolId(1024),
+                              none,
+                              "Plain Ethernet has no line protocol (NONE)");
+        NS_TEST_EXPECT_MSG_EQ(model->GetStartupDelayNs(none),
+                              1500,
+                              "Default plain-Ethernet NIC-driver startup (1.5us)");
+        NS_TEST_EXPECT_MSG_EQ(model->GetPerStepLatencyNs(none),
+                              800,
+                              "Default plain-Ethernet store-and-forward per-hop latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetChunkSize(none),
+                              9 * 1024,
+                              "Default plain-Ethernet segment size (jumbo MTU)");
+        // WireEfficiency=1.0: no expansion (contrast RoCE's ceil(1000/0.95)=1053).
+        NS_TEST_EXPECT_MSG_EQ(model->GetWireSize(1000, none),
+                              1000,
+                              "Plain Ethernet carries no SoHeader overhead");
+        NS_TEST_EXPECT_MSG_EQ_TOL(model->GetEfficiency(none),
+                                  1.0,
+                                  1e-12,
+                                  "Plain Ethernet wire efficiency is 1.0 (no SoHeader)");
+        NS_TEST_EXPECT_MSG_EQ(model->GetVendorName(),
+                              std::string("Ethernet-PLAIN"),
+                              "Plain Ethernet vendor name");
+
+        // Memory-semantic latencies (same shape as RoCE; unconsumed on the bulk
+        // P2P path but kept for GetMemoryLatencyNs parity).
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::SYNC_LOAD_STORE),
+                              1000,
+                              "Plain Ethernet synchronous NIC load/store latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::ASYNC_URMA),
+                              5000,
+                              "Plain Ethernet asynchronous remote memory access latency");
+        NS_TEST_EXPECT_MSG_EQ(model->GetMemoryLatencyNs(MemoryAccessType::DMA_BULK),
+                              0,
+                              "Plain Ethernet bulk DMA latency modeled on the wire");
+    }
+};
+
+/**
  * @brief Test case for the RoCE v2 RDMA payload builder (8B header + round-trip).
  */
 class RocePayloadBuilderTest : public TestCase
@@ -1742,7 +1872,7 @@ class LlrManagerTest : public TestCase
         uint16_t destRank;
         uint16_t flowId;
     };
-    void OnTimeoutCallback(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    void OnTimeoutCallback(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId);
     std::vector<TimeoutRecord> m_timeoutCallbacks;
 };
 
@@ -1750,9 +1880,10 @@ LlrManagerTest::LlrManagerTest() : TestCase("LlrManager") {}
 LlrManagerTest::~LlrManagerTest() {}
 
 void
-LlrManagerTest::OnTimeoutCallback(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+LlrManagerTest::OnTimeoutCallback(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId)
 {
     m_timeoutCallbacks.push_back({seqNum, destRank, flowId});
+    (void)vcId;
 }
 
 void
@@ -1780,7 +1911,7 @@ LlrManagerTest::TestGoBackN()
     }
 
     // Go-Back-N from seqNum=3: should retransmit 3, 4, 5
-    auto retransmits = llr->HandleRetryRequest(3, 1, 0);
+    auto retransmits = llr->HandleRetryRequest(3, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 3u, "GBN: retransmit 3 packets from seqNum=3");
 }
 
@@ -1799,7 +1930,7 @@ LlrManagerTest::TestSack()
 
     // SACK: only retransmit seqNums 2 and 4
     std::unordered_set<uint32_t> nackSet{2, 4};
-    auto retransmits = llr->HandleSackRequest(nackSet, 1, 0);
+    auto retransmits = llr->HandleSackRequest(nackSet, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 2u, "SACK: retransmit only 2 NACKed packets");
 }
 
@@ -1813,15 +1944,15 @@ LlrManagerTest::TestRetryLimit()
     llr->StorePacket(1, pkt, 1);
 
     // Retry twice (retryCount goes to 1, then 2)
-    auto r1 = llr->HandleRetryRequest(1, 1, 0);
+    auto r1 = llr->HandleRetryRequest(1, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(r1.size(), 1u, "First retry succeeds");
 
-    auto r2 = llr->HandleRetryRequest(1, 1, 0);
+    auto r2 = llr->HandleRetryRequest(1, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(r2.size(), 1u, "Second retry succeeds");
 
     // Third retry should exceed limit (retryCount=3 > limit=2)
     // Entry is erased from buffer and permanent loss callback fires
-    auto r3 = llr->HandleRetryRequest(1, 1, 0);
+    auto r3 = llr->HandleRetryRequest(1, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(r3.size(), 0u, "Third retry exceeds limit");
     NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 0u, "Buffer empty after retry exhaustion");
 }
@@ -1865,7 +1996,7 @@ LlrManagerTest::TestBufferOverflow()
                           "Evicted packet remains reconstructable from its source");
 
     std::unordered_set<uint32_t> evictedSeq{1};
-    auto reloaded = llr->HandleSackRequest(evictedSeq, 1, 0);
+    auto reloaded = llr->HandleSackRequest(evictedSeq, 1, 0, 0);
     NS_TEST_EXPECT_MSG_EQ(reloaded.size(), 1u, "Evicted packet is reconstructed");
     NS_TEST_EXPECT_MSG_EQ(reloaded[0].sourceReload, true,
                           "Evicted packet uses the source-reload path");
@@ -1924,14 +2055,14 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 2u, "Both entries present before retry");
 
         // Retry request for dest=1, flow=0, sourceRank=1 — should only retransmit dest 1's packet
-        auto retransmits1 = llr->HandleRetryRequest(10, 1, 0);
+        auto retransmits1 = llr->HandleRetryRequest(10, 1, 0, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits1.size(), 1u, "GBN: dest=1 retransmits 1 packet, not dest=2's");
 
         // Both entries still in buffer (HandleRetryRequest doesn't remove, only retransmits)
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 2u, "Both entries still in buffer after retry");
 
         // Retry request for dest=2, flow=0, sourceRank=2 — should only retransmit dest 2's packet
-        auto retransmits2 = llr->HandleRetryRequest(10, 2, 0);
+        auto retransmits2 = llr->HandleRetryRequest(10, 2, 0, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits2.size(), 1u, "GBN: dest=2 retransmits 1 packet, not dest=1's");
     }
 
@@ -1950,7 +2081,7 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 1u, "Only dest=2 entry remains after RemovePacketsUpTo on dest=1");
 
         // Survivor identity: the remaining entry is for dest=2, flow=0, seq=5
-        auto retransmits = llr->HandleRetryRequest(5, 2, 0);
+        auto retransmits = llr->HandleRetryRequest(5, 2, 0, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 1u, "Survivor (dest=2) retransmitted");
         if (retransmits.size() == 1)
         {
@@ -1977,7 +2108,7 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 1u, "Only dest=2 entry remains after SACK ack on dest=1");
 
         // Survivor identity: the remaining entry is for dest=2, flow=7, seq=3
-        auto retransmits = llr->HandleRetryRequest(3, 2, 7);
+        auto retransmits = llr->HandleRetryRequest(3, 2, 7, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 1u, "Survivor (dest=2, SACK) retransmitted");
         if (retransmits.size() == 1)
         {
@@ -2002,7 +2133,7 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 1u, "dest=3 entry removed, dest=4 remains");
 
         // Survivor identity: the remaining entry is for dest=4, flow=5, seq=42
-        auto retransmits = llr->HandleRetryRequest(42, 4, 5);
+        auto retransmits = llr->HandleRetryRequest(42, 4, 5, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 1u, "Survivor (dest=4) retransmitted");
         if (retransmits.size() == 1)
         {
@@ -2028,7 +2159,7 @@ LlrManagerTest::TestCrossDestinationIsolation()
         NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 1u, "flow=20 entry still present after flow=10 removal");
 
         // Survivor identity: the remaining entry is for dest=1, flow=20
-        auto retransmits = llr->HandleRetryRequest(1, 1, 20);
+        auto retransmits = llr->HandleRetryRequest(1, 1, 20, 0);
         NS_TEST_EXPECT_MSG_EQ(retransmits.size(), 1u, "Survivor (flow=20) retransmitted");
         if (retransmits.size() == 1)
         {
@@ -2063,9 +2194,14 @@ LlrManagerTest::TestTimeoutCallbackIsolation()
     llr->SetRetryTimeout(NanoSeconds(1));
     llr->SetTimeoutCallback(MakeCallback(&LlrManagerTest::OnTimeoutCallback, this));
 
-    // Store two packets with same seqNum/flowId but different destRanks
+    // Store two packets with same seqNum/flowId but different destRanks, then
+    // simulate each hitting the wire (a bare manager has no endpoint pacing
+    // the egress, so the wire-arming call is made explicitly — the timeout
+    // countdown starts at first transmission, not at enqueue).
     llr->StorePacket(100, makePacket(1, 5), 1);  // seq=100, flow=5, dest=1
     llr->StorePacket(100, makePacket(2, 5), 2);  // seq=100, flow=5, dest=2
+    llr->ArmRetryTimeoutAtTransmission(100, 1, 5);
+    llr->ArmRetryTimeoutAtTransmission(100, 2, 5);
 
     NS_TEST_EXPECT_MSG_EQ(llr->GetBufferSize(), 2u, "Both entries stored before Run");
 
@@ -2097,6 +2233,8 @@ LlrManagerTest::TestTimeoutCallbackIsolation()
 
         llr2->StorePacket(200, makePacket(3, 7), 3);  // seq=200, flow=7, dest=3
         llr2->StorePacket(200, makePacket(4, 7), 4);  // seq=200, flow=7, dest=4
+        llr2->ArmRetryTimeoutAtTransmission(200, 3, 7);
+        llr2->ArmRetryTimeoutAtTransmission(200, 4, 7);
 
         NS_TEST_EXPECT_MSG_EQ(llr2->GetBufferSize(), 2u, "Both entries stored before cancellation");
 
@@ -3982,6 +4120,114 @@ class EthernetSwitchEcnTest : public TestCase
     }
 };
 
+/**
+ * @brief Test case for the EthernetSwitch lossy VOQ tail-drop + NACK decision.
+ *
+ * Mirrors EthernetSwitchEcnTest's no-port + public-seam pattern: the lossy drop
+ * is the OPPOSITE of RoCE's lossless ECN mark. OnPacketEnqueue is public on
+ * EthernetSwitch (overriding the protected NvSwitch base) so the drop decision
+ * is unit-testable without driving the full datapath. EmitNackBack gates on
+ * m_llrEnabled (off here) then returnPort<m_ports.size(); with no ports wired
+ * it is a safe no-op -- the test asserts the DROP DECISION (return false/true),
+ * not the NACK egress (covered by the e2e incast run).
+ */
+class EthernetSwitchDropTest : public TestCase
+{
+  public:
+    EthernetSwitchDropTest()
+        : TestCase("EthernetSwitch lossy VOQ tail-drop (plain Ethernet + "
+                   "lossy-RoCE opt-in)") {}
+    void DoRun() override
+    {
+        Ptr<EthernetSwitch> sw = CreateObject<EthernetSwitch>();
+        // Small deterministic threshold; EcnThreshold stays at default 8. The
+        // at-threshold drop (2) and the lossy-RoCE drop (3) both fire before
+        // ECN marking is consulted.
+        sw->SetAttribute("VoqDropThreshold", UintegerValue(4));
+
+        // Plain-Ethernet DATA = [FabricHeader(DATA, ETHERNET, proto=0)][payload].
+        // NO inner SoHeader -- the defining contrast to RoCE (efficiency=1.0 so
+        // SendBulkWireTransferSize stamps no SoHeader).
+        auto makeEthData = []() {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0); // NONE (no EthernetProtocol enum)
+            pkt->AddHeader(fh);
+            return pkt;
+        };
+
+        // (1) Shallow queue (depth 2 < threshold 4): admit (return true).
+        Ptr<Packet> shallow = makeEthData();
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(shallow, 0, 1, 2), true,
+                              "below-threshold Ethernet DATA must be admitted");
+
+        // (2) At-threshold (depth 4 >= 4): tail-drop + NACK (return false). The
+        // lossy path -- the opposite of RoCE's lossless ECN mark.
+        Ptr<Packet> deep = makeEthData();
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(deep, 0, 1, 4), false,
+                              "at-threshold Ethernet DATA must be tail-dropped (lossy)");
+
+        // (3) RoCE DATA at deep queue (depth 10): tail-dropped too -- a
+        // nonzero VoqDropThreshold opts RoCE into the lossy-RoCE (no-PFC)
+        // regime where tail-drop + NACK->LLR retransmit coexists with ECN
+        // marking (mark-before-drop: ecnThreshold 8 < drop threshold 4 here is
+        // inverted, but the drop decision is what this unit pins). Guards the
+        // opt-in: the scratch RoCE path leaves the threshold at its lossless
+        // default (0) unless the user passes --voqDropThreshold explicitly.
+        Ptr<Packet> roce = Create<Packet>(64);
+        SoHeader soh;
+        soh.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        soh.SetEcn(false);
+        soh.SetDataSize(64);
+        roce->AddHeader(soh);
+        FabricHeader rfh;
+        rfh.SetPacketType(FabricPacketType::DATA);
+        rfh.SetFabricType(FabricType::ROCE);
+        rfh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        roce->AddHeader(rfh);
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(roce, 0, 1, 10), false,
+                              "RoCE DATA must be tail-dropped when "
+                              "VoqDropThreshold opts into lossy RoCE");
+
+        // (4) CREDIT control packet at deep queue: bypass (return true) --
+        // dropping control feedback would deadlock the credit loop, matching
+        // the BER bypass.
+        Ptr<Packet> ctrl = Create<Packet>(16);
+        FabricHeader cfh;
+        cfh.SetPacketType(FabricPacketType::CREDIT);
+        cfh.SetFabricType(FabricType::ETHERNET);
+        ctrl->AddHeader(cfh);
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(ctrl, 0, 1, 10), true,
+                              "CREDIT control packet must bypass the lossy drop");
+
+        // (5) VoqDropThreshold=0 = lossless (disabled): both an Ethernet and a
+        // RoCE DATA packet at a deep queue are admitted (return true). Guards
+        // the documented "0=off" semantics -- without the early-return guard,
+        // voqDepth >= 0 would tail-drop every packet (a total-stall foot-gun)
+        // -- and the RoCE lossless default that keeps the scratch RoCE path
+        // byte-identical unless the user opts in.
+        sw->SetAttribute("VoqDropThreshold", UintegerValue(0));
+        Ptr<Packet> disabled = makeEthData();
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(disabled, 0, 1, 10), true,
+                              "VoqDropThreshold=0 (lossless) must admit Ethernet DATA");
+        Ptr<Packet> roceLossless = Create<Packet>(64);
+        SoHeader soh0;
+        soh0.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        soh0.SetEcn(false);
+        soh0.SetDataSize(64);
+        roceLossless->AddHeader(soh0);
+        FabricHeader rfh0;
+        rfh0.SetPacketType(FabricPacketType::DATA);
+        rfh0.SetFabricType(FabricType::ROCE);
+        rfh0.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        roceLossless->AddHeader(rfh0);
+        NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(roceLossless, 0, 1, 10), true,
+                              "VoqDropThreshold=0 (lossless) must admit RoCE DATA");
+    }
+};
+
 // A FabricEndpoint subclass that exposes the protected receive dispatch for
 // test injection. Mirrors EndpointFlowControlOverride's pattern.
 class CnpTestEndpoint : public FabricEndpoint
@@ -4012,6 +4258,170 @@ class CnpTestEndpoint : public FabricEndpoint
 
 NS_OBJECT_ENSURE_REGISTERED(CnpTestEndpoint);
 
+// Receive dispatch routes by the wire-level protocol-framed flag, not by the
+// handling model's efficiency. Two codex-reproduced regressions the efficiency
+// gate caused (round 11, finding 1):
+//   (a) RoCE, dataSize=8: SendBulkWireTransferSize's stamp guard requires
+//       wireChunk > 10 (the SoHeader size); ceil(8/0.95)=9 stays raw. The
+//       efficiency-gated receiver still peeled a SoHeader off 9 bytes and
+//       NS_ASSERT-aborted in Buffer::Iterator.
+//   (b) UB model mounted: public SendData sends raw (no builder framing);
+//       the efficiency-gated receiver stripped a 16-byte UB transaction
+//       header that was never stamped -- 64 payload bytes delivered as 48.
+// The flag makes send/receive gates provably match: it is set exactly where
+// a builder header is stamped, and nowhere else.
+class ProtocolFramedDispatchTest : public TestCase
+{
+  public:
+    ProtocolFramedDispatchTest()
+        : TestCase("Receive dispatch keys on the protocol-framed wire flag")
+    {
+    }
+    void DoRun() override
+    {
+        // ---- (a) Raw RoCE packet under an efficiency-1.0... no: 0.95 model ----
+        // A raw (unframed) DATA packet from a remote RoCE source must take the
+        // raw delivery path: full payload delivered, no SoHeader peel.
+        {
+            Ptr<CnpTestEndpoint> ep = MakeUbLikeEndpoint(
+                CreateObject<RoceProtocolModel>(), CreateObject<RocePayloadBuilder>());
+            ClearDelivered(); // delivery observed via the static capture buffer
+            ep->SetReceiveCallback(MakeCallback(&ProtocolFramedDispatchTest::CaptureDelivered));
+
+
+            const uint32_t rawSize = 9; // the dataSize=8 wire chunk (ceil(8/0.95))
+            Ptr<Packet> raw = Create<Packet>(rawSize);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ROCE);
+            fh.SetSourceRank(kRemoteRank);
+            fh.SetDestRank(0);
+            fh.SetProtocol(0); // raw bulk chunk: no SoHeader stamped
+            fh.SetVirtualChannel(0);
+            fh.SetFlowId(1);
+            fh.SetSequenceNumber(1);
+            fh.SetPayloadSize(rawSize);
+            fh.SetEffectiveDataSize(rawSize);
+            ep->InjectDataPacket(raw, fh);
+
+            NS_TEST_ASSERT_MSG_EQ(m_lastDelivered.size(), rawSize,
+                "Raw RoCE chunk (sub-header-size bulk fragment) must deliver its "
+                "full payload, not abort on a SoHeader deserialize");
+            Simulator::Destroy();
+        }
+
+        // ---- (b) Raw UB packet: efficiency 0.98, but never framed ----
+        // Public SendData emits raw packets even when the UB model/builder are
+        // mounted; the receiver must deliver all 64 bytes (was: 48 after the
+        // spurious 16-byte transaction-header strip).
+        {
+            Ptr<CnpTestEndpoint> ep = MakeUbLikeEndpoint(
+                CreateObject<UbProtocolModel>(), CreateObject<UbPayloadBuilder>());
+            ClearDelivered(); // delivery observed via the static capture buffer
+            ep->SetReceiveCallback(MakeCallback(&ProtocolFramedDispatchTest::CaptureDelivered));
+
+
+            const uint32_t rawSize = 64;
+            Ptr<Packet> raw = Create<Packet>(rawSize);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::UB); // vendor fabric; value only feeds logging
+            fh.SetSourceRank(kRemoteRank);
+            fh.SetDestRank(0);
+            fh.SetProtocol(static_cast<uint8_t>(UbTransaction::MEM_SYNC));
+            fh.SetVirtualChannel(0);
+            fh.SetFlowId(1);
+            fh.SetSequenceNumber(1);
+            fh.SetPayloadSize(rawSize);
+            fh.SetEffectiveDataSize(rawSize);
+            ep->InjectDataPacket(raw, fh);
+
+            NS_TEST_ASSERT_MSG_EQ(m_lastDelivered.size(), rawSize,
+                "Raw UB SendData payload must deliver byte-for-byte (was 48/64 "
+                "under the efficiency gate)");
+            Simulator::Destroy();
+        }
+
+        // ---- (c) Framed UB packet: the flag routes to ExtractData ----
+        // A packet the payload builder actually framed (16-byte transaction
+        // header) carries the flag and must arrive header-stripped.
+        {
+            Ptr<CnpTestEndpoint> ep = MakeUbLikeEndpoint(
+                CreateObject<UbProtocolModel>(), CreateObject<UbPayloadBuilder>());
+            ClearDelivered(); // delivery observed via the static capture buffer
+            ep->SetReceiveCallback(MakeCallback(&ProtocolFramedDispatchTest::CaptureDelivered));
+
+
+            const uint32_t dataSize = 64;
+            const uint8_t proto = static_cast<uint8_t>(UbTransaction::MEM_SYNC);
+            std::vector<uint8_t> data(dataSize, 0xAB);
+            auto chunks = ep->GetProtocolPayloadBuilder()->BuildChunks(
+                data.data(), dataSize, proto, 4096);
+            NS_TEST_ASSERT_MSG_EQ(chunks.size(), 1, "64 B MEM_SYNC builds one chunk");
+
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::UB);
+            fh.SetSourceRank(kRemoteRank);
+            fh.SetDestRank(0);
+            fh.SetProtocol(proto);
+            fh.SetVirtualChannel(0);
+            fh.SetFlowId(1);
+            fh.SetSequenceNumber(1);
+            fh.SetPayloadSize(chunks[0]->GetSize());
+            fh.SetEffectiveDataSize(dataSize);
+            fh.SetProtocolFramed(true); // what SendDataInternal now stamps
+            ep->InjectDataPacket(chunks[0], fh);
+
+            NS_TEST_ASSERT_MSG_EQ(m_lastDelivered.size(), dataSize,
+                "Framed UB chunk must deliver its data payload (16-byte header stripped)");
+            for (uint32_t i = 0; i < dataSize; ++i)
+            {
+                NS_TEST_ASSERT_MSG_EQ(m_lastDelivered[i], 0xAB,
+                    "Framed UB extracted content must match input");
+            }
+            Simulator::Destroy();
+        }
+    }
+
+  private:
+    static constexpr uint16_t kRemoteRank = 8;
+
+    // Bypass delivery so the receive callback sees the bytes directly (the
+    // reorder-buffer path would need a full simulator run to drain).
+    static Ptr<CnpTestEndpoint>
+    MakeUbLikeEndpoint(Ptr<ProtocolModel> model, Ptr<ProtocolPayloadBuilder> builder)
+    {
+        Ptr<CnpTestEndpoint> ep = CreateObject<CnpTestEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 8); // ranks 0-7 local; 8 remote
+        ep->SetProtocolModel(CreateObject<NcclProtocolModel>());
+        ep->SetInterNodeProtocolModel(model);
+        ep->SetProtocolPayloadBuilder(builder);
+        ep->SetBypassReorderBuffer(true);
+        return ep;
+    }
+
+    // The ReceiveCallback type has no user-data slot, so route the captured
+    // bytes through a static buffer.
+    static void
+    CaptureDelivered(uint16_t, Ptr<Packet> pkt, FabricHeader)
+    {
+        Ptr<Packet> p = pkt->Copy();
+        m_lastDelivered.assign(p->GetSize(), 0);
+        p->CopyData(m_lastDelivered.data(), p->GetSize());
+    }
+
+    static void
+    ClearDelivered()
+    {
+        m_lastDelivered.clear();
+    }
+
+    static std::vector<uint8_t> m_lastDelivered;
+};
+std::vector<uint8_t> ProtocolFramedDispatchTest::m_lastDelivered;
+
 // CNP-reaction: an ECN-marked RoCE segment reaching a receiver's protocol
 // dispatch must trigger a Congestion Notification Packet back to the source.
 // This exercises the WU-SoH3 receive-side link (ProcessProtocolDataPacket ->
@@ -4032,8 +4442,9 @@ class CnpReactionTest : public TestCase
     void DoRun() override
     {
         // Receiver: rank 0 on a node with 8 local GPUs, so a remote source rank
-        // (8) selects the RoCE model (efficiency 0.95 < 1.0 — no efficiency>=1.0
-        // short-circuit) and the So fabric type.
+        // (8) selects the RoCE model and the So fabric type. The injected
+        // segment carries the protocol-framed flag (as a real So sender
+        // stamps), so the dispatch routes it to the protocol-aware path.
         Ptr<CnpTestEndpoint> ep = CreateObject<CnpTestEndpoint>();
         ep->SetRank(0);
         ep->SetLocalRankRange(0, 8);
@@ -4094,6 +4505,7 @@ class CnpReactionTest : public TestCase
         fh.SetSourceRank(8); // remote So source
         fh.SetDestRank(0);   // ep is rank 0
         fh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        fh.SetProtocolFramed(true); // the SoHeader above is the framing
         fh.SetVirtualChannel(0);
         fh.SetFlowId(1);
         fh.SetSequenceNumber(seq);
@@ -4224,16 +4636,21 @@ class DcqcnRateMachineTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ_TOL(m->GetAlpha(k), 0.5, 1e-9,
             "first CNP: Alpha = (1-0)*gInit = 0.5");
 
-        // (c) ShapingDelay at Alpha=0.5: rateFactor = 1 - 0.5/2 = 0.75; delay =
-        // base*(1/rateFactor - 1), base = chunkBytes / MaxRate (50e9 B/s).
+        // (c) ShapingDelay at Alpha=0.5: rateFactor = 1 - 0.5/2 = 0.75; the
+        // enforced rate is 0.75*MaxRate, so the pacer spaces chunks one
+        // slot = chunk/(0.75*MaxRate) apart. At simulator time 0 chunk 0 is
+        // not delayed and chunk i is held until i*slot (the pacer's
+        // next-send bookkeeping), spacing consecutive egress starts a full
+        // slot apart -- the reduced rate actually holds.
         const uint32_t chunk = 1000000;
         const double maxRate = 50.0e9;
-        const double baseNs = static_cast<double>(chunk) / maxRate * 1e9;
-        const double expectNs = baseNs * (1.0 / 0.75 - 1.0);
-        NS_TEST_ASSERT_MSG_EQ_TOL(
-            static_cast<double>(m->ShapingDelay(chunk, k).GetNanoSeconds()),
-            expectNs, 100.0,
-            "ShapingDelay must equal base*(1/rateFactor-1) at Alpha=0.5");
+        const double slotNs = static_cast<double>(chunk) / (0.75 * maxRate) * 1e9;
+        const int64_t d0 = m->ShapingDelay(chunk, k).GetNanoSeconds();
+        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d0), 0.0, 2.0,
+            "chunk 0 of a newly-paced flow is not delayed");
+        const int64_t d1 = m->ShapingDelay(chunk, k).GetNanoSeconds();
+        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d1), slotNs, 100.0,
+            "chunk 1 is held one full slot after chunk 0's egress start");
 
         // (d) Fast-recovery timer fires at tFast=50us: g *= gDecay (0.5->0.25),
         // Alpha = 0.5 - 0.5*0.25 = 0.375.
@@ -4292,30 +4709,2139 @@ class PerQpCeilingPacerTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(on->ShapingDelay(chunk, kB).GetNanoSeconds(), 0,
             "a second flow's first chunk must not inherit flow A's pacing");
 
-        // (d) Ceiling + DCQCN compose: both apply, the binding (larger) delay
-        // wins (max). With Alpha=0.5 the DCQCN extra-serialization delay for a
-        // 9000 B chunk at 50e9 B/s is base*(1/0.75-1) = 60 ns; the ceiling slot
-        // is 9000/6.125e9 = 1469 ns. The first chunk's pacer delay is 0, so the
-        // DCQCN delay (60) binds at chunk 0; from chunk 1 the pacer delay
-        // (1469) exceeds the DCQCN delay, so the ceiling binds -- proving the
-        // sustained-throughput cap overrides DCQCN once a flow has history.
+        // (d) Ceiling + DCQCN compose: the effective rate is
+        // min(alpha rate, ceiling) = min(0.75*50e9, 6.125e9) = 6.125e9 B/s
+        // (the ceiling binds), so both chunks of a fresh flow pace at the
+        // ceiling slot — chunk 0 un-delayed, chunk 1 one full slot later.
         on->OnCnp(kA); // Alpha=0.5
         const DcqcnRateMachine::FlowKey kC = 111;
         on->OnCnp(kC); // Alpha=0.5 on a fresh flow (pacer state empty)
-        // chunk 0: max(DCQCN 60, pacer 0) = 60 (DCQCN binds; ceiling pacer is 0
-        // for a flow's first chunk).
         const int64_t d0 = on->ShapingDelay(chunk, kC).GetNanoSeconds();
-        const int64_t dcqcnNs =
-            static_cast<int64_t>(static_cast<double>(chunk) / 50.0e9 * 1e9 *
-                                 (1.0 / 0.75 - 1.0));
-        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d0),
-            static_cast<double>(dcqcnNs), 2.0,
-            "chunk 0: DCQCN delay binds (pacer is 0 for the first chunk)");
-        // chunk 1: max(DCQCN 60, pacer slot 1469) = 1469 (ceiling binds).
+        NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d0), 0.0, 2.0,
+            "chunk 0: a fresh flow's first chunk is not delayed");
         const int64_t d1 = on->ShapingDelay(chunk, kC).GetNanoSeconds();
         NS_TEST_ASSERT_MSG_EQ_TOL(static_cast<double>(d1),
             static_cast<double>(slotNs), 2.0,
-            "chunk 1: ceiling pacer binds over the DCQCN delay");
+            "chunk 1: composed pacer binds at the ceiling rate");
+        Simulator::Destroy();
+    }
+};
+
+// (1b-2) Dispose must cancel armed recovery timers. The timers capture raw
+// `this` (FastRecovery/AdditiveIncrease); codex round 12, finding 3: OnCnp
+// then Dispose then dropping the last reference left the timer armed, and
+// running the simulator fired into freed memory (ASAN heap-use-after-free
+// inside FastRecovery). The regression: arm two flows' timers, Dispose,
+// release, and run — no crash AND the timer never fired (Alpha stays at its
+// post-CNP value instead of decaying through a fast cycle).
+class DcqcnDisposeCancelsTimersTest : public TestCase
+{
+  public:
+    DcqcnDisposeCancelsTimersTest()
+        : TestCase("DCQCN Dispose cancels armed recovery timers") {}
+    void DoRun() override
+    {
+        Ptr<DcqcnRateMachine> m = CreateObject<DcqcnRateMachine>();
+        m->SetAttribute("TFast", TimeValue(NanoSeconds(1000)));
+        const DcqcnRateMachine::FlowKey k = 7;
+        m->OnCnp(k); // arms the fast-recovery timer (Alpha = 0.5)
+        m->Dispose();
+        m = nullptr; // drop the last reference: destructor runs now
+        // No crash: the armed timer must not fire into freed memory.
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        Simulator::Destroy();
+        // Re-mount the scenario with a live machine to pin the semantic
+        // half: Dispose cancels the timer, so Alpha no longer decays.
+        Ptr<DcqcnRateMachine> live = CreateObject<DcqcnRateMachine>();
+        live->SetAttribute("TFast", TimeValue(NanoSeconds(1000)));
+        live->OnCnp(k);
+        live->Dispose();
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ_TOL(live->GetAlpha(k), 0.5, 1e-9,
+            "Dispose must cancel the fast-recovery timer (Alpha stays at its "
+            "post-CNP value instead of decaying through a fast cycle)");
+        Simulator::Destroy();
+    }
+};
+
+// (1b-2) R13#2: SendPacketOnDevice's deferred-egress callbacks capture raw
+// `this` and dereference m_devices; DoDispose must cancel every pending one.
+// Pre-fix: three same-flow paced packets, Dispose at 5us — the deferred sends
+// armed for ~13.4us and ~26.8us fired into the cleared member (SIGSEGV).
+class EgressDisposeCancelsDeferredSendsTest : public TestCase
+{
+  public:
+    EgressDisposeCancelsDeferredSendsTest()
+        : TestCase("endpoint Dispose cancels deferred egress callbacks") {}
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(false);
+
+        static uint64_t delivered = 0;
+        delivered = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader) {
+            delivered++;
+        });
+
+        Ptr<DcqcnRateMachine> dcqcn = CreateObject<DcqcnRateMachine>();
+        dcqcn->SetAttribute("PerQpCeilingGbps", DoubleValue(0.1));
+        tx->SetDcqcnRateMachine(dcqcn);
+
+        tx->Initialize();
+        rx->Initialize();
+
+        // Same flow: consecutive egress starts are a full pace slot apart
+        // (~13.4us), so packets 2 and 3 are deferred past the 5us teardown.
+        std::vector<uint8_t> buf(64, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 64, NcclProtocol::LL, 1, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 64, NcclProtocol::LL, 1, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 64, NcclProtocol::LL, 1, 0);
+
+        Simulator::Schedule(MicroSeconds(5), [tx]() {
+            tx->Dispose();
+        });
+        // Drop the main reference at the same instant; the object's remaining
+        // refcount is held only by the (to-be-cancelled) event lambdas and
+        // this very schedule closure.
+        Simulator::Schedule(MicroSeconds(5), [&tx]() {
+            tx = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(3000));
+        Simulator::Run();
+        // No SIGSEGV past this point is the primary assertion. The first
+        // packet left before disposal and must have been delivered.
+        NS_TEST_ASSERT_MSG_EQ(delivered, 1u,
+            "the pre-disposal packet must be delivered; deferred ones are cancelled");
+        Simulator::Destroy();
+    }
+};
+
+// (1b-5) The WFQ backlog-decrement lambdas also capture raw `this`. Codex
+// round 14, finding 1: the three DecrementBacklog schedules in
+// SendPacketOnDevice were NOT tracked in m_deferredEgressEvents, so
+// disposing (and freeing) an endpoint between the deferred send and the
+// backlog callback left the lambda firing on freed memory — valgrind
+// confirmed a use-after-free at the m_contentionModel deref. Regression:
+// FEC + contention model, one paced P2P packet, dispose + drop the
+// reference, run past the backlog callback time. No crash/UAF is the
+// assertion.
+class EgressDisposeCancelsBacklogCallbacksTest : public TestCase
+{
+  public:
+    EgressDisposeCancelsBacklogCallbacksTest()
+        : TestCase("endpoint Dispose cancels deferred backlog callbacks") {}
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1); // rank 1 remote -> direct egress path
+        ep->AddNetDevice(devs.Get(0));
+        ep->SetNeighborMac(1, Mac48Address::Allocate());
+        ep->SetRoutingEntry(1, 0);
+        ep->SetBypassReorderBuffer(true);
+
+        // FEC (encode latency defers the send) + contention model with a
+        // preloaded second class (numActive == 2 takes the WFQ branch).
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        ep->SetFecModel(fec);
+        Ptr<ContentionModel> cm = CreateObject<ContentionModel>();
+        cm->SetBandwidth(1000); // slow -> backlog callback fires ~seconds out
+        cm->IncrementBacklog(TrafficClass::MEMORY);
+        ep->SetContentionModel(cm);
+
+        ep->Initialize();
+
+        Simulator::Schedule(NanoSeconds(100), [ep]() {
+            std::vector<uint8_t> buf(64, 0);
+            ep->SendP2p(1, buf.data(), 64, 1, 0);
+        });
+        Simulator::Schedule(NanoSeconds(300), [ep]() {
+            ep->Dispose();
+        });
+        // Drop the last strong reference; the object is freed unless the
+        // pending backlog callback (wrongly) keeps a raw `this` alive.
+        Simulator::Schedule(NanoSeconds(310), [&ep]() {
+            ep = nullptr;
+        });
+
+        // Run well past the backlog callback time (~7.2 s at 64 B /
+        // (0.1 * 1000 B/s)); the pre-fix lambda dereferenced freed memory
+        // here (valgrind: Invalid read of size 8 at fabric-endpoint.cc).
+        Simulator::Stop(Seconds(10));
+        Simulator::Run();
+        // Reaching this line without a crash is the assertion.
+        Simulator::Destroy();
+    }
+};
+
+// Endpoint Dispose must also cancel the deferred FEC-decode continuation of
+// RECEIVE processing. Codex round 15, finding 1: ReceiveFromDevice scheduled
+// ContinueReceiveAfterFec with raw `this` (bound member call) without
+// tracking the event, so disposing and releasing the endpoint before the
+// decode latency elapsed fired the continuation into freed memory —
+// valgrind-confirmed invalid reads/writes on the traced-callback and stats
+// members DoDispose had nulled. Regression: receive a 64-B packet under FEC
+// with a 100-us decode latency, dispose at 300 ns, drop the last reference
+// at 310 ns, and run past the decode deadline.
+class EgressDisposeCancelsFecReceiveTest : public TestCase
+{
+  public:
+    EgressDisposeCancelsFecReceiveTest()
+        : TestCase("endpoint Dispose cancels deferred FEC receive continuation") {}
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1); // rank 1 remote
+        ep->AddNetDevice(devs.Get(0));
+        ep->SetNeighborMac(1, Mac48Address::Allocate());
+        ep->SetRoutingEntry(1, 0);
+        ep->SetBypassReorderBuffer(true);
+
+        // FEC with a 100-us decode latency: receive processing is deferred
+        // to ~100 us while the endpoint is disposed at 300 ns and released
+        // at 310 ns.
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        fec->SetEnabled(true);
+        fec->SetFecParams(544, 514, 15);
+        fec->SetDecodeLatency(MicroSeconds(100));
+        ep->SetFecModel(fec);
+        ep->SetFecOpticalOnly(false);
+
+        ep->Initialize();
+
+        // A 64-B DATA packet from rank 1 arrives at ~100 ns.
+        Ptr<Packet> pkt = Create<Packet>(64);
+        FabricHeader h;
+        h.SetPacketType(FabricPacketType::DATA);
+        h.SetSourceRank(1);
+        h.SetDestRank(0);
+        h.SetSequenceNumber(0);
+        h.SetPayloadSize(64);
+        pkt->AddHeader(h);
+        Simulator::Schedule(NanoSeconds(100), [&devs, pkt]() {
+            devs.Get(1)->Send(
+                pkt, Mac48Address::ConvertFrom(devs.Get(0)->GetAddress()), 0x0800);
+        });
+        Simulator::Schedule(NanoSeconds(300), [ep]() {
+            ep->Dispose();
+        });
+        // Drop the last strong reference; the pre-fix continuation held only
+        // raw `this` and dereferenced freed memory at the decode deadline.
+        Simulator::Schedule(NanoSeconds(310), [&ep]() {
+            ep = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(200)); // past the 100-us decode deadline
+        Simulator::Run();
+        // Reaching this line without a crash is the assertion.
+        Simulator::Destroy();
+    }
+};
+
+// Codex round 16, finding 1: SACK source-reload retransmissions scheduled
+// with a readyDelay captured raw `this` and were NOT tracked in
+// m_deferredEgressEvents, so DoDispose could not cancel them. With a
+// one-entry retry buffer and a 100-us reload latency, a NACK for the
+// evicted first packet deferred SendRetransmission to the 100-us mark;
+// disposing and releasing the endpoint at 1 us left the callback firing
+// into freed memory (valgrind-confirmed). Regression: store two packets,
+// NACK the evicted first, dispose+release at 1 us, and run past the reload
+// deadline without a crash.
+class EgressDisposeCancelsSourceReloadRetransmissionsTest : public TestCase
+{
+  public:
+    EgressDisposeCancelsSourceReloadRetransmissionsTest()
+        : TestCase("endpoint Dispose cancels deferred source-reload retransmissions") {}
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(1);
+        ep->SetLocalRankRange(1, 1); // rank 0 remote
+        ep->AddNetDevice(devs.Get(0));
+        ep->SetNeighborMac(0, Mac48Address::Allocate());
+        ep->SetRoutingEntry(0, 0);
+        ep->SetBypassReorderBuffer(true);
+
+        // SACK with a one-entry retry buffer and a 100-us source-reload
+        // latency: the second stored packet evicts the first from the
+        // fast buffer, so NACKing the first queues a SOURCE-RELOAD
+        // retransmission whose readyDelay defers SendRetransmission to
+        // ~100 us while the endpoint is disposed at 1 us and released at
+        // 1.1 us.
+        Ptr<LlrManager> llr = ep->GetLlrManager();
+        llr->SetLlrMode(LlrMode::SACK);
+        llr->SetRetryLimit(3);
+        llr->SetMaxBufferSize(1);
+        llr->SetSourceReloadBandwidth(0);
+        llr->SetSourceReloadLatency(MicroSeconds(100));
+        ep->SetLlrEnabled(true);
+        ep->EnableLlrTimeoutRetransmit();
+
+        ep->Initialize();
+
+        // Two 64-B DATA packets from rank 0 (the source ranks in the
+        // stored headers name the RETRANSMIT target; the retry keys come
+        // from the NACK's (source, flow, vc) triple, so both use rank 0 /
+        // flow 1 / vc 0 with distinct seqs).
+        auto makeData = [](uint32_t seq) {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::DATA);
+            h.SetSourceRank(0);
+            h.SetDestRank(1);
+            h.SetSequenceNumber(seq);
+            h.SetFlowId(1);
+            h.SetVirtualChannel(0);
+            h.SetPayloadSize(64);
+            pkt->AddHeader(h);
+            return pkt;
+        };
+        Simulator::Schedule(NanoSeconds(100), [&ep, makeData]() {
+            // Store both packets directly in the LLR source store: seq 0
+            // occupies the one-entry fast buffer, seq 1 evicts it (the
+            // evicted entry stays recoverable only via source reload).
+            ep->GetLlrManager()->StorePacket(0, makeData(0), 0);
+            ep->GetLlrManager()->StorePacket(1, makeData(1), 0);
+        });
+        // NACK seq 0 (the evicted entry) at 500 ns: DispatchRetransmissions
+        // defers SendRetransmission by the ~100-us reload latency.
+        Ptr<Packet> nack = Create<Packet>(0);
+        {
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::NACK);
+            h.SetSourceRank(0);
+            h.SetDestRank(1);
+            h.SetSequenceNumber(0);
+            h.SetFlowId(1);
+            h.SetVirtualChannel(0);
+            nack->AddHeader(h);
+        }
+        Simulator::Schedule(NanoSeconds(500), [&devs, nack]() {
+            devs.Get(1)->Send(
+                nack, Mac48Address::ConvertFrom(devs.Get(0)->GetAddress()), 0x0800);
+        });
+        Simulator::Schedule(NanoSeconds(1000), [ep]() {
+            ep->Dispose();
+        });
+        // Drop the last strong reference; the pre-fix deferred lambda held
+        // only raw `this` and read freed memory at the reload deadline.
+        Simulator::Schedule(NanoSeconds(1100), [&ep]() {
+            ep = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(200)); // past the 100-us reload deadline
+        Simulator::Run();
+        // The NACK must have taken the source-reload path (seq 0 was evicted
+        // from the one-entry fast buffer by seq 1): otherwise this test
+        // would pass vacuously without exercising the deferred
+        // retransmission.
+        NS_TEST_ASSERT_MSG_EQ(llr->GetSourceReloadCount(), 1u,
+            "the NACK for the evicted entry must queue exactly one "
+            "source-reload retransmission");
+        // Reaching this line without a crash is the assertion.
+        Simulator::Destroy();
+    }
+};
+
+// Codex round 16, finding 2: DoDispose cleared the device/port lists
+// without detaching the raw-pointer promiscuous callbacks installed on the
+// net devices. A packet in flight over a 100-us link arrives AFTER the
+// receiver was disposed and released, invoking ReceiveFromDevice (endpoint)
+// or ReceiveFromPort (switch) on freed memory — valgrind-confirmed invalid
+// reads on both, plus invalid writes in the switch. Regression for both
+// sides: dispose+release the receiver at 1 us and run past the arrival.
+class DeviceCallbackDetachAtDisposeTest : public TestCase
+{
+  public:
+    DeviceCallbackDetachAtDisposeTest()
+        : TestCase("endpoint and switch Dispose detach device promisc callbacks") {}
+    void DoRun() override
+    {
+        // --- Endpoint side ---
+        {
+            NodeContainer nodes;
+            nodes.Add(CreateObject<Node>());
+            nodes.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(MicroSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes);
+
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(1);
+            ep->SetLocalRankRange(1, 1); // rank 0 remote
+            ep->AddNetDevice(devs.Get(0));
+            ep->SetNeighborMac(0, Mac48Address::Allocate());
+            ep->SetRoutingEntry(0, 0);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+
+            // A 64-B DATA packet from rank 0, sent at t=0, arrives at ~100 us.
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::DATA);
+            h.SetSourceRank(0);
+            h.SetDestRank(1);
+            h.SetSequenceNumber(0);
+            h.SetPayloadSize(64);
+            pkt->AddHeader(h);
+            devs.Get(1)->Send(pkt,
+                              Mac48Address::ConvertFrom(devs.Get(0)->GetAddress()),
+                              0x0800);
+            // Dispose and release the receiver well before the arrival.
+            Simulator::Schedule(NanoSeconds(1000), [ep]() {
+                ep->Dispose();
+            });
+            Simulator::Schedule(NanoSeconds(1100), [&ep]() {
+                ep = nullptr;
+            });
+            Simulator::Stop(MicroSeconds(200)); // past the 100-us arrival
+            Simulator::Run();
+            Simulator::Destroy();
+        }
+        // --- Switch side ---
+        {
+            NodeContainer nodes;
+            nodes.Add(CreateObject<Node>());
+            nodes.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(MicroSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes);
+
+            Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+            sw->AddPort(devs.Get(1));
+
+            // A 64-B packet sent at t=0 arrives at the switch port at ~100 us.
+            Ptr<Packet> pkt = Create<Packet>(64);
+            devs.Get(0)->Send(pkt,
+                              Mac48Address::ConvertFrom(devs.Get(1)->GetAddress()),
+                              0x0800);
+            Simulator::Schedule(NanoSeconds(1000), [sw]() {
+                sw->Dispose();
+            });
+            Simulator::Schedule(NanoSeconds(1100), [&sw]() {
+                sw = nullptr;
+            });
+            Simulator::Stop(MicroSeconds(200)); // past the 100-us arrival
+            Simulator::Run();
+            Simulator::Destroy();
+        }
+        // Reaching this line without a crash is the assertion.
+    }
+};
+
+// Forward declaration: the link-error helper is defined further below.
+static void DisableLinkErrorsGlobally();
+
+// (codex round 16, finding 4) Messages smaller than the GPU count produced
+// zero completion thresholds. With 4 GPUs and dataSize=3, the legacy
+// degenerate fallback set every chunk to 3 B, so ExpectedBytesPerDest =
+// dataSize - chunk = 0 for every rank: the first RS delivery flipped the
+// state to AllGather and the second completed the collective with zero
+// AllGather bytes on the wire. The degenerate grid is now [1,1,1,0] (sums
+// to dataSize), thresholds are [2,2,2,3], and the collective only
+// completes after both phases' bytes have actually crossed the wire.
+class FullMeshDegenerateGridTest : public TestCase
+{
+  public:
+    FullMeshDegenerateGridTest()
+        : TestCase("fullmesh allreduce degenerate sub-GPU-count grid") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // < numGpus -> degenerate grid
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<FullMeshAllReduce> inj = CreateObject<FullMeshAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+
+        // Grid: one byte on each of the first dataSize ranks, zero on the
+        // rest; thresholds: dataSize minus the rank's own chunk.
+        const uint64_t grid[4] = {1, 1, 1, 0};
+        for (uint16_t g = 0; g < numGpus; ++g)
+        {
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeChunkSizeOf(g), grid[g],
+                "degenerate grid must be one byte on the first dataSize ranks");
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeExpectedBytesPerDest(g),
+                                  dataSize - grid[g],
+                "degenerate thresholds must be dataSize minus the own chunk");
+            NS_TEST_ASSERT_MSG_GT(inj->ProbeExpectedBytesPerDest(g), 0u,
+                "no threshold may be zero (the pre-fix defect)");
+        }
+
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the degenerate collective must still complete");
+        // Both phases send each nonzero chunk to N-1 peers:
+        // 2 * (N-1) * dataSize = 18 wire bytes (zero-chunk ranks send nothing).
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 2 * (numGpus - 1) * dataSize,
+            "degenerate wire traffic must cover 2(N-1)*dataSize bytes, "
+            "not the zero-AG-byte instant completion");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 16, finding 6) Reduce-scatter sized contributions by the
+// sender's chunk instead of the destination's chunk. Destination dest
+// reduces its OWN chunk, so every source sends its copy of chunk dest and
+// dest receives (N-1)*ChunkSizeOf(dest). For the [4,4,4,3] grid the correct
+// per-rank RS load is [12,12,12,9]; the pre-fix code delivered
+// [11,11,11,12] (whole-collective totals matched, so the coverage test
+// passed while per-rank load and timing were wrong).
+class FullMeshReduceScatterPerDestLoadTest : public TestCase
+{
+  public:
+    FullMeshReduceScatterPerDestLoadTest()
+        : TestCase("fullmesh RS sizes contributions by destination chunk") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 15; // grid [4,4,4,3]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<FullMeshAllReduce> inj = CreateObject<FullMeshAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 15-B allreduce must complete");
+
+        // RS phase: each destination receives (N-1) copies of its OWN chunk.
+        const uint64_t grid[4] = {4, 4, 4, 3};
+        for (uint16_t dest = 0; dest < numGpus; ++dest)
+        {
+            const uint64_t expected = 3 * grid[dest]; // [12,12,12,9]
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeRsExpectedBytes(dest), expected,
+                "RS threshold must be (N-1)*own chunk");
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeRsReceivedBytes(dest), expected,
+                "RS per-destination load must be (N-1)*own chunk "
+                "(the pre-fix code delivered the sender's chunk instead)");
+        }
+        // Whole-collective traffic is unchanged: 2(N-1)*D = 90.
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 90,
+            "RS re-chunking must not change whole-collective traffic");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 17, finding 5) The standalone fullmesh ReduceScatter sized
+// each peer contribution with the SENDER's chunk, but destination dest
+// reduces its own chunk: every source sends its copy of chunk dest, so
+// per-destination RS load is (N-1)*ChunkSizeOf(dest). For the 15-B
+// [4,4,4,3] grid the correct load is [12,12,12,9]; the pre-fix code
+// delivered [11,11,11,12] while whole-collective traffic still totaled
+// 45 B, so the coverage test passed while per-rank load and timing were
+// wrong (the same defect as round 16 finding 6, which fixed
+// FullMeshAllReduce's RS phase but not this standalone injector).
+class FullMeshRsStandalonePerDestLoadTest : public TestCase
+{
+  public:
+    FullMeshRsStandalonePerDestLoadTest()
+        : TestCase("standalone fullmesh RS sizes contributions by destination chunk") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 15; // grid [4,4,4,3]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<FullMeshReduceScatter> inj = CreateObject<FullMeshReduceScatter>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 15-B standalone reduce-scatter must complete");
+
+        // Each destination receives (N-1) copies of its OWN chunk.
+        const uint64_t grid[4] = {4, 4, 4, 3};
+        for (uint16_t dest = 0; dest < numGpus; ++dest)
+        {
+            const uint64_t expected = 3 * grid[dest]; // [12,12,12,9]
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeExpectedBytesPerDest(dest), expected,
+                "RS threshold must be (N-1)*own chunk");
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeReceivedBytes(dest), expected,
+                "RS per-destination load must be (N-1)*own chunk "
+                "(the pre-fix code delivered the sender's chunk instead)");
+        }
+        // Whole-collective traffic is unchanged: (N-1)*D = 45.
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 45,
+            "RS re-chunking must not change whole-collective traffic");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 17, finding 7) AllToAll chunked every peer transfer with a
+// uniform `m_chunkSize = dataSize/numGpus` and fell back to the WHOLE
+// dataSize when that quotient was zero. Two defects: 15 B over 4 GPUs sent
+// 3-byte chunks (12 per rank) and reported completion after 36 aggregate
+// payload bytes instead of the required 45; and the degenerate dataSize <
+// numGpus case made every GPU send the whole dataSize (3 B over 4 GPUs
+// sent 36 bytes instead of nine — and the 4th rank, owning a zero chunk,
+// still got traffic it should never see). The injector now applies the
+// frozen chunk-grid convention (base + one byte for the first
+// dataSize%numGpus chunks; degenerate grids put one byte on each of the
+// first dataSize ranks) with destination-owned sizing at all three send
+// sites, per-destination thresholds, and pre-credited zero-chunk ranks.
+class AlltoallChunkGridCoverageTest : public TestCase
+{
+  public:
+    AlltoallChunkGridCoverageTest()
+        : TestCase("alltoall chunk grid covers the full data size") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 15; // grid [4,4,4,3]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->SetConcurrentMode(true);
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 15-B alltoall must complete");
+        Simulator::Destroy();
+
+        // Aggregate payload across the collective is (N-1)*D = 45 (every
+        // ordered pair (r,s) ships chunk s once). Pre-fix the uniform
+        // 3-byte chunks delivered 36.
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 45,
+            "alltoall whole-collective traffic must cover the full data size");
+        // Per-destination load: the grid indexes the DESTINATION (rank r
+        // sends its chunk-for-s to rank s), so destination dest receives
+        // (N-1) copies-sized ChunkSizeOf(dest): (N-1)*grid[dest].
+        const uint64_t grid[4] = {4, 4, 4, 3};
+        for (uint16_t dest = 0; dest < numGpus; ++dest)
+        {
+            const uint64_t expected = 3 * grid[dest]; // [12,12,12,9]
+            NS_TEST_ASSERT_MSG_EQ(inj->ProbeReceivedBytes(dest), expected,
+                "alltoall per-destination load must be (N-1)*own chunk "
+                "(the grid indexes the destination)");
+        }
+    }
+};
+
+// (codex round 17, finding 7, degenerate case) 3 B over 4 GPUs: the pre-fix
+// whole-dataSize fallback made every GPU send 3 bytes to each of its 3
+// peers — 36 aggregate bytes where the correct degenerate grid [1,1,1,0]
+// sends 9. The zero-chunk rank receives nothing and is pre-credited so the
+// collective still completes.
+class AlltoallDegenerateGridTest : public TestCase
+{
+  public:
+    AlltoallDegenerateGridTest()
+        : TestCase("alltoall degenerate sub-GPU-count grid sends one byte per rank") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // degenerate grid [1,1,1,0]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->SetConcurrentMode(true);
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the degenerate alltoall must complete (zero-chunk rank pre-credited)");
+        // Grid [1,1,1,0]: aggregate payload is 9, not the pre-fix 36.
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 9,
+            "degenerate alltoall must ship one byte per non-zero chunk, "
+            "not the whole dataSize per peer");
+        // Zero-chunk rank 3 receives nothing; ranks 0-2 each receive the
+        // three other ranks' chunks toward them: dest receives 3 copies of
+        // its own 1-byte chunk (the grid indexes the destination).
+        NS_TEST_ASSERT_MSG_EQ(inj->ProbeReceivedBytes(0), 3,
+            "rank 0 receives three 1-byte chunks (one per source rank)");
+        NS_TEST_ASSERT_MSG_EQ(inj->ProbeReceivedBytes(3), 0,
+            "the zero-chunk rank must receive nothing in the degenerate grid");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 17, finding 7, ring mode) The zero-chunk rank's ring sends
+// are chained off receive-complete events; pre-credited (it receives
+// nothing), its chain never starts and the partners waiting for its chunks
+// stall — the 3-B ring alltoall hung until the 1-hour sim cap. The send
+// chain of a pre-credited rank must be driven directly.
+class AlltoallDegenerateRingModeTest : public TestCase
+{
+  public:
+    AlltoallDegenerateRingModeTest()
+        : TestCase("degenerate alltoall ring drives pre-credited ranks' sends") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // degenerate grid [1,1,1,0]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        // RING_PIPELINE mode (default — no SetConcurrentMode call).
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        // A short stop: the pre-fix stall never completed at any horizon.
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the degenerate RING_PIPELINE alltoall must complete — the "
+            "pre-credited zero-chunk rank's send chain must be driven, not "
+            "chained off receives it never gets");
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 9,
+            "degenerate ring alltoall still ships exactly one byte per "
+            "nonzero chunk (aggregate 9)");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 7) Zero-data AllToAll: Initialize(4, 0, ...) hit
+// the Complete() short-circuit BEFORE the completion callback was typically
+// registered; Start() then overwrote COMPLETED with RUNNING, and zero-byte
+// sends are no-ops so nothing ever completed it again — the CLI reported
+// status=incomplete at the 1-hour cap. Start() must respect an already-
+// completed collective.
+class AlltoallZeroDataStartTest : public TestCase
+{
+  public:
+    AlltoallZeroDataStartTest()
+        : TestCase("zero-data alltoall stays completed across Start()") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            eps.push_back(ep);
+        }
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->Initialize(numGpus, 0, eps);
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "zero-data alltoall completes at Initialize (all chunks zero)");
+        bool fired = false;
+        inj->SetCompletionCallback([&](uint64_t) { fired = true; });
+        inj->Start();
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "Start() must not overwrite COMPLETED with RUNNING for a "
+            "zero-data alltoall (nothing will ever complete it again)");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 2) Ring AllToAll pooled different steps'
+// fragments in one per-dest counter and RESET it to zero at a threshold
+// cross, discarding the overshoot. With one lane delayed 100 us, a dest
+// pooled step-s+1 fragments before crossing its step-s threshold; the
+// reset threw those bytes away and the next threshold never accumulated
+// enough — all bytes sent, the collective never completed. The counter now
+// carries the overshoot forward (subtract, not reset).
+class AlltoallRingOvershootCarryTest : public TestCase
+{
+  public:
+    AlltoallRingOvershootCarryTest()
+        : TestCase("ring alltoall carries step-counter overshoot forward") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 3;
+        const uint32_t lanes = 18;
+        const uint64_t dataSize = 300; // grid [100,100,100]
+        NodeContainer nodes;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+
+        // Wire the full mesh; the (0,2) pair's LAST lane gets a 100-us
+        // delay so rank 0's fragments arrive interleaved across steps.
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<std::vector<std::vector<uint32_t>>> routes(
+            numGpus, std::vector<std::vector<uint32_t>>(numGpus));
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            ep->SetBypassReorderBuffer(true);
+            ep->SetNumLanes(lanes);
+            eps.push_back(ep);
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            for (uint16_t q = r + 1; q < numGpus; ++q)
+            {
+                for (uint32_t lane = 0; lane < lanes; ++lane)
+                {
+                    const bool delayed =
+                        (r == 0 && q == 2 && lane == lanes - 2);
+                    p2p.SetChannelAttribute(
+                        "Delay", TimeValue(delayed ? MicroSeconds(100)
+                                                    : NanoSeconds(400)));
+                    NetDeviceContainer pair = p2p.Install(nodes.Get(r), nodes.Get(q));
+                    routes[r][q].push_back(eps[r]->AddNetDevice(pair.Get(0)));
+                    routes[q][r].push_back(eps[q]->AddNetDevice(pair.Get(1)));
+                }
+            }
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            for (uint16_t q = 0; q < numGpus; ++q)
+            {
+                if (r != q) eps[r]->SetRoutingDevices(q, routes[r][q]);
+            }
+            eps[r]->Initialize();
+        }
+
+        Ptr<AlltoAllInjector> inj = CreateObject<AlltoAllInjector>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(500)); // past the 100-us delayed lane
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the delayed-lane ring alltoall must complete — overshoot bytes "
+            "pooled across steps must carry forward, not be discarded by a "
+            "counter reset");
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), 2 * dataSize,
+            "ring alltoall still ships (N-1)*D effective bytes");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 1) The credit manager can outlive the endpoint
+// (attribute-supplied, externally retained); DoDispose dropped the endpoint
+// reference but left the manager's OnCreditAvailable callback bound to the
+// freed endpoint — ReturnCredits after disposal fired into freed memory
+// (valgrind-confirmed invalid reads in TrySendQueuedPackets). DoDispose now
+// detaches the callback.
+class CreditManagerDetachedAtDisposeTest : public TestCase
+{
+  public:
+    CreditManagerDetachedAtDisposeTest()
+        : TestCase("credit manager callback detached at endpoint dispose") {}
+
+    static Ptr<CreditManager>& Credits()
+    {
+        static Ptr<CreditManager> cm;
+        return cm;
+    }
+    static Ptr<FabricEndpoint>& Ep()
+    {
+        static Ptr<FabricEndpoint> ep;
+        return ep;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // Externally retained credit manager supplied via the attribute —
+        // it survives the endpoint.
+        Credits() = CreateObject<CreditManager>();
+        Ep() = CreateObject<FabricEndpoint>();
+        Ep()->SetAttribute("CreditManager", PointerValue(Credits()));
+        Credits()->InitializeVc(0, 1);
+        Ep()->Initialize();
+        // Exhaust the one-credit window so the callback matters.
+        Credits()->ConsumeCredit(0, 0);
+        // Dispose and release the endpoint; the manager stays alive.
+        Ep()->Dispose();
+        Ep() = nullptr;
+        // Returning credits would invoke OnCreditAvailable on freed memory
+        // pre-fix (valgrind adjudicates; reaching here without a crash is
+        // the weak form of the assertion).
+        Credits()->ReturnCredits(0, 1);
+        Credits() = nullptr;
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 3) NVLS AllGather's switch threshold required
+// only the uniform dataSize/numGpus from every source, but the injector
+// uploads the frozen chunk grid (first D%N ranks carry one extra byte).
+// With one lane delayed, the switch aggregated a 4-GPU / 9-B AllGather
+// after rank 0's first 2 bytes: the 8-byte multicast retired the ledger
+// and rank 0's third byte started an aggregation that never completed —
+// every receiver stuck at 8/9. The switch now requires each source's FULL
+// chunk (base + remainder byte).
+class NvlsAllGatherRemainderThresholdTest : public TestCase
+{
+  public:
+    NvlsAllGatherRemainderThresholdTest()
+        : TestCase("NVLS allgather switch waits for each source's full chunk") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 9; // grid [3,2,2,2]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        const uint32_t lanes = 18;
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(numGpus);
+        sw->SetAllGatherChunkSize(dataSize / numGpus);
+        sw->SetAllGatherDataSize(dataSize);
+
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            for (uint32_t lane = 0; lane < lanes; ++lane)
+            {
+                // Rank 0's lane 2 is slow: its third byte lags the others.
+                p2p.SetChannelAttribute(
+                    "Delay",
+                    TimeValue((r == 0 && lane == 2) ? MicroSeconds(100)
+                                                    : NanoSeconds(400)));
+                NetDeviceContainer pair =
+                    p2p.Install(nodes.Get(r), switchNode.Get(0));
+                if (lane == 0)
+                {
+                    Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+                    ep->SetRank(r);
+                    ep->SetLocalRankRange(0, numGpus);
+                    ep->SetBypassReorderBuffer(true);
+                    ep->SetNumLanes(lanes);
+                    eps.push_back(ep);
+                }
+                eps[r]->AddNetDevice(pair.Get(0));
+                eps[r]->SetRoutingEntry(0, eps[r]->GetNNetDevices() - 1);
+                sw->AddPort(pair.Get(1));
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<NvlsAllGather> inj = CreateObject<NvlsAllGather>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(500)); // past the 100-us lane
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 9-B NVLS allgather must complete — the switch must wait "
+            "for rank 0's third byte (chunk+remainder), not fire the "
+            "multicast on the uniform floor");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 18, finding 4) Hierarchical AllToAll truncated the chunk
+// grid like the flat injector did pre-round-17: uniform D/N chunks sent 36
+// aggregate bytes for a 2-node / 2-GPU / 15-B alltoall (45 correct), and
+// the degenerate D=3 grid sent NOTHING (chunkSize=0, expected-bytes hack
+// stalled to the 1-hour cap). It now uses the frozen destination-sized
+// chunk grid with degenerate pre-crediting.
+class HierarchicalAlltoallChunkGridTest : public TestCase
+{
+  public:
+    HierarchicalAlltoallChunkGridTest()
+        : TestCase("hierarchical alltoall covers the full data size") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint64_t dataSize = 15; // grid [4,4,4,3]
+        const uint64_t dataSizeDegenerate = 3; // grid [1,1,1,0]
+
+        for (int variant = 0; variant < 2; ++variant)
+        {
+            const uint64_t d = variant == 0 ? dataSize : dataSizeDegenerate;
+            HybridTopologyHelper helper;
+            helper.AddNvLinkFabric(2, "fullmesh", 0, "200Gbps", "400ns");
+            helper.AddNvLinkFabric(2, "fullmesh", 2, "200Gbps", "400ns");
+            helper.AddCrossFabricLink(0, 1, 0, 2, "100Gbps", "1us");
+            helper.Build();
+            helper.PopulateCrossFabricRouting();
+            auto apps = helper.GetAllEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t r = 0; r < apps.GetN(); ++r)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                ep->SetNumVirtualChannels(1);
+                ep->SetVcCredits(0, 1000000);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+
+            Ptr<HierarchicalAlltoAll> inj = CreateObject<HierarchicalAlltoAll>();
+            inj->SetGpusPerNode(2);
+            inj->SetNumNodes(2);
+            inj->Initialize(4, d, eps);
+            inj->Start();
+            Simulator::Stop(MicroSeconds(2000));
+            Simulator::Run();
+            // Whole-collective payload: every ordered pair (r,s) ships
+            // ChunkSizeOf(s) once — (N-1)*D. Pre-fix: 36 (variant 0) and a
+            // stall (variant 1).
+            NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+                "the hierarchical alltoall must complete (degenerate grid "
+                "ranks pre-credited)");
+            Simulator::Destroy();
+        }
+    }
+};
+
+// (codex round 18, finding 5) Every cross-fabric route used the gateway's
+// LAST attached device, so a gateway with two cross-fabric links routed
+// BOTH remote fabrics over the second link — transfers to the first remote
+// fabric delivered zero bytes. PopulateCrossFabricRouting now uses the
+// per-link device index recorded at build time.
+class HybridCrossFabricRoutingTest : public TestCase
+{
+  public:
+    HybridCrossFabricRoutingTest()
+        : TestCase("hybrid multi-link gateway routes each fabric on its own device") {}
+
+    static uint64_t Got2;
+    static uint64_t Got4;
+    static void Rx(uint16_t rank, Ptr<Packet> p, FabricHeader h)
+    {
+        if (h.GetPacketType() != FabricPacketType::DATA) return;
+        const uint32_t sz = h.GetEffectiveDataSize() ? h.GetEffectiveDataSize()
+                                                     : p->GetSize();
+        if (rank == 2) Got2 += sz;
+        if (rank == 4) Got4 += sz;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        Got2 = Got4 = 0;
+        // Three 2-GPU fabrics; gateway rank 0 is separately linked to
+        // ranks 2 (device 1) and 4 (device 2).
+        HybridTopologyHelper helper;
+        for (uint16_t f = 0; f < 3; ++f)
+        {
+            helper.AddNvLinkFabric(2, "fullmesh", 2 * f, "200Gbps", "400ns");
+        }
+        helper.AddCrossFabricLink(0, 1, 0, 2, "100Gbps", "1us");
+        helper.AddCrossFabricLink(0, 2, 0, 4, "100Gbps", "1us");
+        helper.Build();
+        helper.PopulateCrossFabricRouting();
+        auto apps = helper.GetAllEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t r = 0; r < apps.GetN(); ++r)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 1000000);
+            ep->Initialize();
+            ep->SetReceiveCallback(MakeCallback(&Rx));
+            eps.push_back(ep);
+        }
+        // The two cross-fabric routes from rank 0 must use DIFFERENT devices.
+        NS_TEST_ASSERT_MSG_EQ(eps[0]->GetRoutingDeviceIndex(2) !=
+                                  eps[0]->GetRoutingDeviceIndex(4),
+                              true,
+            "gateway with two cross-fabric links must route each remote "
+            "fabric via its own device, not the last device for both");
+        Simulator::Schedule(MicroSeconds(1), [&]() {
+            eps[0]->SendBulkWireTransferSize(2, 64, 3, 1, 0);
+            eps[0]->SendBulkWireTransferSize(4, 64, 3, 2, 0);
+        });
+        Simulator::Stop(MicroSeconds(1000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(Got2, 64,
+            "64-B transfer to rank 2 must deliver over ITS cross-fabric link");
+        NS_TEST_ASSERT_MSG_EQ(Got4, 64,
+            "64-B transfer to rank 4 must deliver over ITS cross-fabric link");
+        Simulator::Destroy();
+    }
+};
+uint64_t HybridCrossFabricRoutingTest::Got2 = 0;
+uint64_t HybridCrossFabricRoutingTest::Got4 = 0;
+
+// (codex round 18, finding 8) SetLinkDegradationModel stored a member no
+// build path read: a 0.99 packet-loss model delivered all 4,096 offered
+// bytes and the endpoint attribute stayed null. Build() now installs a
+// seeded per-endpoint copy of the shared model (BER must be 0 for a
+// loss-only model — BER>0 without FEC/LLR is the pre-existing
+// unrecoverable-config fatal).
+class HybridLinkDegradationTest : public TestCase
+{
+  public:
+    HybridLinkDegradationTest()
+        : TestCase("hybrid helper applies its configured degradation model") {}
+
+    static uint64_t Got1;
+    static void Rx(uint16_t rank, Ptr<Packet> p, FabricHeader h)
+    {
+        if (h.GetPacketType() != FabricPacketType::DATA) return;
+        const uint32_t sz = h.GetEffectiveDataSize() ? h.GetEffectiveDataSize()
+                                                     : p->GetSize();
+        if (rank == 1) Got1 += sz;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        Got1 = 0;
+        HybridTopologyHelper helper;
+        for (uint16_t f = 0; f < 3; ++f)
+        {
+            helper.AddNvLinkFabric(2, "fullmesh", 2 * f, "200Gbps", "400ns");
+        }
+        helper.AddCrossFabricLink(0, 1, 0, 2, "100Gbps", "1us");
+        helper.AddCrossFabricLink(0, 2, 0, 4, "100Gbps", "1us");
+        Ptr<LinkDegradationModel> degradation = CreateObject<LinkDegradationModel>();
+        degradation->SetBer(0.0); // loss-rate only (BER>0 needs FEC/LLR)
+        degradation->SetPacketLossRate(0.99);
+        helper.SetLinkDegradationModel(degradation);
+        helper.Build();
+        helper.PopulateCrossFabricRouting();
+        auto apps = helper.GetAllEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t r = 0; r < apps.GetN(); ++r)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 1000000);
+            ep->Initialize();
+            ep->SetReceiveCallback(MakeCallback(&Rx));
+            eps.push_back(ep);
+        }
+        PointerValue modelValue;
+        eps[1]->GetAttribute("LinkDegradationModel", modelValue);
+        NS_TEST_ASSERT_MSG_EQ(modelValue.Get<LinkDegradationModel>() != nullptr,
+                              true,
+            "the configured degradation model must be installed on the "
+            "endpoints (it was stored but never applied)");
+        Simulator::Schedule(MicroSeconds(1), [&]() {
+            for (uint16_t i = 0; i < 64; ++i)
+            {
+                eps[0]->SendBulkWireTransferSize(1, 64, 3, 1, 0);
+            }
+        });
+        Simulator::Stop(MicroSeconds(1000));
+        Simulator::Run();
+        // 64 x 64 B offered at loss rate 0.99: essentially nothing may
+        // survive (pre-fix: ALL 4,096 bytes arrived).
+        NS_TEST_ASSERT_MSG_EQ(Got1 < 4096, true,
+            "a 0.99 packet-loss rate must drop (nearly) all offered bytes — "
+            "pre-fix every byte was delivered");
+        Simulator::Destroy();
+    }
+};
+uint64_t HybridLinkDegradationTest::Got1 = 0;
+
+// (codex round 17, finding 1) Zero-sized chunks crashed multi-lane fabrics.
+// The degenerate sub-GPU-count grid gives ranks past dataSize a zero chunk;
+// the zero-byte bulk transfer reached the fragment math, where wireSize=0
+// (LL framing of 0 bytes) makes wireChunkSize=0 and sentChunks divides by
+// it — SIGFPE at --numGpus=4 --dataSize=3 --numLanes=18 for all three
+// fullmesh injectors. SendBulkWireTransferSize now returns early on
+// dataSize==0 (nothing to send, nothing to retry).
+class ZeroChunkBulkTransferTest : public TestCase
+{
+  public:
+    ZeroChunkBulkTransferTest()
+        : TestCase("zero-sized fullmesh chunks skip the bulk fragment math") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        // The pre-fix code divided by wireChunkSize==0 (LL framing of 0
+        // bytes is 0 wire bytes; needFragment triggers on devices.size()>1)
+        // and crashed with SIGFPE before any completion check.
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // degenerate grid [1,1,1,0]
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            // Two devices on endpoint 3: the multi-device spray path
+            // (needFragment = devices.size() > 1) is what crashed pre-fix.
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            if (r == 3)
+            {
+                NetDeviceContainer extra = p2p.Install(nodes.Get(r), switchNode.Get(0));
+                ep->AddNetDevice(extra.Get(0));
+                sw->AddPort(extra.Get(1));
+                // Route dest 0 through BOTH devices: the multi-device spray
+                // path (needFragment = devices.size() > 1) is the pre-fix
+                // crash site.
+                ep->SetRoutingDevices(0, {0u, 1u});
+            }
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        // Rank 3 owns the zero chunk: its two phases each call
+        // SendBulkWireTransferSize(dest, 0, ...), which must return early
+        // instead of dividing by wireChunkSize == 0. The multi-device
+        // endpoint takes the fragment path (needFragment = devices > 1),
+        // the exact pre-fix crash site.
+        eps[3]->SendBulkWireTransferSize(0, 0, 1, 1, 0);
+
+        // And the whole degenerate collective completes without crashing.
+        Ptr<FullMeshAllReduce> inj = CreateObject<FullMeshAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the degenerate collective must complete on a multi-lane fabric");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 16, finding 3) The injector startup event survives disposal.
+// Start() schedules the first phase with raw `this`; DoDispose must cancel
+// it (via the CollectiveInjector::m_pendingEvents discipline), otherwise a
+// disposed-and-released injector is read from freed memory when the default
+// 65-us startup expires. Variant A: dispose mid-startup. Variant B: dispose
+// mid-startup on the ring injector (same scheduling pattern).
+class InjectorStartupEventCancelledAtDisposeTest : public TestCase
+{
+  public:
+    InjectorStartupEventCancelledAtDisposeTest()
+        : TestCase("injector startup event is cancelled at dispose") {}
+
+    Ptr<FullMeshAllReduce> DisposeAt(uint64_t atNs)
+    {
+        Ptr<FullMeshAllReduce> inj = CreateObject<FullMeshAllReduce>();
+        Simulator::Schedule(NanoSeconds(atNs), [inj]() {
+            inj->Dispose();
+        });
+        Simulator::Schedule(NanoSeconds(atNs + 100), [&inj]() {
+            inj = nullptr; // release the last Ptr -> destructor runs
+        });
+        return inj;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1);
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<FullMeshAllReduce> inj = DisposeAt(1000);
+        inj->Initialize(numGpus, 15, eps);
+        inj->Start(); // schedules TriggerReduceScatterPhase at the ~65-us startup
+        Simulator::Stop(MicroSeconds(500)); // well past the startup expiry
+        Simulator::Run();
+        Simulator::Destroy();
+        // Reaching this line without reading freed memory is the assertion.
+    }
+};
+
+// (R17#2) The memory-semantic completion event and the memory-device read
+// response event both capture raw `this` and must be cancelled at dispose.
+// Codex round 17, finding 2: with a 100-us sync/memory latency and the
+// endpoint disposed AND released at 1 us, valgrind confirmed invalid reads
+// in NotifyMemorySemanticComplete (fabric-endpoint-send.cc:821/841 events)
+// and SendMemoryResponse (fabric-endpoint.cc:2249 event) at the 100-us
+// firing. Regression: fire a memory-semantic write and a memory-semantic
+// read into a MEMORY device, dispose+release the relevant endpoints at
+// 1 us, and run past the 100-us expiry — no freed reads, and the
+// completion callback never fires after dispose.
+class MemoryEventCancelledAtDisposeTest : public TestCase
+{
+  public:
+    MemoryEventCancelledAtDisposeTest()
+        : TestCase("memory-semantic events are cancelled at dispose") {}
+
+    // Static holders so the scheduled release lambdas drop the LAST
+    // reference (the DoRun-local Ptrs are not captured) — the destructor
+    // must actually run before the 100-us events.
+    static Ptr<FabricEndpoint>& Sender()
+    {
+        static Ptr<FabricEndpoint> ep;
+        return ep;
+    }
+    static Ptr<FabricEndpoint>& MemDevice()
+    {
+        static Ptr<FabricEndpoint> ep;
+        return ep;
+    }
+    static int& Completions()
+    {
+        static int n = 0;
+        return n;
+    }
+
+    static void OnSemComplete(uint16_t, uint64_t, MemoryAccessType)
+    {
+        ++Completions();
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        Completions() = 0;
+        NodeContainer a, b;
+        a.Add(CreateObject<Node>());
+        b.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer pair = p2p.Install(a.Get(0), b.Get(0));
+
+        Sender() = CreateObject<FabricEndpoint>();
+        Sender()->SetRank(0);
+        Sender()->SetLocalRankRange(0, 1);
+        Sender()->AddNetDevice(pair.Get(0));
+        Sender()->SetRoutingEntry(1, 0);
+        Sender()->SetBypassReorderBuffer(true);
+        Sender()->SetNeighborMac(1, Mac48Address::ConvertFrom(pair.Get(1)->GetAddress()));
+        // 100-us completion event — far past the 1-us dispose below.
+        Sender()->SetSyncMemLatencyNs(100000);
+        Sender()->SetMemorySemanticCallback(MakeCallback(&OnSemComplete));
+
+        MemDevice() = CreateObject<FabricEndpoint>();
+        MemDevice()->SetRank(1);
+        MemDevice()->SetLocalRankRange(1, 1);
+        MemDevice()->AddNetDevice(pair.Get(1));
+        MemDevice()->SetRoutingEntry(0, 0);
+        MemDevice()->SetBypassReorderBuffer(true);
+        MemDevice()->SetNeighborMac(0, Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+        MemDevice()->SetDeviceType(DeviceType::MEMORY);
+        MemDevice()->SetMemorySize(4096);
+        // 100-us response event — far past the 1-us dispose below.
+        MemDevice()->SetMemoryLatency(MicroSeconds(100));
+
+        Sender()->Initialize();
+        MemDevice()->Initialize();
+
+        // Memory-semantic write (completion event on the sender) and read
+        // (response event on the MEMORY device).
+        Simulator::Schedule(NanoSeconds(0), []() {
+            uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            Sender()->SendMemorySemantic(1, 0, payload, sizeof(payload),
+                                         MemoryAccessType::SYNC_LOAD_STORE);
+            Sender()->SendMemorySemantic(1, 0, nullptr, 8,
+                                         MemoryAccessType::SYNC_LOAD_STORE);
+        });
+
+        // Dispose and release BOTH endpoints at 1 us — before the 100-us
+        // completion and response events.
+        Simulator::Schedule(MicroSeconds(1), []() {
+            Sender()->Dispose();
+            MemDevice()->Dispose();
+            Sender() = nullptr;
+            MemDevice() = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(500)); // well past the 100-us expiry
+        Simulator::Run();
+        Simulator::Destroy();
+        // The completion callback must not fire after dispose...
+        NS_TEST_ASSERT_MSG_EQ(Completions(), 0,
+                              "memory-semantic completion fired after dispose");
+        // ...and reaching this line without reading freed memory is the
+        // rest of the assertion (valgrind adjudicates the response event).
+    }
+};
+
+// (R17#3) FabricEndpoint::DoDispose drops m_llrManager without detaching
+// its endpoint callbacks (OnLlrRetryTimeout / NotifyPermanentLoss) or
+// cancelling its armed retry timers. An external GetLlrManager() holder
+// keeps the manager alive after the endpoint is gone; its 100-us retry
+// timer then invokes OnLlrRetryTimeout on freed endpoint memory (codex
+// round 17, finding 3 — valgrind-confirmed invalid reads at the
+// m_llrEnabled / m_llrManager guards). Regression: retain the manager,
+// store + wire-arm an un-ACKed packet, dispose+release the endpoint at
+// 1 us, and run past the 100-us expiry.
+class LlrManagerDetachedAtDisposeTest : public TestCase
+{
+  public:
+    LlrManagerDetachedAtDisposeTest()
+        : TestCase("LLR manager callbacks and timers detach at dispose") {}
+
+    static Ptr<FabricEndpoint>& Ep()
+    {
+        static Ptr<FabricEndpoint> ep;
+        return ep;
+    }
+    static Ptr<LlrManager>& RetainedLlr()
+    {
+        static Ptr<LlrManager> llr;
+        return llr;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ep() = CreateObject<FabricEndpoint>();
+        Ep()->SetRank(1);
+        Ep()->SetLocalRankRange(1, 1);
+        Ep()->AddNetDevice(devs.Get(0));
+        Ep()->SetNeighborMac(0, Mac48Address::Allocate());
+        Ep()->SetRoutingEntry(0, 0);
+        Ep()->SetBypassReorderBuffer(true);
+
+        // The external holder that outlives the endpoint.
+        RetainedLlr() = Ep()->GetLlrManager();
+        RetainedLlr()->SetLlrMode(LlrMode::SACK);
+        RetainedLlr()->SetRetryLimit(3);
+        RetainedLlr()->SetRetryTimeout(MicroSeconds(100));
+        Ep()->SetLlrEnabled(true);
+        Ep()->EnableLlrTimeoutRetransmit(); // wires OnLlrRetryTimeout (raw this)
+
+        Ep()->Initialize();
+
+        // Store an un-ACKed packet and arm its retry timer the way the
+        // wire-egress path does (ArmRetryTimeoutAtTransmission).
+        Simulator::Schedule(NanoSeconds(0), [&devs]() {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::DATA);
+            h.SetSourceRank(1);
+            h.SetDestRank(0);
+            h.SetSequenceNumber(0);
+            h.SetFlowId(1);
+            h.SetVirtualChannel(0);
+            h.SetPayloadSize(64);
+            pkt->AddHeader(h);
+            RetainedLlr()->StorePacket(0, pkt, 0);
+            RetainedLlr()->ArmRetryTimeoutAtTransmission(0, 0, 1, 0);
+        });
+
+        // Dispose and release the ENDPOINT at 1 us; the retained manager
+        // (and pre-fix, its armed timer) survives.
+        Simulator::Schedule(NanoSeconds(1000), []() { Ep()->Dispose(); });
+        Simulator::Schedule(NanoSeconds(1100), []() { Ep() = nullptr; });
+
+        Simulator::Stop(MicroSeconds(300)); // past the 100-us timer
+        Simulator::Run();
+        Simulator::Destroy();
+        // Reaching this line without reading freed endpoint memory is the
+        // assertion (valgrind adjudicates).
+        RetainedLlr() = nullptr;
+    }
+};
+
+// (R17#4) ~ProtocolConfigRunner leaves the OnPacketReceived callback
+// registered on surviving endpoints. A delivered packet after the runner
+// is destroyed invoked OnPacketReceived on freed runner memory (codex
+// round 17, finding 4 — 64-B transfer over a 100-us link, runner destroyed
+// at 1 us, valgrind-confirmed invalid reads at the m_executor guard and
+// header field loads). The destructor now detaches exactly the callback it
+// installed (identity-compared, so a later re-binding is untouched).
+// Regression: run a P2P stencil through the real runner, destroy it at
+// 1 us, run past the delivery — no freed reads, and the endpoints'
+// callbacks are null afterwards.
+class ProtocolConfigRunnerDetachTest : public TestCase
+{
+  public:
+    ProtocolConfigRunnerDetachTest()
+        : TestCase("ProtocolConfigRunner destructor detaches endpoint callbacks") {}
+
+    static std::unique_ptr<ProtocolConfigRunner>& Runner()
+    {
+        static std::unique_ptr<ProtocolConfigRunner> runner;
+        return runner;
+    }
+
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+
+        // Two endpoints over a 100-us link: the 64-B stencil transfer
+        // delivers long after the runner's 1-us destruction.
+        NodeContainer a, b;
+        a.Add(CreateObject<Node>());
+        b.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(MicroSeconds(100)));
+        NetDeviceContainer pair = p2p.Install(a.Get(0), b.Get(0));
+
+        std::vector<Ptr<FabricEndpoint>> eps;
+        Ptr<FabricEndpoint> ep0 = CreateObject<FabricEndpoint>();
+        ep0->SetRank(0);
+        ep0->SetLocalRankRange(0, 1);
+        ep0->AddNetDevice(pair.Get(0));
+        ep0->SetRoutingEntry(1, 0);
+        ep0->SetBypassReorderBuffer(true);
+        ep0->SetNeighborMac(1, Mac48Address::ConvertFrom(pair.Get(1)->GetAddress()));
+        eps.push_back(ep0);
+        Ptr<FabricEndpoint> ep1 = CreateObject<FabricEndpoint>();
+        ep1->SetRank(1);
+        ep1->SetLocalRankRange(1, 1);
+        ep1->AddNetDevice(pair.Get(1));
+        ep1->SetRoutingEntry(0, 0);
+        ep1->SetBypassReorderBuffer(true);
+        ep1->SetNeighborMac(0, Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+        eps.push_back(ep1);
+        for (auto& ep : eps) ep->Initialize();
+
+        // Load the single-P2P stencil (the same one the probe used).
+        ProtocolConfig pconfig;
+        std::string err;
+        NS_TEST_ASSERT_MSG_EQ(
+            pconfig.Load("configs/protocol_configs/p2p-single.cfg", &err), true,
+            "p2p-single.cfg loads: " << err);
+        ProtocolProfile prof;
+        NS_TEST_ASSERT_MSG_EQ(prof.Load(pconfig.GetProfilePath()), true,
+                              "profile loads");
+        for (const auto& kv : pconfig.GetStackValues())
+        {
+            prof.Set(kv.first, kv.second);
+        }
+        ProtocolBundle pbundle = prof.Build();
+        ProtocolConfigRunner::ApplyBundle(eps, pbundle, 65536);
+
+        Runner() = std::make_unique<ProtocolConfigRunner>();
+        NS_TEST_ASSERT_MSG_EQ(
+            Runner()->Initialize(eps, pbundle, pconfig, /*numGpus=*/2,
+                                 /*dataSize=*/64, &err), true,
+            "runner initializes: " << err);
+        Runner()->Start();
+
+        // Destroy the runner at 1 us — before the ~100-us delivery.
+        Simulator::Schedule(MicroSeconds(1), []() { Runner().reset(); });
+
+        Simulator::Stop(MicroSeconds(500)); // past the delivery
+        Simulator::Run();
+
+        // The runner's callbacks must be gone from the surviving endpoints.
+        for (const auto& ep : eps)
+        {
+            NS_TEST_ASSERT_MSG_EQ(ep->GetReceiveCallback().IsNull(), true,
+                                  "endpoint receive callback detached at runner destruction");
+        }
+        Simulator::Destroy();
+        // Reaching this line without reading freed runner memory is the
+        // rest of the assertion (valgrind adjudicates).
+    }
+};
+
+// (1b-3) LLR retry timers must not start while the pacer still holds the
+// packet. Codex round 12, finding 4: StorePacket armed the timeout at
+// ENQUEUE time, but a DCQCN-shaped flow defers the first wire transmission
+// by pace slots; with a retry timeout shorter than a slot, retries exhausted
+// entirely before any transmission and a loss-free link produced permanent
+// losses. Regression: pace both flows at a sub-slot retry timeout and assert
+// every byte arrives with zero permanent losses and zero retransmissions.
+class LlrTimeoutStartsAtWireTest : public TestCase
+{
+  public:
+    LlrTimeoutStartsAtWireTest()
+        : TestCase("LLR retry timeout starts at wire transmission, not enqueue") {}
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1); // dest 1 is remote (So path, shaped)
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(false);
+
+        static uint64_t rxBytes = 0;
+        static uint64_t gapBytes = 0;
+        rxBytes = 0;
+        gapBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader h) {
+            if (h.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+            {
+                gapBytes += h.GetEffectiveDataSize();
+            }
+            else
+            {
+                rxBytes += h.GetEffectiveDataSize();
+            }
+        });
+
+        // LLR with a retry timeout SHORTER than the pacer slot: 1us vs ~13.4us
+        // for 1000B at the 0.1 Gbps per-QP ceiling. Pre-fix this exhausted the
+        // retry budget during the first pace slot (all loss fabricated).
+        // LLR is enabled on BOTH endpoints: the receiver's manager is what
+        // turns deliveries into ACKs (SendLlrAckPacket is a no-op without
+        // it), matching the protocol-config wiring where lossy fabrics
+        // enable LLR on every endpoint.
+        Ptr<LlrManager> llr = tx->GetLlrManager();
+        llr->SetRetryTimeout(NanoSeconds(1000));
+        llr->SetRetryLimit(1);
+        llr->SetLlrMode(LlrMode::SACK);
+        tx->SetLlrEnabled(true);
+        tx->EnableLlrTimeoutRetransmit();
+        rx->SetLlrEnabled(true);
+
+        Ptr<LinkDegradationModel> degr = CreateObject<LinkDegradationModel>();
+        degr->SetAttribute("Ber", DoubleValue(0.0)); // loss-free link
+        tx->SetLinkDegradationModel(degr);
+        rx->SetLinkDegradationModel(degr);
+
+        Ptr<DcqcnRateMachine> dcqcn = CreateObject<DcqcnRateMachine>();
+        dcqcn->SetAttribute("PerQpCeilingGbps", DoubleValue(0.1));
+        tx->SetDcqcnRateMachine(dcqcn);
+
+        tx->Initialize();
+        rx->Initialize();
+
+        // Two flows, one 1000B packet each (each flow's pacer holds its chunk
+        // until a full slot after the flow's previous egress).
+        std::vector<uint8_t> buf(1000, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 1000, NcclProtocol::LL, 1, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 1000, NcclProtocol::LL, 2, 0);
+
+        Simulator::Stop(MicroSeconds(3000));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(rxBytes, 2000u,
+            "both paced packets must be delivered in full on a loss-free link");
+        NS_TEST_ASSERT_MSG_EQ(gapBytes, 0u,
+            "no PERMANENT_LOSS gap bytes: pacing must not fabricate loss");
+        NS_TEST_ASSERT_MSG_EQ(llr->GetPermanentLossCount(), 0u,
+            "zero permanent losses while the pacer holds packets");
+        NS_TEST_ASSERT_MSG_EQ(llr->GetRetransmittedPackets(), 0u,
+            "zero retransmissions on a loss-free link");
+        Simulator::Destroy();
+    }
+};
+
+// (1b) R13#1: the retransmission's retry countdown must start at its WIRE
+// transmission, not when it is queued. Pre-fix the retransmission armed its
+// timer at readyDelay + timeout, so with a 64-B LL packet, 0.1-Gbps pacer
+// (~13.4-us slot), 1-us timeout and one retry the budget expired while the
+// repair was still queued: permanent loss declared ~2 us, repair transmitted
+// 13.36 us, 64 B lost on a link that delivers the repair.
+class LlrRetryArmsAtWireOnRetransmitTest : public TestCase
+{
+  public:
+    LlrRetryArmsAtWireOnRetransmitTest()
+        : TestCase("LLR retransmission arms its retry timeout at wire transmission") {}
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(false);
+
+        static uint64_t rxBytes = 0;
+        static uint64_t gapBytes = 0;
+        rxBytes = 0;
+        gapBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader h) {
+            if (h.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+            {
+                gapBytes += h.GetEffectiveDataSize();
+            }
+            else
+            {
+                rxBytes += h.GetEffectiveDataSize();
+            }
+        });
+
+        Ptr<LlrManager> llr = tx->GetLlrManager();
+        llr->SetRetryTimeout(NanoSeconds(1000));
+        llr->SetRetryLimit(1);
+        llr->SetLlrMode(LlrMode::SACK);
+        tx->SetLlrEnabled(true);
+        tx->EnableLlrTimeoutRetransmit();
+        rx->SetLlrEnabled(true); // receiver turns deliveries into ACKs
+
+        // Drop exactly the first wire copy (the rate models never see it —
+        // the drop happens on the channel, after egress shaping).
+        Ptr<DropFirstErrorModel> err = CreateObject<DropFirstErrorModel>();
+        devs.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(err));
+
+        Ptr<DcqcnRateMachine> dcqcn = CreateObject<DcqcnRateMachine>();
+        dcqcn->SetAttribute("PerQpCeilingGbps", DoubleValue(0.1));
+        tx->SetDcqcnRateMachine(dcqcn);
+
+        tx->Initialize();
+        rx->Initialize();
+
+        std::vector<uint8_t> buf(64, 0);
+        tx->SendDataWithProtocol(1, buf.data(), 64, NcclProtocol::LL, 1, 0);
+
+        Simulator::Stop(MicroSeconds(3000));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(rxBytes, 64u,
+            "the retransmitted 64-B packet must be delivered in full");
+        NS_TEST_ASSERT_MSG_EQ(gapBytes, 0u,
+            "no PERMANENT_LOSS: the repair reaches the wire before the budget expires");
+        NS_TEST_ASSERT_MSG_EQ(llr->GetPermanentLossCount(), 0u,
+            "zero permanent losses when the retransmission is merely paced");
+        NS_TEST_ASSERT_MSG_EQ(llr->GetRetransmittedPackets(), 1u,
+            "exactly one retransmission (the dropped first copy)");
+        Simulator::Destroy();
+    }
+};
+
+// (1c) RTTCC rate machine: probe cadence, Swift-style MD/AI math, per-flow
+// pacer, and the parity foundation (unknown flow / at-line-rate flow shape
+// nothing). Probe/response timing is driven by scheduled events so the RTT
+// samples come from real simulator-time differences.
+class RttccRateMachineTest : public TestCase
+{
+  public:
+    RttccRateMachineTest()
+        : TestCase("RTTCC rate machine probe cadence, MD-AI math, per-flow pacer") {}
+    void DoRun() override
+    {
+        Ptr<RttccRateMachine> m = CreateObject<RttccRateMachine>();
+        // AI=200 so two below-target samples recover 240 -> 400 (line rate).
+        m->SetAttribute("AdditiveIncreaseGbps", DoubleValue(200.0));
+        const RttccRateMachine::FlowKey kA = 12345;
+        const RttccRateMachine::FlowKey kB = 67890;
+        const uint32_t chunk = 9000;
+
+        // (a) Parity: unknown flow -> ShapingDelay 0 (repeatedly, no state),
+        // rate reads as the line rate (400 default).
+        for (int i = 0; i < 3; ++i)
+        {
+            NS_TEST_ASSERT_MSG_EQ(m->ShapingDelay(chunk, kA).GetNanoSeconds(), 0,
+                "unknown flow must not be paced (parity-safe)");
+        }
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->GetRateGbps(kA), 400.0, 1e-9,
+            "unknown flow reads the line rate");
+
+        // (b) Probe cadence at t=0: first true, immediate second false
+        // (ProbeInterval=5000 default).
+        uint32_t seq0 = 99;
+        NS_TEST_ASSERT_MSG_EQ(m->MaybeStartProbe(kA, seq0), true,
+            "first chunk of a flow must probe");
+        NS_TEST_ASSERT_MSG_EQ(seq0, 0, "first probe seq is 0");
+        uint32_t seqX = 99;
+        NS_TEST_ASSERT_MSG_EQ(m->MaybeStartProbe(kA, seqX), false,
+            "second probe within ProbeInterval must be suppressed");
+
+        Simulator::Schedule(NanoSeconds(4000), [this, m, kA]() {
+            uint32_t s = 99;
+            NS_TEST_ASSERT_MSG_EQ(m->MaybeStartProbe(kA, s), false,
+                "probe at 4000ns (< 5000ns interval) must be suppressed");
+        });
+
+        // (c) Over-target response at t=20000: rtt=20000 > target 10000 ->
+        // factor = 1 - 0.8*(20000-10000)/20000 = 0.6 -> rate = 400*0.6 = 240.
+        // Pacer then spaces chunks at slot = 9000 B / (240*1.25e8 B/s) = 300ns:
+        // consecutive same-time calls yield 0 / 300 / 600.
+        Simulator::Schedule(NanoSeconds(20000), [this, m, kA, kB, chunk]() {
+            m->OnProbeResponse(kB, 0);   // unknown flow: ignored
+            m->OnProbeResponse(kA, 999); // stale seq: ignored
+            NS_TEST_ASSERT_MSG_EQ_TOL(m->GetRateGbps(kA), 400.0, 1e-9,
+                "ignored echoes must not change the rate");
+            m->OnProbeResponse(kA, 0);
+            NS_TEST_ASSERT_MSG_EQ_TOL(m->GetRateGbps(kA), 240.0, 1e-6,
+                "over-target MD: rate = 400 * (1 - 0.8*10000/20000) = 240");
+            const int64_t d0 = m->ShapingDelay(chunk, kA).GetNanoSeconds();
+            const int64_t d1 = m->ShapingDelay(chunk, kA).GetNanoSeconds();
+            const int64_t d2 = m->ShapingDelay(chunk, kA).GetNanoSeconds();
+            NS_TEST_ASSERT_MSG_EQ(d0, 0, "throttled flow: first chunk unpaced");
+            NS_TEST_ASSERT_MSG_EQ(d1, 300, "chunk 1 paced one 300ns slot");
+            NS_TEST_ASSERT_MSG_EQ(d2, 600, "chunk 2 paced two 300ns slots");
+            // Interval elapsed (20000 >= 0+5000): a new probe fires (seq 1).
+            uint32_t s = 99;
+            NS_TEST_ASSERT_MSG_EQ(m->MaybeStartProbe(kA, s), true,
+                "probe after ProbeInterval elapsed must fire");
+            NS_TEST_ASSERT_MSG_EQ(s, 1, "second probe seq is 1");
+        });
+
+        // (d) Below-target response at t=21000 (rtt=1000 <= 10000): AI
+        // 240+200=440, capped at line 400 -> stored as the 0.0 "at line rate"
+        // sentinel -> ShapingDelay back to a 0-delay no-op.
+        Simulator::Schedule(NanoSeconds(21000), [this, m, kA, chunk]() {
+            m->OnProbeResponse(kA, 1);
+            NS_TEST_ASSERT_MSG_EQ_TOL(m->GetRateGbps(kA), 400.0, 1e-9,
+                "AI recovery must cap at the line rate");
+            NS_TEST_ASSERT_MSG_EQ(m->ShapingDelay(chunk, kA).GetNanoSeconds(), 0,
+                "at line rate the pacer must be a 0-delay no-op again");
+        });
+
+        Simulator::Stop(MicroSeconds(30));
+        Simulator::Run();
+
+        // (e) Aggregate stats: 2 probes, 2 samples, min/max RTT 1000/20000,
+        // min flow rate back at 400 after recovery.
+        NS_TEST_ASSERT_MSG_EQ(m->GetProbesSent(), 2, "two probes sent");
+        NS_TEST_ASSERT_MSG_EQ(m->GetRttSamples(), 2, "two RTT samples");
+        NS_TEST_ASSERT_MSG_EQ(m->GetMinRttNs(), 1000, "min RTT 1000ns");
+        NS_TEST_ASSERT_MSG_EQ(m->GetMaxRttNs(), 20000, "max RTT 20000ns");
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->GetMinFlowRateGbps(), 400.0, 1e-9,
+            "recovered flow reads the line rate");
         Simulator::Destroy();
     }
 };
@@ -4414,6 +6940,10 @@ class SoOnlyPredicateTest : public TestCase
             "Su MacTx must fire at send time (zero shaping delay)");
 
         // --- So packet (remote dest, RoCE SIMPLE, eff=0.95): shaped, deferred --
+        // The DCQCN delay is a per-flow PACER: a fresh flow's chunk 0 is not
+        // delayed, chunk 1 is held one pace slot after chunk 0's egress start.
+        // The expected slot is computed from the same formula the machine
+        // uses (Alpha=0.5 -> rateFactor 0.75 of the 50e9 B/s line rate).
         Ptr<Packet> soPkt = Create<Packet>(chunk);
         FabricHeader soFh;
         soFh.SetPacketType(FabricPacketType::DATA);
@@ -4426,22 +6956,28 @@ class SoOnlyPredicateTest : public TestCase
         soFh.SetSequenceNumber(2);
         soPkt->AddHeader(soFh);
 
-        const Time expectShaping = machine->ShapingDelay(soPkt->GetSize(), soKey);
-        NS_TEST_ASSERT_MSG_EQ(expectShaping.IsStrictlyPositive(), true,
-            "charged So flow must have positive shaping delay");
+        const double slotNs = static_cast<double>(chunk) / (0.75 * 50.0e9) * 1e9;
+        // Chunk 0 of the So flow: pacer delay 0, fires synchronously.
         m_sawTx = false;
         ep->InjectSend(soPkt, 0, destMac);
+        NS_TEST_ASSERT_MSG_EQ(m_sawTx, true,
+            "So chunk 0 (fresh pacer state) sends synchronously");
+        // Chunk 1: held one pace slot after chunk 0's egress start.
+        Ptr<Packet> soPkt2 = Create<Packet>(chunk);
+        FabricHeader soFh2 = soFh;
+        soFh2.SetSequenceNumber(3);
+        soPkt2->AddHeader(soFh2);
+        m_sawTx = false;
+        ep->InjectSend(soPkt2, 0, destMac);
         NS_TEST_ASSERT_MSG_EQ(m_sawTx, false,
-            "So (eff<1.0, Alpha>0) must defer MacTx by ShapingDelay");
+            "So (eff<1.0, Alpha>0) chunk 1 must defer MacTx by the pace slot");
         Simulator::Stop(MicroSeconds(30)); // < tFast(50us): Alpha stays 0.5
         Simulator::Run();
         NS_TEST_ASSERT_MSG_EQ(m_sawTx, true,
             "deferred So MacTx must fire after the simulator advances");
-        // Both sends occurred at Now=0, so the deferred fire time == ShapingDelay.
         NS_TEST_ASSERT_MSG_EQ_TOL(
-            static_cast<double>(m_txTime.GetNanoSeconds()),
-            static_cast<double>(expectShaping.GetNanoSeconds()), 1000.0,
-            "So MacTx must fire at Now + ShapingDelay");
+            static_cast<double>(m_txTime.GetNanoSeconds()), slotNs, 1000.0,
+            "So chunk 1 MacTx must fire one pace slot after chunk 0");
         Simulator::Destroy();
     }
     void OnMacTx(Ptr<const Packet> /*p*/)
@@ -4970,6 +7506,1024 @@ class NvlsAllGatherCorrectnessTest : public TestCase
     }
 };
 
+// A bare NvSwitch driven directly through the ALLGATHER aggregation path
+// (ProcessAllGather is normally reached via ReceiveFromPort). One dummy
+// point-to-point port is installed so the multicast-result Send has a real
+// device to fire on; the peer device's receive callback counts the results.
+class NvSwitchAggHarness : public NvSwitch
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::NvSwitchAggHarness")
+                                .SetParent<NvSwitch>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<NvSwitchAggHarness>();
+        return tid;
+    }
+    NvSwitchAggHarness() = default;
+    // Expose the protected test seams at public scope for this harness.
+    using NvSwitch::InjectAggregateUpload;
+    using NvSwitch::InjectResultNack;
+    using NvSwitch::GetSharpResultStoreSize;
+};
+
+NS_OBJECT_ENSURE_REGISTERED(NvSwitchAggHarness);
+
+// NVLS/SHARP upload dedup: a retransmitted upload (its LLR ack lost) must not
+// count as a new contribution. Codex repro (round 11, finding 2): 2 GPUs
+// expected 64 B each; rank 0's 32 B fragment retransmitted with the same seq;
+// rank 1 sends 64 B. Only 96 unique bytes exist, yet the switch declared the
+// flow complete and multicasted a 128 B result. The dedup gate must leave
+// rank 0's ledger at 32 B so the flow stays incomplete.
+// Switch DoDispose must cancel the deferred collective-result multicasts.
+// Codex round 15, finding 2: ProcessAllReduce scheduled
+// MulticastAllReduceResult (and the partition/allgather variants, plus the
+// FEC-coding egress hold) with raw `this` while DoDispose cancelled only the
+// arbitration event — completing a 64-B aggregation with a 100-µs
+// aggregation delay, then disposing and releasing the switch at 1 µs,
+// produced a valgrind-confirmed UAF/SIGSEGV in MulticastAllReduceResult
+// (nvswitch.cc:1203, the cleared m_allReduceBuffer). Regression: drive the
+// aggregation to completion via the inject seam, dispose mid-delay, drop the
+// last reference, and run past the multicast deadline.
+class SwitchDisposeCancelsResultMulticastsTest : public TestCase
+{
+  public:
+    SwitchDisposeCancelsResultMulticastsTest()
+        : TestCase("switch Dispose cancels deferred result multicasts") {}
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(1));
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        sw->SetAllReduceDataSize(64);
+        sw->SetAllReduceAggregationDelay(100000); // 100 µs
+
+        // Two contributors of the full 64 B each: the aggregation completes
+        // and MulticastAllReduceResult is deferred by the 100-µs delay.
+        Simulator::Schedule(NanoSeconds(100), [sw]() {
+            sw->InjectAggregateUpload(1, 0, 0, 64, false);
+            sw->InjectAggregateUpload(1, 1, 0, 64, false);
+        });
+        Simulator::Schedule(NanoSeconds(1000), [sw]() {
+            sw->Dispose();
+        });
+        // Drop the last strong reference; the pre-fix multicast held only
+        // raw `this` and dereferenced freed state at the delay deadline.
+        Simulator::Schedule(NanoSeconds(1100), [&sw]() {
+            sw = nullptr;
+        });
+
+        Simulator::Stop(MicroSeconds(300)); // past the 100.1-µs deadline
+        Simulator::Run();
+        // Reaching this line without a crash is the assertion.
+        Simulator::Destroy();
+    }
+};
+
+class SharpUploadDedupTest : public TestCase
+{
+  public:
+    SharpUploadDedupTest()
+        : TestCase("NVLS and SHARP retransmitted uploads are not double-counted")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // One port; its peer counts multicast result packets. The link must
+        // carry a real fabric data rate: the p2p default (32 kbps) serializes
+        // even a ~100 B packet in milliseconds, past the stop time, so the
+        // result packets would never reach the counting peer.
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+        uint32_t resultCount = 0;
+        devs.Get(1)->SetReceiveCallback(
+            [&resultCount](Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&) {
+                resultCount++;
+                return true;
+            });
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(0));
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(2); // 2 GPUs
+        sw->SetAllGatherChunkSize(64); // 64 B expected per GPU
+        sw->SetAllGatherDataSize(128);
+
+        // Rank 0: 32 B fragment, then the SAME seq retransmitted (ack lost).
+        sw->InjectAggregateUpload(1, 0, /*seq=*/100, 32, true);
+        sw->InjectAggregateUpload(1, 0, /*seq=*/100, 32, true); // duplicate
+        // Rank 1: full 64 B chunk.
+        sw->InjectAggregateUpload(1, 1, /*seq=*/200, 64, true);
+
+        // Only 96 unique bytes: the flow must NOT be complete. With the
+        // double-count the switch's m_allGatherReceivedBytes[1][0] read 64,
+        // the result multicast fired, and a "complete" 128 B result was
+        // assembled from 96 unique bytes.
+        Simulator::Stop(MicroSeconds(50)); // aggregation delay is scheduled
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpDuplicateUploads(), 1,
+            "The duplicate upload must be counted exactly once");
+        NS_TEST_ASSERT_MSG_EQ(resultCount, 0,
+            "No result may be multicast while unique bytes < the collective "
+            "size (96 < 128)");
+        Simulator::Destroy();
+
+        // Control: with the missing 32 B delivered under a NEW seq, the flow
+        // completes and the result is multicast (chunk sizes 32+32+64 = 3
+        // result packets to the one learned dest).
+        // Same real link rate for the control run (p2p helper retains the
+        // 200Gbps attribute set above).
+        NodeContainer nodes2;
+        nodes2.Add(CreateObject<Node>());
+        nodes2.Add(CreateObject<Node>());
+        NetDeviceContainer devs2 = p2p.Install(nodes2);
+        uint32_t resultCount2 = 0;
+        devs2.Get(1)->SetReceiveCallback(
+            [&resultCount2](Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&) {
+                resultCount2++;
+                return true;
+            });
+        Ptr<NvSwitchAggHarness> sw2 = CreateObject<NvSwitchAggHarness>();
+        sw2->AddPort(devs2.Get(0));
+        sw2->SetAllGatherEnabled(true);
+        sw2->SetAllGatherThreshold(2);
+        sw2->SetAllGatherChunkSize(64);
+        sw2->SetAllGatherDataSize(128);
+        sw2->InjectAggregateUpload(1, 0, 100, 32, true);
+        sw2->InjectAggregateUpload(1, 0, 100, 32, true); // duplicate — ignored
+        sw2->InjectAggregateUpload(1, 0, 101, 32, true); // the real second fragment
+        sw2->InjectAggregateUpload(1, 1, 200, 64, true);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw2->GetSharpDuplicateUploads(), 1,
+            "Duplicate still counted exactly once in the control run");
+        NS_TEST_ASSERT_MSG_EQ(resultCount2, 3,
+            "Completed flow must multicast its result chunks (32+32+64 B)");
+        Simulator::Destroy();
+    }
+};
+
+// NVLS/SHARP upload dedup must SURVIVE the result multicast. The dedup
+// ledger (m_seenUploadSeqs) used to be erased when the flow completed and
+// multicasted its result, so replaying the SAME (flow, src, seq) uploads
+// after the result re-registered as new contributions: the ledgers
+// re-accumulated, the flow "completed" a second time, and the switch
+// multicasted a second full result — 256 B of result traffic where 128 B
+// is correct, with zero duplicates reported (codex round 12, finding 5).
+class SharpUploadDedupSurvivesResultTest : public TestCase
+{
+  public:
+    SharpUploadDedupSurvivesResultTest()
+        : TestCase("Upload dedup survives the result multicast")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+        uint32_t resultCount = 0;
+        uint64_t resultBytes = 0;
+        devs.Get(1)->SetReceiveCallback(
+            [&resultCount, &resultBytes](Ptr<NetDevice>, Ptr<const Packet> p, uint16_t, const Address&) {
+                FabricHeader h;
+                Ptr<Packet> c = p->Copy();
+                if (c->PeekHeader(h))
+                {
+                    resultCount++;
+                    resultBytes += h.GetEffectiveDataSize();
+                }
+                return true;
+            });
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(0));
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(2);
+        sw->SetAllGatherChunkSize(64);
+        sw->SetAllGatherDataSize(128);
+
+        // Complete the flow: 2 GPUs x 64 B.
+        sw->InjectAggregateUpload(1, 0, 100, 64, true);
+        sw->InjectAggregateUpload(1, 1, 200, 64, true);
+
+        // After the result multicast has fired (the aggregation delay is
+        // scheduled), replay both uploads with the SAME seqs — a late
+        // retransmission whose LLR ack raced the multicast.
+        Simulator::Schedule(MicroSeconds(30), [&sw]() {
+            sw->InjectAggregateUpload(1, 0, 100, 64, true);
+            sw->InjectAggregateUpload(1, 1, 200, 64, true);
+        });
+
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpDuplicateUploads(), 2,
+            "Both post-result replays must be rejected as duplicates");
+        NS_TEST_ASSERT_MSG_EQ(resultCount, 2,
+            "Exactly one result set (2 chunks x 64 B) may be multicast; "
+            "the replay must not re-complete the flow");
+        NS_TEST_ASSERT_MSG_EQ(resultBytes, 128,
+            "Result traffic is 128 B, not a second 128 B result");
+        Simulator::Destroy();
+    }
+};
+
+// Multicast result sends must honor FEC wire expansion. The direct
+// port->Send sites bypassed FEC egress entirely: with RS(544,514,15) a
+// 65,536-B result fragment serialized as 65,536 wire bytes where
+// GetEncodedSize requires 70,040 — the result link's serialization (and
+// txBytes accounting) was ~6.6% understated, and the codec latency never
+// applied (codex round 12, finding 7).
+class MulticastResultFecExpansionTest : public TestCase
+{
+  public:
+    MulticastResultFecExpansionTest()
+        : TestCase("Multicast results expand for FEC on the result port")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(0));
+
+        // FEC RS(544,514,15) on the switch, optical-only, port 0 optical.
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        fec->SetFecParams(544, 514, 15);
+        fec->SetEnabled(true);
+        sw->SetFecModel(fec);
+        sw->SetFecOpticalOnly(true);
+        Ptr<LinkDegradationModel> portModel = CreateObject<LinkDegradationModel>();
+        LinkMetadata meta;
+        meta.linkClass = "inter_rack";
+        meta.medium = "optical";
+        meta.protocol = "RoCEv2";
+        portModel->SetLinkMetadata(meta);
+        sw->SetPortDegradationModel(0, portModel);
+
+        uint64_t wireBodyBytes = 0;
+        devs.Get(1)->SetReceiveCallback(
+            [&wireBodyBytes](Ptr<NetDevice>, Ptr<const Packet> p, uint16_t, const Address&) {
+                Ptr<Packet> c = p->Copy();
+                PppHeader ppp;
+                c->RemoveHeader(ppp);
+                wireBodyBytes += c->GetSize();
+                return true;
+            });
+
+        // AllGather: 2 GPUs x 65,536 B -> two 65,536-B result chunks on
+        // port 0, each of which must expand to 70,040 wire bytes.
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(2);
+        sw->SetAllGatherChunkSize(65536);
+        sw->SetAllGatherDataSize(131072);
+        sw->InjectAggregateUpload(1, 0, 100, 65536, true);
+        sw->InjectAggregateUpload(1, 1, 200, 65536, true);
+
+        Simulator::Stop(MicroSeconds(200)); // codec latency is scheduled
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(
+            wireBodyBytes,
+            static_cast<uint64_t>(2 * (fec->GetEncodedSize(65536) + 37)),
+            "Each 65,536-B result fragment must serialize with its FEC parity "
+            "(70,040 B body + 37 B FabricHeader)");
+        Simulator::Destroy();
+    }
+};
+
+// NcclRingAllReduce chunk sizing must COVER dataSize: the channels*numGpus
+// chunk grid carries dataSize/(C*N) bytes per chunk plus one extra byte for
+// the first dataSize%(C*N) chunks, so the ring's total effective traffic is
+// exactly 2(N-1)*dataSize. The old floor division dropped the remainder
+// (2 nodes x 2 GPUs, 2 channels, dataSize=15 -> chunkSize=1 -> 8 of 15
+// tensor bytes represented, 48 B of traffic where 90 B is required, yet the
+// collective reported complete — codex round 12, finding 8).
+class NcclRingChunkCoverageTest : public TestCase
+{
+  public:
+    NcclRingChunkCoverageTest()
+        : TestCase("NcclRing chunk grid covers the full data size")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        // 2 nodes x 2 GPUs on a switched p2p fabric: every rank can reach
+        // every other rank (ring successor may be cross-node).
+        const uint16_t numGpus = 4;
+        NodeContainer nodes;
+        for (int i = 0; i < numGpus; ++i)
+        {
+            nodes.Add(CreateObject<Node>());
+        }
+        NodeContainer switchNode;
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r)
+                {
+                    ep->SetRoutingEntry(d, 0);
+                }
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        // Static routes + neighbor MACs so the switch forwards and endpoints
+        // unicast (Initialize below overwrites the receive callback with the
+        // injector's, so coverage is probed via GetSentDataBytes).
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r)
+                {
+                    eps[r]->SetNeighborMac(d, macs[d]);
+                }
+            }
+        }
+        for (auto& ep : eps)
+        {
+            ep->Initialize();
+        }
+
+        Ptr<NcclRingAllReduce> ar = CreateObject<NcclRingAllReduce>();
+        ar->SetNumNodes(2);
+        ar->SetGpusPerNode(2);
+        ar->SetNumChannels(2);
+        ar->Initialize(numGpus, /*dataSize=*/15, eps);
+        ar->Start();
+
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        // 2(N-1)*D = 90 effective bytes on the wire; the old floor division
+        // sent 48 (chunkSize=1 everywhere -> 8 of 15 tensor bytes covered).
+        NS_TEST_ASSERT_MSG_EQ(ar->IsCompleted(), true,
+            "the 15-B ring must complete");
+        NS_TEST_ASSERT_MSG_EQ(ar->GetSentDataBytes(), 90u,
+            "total effective traffic must cover the full data size: "
+            "2(N-1)*D = 90 B, not 48 B");
+
+        // R13#4: chunk identity keys on the channel's RING POSITION, not the
+        // numeric rank. Channel 1's ring is 1->0->3->2 (rotated), so at step 0
+        // rank 1 (position 0) carries chunk 4 B, rank 0 (position 1) chunk
+        // 4 B, rank 3 (position 2) chunk 4 B, rank 2 (position 3) chunk 3 B;
+        // at each later step the same chunks advance one position backwards.
+        // Chunk-invariant: a rank forwards at step s+1 exactly what it
+        // received at step s.
+        for (uint32_t step = 0; step + 1 < 6; ++step)
+        {
+            for (uint16_t r = 0; r < numGpus; ++r)
+            {
+                for (uint32_t c = 0; c < 2; ++c)
+                {
+                    NS_TEST_ASSERT_MSG_EQ(
+                        ar->ProbeChunkSizeOf(c, r, step + 1),
+                        ar->ProbeExpectedRecvBytes(r, c, step),
+                        "a rank must forward the chunk it received: ring-order "
+                        "chunk identity (channel rotation respected)");
+                }
+            }
+        }
+        Simulator::Destroy();
+    }
+};
+
+// R13#3: RingAllReduce's segment grid must cover the full data size. Plain
+// integer division dropped dataSize % numGpus bytes: 4 ranks / 15 B sent 72
+// effective bytes where 2(N-1)*D = 90 is required. Both execution paths.
+class RingAllReduceSegmentCoverageTest : public TestCase
+{
+  public:
+    RingAllReduceSegmentCoverageTest()
+        : TestCase("RingAllReduce segment grid covers the full data size") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        for (int mode = 0; mode < 2; ++mode)
+        {
+            const uint16_t numGpus = 4;
+            NodeContainer nodes;
+            for (int i = 0; i < numGpus; ++i)
+            {
+                nodes.Add(CreateObject<Node>());
+            }
+            NodeContainer switchNode;
+            switchNode.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+            Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            std::vector<Mac48Address> macs;
+            for (uint16_t r = 0; r < numGpus; ++r)
+            {
+                NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+                Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+                ep->SetRank(r);
+                ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+                ep->AddNetDevice(pair.Get(0));
+                for (uint16_t d = 0; d < numGpus; ++d)
+                {
+                    if (d != r)
+                    {
+                        ep->SetRoutingEntry(d, 0);
+                    }
+                }
+                ep->SetBypassReorderBuffer(true);
+                eps.push_back(ep);
+                macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+                sw->AddPort(pair.Get(1));
+            }
+            for (uint16_t r = 0; r < numGpus; ++r)
+            {
+                sw->AddStaticRoute(macs[r], r);
+                for (uint16_t d = 0; d < numGpus; ++d)
+                {
+                    if (d != r)
+                    {
+                        eps[r]->SetNeighborMac(d, macs[d]);
+                    }
+                }
+            }
+            for (auto& ep : eps)
+            {
+                ep->Initialize();
+            }
+
+            Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
+                               BooleanValue(mode == 0));
+            Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+            ring->SetPerStepSwOverhead(NanoSeconds(0));
+            ring->SetStartupDelay(NanoSeconds(0));
+            ring->Initialize(numGpus, /*dataSize=*/15, eps);
+            ring->Start();
+            Simulator::Stop(MicroSeconds(2000));
+            Simulator::Run();
+            NS_TEST_ASSERT_MSG_EQ(ring->IsCompleted(), true,
+                "the 15-B ring must complete (both transaction and wire paths)");
+            NS_TEST_ASSERT_MSG_EQ(ring->GetSentDataBytes(),
+                                  mode == 0 ? 0u : 90u,
+                "wire-path traffic must cover the full data size: "
+                "2(N-1)*D = 90 B, not 72 B");
+            Simulator::Destroy();
+        }
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
+    }
+};
+
+// R15#7: the OTHER collective injectors must also cover the full data
+// size. RingAllGather, RingReduceScatter, and FullMeshAllReduce sized
+// every transfer with plain dataSize / numGpus, dropping dataSize %
+// numGpus bytes — 4 GPUs / 15 B completed after 72 of the 90 wire bytes a
+// fullmesh allreduce requires (only 12 of 15 tensor bytes represented).
+// The coverage probes assert the exact whole-collective traffic:
+// ring AG/RS: (N-1)*D; fullmesh allreduce: 2(N-1)*D (both phases).
+class CollectiveInjectorCoverageTest : public TestCase
+{
+  public:
+    CollectiveInjectorCoverageTest()
+        : TestCase("Ring AG-RS and FullMesh grids cover the full data size") {}
+
+    template <typename InjectorT>
+    void RunCoverage(uint64_t dataSize, uint64_t expectedBytes,
+                     const char* what)
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        const uint16_t numGpus = 4;
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<InjectorT> inj = CreateObject<InjectorT>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 15-B collective must complete");
+        NS_TEST_ASSERT_MSG_EQ(inj->GetSentDataBytes(), expectedBytes, what);
+        Simulator::Destroy();
+    }
+
+    void DoRun() override
+    {
+        // 4 GPUs / 15 B: segment grid 4+4+4+3.
+        // RingAllGather / RingReduceScatter: N-1 steps, each rank sends
+        // its segment once per step -> (N-1)*D = 45 wire bytes (the old
+        // floor division sent 36).
+        RunCoverage<RingAllGather>(15, 45,
+            "RingAllGather traffic must cover the full data size: "
+            "(N-1)*D = 45 B, not 36 B");
+        RunCoverage<RingReduceScatter>(15, 45,
+            "RingReduceScatter traffic must cover the full data size: "
+            "(N-1)*D = 45 B, not 36 B");
+        // FullMeshAllReduce: both phases broadcast the full grid to N-1
+        // peers -> 2(N-1)*D = 90 wire bytes (the old floor division sent
+        // 72, covering only 12 of 15 tensor bytes).
+        RunCoverage<FullMeshAllReduce>(15, 90,
+            "FullMeshAllReduce traffic must cover the full data size: "
+            "2(N-1)*D = 90 B, not 72 B");
+        // Standalone fullmesh AG/RS: each rank broadcasts its chunk to N-1
+        // peers -> (N-1)*D = 45 wire bytes (the old floor division sent 36,
+        // codex round 16, finding 5).
+        RunCoverage<FullMeshAllGather>(15, 45,
+            "FullMeshAllGather traffic must cover the full data size: "
+            "(N-1)*D = 45 B, not 36 B");
+        RunCoverage<FullMeshReduceScatter>(15, 45,
+            "FullMeshReduceScatter traffic must cover the full data size: "
+            "(N-1)*D = 45 B, not 36 B");
+    }
+};
+
+// Wire-path receive ledger must be keyed per SENDER step. Codex round 14,
+// finding 3: a single per-dest counter mixed bytes of different steps when
+// pipelined senders drifted ahead of the receiver (or a retransmission
+// delivered a late copy after the counter advanced) — the mixed counter
+// crossed one step's threshold with another step's bytes and starved a
+// later step: 4 GPU / 16 MiB-1 / BER 1e-8 / SACK / 64 retries /
+// timeout retransmit stalled incomplete with ZERO permanent losses and an
+// empty retry store. Regression: the same shape shrunk to 15 B with BER
+// drops and retransmissions must complete.
+class RingAllReduceLossyWireLedgerTest : public TestCase
+{
+  public:
+    RingAllReduceLossyWireLedgerTest()
+        : TestCase("RingAllReduce wire ledger stays per-step under loss") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        const uint16_t numGpus = 4;
+        NodeContainer nodes;
+        for (int i = 0; i < numGpus; ++i)
+        {
+            nodes.Add(CreateObject<Node>());
+        }
+        NodeContainer switchNode;
+        switchNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r)
+                {
+                    ep->SetRoutingEntry(d, 0);
+                }
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r)
+                {
+                    eps[r]->SetNeighborMac(d, macs[d]);
+                }
+            }
+        }
+        // Deterministic loss: drop the first packet on rank 0's uplink so a
+        // step-0 fragment is lost and recovered by retransmission — the
+        // repair lands while later steps are already flowing, the exact
+        // interleaving that mixed the old single-counter ledger.
+        Ptr<DropFirstErrorModel> err = CreateObject<DropFirstErrorModel>();
+        eps[0]->GetNetDevice(0)->SetAttribute(
+            "ReceiveErrorModel", PointerValue(err));
+        for (auto& ep : eps)
+        {
+            ep->SetLlrEnabled(true);
+            Ptr<LlrManager> llrMgr = ep->GetLlrManager();
+            llrMgr->SetLlrMode(LlrMode::SACK);
+            llrMgr->SetRetryLimit(64);
+            llrMgr->SetRetryTimeout(NanoSeconds(1000));
+            ep->EnableLlrTimeoutRetransmit();
+            ep->Initialize();
+        }
+
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(false));
+        Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+        ring->SetPerStepSwOverhead(NanoSeconds(0));
+        ring->SetStartupDelay(NanoSeconds(0));
+        // 15 B over 4 GPUs: 4+4+4+3 grid — every step boundary carries a
+        // different segment size, so any cross-step ledger mixing shows up
+        // as an early/late completion.
+        ring->Initialize(numGpus, /*dataSize=*/15, eps);
+        ring->Start();
+        Simulator::Stop(MicroSeconds(5000));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(ring->IsCompleted(), true,
+            "the lossy 15-B wire ring must complete: per-step ledgers must not "
+            "mix steps (codex round 14, finding 3)");
+        Simulator::Destroy();
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
+    }
+};
+
+// Chunk identity must rotate consistently across the AllGather direction
+// reversal. Codex round 14, finding 4: SegmentSizeOf kept decrementing the
+// ownership offset (g - s) mod N after the ring reversed at the
+// RS/AG boundary, so a rank's receive/forward segment sizes disagreed in
+// AG steps — at 4 GPUs / 259 B, rank 1 received 64 effective bytes at step 3
+// but "forwarded" 65 at step 4. The invariant a real ring keeps: at every
+// step s, a rank transmits at s+1 exactly the chunk it received at s, i.e.
+// for all g, s: SegmentSizeOf(sendTarget(g, s), s + 1) == SegmentSizeOf(g, s).
+// This test reads the rotation directly through the probe wrappers —
+// independent of simulator plumbing — over N in {2,3,4,5,8} and the codex
+// geometry (4 GPUs / 259 B).
+class RingAllReduceChunkRotationTest : public TestCase
+{
+  public:
+    RingAllReduceChunkRotationTest()
+        : TestCase("RingAllReduce chunk identity is consistent across AG reversal") {}
+    void DoRun() override
+    {
+        ObjectFactory protoFactory("ns3::NcclProtocolModel");
+        Ptr<ProtocolModel> protoModel = protoFactory.Create<ProtocolModel>();
+        protoModel->SetForceProtocolId(static_cast<uint8_t>(3)); // SIMPLE
+        // Initialize() reads endpoints[0]'s protocol model; a single bare
+        // endpoint suffices — nothing is ever sent on this path.
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetProtocolModel(protoModel);
+
+        for (uint16_t numGpus : {2, 3, 4, 5, 8})
+        {
+            const uint64_t dataSize = 100 * numGpus + 7; // uneven remainder
+            Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
+                               BooleanValue(false));
+            Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+            ring->Initialize(numGpus, dataSize, {ep});
+            const uint32_t totalSteps = 2 * (numGpus - 1);
+            for (uint32_t step = 0; step + 1 < totalSteps; ++step)
+            {
+                for (uint16_t gpu = 0; gpu < numGpus; ++gpu)
+                {
+                    const uint64_t sent = ring->ProbeSegmentSizeOf(gpu, step);
+                    const uint16_t target = ring->ProbeSendTarget(gpu, step);
+                    const uint64_t forwarded =
+                        ring->ProbeSegmentSizeOf(target, step + 1);
+                    std::ostringstream oss;
+                    oss << "N=" << numGpus << " gpu=" << gpu
+                        << " step=" << step << ": rank " << gpu << " sends "
+                        << sent << " B but target rank " << target
+                        << " forwards " << forwarded
+                        << " B — chunk identity must survive the step";
+                    NS_TEST_ASSERT_MSG_EQ(forwarded, sent, oss.str());
+                }
+            }
+        }
+
+        // Codex repro geometry: 4 GPUs / 259 B. Old formula had rank 1
+        // receiving 64 B at step 3 (RS boundary) and forwarding 65 B at
+        // step 4 (first AG step).
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
+                           BooleanValue(false));
+        Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+        ring->Initialize(4, /*dataSize=*/259, {ep});
+        const uint32_t totalSteps = 2 * (4 - 1);
+        uint64_t totalGrid = 0;
+        for (uint32_t step = 0; step < totalSteps; ++step)
+        {
+            for (uint16_t gpu = 0; gpu < 4; ++gpu)
+            {
+                totalGrid += ring->ProbeSegmentSizeOf(gpu, step);
+            }
+        }
+        NS_TEST_ASSERT_MSG_EQ(totalGrid, 2 * (4 - 1) * 259u,
+            "the full step grid must still sum to 2(N-1)*D");
+
+        // Codex round 15, finding 4: the SAME invariant with a
+        // topology-embedded REORDERED ring, 0->1->3->2. Numeric-rank
+        // ownership breaks here — rank 2 sits at ring POSITION 3, so it
+        // must transmit the position-3 chunk (64 B of 259 = 4x64 + 3),
+        // not the rank-2 chunk (65 B). The bare endpoint above carries no
+        // embedding, so its rank-arithmetic fallback masked this case.
+        {
+            const uint16_t n = 4;
+            const uint16_t next[4] = {1, 3, 0, 2}; // 0->1, 1->3, 3->2, 2->0
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint16_t r = 0; r < n; ++r)
+            {
+                Ptr<FabricEndpoint> e = CreateObject<FabricEndpoint>();
+                e->SetRank(r);
+                e->SetProtocolModel(protoModel);
+                uint16_t prev = 0xFFFF; // the rank whose next is r
+                for (uint16_t d = 0; d < n; ++d)
+                {
+                    if (next[d] == r)
+                    {
+                        prev = d;
+                    }
+                }
+                e->SetRingNeighbors(next[r], prev);
+                eps.push_back(e);
+            }
+            Ptr<RingAllReduce> reordered = CreateObject<RingAllReduce>();
+            reordered->Initialize(n, /*dataSize=*/259, eps);
+            const uint32_t reorderedSteps = 2 * (n - 1);
+            uint64_t reorderedGrid = 0;
+            for (uint32_t step = 0; step < reorderedSteps; ++step)
+            {
+                for (uint16_t gpu = 0; gpu < n; ++gpu)
+                {
+                    reorderedGrid += reordered->ProbeSegmentSizeOf(gpu, step);
+                }
+            }
+            NS_TEST_ASSERT_MSG_EQ(reorderedGrid, 2 * (n - 1) * 259u,
+                "reordered ring: the step grid must sum to 2(N-1)*D");
+            for (uint32_t step = 0; step + 1 < reorderedSteps; ++step)
+            {
+                for (uint16_t gpu = 0; gpu < n; ++gpu)
+                {
+                    const uint64_t sent = reordered->ProbeSegmentSizeOf(gpu, step);
+                    const uint16_t target = reordered->ProbeSendTarget(gpu, step);
+                    const uint64_t forwarded =
+                        reordered->ProbeSegmentSizeOf(target, step + 1);
+                    std::ostringstream oss;
+                    oss << "reordered ring (0->1->3->2) gpu=" << gpu
+                        << " step=" << step << ": rank " << gpu << " sends "
+                        << sent << " B but target rank " << target
+                        << " forwards " << forwarded
+                        << " B — chunk identity must survive the step";
+                    NS_TEST_ASSERT_MSG_EQ(forwarded, sent, oss.str());
+                }
+            }
+        }
+        Simulator::Destroy();
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
+    }
+};
+
+// Rank-0 transmit instants shared between the trace callback and the
+// transaction-input-dependency test body (trace callbacks take no captures).
+static std::vector<double> g_r15f3_tx0;
+
+// The transaction-graph ring must be RECEIVE-driven, like the wire path.
+// Codex round 15, finding 3: BuildTransactionGraph chained each GPU's step
+// s+1 send on delivery of the GPU's OWN step-s transfer (dependency = own
+// previous wait node in a gpu-major loop), so every rank transmitted at
+// wire speed regardless of input arrival. In a 4-GPU / 256-B SIMPLE ring
+// with three 1-us links and one 100-us link, the transaction-path run
+// disagreed with the receive-driven wire-path run by ~100 us per
+// slow-link traversal (rank 0's send cadence was its own slow-link
+// delivery spacing rather than its input arrival). The corrected graph
+// gates each GPU's step s+1 send on DELIVERY of its step-s input (the
+// send whose GetSendTarget IS that GPU — a ring step is a permutation),
+// the same rule the wire path applies in OnGpuStepReceiveComplete. This
+// test runs BOTH paths on the identical cluster and asserts the durations
+// match and each rank's transmit instants match exactly.
+class RingAllReduceTransactionInputDependencyTest : public TestCase
+{
+    struct RunResult
+    {
+        uint64_t durationNs{0};
+        bool completed{false};
+        std::vector<double> tx0Us; // rank-0 transmit instants, microseconds
+    };
+
+    // Build a 4-GPU switched cluster; rank 0's port is the slow link
+    // (100 us propagation vs 1 us everywhere else). The switch Ptr MUST be
+    // kept for the run's lifetime: the port devices' promisc callbacks hold
+    // raw `this` into the NvSwitch, so dropping the last Ptr before
+    // Simulator::Run() leaves them firing into freed memory.
+    struct Cluster
+    {
+        std::vector<Ptr<FabricEndpoint>> eps;
+        Ptr<NvSwitch> sw;
+    };
+
+    static Cluster BuildSlowLinkCluster()
+    {
+        const uint16_t numGpus = 4;
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<Mac48Address> macs;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("100Gbps")));
+            p2p.SetChannelAttribute("Delay",
+                TimeValue(r == 0 ? MicroSeconds(100) : MicroSeconds(1)));
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(r, 1); // every dest is remote (So path)
+            ep->AddNetDevice(pair.Get(0));
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) ep->SetRoutingEntry(d, 0);
+            }
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            macs.push_back(Mac48Address::ConvertFrom(pair.Get(0)->GetAddress()));
+            sw->AddPort(pair.Get(1));
+        }
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            sw->AddStaticRoute(macs[r], r);
+            for (uint16_t d = 0; d < numGpus; ++d)
+            {
+                if (d != r) eps[r]->SetNeighborMac(d, macs[d]);
+            }
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        // SIMPLE forced (as in the codex repro and the shared cluster
+        // builder): the 256-B segments must ride one raw SIMPLE transfer per
+        // step, not LL/LL128 framing.
+        ObjectFactory protoFactory("ns3::NcclProtocolModel");
+        Ptr<ProtocolModel> protoModel = protoFactory.Create<ProtocolModel>();
+        protoModel->SetForceProtocolId(static_cast<uint8_t>(3)); // SIMPLE
+        ObjectFactory payloadFactory("ns3::NcclProtocolPayloadBuilder");
+        Ptr<ProtocolPayloadBuilder> payloadBuilder =
+            payloadFactory.Create<ProtocolPayloadBuilder>();
+        for (auto& ep : eps)
+        {
+            ep->SetProtocolModel(protoModel);
+        }
+        (void)payloadBuilder;
+        return {eps, sw};
+    }
+
+    static RunResult RunPath(bool useTransactionModel)
+    {
+        RunResult result;
+        Cluster c = BuildSlowLinkCluster();
+
+        c.eps[0]->TraceConnectWithoutContext(
+            "Tx", MakeCallback(
+                      +[](uint32_t, uint32_t) {
+                          g_r15f3_tx0.push_back(Simulator::Now().GetSeconds() * 1e6);
+                      }));
+        g_r15f3_tx0.clear();
+
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
+                           BooleanValue(useTransactionModel));
+        Ptr<RingAllReduce> ring = CreateObject<RingAllReduce>();
+        // A NONZERO explicit startup delay survives Initialize(); zero would
+        // be replaced by the protocol default (65 us), which dilutes the
+        // 100-us link enough to mask small ordering errors.
+        ring->SetStartupDelay(NanoSeconds(1000));
+        ring->SetPerStepSwOverhead(NanoSeconds(0));
+        bool* completed = &result.completed;
+        uint64_t* duration = &result.durationNs;
+        ring->SetCompletionCallback([completed, duration](uint64_t durNs) {
+            *completed = true;
+            *duration = durNs;
+        });
+        ring->Initialize(4, /*dataSize=*/256, c.eps);
+        ring->Start();
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+        result.tx0Us = g_r15f3_tx0;
+        g_r15f3_tx0.clear();
+        Simulator::Destroy();
+        return result;
+    }
+
+  public:
+    RingAllReduceTransactionInputDependencyTest()
+        : TestCase("Ring transaction graph waits on input receipt, not own delivery") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        const RunResult wire = RunPath(false);
+        NS_TEST_ASSERT_MSG_EQ(wire.completed, true,
+            "the wire-path reference run must complete");
+        const RunResult tx = RunPath(true);
+        NS_TEST_ASSERT_MSG_EQ(tx.completed, true,
+            "the transaction-path run must complete");
+
+        // Pre-fix: 410.296 (wire) vs 608.296 us (transaction). The corrected
+        // graph must reproduce the wire path exactly.
+        NS_TEST_ASSERT_MSG_EQ(tx.durationNs, wire.durationNs,
+            "transaction-path duration must equal the receive-driven wire-path "
+            "duration (codex round 15, finding 3: rank sends must be gated on "
+            "input receipt, not on the rank's own outgoing delivery)");
+
+        NS_TEST_ASSERT_MSG_EQ(tx.tx0Us.size(), wire.tx0Us.size(),
+            "rank 0 must transmit the same number of steps on both paths");
+        for (size_t i = 0; i < wire.tx0Us.size() && i < tx.tx0Us.size(); ++i)
+        {
+            std::ostringstream oss;
+            oss << "rank-0 transmit #" << i << ": transaction path at "
+                << tx.tx0Us[i] << " us vs wire path at " << wire.tx0Us[i]
+                << " us — send ordering must be receive-driven";
+            NS_TEST_ASSERT_MSG_EQ_TOL(tx.tx0Us[i], wire.tx0Us[i], 1e-9, oss.str());
+        }
+
+        Config::SetDefault("ns3::RingAllReduce::UseTransactionModel", BooleanValue(true));
+    }
+};
+
 class HierarchicalAllReduceCorrectnessTest : public TestCase
 {
   public:
@@ -4995,8 +8549,329 @@ class HierarchicalAllReduceCorrectnessTest : public TestCase
 };
 
 // ---------------------------------------------------------------------------
+
+
 // P1: NvSwitch microarchitecture.
 // ---------------------------------------------------------------------------
+
+// Multicast-result retention: the switch-side LLR store must not evict a
+// result fragment before its first delivery. Codex repro (round 11, finding
+// 3): an 8-GPU 128-MiB allgather on the 18-lane fabric yields 1,024 result
+// fragments per dest; the old store kept full packet copies under a 512-entry
+// per-dest window, so the first half was evicted at generation time and any
+// loss of an evicted fragment was unrepairable (SACK, retry 64, plr 0.001:
+// collective incomplete at the sim limit). The store now keeps the stamped
+// header only (bodies are dummy bytes) under a 4096-entry window. The test
+// reproduces the eviction geometry — 8 ranks x 1024 fragments to one dest =
+// 8192 result chunks — and asserts both an early (seq 5) and a late (seq
+// 8150) NACK are serviceable, plus the store's per-dest bound.
+class SharpResultRetentionTest : public TestCase
+{
+  public:
+    SharpResultRetentionTest()
+        : TestCase("Multicast result store retains fragments for NACK repair")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        sw->AddPort(devs.Get(0));
+        sw->SetLlrEnabled(true);
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(8);
+        sw->SetAllGatherChunkSize(16777216); // 16 MiB per rank
+        sw->SetAllGatherDataSize(134217728); // 8 x 16 MiB
+
+        // 8 ranks x 1024 fragments of 16 KiB each: the codex-repro geometry.
+        for (uint16_t r = 0; r < 8; ++r)
+        {
+            for (uint32_t s = 0; s < 1024; ++s)
+            {
+                sw->InjectAggregateUpload(1, r, 1000 + s, 16384, true);
+            }
+        }
+        // Let the aggregation-delay event run the multicast.
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+
+        // 8192 result chunks emitted; the early ones must still be repairable
+        // (the old 512-entry window evicted all but the last 512 — seq 5 was
+        // gone before its first delivery).
+        NS_TEST_ASSERT_MSG_EQ(sw->GetMulticastSeqNum(), 8192,
+            "8 ranks x 1024 fragments must produce 8192 result chunks");
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpResultStoreSize(7), 8192,
+            "The per-dest store must retain every result fragment of the "
+            "flow (8192 here; the old 512-entry window evicted 94% at "
+            "generation time)");
+        NS_TEST_ASSERT_MSG_EQ(sw->InjectResultNack(7, 5), true,
+            "An early fragment (seq 5) must be NACK-repairable");
+        NS_TEST_ASSERT_MSG_EQ(sw->InjectResultNack(7, 8150), true,
+            "A late fragment (seq 8150) must be NACK-repairable");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 24, finding 4) StoreMulticastResult erased the previous
+// flow's window when a new flow's first result landed — even while the old
+// flow's results were still in flight. A subsequent NACK for flow 1/seq 0
+// fell back to the dest's LAST stored flow (flow 2) via m_lastResultFlow and
+// retransmitted flow 2's seq 0 under a flow-1 request, while flow 1's
+// genuinely lost result stayed unrecoverable. The store is per (dest, flow),
+// so concurrent flows keep independent windows; a named-flow NACK repairs
+// only its own flow.
+class SharpResultFlowIsolationTest : public TestCase
+{
+  public:
+    SharpResultFlowIsolationTest()
+        : TestCase("SHARP result store keeps flows' repair state isolated") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("400Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(10)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        // Per-flow result counters on the dest-side device.
+        unsigned flow1Packets = 0, flow2Packets = 0;
+        devs.Get(1)->SetPromiscReceiveCallback(
+            [&flow1Packets, &flow2Packets](Ptr<NetDevice>, Ptr<const Packet> p,
+                                           uint16_t, const Address&, const Address&,
+                                           NetDevice::PacketType) {
+                FabricHeader h;
+                p->PeekHeader(h);
+                if (h.GetPacketType() == FabricPacketType::ALLREDUCE)
+                {
+                    if (h.GetFlowId() == 1)
+                        flow1Packets++;
+                    if (h.GetFlowId() == 2)
+                        flow2Packets++;
+                }
+                return true;
+            });
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        nodes.Get(0)->AddDevice(sw);
+        sw->AddPort(devs.Get(0));
+        sw->AddRankPort(0, 0);
+        sw->SetLlrEnabled(true);
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        sw->SetAllReduceDataSize(64);
+        sw->SetAllReduceNumPartitions(1);
+        sw->SetAllReduceAggregationDelay(0);
+
+        // Flow 1 completes and multicasts its result; flow 2 completes and
+        // multicasts DURING flow 1's delivery window (10-µs link — flow 1's
+        // result is still on the wire when flow 2's store writes begin).
+        sw->InjectAggregateUpload(1, 0, 0, 64, false);
+        Simulator::Schedule(NanoSeconds(100), [sw] {
+            sw->InjectAggregateUpload(2, 0, 0, 64, false);
+        });
+        // NACK for FLOW 1 / seq 0 at 1 µs: pre-fix this retransmitted flow
+        // 2's seq 0 (fallback through m_lastResultFlow once flow 2's store
+        // replaced flow 1's), leaving flow 1's loss unrecoverable.
+        Simulator::Schedule(MicroSeconds(1), [devs] {
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::NACK);
+            h.SetSourceRank(0);
+            h.SetDestRank(0xFFFF);
+            h.SetFlowId(1);
+            h.SetSequenceNumber(0);
+            Ptr<Packet> pkt = Create<Packet>();
+            pkt->AddHeader(h);
+            devs.Get(1)->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+        });
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+
+        // Flow 1's result + its own repair = 2; flow 2's single result = 1.
+        // Pre-fix: flow1=1 (no repair) / flow2=2 (the wrong-flow repair).
+        NS_TEST_ASSERT_MSG_EQ(flow1Packets, 2u,
+            "flow 1's NACK must repair FLOW 1's own result (pre-fix: its "
+            "repair state was erased and the NACK retransmitted flow 2's "
+            "fragment instead)");
+        NS_TEST_ASSERT_MSG_EQ(flow2Packets, 1u,
+            "flow 2 must not grow a packet from flow 1's NACK (pre-fix: the "
+            "wrong-flow repair retransmitted flow 2's seq 0)");
+        // Store-level check: BOTH flows' windows survive concurrently.
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpResultStoreSize(0), 2u,
+            "both flows' repair windows must coexist in the store");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 24, finding 5) SendBulkWireTransfer's dataSize parameter was
+// uint32_t while every collective driver computes uint64_t volumes: a
+// 3-GPU-per-node local ring ships (g-1) segments — a 4-GiB aggregate at
+// D=6 GiB — which truncated to ZERO bytes and stalled phase 1 with no
+// packets emitted. The parameter is now uint64_t (the wrapper forwards to
+// SendBulkWireTransferSize and never reads the data pointer).
+class BulkWireTransferWideSizeTest : public TestCase
+{
+  public:
+    BulkWireTransferWideSizeTest()
+        : TestCase("SendBulkWireTransfer carries 64-bit volumes") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetLocalRankRange(0, 1);
+        // Exactly 2^32: the value that truncated to zero pre-fix.
+        const uint64_t volume = uint64_t{1} << 32;
+        ep->SendBulkWireTransfer(1, nullptr, volume, 3, 1, 0);
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 512u,
+            "a 4-GiB bulk volume must emit its full fragment stream (512 "
+            "chunks at the 8-MiB bulk chunk size); pre-fix the uint32_t "
+            "parameter truncated it to zero packets");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// Multicast result sequence numbering must be per-destination: endpoint
+// reorder buffers (the module default, SetBypassReorderBuffer(false)) key on
+// (vc, flow, source) and expect each stream to start at seq 0. Codex repro
+// (round 11, finding 4): one global counter advanced across destinations, so
+// with two GPUs the first dest received seqs 0-1 (delivered) while the
+// second buffered seqs 2-3 forever awaiting 0 — 128 B / 0 B delivered. Codex
+// round 12, finding 1: the per-dest fix still spanned FLOWS — a second
+// collective on the same switch continued the dest's counter at seq 2, so
+// flow 2's reorder stream buffered forever (0 B delivered). The fix numbers
+// each (destination, flow) stream independently from 0.
+class MulticastSeqPerDestTest : public TestCase
+{
+  public:
+    MulticastSeqPerDestTest()
+        : TestCase("Multicast result seqs are per-destination and per-flow (reorder buffers)")
+    {
+    }
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // Two endpoints, each with its own p2p link to the switch; both run
+        // with the reorder buffer ENABLED (module default).
+        NodeContainer epNodes;
+        epNodes.Add(CreateObject<Node>());
+        epNodes.Add(CreateObject<Node>());
+        NodeContainer swNode;
+        swNode.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer d0 = p2p.Install(epNodes.Get(0), swNode.Get(0));
+        NetDeviceContainer d1 = p2p.Install(epNodes.Get(1), swNode.Get(0));
+
+        uint64_t rxA = 0;
+        uint64_t rxB = 0;
+        uint64_t rx2A = 0; // flow 2 (second collective) per-dest deliveries
+        uint64_t rx2B = 0;
+        Ptr<FabricEndpoint> epA = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> epB = CreateObject<FabricEndpoint>();
+        epA->SetRank(0);
+        epB->SetRank(1);
+        epA->SetLocalRankRange(0, 8);
+        epB->SetLocalRankRange(0, 8);
+        epA->AddNetDevice(d0.Get(0));
+        epB->AddNetDevice(d1.Get(0));
+        // Default is already false (reorder on); set it explicitly so the
+        // test's intent survives any future default change.
+        epA->SetBypassReorderBuffer(false);
+        epB->SetBypassReorderBuffer(false);
+        epA->SetReceiveCallback(
+            [&rxA, &rx2A](uint16_t, Ptr<Packet>, FabricHeader h) {
+                if (h.GetFlowId() == 1)
+                {
+                    rxA += h.GetEffectiveDataSize();
+                }
+                else if (h.GetFlowId() == 2)
+                {
+                    rx2A += h.GetEffectiveDataSize();
+                }
+            });
+        epB->SetReceiveCallback(
+            [&rxB, &rx2B](uint16_t, Ptr<Packet>, FabricHeader h) {
+                if (h.GetFlowId() == 1)
+                {
+                    rxB += h.GetEffectiveDataSize();
+                }
+                else if (h.GetFlowId() == 2)
+                {
+                    rx2B += h.GetEffectiveDataSize();
+                }
+            });
+        epA->Initialize();
+        epB->Initialize();
+
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->AddPort(d0.Get(1));
+        sw->AddPort(d1.Get(1));
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(2);
+        sw->SetAllGatherChunkSize(64);
+        sw->SetAllGatherDataSize(128);
+
+        // Each rank uploads 64 B on its own port (a real wire send so the
+        // switch learns both port->rank mappings), for flow 1 and then again
+        // for flow 2 — two collectives on the same switch (codex round 12:
+        // the per-dest-only counter continued flow 2's stream at seq 2, so
+        // its reorder buffer waited forever for seq 0).
+        for (int f = 1; f <= 2; ++f)
+        {
+            for (int r = 0; r < 2; ++r)
+            {
+                FabricHeader fh;
+                fh.SetPacketType(FabricPacketType::ALLGATHER);
+                fh.SetFlowId(f);
+                fh.SetSourceRank(r);
+                fh.SetDestRank(0xFFFF);
+                fh.SetSequenceNumber(r);
+                fh.SetPayloadSize(64);
+                fh.SetEffectiveDataSize(64);
+                Ptr<Packet> pkt = Create<Packet>(64);
+                pkt->AddHeader(fh);
+                (r == 0 ? d0.Get(0) : d1.Get(0))
+                    ->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            }
+        }
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+
+        // Both dests must receive the full 128 B multicast result through
+        // their reorder buffers. Pre-fix: rxA=128, rxB=0 (seqs 2-3 parked
+        // forever awaiting seq 0).
+        NS_TEST_ASSERT_MSG_EQ(rxA, 128,
+            "Dest 0 must receive the full result (its seq stream starts at 0)");
+        NS_TEST_ASSERT_MSG_EQ(rxB, 128,
+            "Dest 1 must receive the full result — a per-dest seq stream "
+            "starting at 0, not a global counter's continuation (pre-fix: "
+            "seqs 2-3 buffered forever, 0 B delivered)");
+        // Flow 2 must ALSO deliver fully to both dests: its reorder stream
+        // keys on (vc, flow 2, source) and starts at 0. Pre-fix (round 12,
+        // finding 1): the per-dest counter continued at seq 2, so flow 2's
+        // seqs 2-3 parked forever — 0 B / 0 B delivered.
+        NS_TEST_ASSERT_MSG_EQ(rx2A, 128,
+            "Dest 0 must receive flow 2's full result — per-flow seq streams "
+            "restart at 0, not a per-dest counter's continuation");
+        NS_TEST_ASSERT_MSG_EQ(rx2B, 128,
+            "Dest 1 must receive flow 2's full result (pre-fix: 0 B — flow "
+            "2's result seqs continued the dest's counter)");
+        Simulator::Destroy();
+    }
+};
+
 
 // Forwarding + no-spurious-TTL-drop: a 4-GPU switched fabric forwards GPU0's
 // DATA to GPU1, the switch counts rx/tx, and GetTtlDrops()==0 (TTL is hardcoded
@@ -5328,6 +9203,91 @@ class TrafficPatternTest : public TestCase
     bool m_completeFired;
 };
 
+// (codex round 24, finding 6) The gateway's cross-fabric forwarding handler
+// was never connected to ingress: the base receive path consults only
+// m_routingTable, so a cross-fabric route (SetCrossFabricRoute) never fired —
+// the transit packet was delivered LOCALLY at the gateway and the remote rank
+// received nothing. Even with a base routing entry, the base forwarding
+// branch re-sent immediately and ignored GatewayDelay (configured 100 µs
+// produced a ~1204-ns traversal). GatewayEndpoint now overrides the
+// forwarding decision: hybrid-table routes go through ScheduleForwarding,
+// which applies the delay.
+class GatewayForwardingDelayTest : public TestCase
+{
+  public:
+    GatewayForwardingDelayTest()
+        : TestCase("GatewayEndpoint forwards cross-fabric routes with gateway delay") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer n;
+        n.Create(3);
+        PointToPointHelper p;
+        p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto ab = p.Install(n.Get(0), n.Get(1));
+        auto bc = p.Install(n.Get(1), n.Get(2));
+
+        auto a = CreateObject<FabricEndpoint>();
+        auto c = CreateObject<FabricEndpoint>();
+        auto b = CreateObject<GatewayEndpoint>();
+        n.Get(0)->AddApplication(a);
+        n.Get(1)->AddApplication(b);
+        n.Get(2)->AddApplication(c);
+        a->SetRank(0);
+        b->SetRank(1);
+        c->SetRank(2);
+        a->SetLocalRankRange(0, 1);
+        b->SetLocalRankRange(1, 1);
+        c->SetLocalRankRange(2, 1);
+        a->AddNetDevice(ab.Get(0));
+        b->AddFabricDevice(FabricType::NVLINK, ab.Get(1));
+        b->AddFabricDevice(FabricType::ETHERNET, bc.Get(0));
+        c->AddNetDevice(bc.Get(1));
+        a->SetRoutingEntry(2, 0);
+        a->SetNeighborMac(2, Mac48Address::ConvertFrom(ab.Get(1)->GetAddress()));
+        b->SetHybridRoutingTable(CreateObject<HybridRoutingTable>());
+        b->SetCrossFabricRoute(2, FabricType::ETHERNET, 1);
+        b->SetGatewayDelay(MicroSeconds(100));
+        b->SetNeighborMac(2, Mac48Address::ConvertFrom(bc.Get(1)->GetAddress()));
+        // NO base routing entry: the hybrid table alone must carry the route
+        // (pre-fix the packet was delivered locally at the gateway).
+        a->SetStartTime(Seconds(0));
+        b->SetStartTime(Seconds(0));
+        c->SetStartTime(Seconds(0));
+
+        uint64_t sinkBytes = 0, gatewayBytes = 0, sinkAt = 0;
+        b->SetReceiveCallback(
+            [&gatewayBytes](uint16_t, Ptr<Packet>, FabricHeader h) {
+                gatewayBytes += h.GetEffectiveDataSize();
+            });
+        c->SetReceiveCallback(
+            [&sinkBytes, &sinkAt](uint16_t, Ptr<Packet>, FabricHeader h) {
+                sinkBytes += h.GetEffectiveDataSize();
+                sinkAt = Simulator::Now().GetNanoSeconds();
+            });
+
+        Simulator::Schedule(MicroSeconds(1), [a] {
+            a->SendBulkWireTransferSize(2, 64, 3, 1, 0);
+        });
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(gatewayBytes, 0u,
+            "transit packet must not be delivered locally at the gateway "
+            "(pre-fix: 64 B consumed locally, remote rank starved)");
+        NS_TEST_ASSERT_MSG_EQ(sinkBytes, 64u,
+            "the cross-fabric route must deliver to the remote rank "
+            "(pre-fix: 0 B — the hybrid table was never consulted)");
+        // 1 µs send + 100 µs gateway delay + ~200 ns wire: the traversal
+        // must reflect GatewayDelay, not the pre-fix ~1204 ns bypass.
+        NS_TEST_ASSERT_MSG_GT(sinkAt, 100000u,
+            "gateway delay must be applied to cross-fabric forwarding "
+            "(pre-fix: 1204 ns with a configured 100,000 ns delay)");
+        Simulator::Destroy();
+    }
+};
+
 class GatewayEndpointTest : public TestCase
 {
   public:
@@ -5371,6 +9331,856 @@ class GatewayEndpointTest : public TestCase
         gw->SetGatewayDelay(NanoSeconds(1500));
         NS_TEST_EXPECT_MSG_EQ(gw->GetGatewayDelay().GetNanoSeconds(), 1500,
                               "gateway delay round-trips");
+    }
+};
+
+// (codex round 19, finding 1) The CreditManager pointer attribute used a raw
+// member accessor: swapping the manager through the attribute rebound the
+// endpoint's OnCreditAvailable but left the OLD manager still holding the
+// callback — credit returns on the retired manager fired into the endpoint
+// and the new manager's queue starved. The setter-based accessor detaches
+// the old binding at swap.
+class CreditManagerAttributeSwapTest : public TestCase
+{
+  public:
+    CreditManagerAttributeSwapTest()
+        : TestCase("credit manager attribute swap detaches old binding") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Ptr<CreditManager> oldCm = CreateObject<CreditManager>();
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetAttribute("CreditManager", PointerValue(oldCm));
+        oldCm->InitializeVc(0, 1);
+        ep->Initialize();
+        NS_TEST_ASSERT_MSG_EQ(
+            oldCm->GetCreditAvailableCallback().IsNull(), false,
+            "old manager holds the endpoint's credit callback after install");
+        // Swap in a new manager through the same attribute seam.
+        Ptr<CreditManager> newCm = CreateObject<CreditManager>();
+        ep->SetAttribute("CreditManager", PointerValue(newCm));
+        newCm->InitializeVc(0, 1);
+        NS_TEST_ASSERT_MSG_EQ(
+            oldCm->GetCreditAvailableCallback().IsNull(), true,
+            "attribute swap must detach the old manager's binding (the "
+            "retired manager must not fire the endpoint's callback)");
+        NS_TEST_ASSERT_MSG_EQ(
+            newCm->GetCreditAvailableCallback().IsNull(), false,
+            "the new manager receives the endpoint's binding");
+        // Credit returns on the retired manager must not notify the
+        // endpoint (weak form: no callback invocation, no crash).
+        oldCm->ReturnCredits(0, 1);
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 19, finding 2) Hierarchical reduce-scatter's ring branch sent
+// ONE segment per step instead of the g-1 aggregate steps' volume: at
+// g=4/segment 4 MiB the ring moved 4 MiB per GPU instead of 12 MiB — a 3x
+// under-transfer. The expected volume per GPU is m_segmentSize*(g-1).
+class HierarchicalRingReduceScatterVolumeTest : public TestCase
+{
+  public:
+    HierarchicalRingReduceScatterVolumeTest()
+        : TestCase("hierarchical ring reduce-scatter moves segment*(g-1) bytes") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 4;
+        const uint64_t dataSize = 16 * 1024 * 1024;
+        // segmentSize = dataSize/gpusPerNode = 4 MiB; the phase-1 receive
+        // threshold is segmentSize*(gpusPerNode-1) = 12 MiB per GPU.
+
+        // Two 4-GPU fullmesh fabrics cross-linked (the supported multi-node
+        // configuration — the sim aborts on numNodes <= 1). Pre-credits keep
+        // the 12 MiB local ring unconstrained.
+        HybridTopologyHelper helper;
+        helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+        helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+        helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+        helper.Build();
+        helper.PopulateCrossFabricRouting();
+        auto apps = helper.GetAllEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t r = 0; r < apps.GetN(); ++r)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 1000000);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+
+        // The injector's CheckLocalReduceScatterComplete gates phase 1 on
+        // segmentSize*(g-1) RECEIVED bytes per GPU, so a completed phase 1
+        // at 12 MiB expected IS the volume assertion: the pre-fix send of a
+        // single undersized segment left the receive ledger short and the
+        // collective never advanced past phase 1.
+        Ptr<HierarchicalAllReduce> inj = CreateObject<HierarchicalAllReduce>();
+        inj->SetGpusPerNode(gpusPerNode);
+        inj->SetNumNodes(2);
+        inj->SetIntraNodeAlgorithm("ring");
+        inj->Initialize(2 * gpusPerNode, dataSize, eps);
+        bool phaseDone = false;
+        inj->SetCompletionCallback([&](uint64_t) { phaseDone = true; });
+        inj->Start();
+        Simulator::Stop(MilliSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "ring reduce-scatter must deliver segmentSize*(g-1) bytes per "
+            "GPU — the send volume and the completion threshold must match");
+        NS_TEST_ASSERT_MSG_EQ(phaseDone, true,
+            "the two-node hierarchical allreduce must fire its completion");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 19, finding 3) SHARP's switch byte ledger credited padding
+// fragments as real data (effectiveSize==0 fell back to payloadSize), so
+// spray fragments' wire padding inflated the per-source ledger and the
+// switch could aggregate before every source's EFFECTIVE bytes arrived.
+// The ledger is effective-bytes-only now; padding legitimately counts 0.
+class SharpEffectiveByteLedgerTest : public TestCase
+{
+  public:
+    SharpEffectiveByteLedgerTest()
+        : TestCase("SHARP switch ledger counts effective bytes only") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 8; // grid [2,2,2,2]
+
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(numGpus);
+        sw->SetAllReduceDataSize(dataSize);
+
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(400)));
+
+        std::vector<Ptr<FabricEndpoint>> eps;
+        uint32_t nextPort = 0;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            ep->AddNetDevice(pair.Get(0));
+            ep->SetRoutingEntry(0, 0);
+            sw->AddPort(pair.Get(1));
+            sw->AddRankPort(r, nextPort++);
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        // Uploads: each rank sends its full 8-B chunk as collective spray
+        // fragments. With dataSize=8 the switch must aggregate after 8
+        // EFFECTIVE bytes per source — padding must not advance the ledger.
+        Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "SHARP allreduce must complete with effective-only ledgers");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 19, finding 6) NVLS AllGather with dataSize < numGpus: rank
+// dataSize..numGpus-1 hold zero-sized chunks and never upload, so the
+// switch's m_portRankMap (learned from uploads) never sees them and the
+// multicast result loop skipped them — receivers stalled at done=N-1 of N.
+// Helpers now register rank->port (AddRankPort) alongside the static route
+// and the multicast builders union the registered map with the learned one.
+class NvlsAllGatherDegenerateGridMulticastTest : public TestCase
+{
+  public:
+    NvlsAllGatherDegenerateGridMulticastTest()
+        : TestCase("NVLS allgather degenerate grid reaches zero-chunk ranks") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 3; // grid [1,1,1,0]: rank 3 holds nothing
+
+        NodeContainer nodes, switchNode;
+        for (int i = 0; i < numGpus; ++i) nodes.Add(CreateObject<Node>());
+        switchNode.Add(CreateObject<Node>());
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->SetAllGatherEnabled(true);
+        sw->SetAllGatherThreshold(numGpus);
+        sw->SetAllGatherChunkSize(dataSize / numGpus);
+        sw->SetAllGatherDataSize(dataSize);
+
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(400)));
+
+        std::vector<Ptr<FabricEndpoint>> eps;
+        uint32_t nextPort = 0;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            ep->SetBypassReorderBuffer(true);
+            eps.push_back(ep);
+            NetDeviceContainer pair = p2p.Install(nodes.Get(r), switchNode.Get(0));
+            ep->AddNetDevice(pair.Get(0));
+            ep->SetRoutingEntry(0, 0);
+            sw->AddPort(pair.Get(1));
+            // The helper's registration seam: mirrors what
+            // GpuClusterTopologyHelper does for the switched topology.
+            sw->AddRankPort(r, nextPort++);
+        }
+        for (auto& ep : eps) ep->Initialize();
+
+        Ptr<NvlsAllGather> inj = CreateObject<NvlsAllGather>();
+        inj->Initialize(numGpus, dataSize, eps);
+        inj->Start();
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 3-B NVLS allgather over 4 GPUs must complete: rank 3's "
+            "zero chunk means it never uploads, so the multicast result "
+            "must reach it through the helper-registered rank->port map");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 19, finding 8) Zero-data FullMesh collectives: every chunk
+// is zero, SendBulkWireTransferSize is a no-op at 0 bytes, so nothing ever
+// fires OnPacketReceived and the collective stalled to the simulation cap
+// (CLI status=incomplete at the 1-hour limit). TriggerSends now completes
+// the collective directly for zero data.
+class FullMeshZeroDataCompletionTest : public TestCase
+{
+  public:
+    FullMeshZeroDataCompletionTest()
+        : TestCase("zero-data fullmesh collectives complete without wire traffic") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+
+        // Minimal endpoint set: zero-data never touches the wire, so plain
+        // endpoints without devices suffice.
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            eps.push_back(ep);
+        }
+
+        Ptr<FullMeshAllGather> ag = CreateObject<FullMeshAllGather>();
+        ag->Initialize(numGpus, 0, eps);
+        bool agFired = false;
+        ag->SetCompletionCallback([&](uint64_t) { agFired = true; });
+        ag->Start();
+
+        Ptr<FullMeshAllReduce> ar = CreateObject<FullMeshAllReduce>();
+        ar->Initialize(numGpus, 0, eps);
+        bool arFired = false;
+        ar->SetCompletionCallback([&](uint64_t) { arFired = true; });
+        ar->Start();
+
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(ag->IsCompleted(), true,
+            "zero-data fullmesh allgather must complete at TriggerSends, "
+            "not stall to the simulation cap");
+        NS_TEST_ASSERT_MSG_EQ(agFired, true,
+            "zero-data fullmesh allgather must fire its completion callback");
+        NS_TEST_ASSERT_MSG_EQ(ar->IsCompleted(), true,
+            "zero-data fullmesh allreduce must complete at "
+            "TriggerReduceScatterPhase, not stall to the simulation cap");
+        NS_TEST_ASSERT_MSG_EQ(arFired, true,
+            "zero-data fullmesh allreduce must fire its completion callback");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 20, finding 1) SHARP/NVLS RESULT receive paths fell back to
+// the packet's wire size when effectiveDataSize was 0 (padding fragments),
+// so receivers credited padding as data and completed before every source's
+// EFFECTIVE bytes arrived. The result ledgers are effective-bytes-only now.
+// Mirrors codex's probe: 4 GPUs / D=8 / 8 partitions / 2 links per GPU; the
+// wrapped receive callbacks must observe exactly [8,8,8,8] effective bytes.
+class SharpResultEffectiveOnlyLedgerTest : public TestCase
+{
+  public:
+    SharpResultEffectiveOnlyLedgerTest()
+        : TestCase("SHARP result receive counts effective bytes only") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 8;
+
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+
+        Ptr<NvSwitch> sw;
+        auto swNode = helper.GetSwitchNodes().Get(0);
+        for (uint32_t i = 0; i < swNode->GetNDevices(); ++i)
+        {
+            Ptr<NvSwitch> s = DynamicCast<NvSwitch>(swNode->GetDevice(i));
+            if (s) sw = s;
+        }
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(numGpus);
+        sw->SetAllReduceDataSize(dataSize);
+        sw->SetAllReduceNumPartitions(8);
+
+        Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+        inj->Initialize(numGpus, dataSize, eps);
+        uint64_t actual[4] = {};
+        bool done = false;
+        inj->SetCompletionCallback([&](uint64_t) { done = true; });
+        for (uint32_t i = 0; i < eps.size(); ++i)
+        {
+            FabricEndpoint::ReceiveCallback cb = eps[i]->GetReceiveCallback();
+            eps[i]->SetReceiveCallback(
+                [&, cb, i](uint16_t rank, Ptr<Packet> p, FabricHeader h) {
+                    if (h.GetPacketType() == FabricPacketType::ALLREDUCE)
+                        actual[i] += h.GetEffectiveDataSize();
+                    cb(rank, p, h);
+                });
+        }
+        inj->Start();
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the 8-B SHARP allreduce over 4 GPUs must complete");
+        NS_TEST_ASSERT_MSG_EQ(done, true,
+            "SHARP completion callback must fire");
+        for (int i = 0; i < 4; ++i)
+        {
+            std::ostringstream oss;
+            oss << "GPU " << i << " received " << actual[i]
+                << " effective result bytes (expected 8)";
+            NS_TEST_ASSERT_MSG_EQ(actual[i], 8u, oss.str());
+        }
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 20, findings 5+6) Injector dispose and runner teardown used
+// to clear the endpoint receive callback UNCONDITIONALLY, clobbering a
+// successor's binding. DoDispose/teardown now detach only when the stored
+// binding is still their own callback.
+class InjectorDisposeDetachIfOwnerTest : public TestCase
+{
+  public:
+    InjectorDisposeDetachIfOwnerTest()
+        : TestCase("injector dispose detaches only its own receive binding") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+
+        // Real fullmesh fabric: injector B's allgather must actually move
+        // data to complete, so the endpoints need devices and a protocol.
+        GpuClusterTopologyHelper helper(numGpus, 0);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        NodeContainer nodes = helper.BuildFullMesh();
+        (void)nodes;
+        auto apps = helper.GetEndpoints();
+        Ptr<ProtocolModel> protoModel = CreateObject<NcclProtocolModel>();
+        protoModel->SetForceProtocolId(3); // SIMPLE
+        Ptr<ProtocolPayloadBuilder> builder = CreateObject<NcclProtocolPayloadBuilder>();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->SetProtocolModel(protoModel);
+            ep->SetProtocolPayloadBuilder(builder);
+            ep->SetBulkChunkSize(8 * 1024 * 1024);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+
+        Ptr<FullMeshAllGather> old = CreateObject<FullMeshAllGather>();
+        old->Initialize(numGpus, 16, eps);
+        Ptr<FullMeshAllGather> next = CreateObject<FullMeshAllGather>();
+        next->Initialize(numGpus, 16, eps);
+        bool nextDone = false;
+        next->SetCompletionCallback([&](uint64_t) { nextDone = true; });
+        next->Start();
+        old->Dispose();
+        NS_TEST_ASSERT_MSG_EQ(eps[0]->GetReceiveCallback().IsNull(), false,
+            "disposing injector A must not clear injector B's receive "
+            "binding (owner-checked detach)");
+        Simulator::Stop(MilliSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(nextDone, true,
+            "injector B must still complete after injector A is disposed");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 20, finding 2) Hierarchical AllGather 2x2 with D=1/2/4: the
+// phase-2 pre-credit keyed on the OWN node's chunk, so ranks on the
+// non-degenerate node (nonzero own chunk, zero REMOTE obligation) waited
+// for bytes nobody sends — the collective stalled to the simulation cap.
+// Pre-credit now keys on the zero remote receive obligation.
+class HierarchicalAllGatherDegenerateGridTest : public TestCase
+{
+  public:
+    HierarchicalAllGatherDegenerateGridTest()
+        : TestCase("hierarchical allgather degenerate 2x2 grid completes") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 2;
+        const uint32_t numNodes = 2;
+        for (uint64_t dataSize : {1ULL, 2ULL, 4ULL})
+        {
+            Simulator::Destroy();
+            HybridTopologyHelper helper;
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+            helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+            helper.Build();
+            helper.PopulateCrossFabricRouting();
+            auto apps = helper.GetAllEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t r = 0; r < apps.GetN(); ++r)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                ep->SetNumVirtualChannels(1);
+                ep->SetVcCredits(0, 1000000);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+            Ptr<HierarchicalAllGather> inj = CreateObject<HierarchicalAllGather>();
+            inj->SetGpusPerNode(gpusPerNode);
+            inj->SetNumNodes(numNodes);
+            inj->Initialize(numNodes * gpusPerNode, dataSize, eps);
+            bool done = false;
+            inj->SetCompletionCallback([&](uint64_t) { done = true; });
+            inj->Start();
+            Simulator::Stop(MilliSeconds(100));
+            Simulator::Run();
+            NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+                "hierarchical allgather 2x2 must complete at D=" << dataSize);
+            NS_TEST_ASSERT_MSG_EQ(done, true,
+                "hierarchical allgather 2x2 completion callback must fire at D="
+                << dataSize);
+            Simulator::Destroy();
+        }
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 20, finding 3) Hierarchical AllReduce/ReduceScatter with a
+// dataSize the flat division truncates (2x2 / D=15): flat floor chunks sent
+// 80 (AR) / 40 (RS) bytes where the remainder-aware grid tiles D exactly —
+// 90 / 45. Send sizes, receive thresholds, and (AR) the two-level grid must
+// agree, or ranks stall waiting for remainder bytes nobody ships.
+class HierarchicalRemainderGridTest : public TestCase
+{
+  public:
+    HierarchicalRemainderGridTest()
+        : TestCase("hierarchical AR and RS remainder grids tile dataSize exactly") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 2;
+        const uint32_t numNodes = 2;
+        const uint64_t dataSize = 15; // grid AR: seg [8,7], chunks [4,3]x2
+
+        // Two SEPARATE fabric builds: both injectors share one endpoint
+        // receive slot, so running them concurrently makes the second
+        // SetupReceiveCallbacks clobber the first — each collective runs
+        // on its own fabric, sequentially.
+        for (int round = 0; round < 2; ++round)
+        {
+            HybridTopologyHelper helper;
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+            helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+            helper.Build();
+            helper.PopulateCrossFabricRouting();
+            auto apps = helper.GetAllEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t r = 0; r < apps.GetN(); ++r)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                ep->SetNumVirtualChannels(1);
+                ep->SetVcCredits(0, 1000000);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+
+            bool done = false;
+            if (round == 0)
+            {
+                Ptr<HierarchicalAllReduce> ar = CreateObject<HierarchicalAllReduce>();
+                ar->SetGpusPerNode(gpusPerNode);
+                ar->SetNumNodes(numNodes);
+                ar->Initialize(numNodes * gpusPerNode, dataSize, eps);
+                ar->SetCompletionCallback([&](uint64_t) { done = true; });
+                ar->Start();
+                Simulator::Stop(MilliSeconds(200));
+                Simulator::Run();
+                NS_TEST_ASSERT_MSG_EQ(ar->IsCompleted(), true,
+                    "hierarchical allreduce 2x2 D=15 must complete: flat "
+                    "floor chunks moved 80 of the grid's 90 bytes and "
+                    "stalled ranks on the remainder");
+                NS_TEST_ASSERT_MSG_EQ(done, true,
+                    "hierarchical allreduce completion callback must fire");
+            }
+            else
+            {
+                Ptr<HierarchicalReduceScatter> rs = CreateObject<HierarchicalReduceScatter>();
+                rs->SetGpusPerNode(gpusPerNode);
+                rs->SetNumNodes(numNodes);
+                rs->Initialize(numNodes * gpusPerNode, dataSize, eps);
+                rs->SetCompletionCallback([&](uint64_t) { done = true; });
+                rs->Start();
+                Simulator::Stop(MilliSeconds(200));
+                Simulator::Run();
+                NS_TEST_ASSERT_MSG_EQ(rs->IsCompleted(), true,
+                    "hierarchical reducescatter 2x2 D=15 must complete: "
+                    "flat floor chunks moved 40 of the grid's 45 bytes");
+                NS_TEST_ASSERT_MSG_EQ(done, true,
+                    "hierarchical reducescatter completion callback must "
+                    "fire");
+            }
+            Simulator::Destroy();
+        }
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 20, finding 4) Replacing a BLOCKED CreditManager with a
+// credited one via the attribute seam left queued sends stranded: the new
+// manager was installed but nothing re-ran the deferred-send path. The
+// setter now drains the queue after installing the binding.
+class CreditManagerSwapWakesQueuedSendsTest : public TestCase
+{
+  public:
+    CreditManagerSwapWakesQueuedSendsTest()
+        : TestCase("credit manager swap drains the queued sends") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        const uint16_t numGpus = 2;
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+        // Drain receiver: count delivered payload bytes.
+        uint64_t rx = 0;
+        eps[1]->SetReceiveCallback(
+            [&](uint16_t, Ptr<Packet>, FabricHeader h) { rx += h.GetEffectiveDataSize(); });
+        // Zero out the sender's credits, queue a 1000-B transfer...
+        eps[0]->SetVcCredits(0, 0);
+        eps[0]->SendBulkWireTransferSize(1, 1000, 3, 42, 0);
+        // ...then swap in a fresh manager WITH credits (the attribute
+        // seam). The queued transfer must now proceed.
+        Ptr<CreditManager> next = CreateObject<CreditManager>();
+        next->InitializeVc(0, 4);
+        eps[0]->SetAttribute("CreditManager", PointerValue(next));
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(rx, 1000u,
+            "swapping in a credited CreditManager must deliver the queued "
+            "1000-B transfer (stranded queue pre-fix)");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 20, finding 7) Deferred backlog-decrement lambdas captured
+// `this` (the FabricEndpoint) instead of the ContentiousModel: an endpoint
+// replaced/destroyed before the deferred fire dereferenced freed memory.
+// The lambdas now hold the model via Ptr.
+class ContentionBacklogSurvivesModelSwapTest : public TestCase
+{
+  public:
+    ContentionBacklogSurvivesModelSwapTest()
+        : TestCase("contention backlog decrement survives model replacement") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        const uint16_t numGpus = 2;
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+        Ptr<ContentionModel> model = CreateObject<ContentionModel>();
+        model->SetBandwidth(1000000000);
+        eps[0]->SetContentionModel(model);
+        eps[0]->SendBulkWireTransferSize(1, 1000, 3, 42, 0);
+        // Replace the contention model while the deferred decrement is
+        // still pending — the lambda must fire against the retained model,
+        // not the endpoint's (new) member.
+        eps[0]->SetContentionModel(nullptr);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+        // No crash and clean run IS the assertion (the pre-fix deref was a
+        // use-after-free on the endpoint's cleared member).
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 20, finding 8) --startupDelay ignored by hierarchical
+// injectors: Start() unconditionally used the size-derived model delay. The
+// override now wins whenever set. Observed via the completion timestamp.
+class HierarchicalStartupDelayOverrideTest : public TestCase
+{
+  public:
+    HierarchicalStartupDelayOverrideTest()
+        : TestCase("hierarchical startupDelay override shifts completion") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 2;
+        const uint32_t numNodes = 2;
+        const uint64_t dataSize = 1 << 20;
+        const uint64_t overrideNs = 100000000ULL; // 100 ms
+
+        for (int withOverride = 0; withOverride <= 1; ++withOverride)
+        {
+            HybridTopologyHelper helper;
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+            helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+            helper.Build();
+            helper.PopulateCrossFabricRouting();
+            auto apps = helper.GetAllEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t r = 0; r < apps.GetN(); ++r)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                ep->SetNumVirtualChannels(1);
+                ep->SetVcCredits(0, 1000000);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+            Ptr<HierarchicalAllReduce> inj = CreateObject<HierarchicalAllReduce>();
+            inj->SetGpusPerNode(gpusPerNode);
+            inj->SetNumNodes(numNodes);
+            if (withOverride)
+                inj->SetStartupDelay(NanoSeconds(overrideNs));
+            inj->Initialize(numNodes * gpusPerNode, dataSize, eps);
+            uint64_t doneNs = 0;
+            inj->SetCompletionCallback([&](uint64_t ns) { doneNs = ns; });
+            inj->Start();
+            Simulator::Stop(MilliSeconds(500));
+            Simulator::Run();
+            NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+                "hierarchical allreduce must complete (override="
+                << withOverride << ")");
+            if (withOverride)
+            {
+                NS_TEST_ASSERT_MSG_EQ(doneNs >= overrideNs, true,
+                    "the startupDelay override (100 ms) must shift the "
+                    "completion timestamp (was identical to the baseline "
+                    "pre-fix)");
+            }
+            else
+            {
+                m_baselineNs = doneNs;
+            }
+            Simulator::Destroy();
+        }
+        NS_TEST_ASSERT_MSG_EQ(m_baselineNs < overrideNs, true,
+            "the model-derived baseline must sit far below the override");
+        Simulator::Destroy();
+    }
+
+  private:
+    uint64_t m_baselineNs = 0;
+};
+
+// (codex round 20, finding 9) Hierarchical ReduceScatter with
+// gpusPerNode=1: StartLocalReduceScatter unconditionally drove the local
+// phase-1 machinery sized for g>1 (threshold chunks*(g-1) = 0 with the old
+// clamp), stalling the collective. The g<=1 shortcut now jumps straight to
+// the inter-node phase.
+class HierarchicalReduceScatterSingleNodeGpuTest : public TestCase
+{
+  public:
+    HierarchicalReduceScatterSingleNodeGpuTest()
+        : TestCase("hierarchical reducescatter gpusPerNode=1 completes") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 1;
+        const uint32_t numNodes = 2;
+        const uint64_t dataSize = 16;
+
+        HybridTopologyHelper helper;
+        helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+        helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+        helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+        helper.Build();
+        helper.PopulateCrossFabricRouting();
+        auto apps = helper.GetAllEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t r = 0; r < apps.GetN(); ++r)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+            ep->SetNumVirtualChannels(1);
+            ep->SetVcCredits(0, 1000000);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+        Ptr<HierarchicalReduceScatter> inj = CreateObject<HierarchicalReduceScatter>();
+        inj->SetGpusPerNode(gpusPerNode);
+        inj->SetNumNodes(numNodes);
+        inj->Initialize(numNodes * gpusPerNode, dataSize, eps);
+        bool done = false;
+        inj->SetCompletionCallback([&](uint64_t) { done = true; });
+        inj->Start();
+        Simulator::Stop(MilliSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "hierarchical reducescatter must complete with one GPU per "
+            "node (the g>1-only local phase stalled it pre-fix)");
+        NS_TEST_ASSERT_MSG_EQ(done, true,
+            "hierarchical reducescatter completion callback must fire");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 20, finding 10) Zero-data collectives beyond fullmesh: ring
+// and SHARP allreduce built transaction graphs whose wait nodes got zero
+// completion thresholds (Validate aborts); ring/fullmesh AG/RS, tree,
+// reduce/broadcast, and the p2p patterns stalled with nothing to send.
+// Every injector now short-circuits dataSize==0 to Complete().
+class ZeroDataCollectiveCompletionTest : public TestCase
+{
+  public:
+    ZeroDataCollectiveCompletionTest()
+        : TestCase("zero-data ring tree and fullmesh collectives complete trivially") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+
+        // Ring/tree injectors need no switch: plain endpoints suffice.
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint16_t r = 0; r < numGpus; ++r)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            ep->SetRank(r);
+            ep->SetLocalRankRange(0, numGpus);
+            eps.push_back(ep);
+        }
+
+        struct Case
+        {
+            const char* name;
+            std::function<Ptr<Object>()> make;
+        };
+        // Each case builds and starts the injector; completion asserted.
+        auto runCase = [&](const char* name, auto makeInj) {
+            bool done = false;
+            auto inj = makeInj();
+            inj->SetCompletionCallback([&](uint64_t) { done = true; });
+            inj->Start();
+            Simulator::Stop(MicroSeconds(100));
+            Simulator::Run();
+            NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+                "zero-data " << name << " must complete trivially");
+            NS_TEST_ASSERT_MSG_EQ(done, true,
+                "zero-data " << name << " must fire its completion callback");
+            Simulator::Destroy();
+        };
+
+        runCase("ring allreduce", [&] {
+            auto inj = CreateObject<RingAllReduce>();
+            inj->Initialize(numGpus, 0, eps);
+            return inj;
+        });
+        runCase("ring allgather", [&] {
+            auto inj = CreateObject<RingAllGather>();
+            inj->Initialize(numGpus, 0, eps);
+            return inj;
+        });
+        runCase("ring reducescatter", [&] {
+            auto inj = CreateObject<RingReduceScatter>();
+            inj->Initialize(numGpus, 0, eps);
+            return inj;
+        });
+        runCase("ring broadcast", [&] {
+            auto inj = CreateObject<RingBroadcast>();
+            inj->Initialize(numGpus, 0, eps);
+            return inj;
+        });
+        runCase("tree allreduce", [&] {
+            auto inj = CreateObject<TreeAllReduce>();
+            inj->Initialize(numGpus, 0, eps);
+            return inj;
+        });
+        runCase("fullmesh reducescatter", [&] {
+            auto inj = CreateObject<FullMeshReduceScatter>();
+            inj->Initialize(numGpus, 0, eps);
+            return inj;
+        });
     }
 };
 
@@ -5485,6 +10295,903 @@ class RailOptimizedFatTreeCoreTierTest : public TestCase
     }
 };
 
+
+
+// (codex round 24, finding 7) The CLI documents --ecnThreshold "0=off", but
+// MarkEcnIfCongested gated only on `voqDepth < m_ecnThreshold`: with a
+// threshold of 0 that comparison is `0 < 0 == false`, so a quiescent link
+// (VOQ depth 0) still marked every RoCE DATA packet -- a 64-byte P2P run
+// with dcqcn=1/ecnThreshold=0 produced one ECN mark and one CNP. Threshold
+// 0 must disable marking, like the voqDropThreshold guard above it.
+class EcnThresholdZeroDisablesTest : public TestCase
+{
+  public:
+    EcnThresholdZeroDisablesTest() : TestCase("EcnThreshold=0 disables ECN marking") {}
+    void DoRun() override
+    {
+        Ptr<EthernetSwitch> sw = CreateObject<EthernetSwitch>();
+        sw->SetAttribute("EcnThreshold", UintegerValue(0));
+
+        // RoCE DATA packet arriving into a quiescent VOQ (depth 0): the
+        // pre-fix bug marked exactly this (0 < 0 is false).
+        Ptr<Packet> pkt = Create<Packet>(64);
+        SoHeader soh;
+        soh.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        soh.SetEcn(false);
+        soh.SetDataSize(64);
+        pkt->AddHeader(soh);
+        FabricHeader fh;
+        fh.SetPacketType(FabricPacketType::DATA);
+        fh.SetFabricType(FabricType::ROCE);
+        fh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        pkt->AddHeader(fh);
+
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(pkt, 0), false,
+                              "ecnThreshold=0 must disable marking even at VOQ depth 0");
+        // Even a genuinely deep queue stays unmarked: "0=off", not "0=mark-all".
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(pkt, 100), false,
+                              "ecnThreshold=0 must disable marking at any VOQ depth");
+        // The packet itself must be untouched (no spurious SoHeader rewrite).
+        FabricHeader outFh;
+        pkt->PeekHeader(outFh);
+        Ptr<Packet> copy = pkt->Copy();
+        copy->RemoveHeader(outFh);
+        SoHeader outSo;
+        copy->PeekHeader(outSo);
+        NS_TEST_ASSERT_MSG_EQ(outSo.GetEcn(), false, "SoHeader ECN bit must stay clear");
+    }
+};
+
+// (codex round 23, finding 1) The DCQCN/RTTCC flow key carried no source
+// rank, so two senders sharing (dest, vc, flow) coordinates merged onto one
+// pacer when the machine is shared (the sim's single-NIC modeling): the
+// second sender inherited the first's pacing debt and finished at 1434.8 µs
+// where independent state finishes at 715.1 µs. The rate key now includes
+// the sender rank.
+// (codex round 24, finding 2) Forwarded packets were shaped on the FORWARDING
+// endpoint's m_rank at both rate machines: on routes 0->1->2 and 1->2 (shared
+// dest=2/vc=0/flow=7 coordinates, 49-Gbps per-QP ceiling on one shared
+// machine), endpoint 1's key merged source 0's transit stream onto source 1's
+// pacer — source 0 finished at 1434 us where the independent-pacer time is
+// 714 us. The per-QP pacer is a SENDER-NIC property: forwarded packets carry
+// the original sender's rank and are now skipped at both machines (the CNP /
+// RTT-response receive paths already key on the flow's origin).
+class DcqcnForwardedPacketOriginTest : public TestCase
+{
+  public:
+    DcqcnForwardedPacketOriginTest()
+        : TestCase("DCQCN forwarded packets skip the forwarder's pacer") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p;
+        p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto ab = p.Install(nodes.Get(0), nodes.Get(1));
+        auto bc = p.Install(nodes.Get(1), nodes.Get(2));
+
+        std::array<Ptr<FabricEndpoint>, 3> ep;
+        Ptr<DcqcnRateMachine> rate = CreateObject<DcqcnRateMachine>();
+        rate->SetAttribute("PerQpCeilingGbps", DoubleValue(49));
+        std::array<uint64_t, 2> rx{}, done{};
+        for (unsigned i = 0; i < 3; ++i)
+        {
+            ep[i] = CreateObject<FabricEndpoint>();
+            nodes.Get(i)->AddApplication(ep[i]);
+            ep[i]->SetRank(i);
+            ep[i]->SetNodeId(i);
+            ep[i]->SetLocalRankRange(i, 1);
+            ep[i]->SetInterNodeProtocolModel(CreateObject<RoceProtocolModel>());
+            ep[i]->SetBulkChunkSize(65536);
+            ep[i]->SetBypassReorderBuffer(true);
+            ep[i]->Initialize();
+            ep[i]->SetReceiveCallback(
+                [&rx, &done](uint16_t, Ptr<Packet>, FabricHeader h) {
+                    if (h.GetPacketType() != FabricPacketType::DATA)
+                        return;
+                    unsigned s = h.GetSourceRank();
+                    if (s >= 2)
+                        return;
+                    rx[s] += h.GetEffectiveDataSize();
+                    if (rx[s] >= (4u << 20))
+                        done[s] = Simulator::Now().GetNanoSeconds();
+                });
+            // ONE shared machine across endpoint 0 (origin) and endpoint 1
+            // (origin + forwarder) — the sim's single-NIC convention.
+            ep[i]->SetDcqcnRateMachine(rate);
+        }
+        ep[0]->AddNetDevice(ab.Get(0));
+        ep[1]->AddNetDevice(ab.Get(1));
+        ep[1]->AddNetDevice(bc.Get(0));
+        ep[2]->AddNetDevice(bc.Get(1));
+        ep[0]->SetRoutingEntry(2, 0);
+        ep[0]->SetNeighborMac(2, Mac48Address::ConvertFrom(ab.Get(1)->GetAddress()));
+        ep[1]->SetRoutingEntry(2, 1);
+        ep[1]->SetNeighborMac(2, Mac48Address::ConvertFrom(bc.Get(1)->GetAddress()));
+
+        Simulator::Schedule(MicroSeconds(1), [ep] {
+            ep[0]->SendBulkWireTransferSize(2, 4u << 20, 1, 7, 0);
+            ep[1]->SendBulkWireTransferSize(2, 4u << 20, 1, 7, 0);
+        });
+        Simulator::Stop(MilliSeconds(5));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(rx[0], 4u << 20, "forwarded stream fully delivered");
+        NS_TEST_ASSERT_MSG_EQ(rx[1], 4u << 20, "direct stream fully delivered");
+        NS_TEST_ASSERT_MSG_EQ(done[0] > 0 && done[1] > 0, true, "both streams complete");
+        // The forwarded stream must finish at the independent-pacer time
+        // (~714 us), NOT the merged ~1434 us. Assert against a threshold
+        // well below the merge artifact but above the true pace.
+        NS_TEST_ASSERT_MSG_LT(done[0], 1000000u,
+            "forwarded stream must not inherit the forwarder's pacing debt "
+            "(pre-fix: 1,434,200 ns; independent-pacer time ~714,398 ns)");
+        // And the two same-coordinates senders stay isolated (round 23's
+        // guarantee holds on the shared machine): within ~100 us of each other.
+        uint64_t diff = (done[0] > done[1]) ? done[0] - done[1] : done[1] - done[0];
+        NS_TEST_ASSERT_MSG_LT(diff, 100000u,
+            "forwarded and direct senders with identical coordinates must be "
+            "paced independently at the forwarder");
+        Simulator::Destroy();
+    }
+};
+
+class DcqcnFlowKeySenderIsolationTest : public TestCase
+{
+  public:
+    DcqcnFlowKeySenderIsolationTest()
+        : TestCase("DCQCN shared machine keeps per-sender flow state isolated") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        GpuClusterTopologyHelper helper(3, 1);
+        helper.SetLinkDataRate("400Gbps");
+        helper.SetLinkDelay("100ns");
+        helper.SetLinksPerGpu(1);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<uint64_t> lastArrival(3, 0);
+        Ptr<DcqcnRateMachine> shared = CreateObject<DcqcnRateMachine>();
+        shared->SetAttribute("PerQpCeilingGbps", DoubleValue(49));
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetLocalRankRange(i, 1);
+            ep->SetInterNodeProtocolModel(CreateObject<RoceProtocolModel>());
+            ep->SetBypassReorderBuffer(true);
+            ep->SetBulkChunkSize(65536);
+            ep->Initialize();
+            ep->SetReceiveCallback(
+                [&lastArrival](uint16_t, Ptr<Packet>, FabricHeader h) {
+                    if (h.GetPacketType() == FabricPacketType::DATA)
+                    {
+                        lastArrival[h.GetSourceRank()] =
+                            Simulator::Now().GetNanoSeconds();
+                    }
+                });
+            // ONE shared machine across both senders — the sim's convention.
+            ep->SetDcqcnRateMachine(shared);
+            eps.push_back(ep);
+        }
+
+        // Two senders, identical (dest=0, flow=7, vc=0) coordinates.
+        const uint64_t d = 4 * 1024 * 1024;
+        eps[1]->SendBulkWireTransferSize(0, d, 1, 7, 0);
+        eps[2]->SendBulkWireTransferSize(0, d, 1, 7, 0);
+        Simulator::Stop(MilliSeconds(5));
+        Simulator::Run();
+
+        // The two streams are paced INDEPENDENTLY: the second sender's
+        // completion must not inherit the first's pacing debt (pre-fix
+        // 1,434,799 ns vs 715,096 ns independent; a 2x merge artifact).
+        const uint64_t t1 = lastArrival[1];
+        const uint64_t t2 = lastArrival[2];
+        NS_TEST_ASSERT_MSG_EQ(t1 > 0 && t2 > 0, true,
+            "both senders' streams must arrive");
+        uint64_t diff = (t1 > t2) ? t1 - t2 : t2 - t1;
+        NS_TEST_ASSERT_MSG_LT(diff, 100000u,
+            "two same-coordinates senders must finish within 100 µs of each "
+            "other on independent pacers (pre-fix: 721 µs apart on a shared "
+            "pacer)");
+        Simulator::Destroy();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Codex round 22 regressions.
+// ---------------------------------------------------------------------------
+
+// (codex round 22, finding 1) Legacy single-multicast SHARP AllReduce: late
+// padding uploads re-satisfy allComplete after the multicast cleared the
+// buffer, scheduling a SECOND result event that dereferences the empty
+// buffer's begin() — SIGSEGV. The once-per-flow done marker makes the
+// collective one-shot; the delayed lanes here reproduce the late arrivals.
+class SharpLegacyMulticastOnceTest : public TestCase
+{
+  public:
+    SharpLegacyMulticastOnceTest()
+        : TestCase("SHARP legacy multicast result fires once per flow") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 1;
+
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            // Channel-level delay on each GPU's first link: uploads land at
+            // the switch staggered, so padding fragments arrive after the
+            // multicast has already fired.
+            ep->GetNetDevice(0)->GetChannel()->SetAttribute(
+                "Delay", TimeValue(NanoSeconds(500)));
+            eps.push_back(ep);
+        }
+
+        Ptr<NvSwitch> sw;
+        auto swNode = helper.GetSwitchNodes().Get(0);
+        for (uint32_t i = 0; i < swNode->GetNDevices(); ++i)
+        {
+            Ptr<NvSwitch> s = DynamicCast<NvSwitch>(swNode->GetDevice(i));
+            if (s) sw = s;
+        }
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(numGpus);
+        sw->SetAllReduceDataSize(dataSize);
+        sw->SetAllReduceNumPartitions(1);
+        sw->SetAllReduceAggregationDelay(10000);
+
+        Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+        inj->SetAttribute("UseTransactionModel", BooleanValue(false));
+        inj->Initialize(numGpus, dataSize, eps);
+        bool done = false;
+        inj->SetCompletionCallback([&](uint64_t) { done = true; });
+        inj->Start();
+        Simulator::Stop(MilliSeconds(1));
+        Simulator::Run();
+        // Pre-fix this crashed inside MulticastAllReduceResult (empty
+        // begin()); completing at all is the regression assertion.
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "legacy single-multicast SHARP must complete once and survive "
+            "late padding uploads");
+        NS_TEST_ASSERT_MSG_EQ(done, true,
+            "SHARP completion callback must fire");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 22, finding 2) NcclRingAllReduce at dataSize == 0 fell into
+// the degenerate-grid floor (1-byte chunks) and fabricated 48 endpoint
+// transmissions for a zero-byte collective. D=0 now completes trivially
+// with nothing on the wire.
+class NcclRingZeroDataTest : public TestCase
+{
+  public:
+    NcclRingZeroDataTest()
+        : TestCase("NcclRing zero-data allreduce emits no packets") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+
+        // Switched fabric so GetTxPackets reflects real wire attempts
+        // (the pre-fix behavior fabricated 48 transmissions at 2x2/2-channel).
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+
+        Ptr<NcclRingAllReduce> inj = CreateObject<NcclRingAllReduce>();
+        // 2 nodes x 2 GPUs (node-major rank layout), mirroring the CLI repro.
+        inj->SetNumNodes(2);
+        inj->SetGpusPerNode(2);
+        inj->Initialize(numGpus, 0, eps);
+        bool done = false;
+        inj->SetCompletionCallback([&](uint64_t) { done = true; });
+        inj->Start();
+        Simulator::Stop(MicroSeconds(200));
+        Simulator::Run();
+        uint32_t txPackets = 0;
+        for (const auto& ep : eps)
+        {
+            txPackets += ep->GetTxPackets();
+        }
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "zero-data NcclRing must complete trivially");
+        NS_TEST_ASSERT_MSG_EQ(done, true,
+            "zero-data NcclRing must fire its completion callback");
+        NS_TEST_ASSERT_MSG_EQ(txPackets, 0u,
+            "a zero-byte allreduce must not fabricate 1-byte chunks onto "
+            "the wire (was 48 endpoint transmissions at 2x2/2-channel)");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 22, finding 5) The backlog-decrement ledger is pruned of
+// fired entries on each append, so it tracks only in-flight decrements.
+// After a fully-drained burst the accounting is exact (backlog zero) and a
+// following mid-flight disposal still balances the pending entries.
+class ContentionBacklogLedgerPruningTest : public TestCase
+{
+  public:
+    ContentionBacklogLedgerPruningTest()
+        : TestCase("backlog ledger prunes fired entries and stays balanced") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        const uint16_t numGpus = 2;
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(1);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 100000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+        Ptr<ContentionModel> shared = CreateObject<ContentionModel>();
+        shared->SetBandwidth(1000000000);
+        eps[0]->SetContentionModel(shared);
+
+        // Wave 1: 2000 sends, all increment/decrement pairs fire.
+        uint8_t byte = 0xAB;
+        for (int i = 0; i < 2000; ++i)
+        {
+            eps[0]->SendP2p(1, &byte, 1, 1, 0);
+        }
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(shared->GetBacklog(TrafficClass::P2P), 0u,
+            "a fully-drained burst must leave zero backlog — every scheduled "
+            "decrement fired");
+
+        // Wave 2 + mid-flight disposal: the pruned ledger must still carry
+        // the pending entries so DoDispose balances them.
+        for (int i = 0; i < 50; ++i)
+        {
+            eps[0]->SendP2p(1, &byte, 1, 1, 0);
+        }
+        Simulator::Schedule(NanoSeconds(30), [&]() { eps[0]->Dispose(); });
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(shared->GetBacklog(TrafficClass::P2P), 0u,
+            "disposal must balance the pending (pruned-but-in-flight) "
+            "entries after 2000 prior fired cycles");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 22, finding 7) --nvlsNumPartitions=0 is documented (and the
+// header contract states) as the legacy single-multicast mode, but the
+// switch substituted the threshold (N partitions). 0 and 1 must now behave
+// identically (single multicast), and 4 must pipeline differently.
+class NvlsPartitionZeroSemanticsTest : public TestCase
+{
+  public:
+    NvlsPartitionZeroSemanticsTest()
+        : TestCase("NVLS AllReduce partition 0 equals single multicast") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 1048576;
+
+        auto runWith = [&](uint32_t partitions) {
+            GpuClusterTopologyHelper helper(numGpus, 1);
+            helper.SetLinkDataRate("100Gbps");
+            helper.SetLinkDelay("400ns");
+            helper.SetLinksPerGpu(2);
+            helper.BuildFullyConnected();
+            auto apps = helper.GetEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t i = 0; i < apps.GetN(); ++i)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+                ep->SetBypassReorderBuffer(true);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+            Ptr<NvSwitch> sw;
+            auto swNode = helper.GetSwitchNodes().Get(0);
+            for (uint32_t i = 0; i < swNode->GetNDevices(); ++i)
+            {
+                Ptr<NvSwitch> s = DynamicCast<NvSwitch>(swNode->GetDevice(i));
+                if (s) sw = s;
+            }
+            sw->SetAllReduceEnabled(true);
+            sw->SetAllReduceThreshold(numGpus);
+            sw->SetAllReduceDataSize(dataSize);
+            sw->SetAllReduceNumPartitions(partitions);
+
+            Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+            inj->SetAttribute("UseTransactionModel", BooleanValue(false));
+            inj->Initialize(numGpus, dataSize, eps);
+            bool done = false;
+            inj->SetCompletionCallback([&](uint64_t) { done = true; });
+            inj->Start();
+            Simulator::Stop(MilliSeconds(100));
+            Simulator::Run();
+            Simulator::Destroy();
+            return done;
+        };
+
+        NS_TEST_ASSERT_MSG_EQ(runWith(0), true,
+            "partitions=0 (legacy single multicast) must complete");
+        NS_TEST_ASSERT_MSG_EQ(runWith(1), true,
+            "partitions=1 (single multicast) must complete");
+        NS_TEST_ASSERT_MSG_EQ(runWith(4), true,
+            "partitions=4 (pipelined) must complete");
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Codex round 21 regressions.
+// ---------------------------------------------------------------------------
+
+// Returns true iff the single-rank collective completed (and its callback
+// fired); the CALLER asserts, so this helper works at file scope where the
+// NS_TEST_ASSERT macros (which need `this`) cannot live.
+template <typename InjectorT>
+bool
+RunSingleRankTrivial()
+{
+    DisableLinkErrorsGlobally();
+    Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+    const uint16_t numGpus = 1;
+    const uint64_t dataSize = 1024;
+
+    // No fabric needed: N=1 never transmits (the trivial-completion paths
+    // fire before any send), so a bare endpoint with a protocol model
+    // suffices — BuildFullMesh aborts below 2 nodes.
+    NodeContainer node = NodeContainer();
+    node.Create(1);
+    Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+    ep->SetNode(node.Get(0));
+    ep->SetRank(0);
+    ep->SetVcCredits(0, 10000);
+    ep->SetBypassReorderBuffer(true);
+    ep->Initialize();
+    std::vector<Ptr<FabricEndpoint>> eps{ep};
+    Ptr<InjectorT> inj = CreateObject<InjectorT>();
+    inj->Initialize(numGpus, dataSize, eps);
+    bool done = false;
+    inj->SetCompletionCallback([&](uint64_t) { done = true; });
+    inj->Start();
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+    bool ok = inj->IsCompleted() && done;
+    Simulator::Destroy();
+    return ok;
+}
+
+
+// (codex round 21, finding 1) Legacy SHARP counted one GPU's completion
+// repeatedly: every result fragment after the threshold crossed (padding
+// with zero effective bytes included) re-fired the completion check, so a
+// GPU could be counted multiple times. With one slow GPU a late padding
+// fragment completed the collective with the slow GPU's totals still at
+// zero. The guard is once-per-GPU.
+class SharpBroadcastOncePerGpuTest : public TestCase
+{
+  public:
+    SharpBroadcastOncePerGpuTest()
+        : TestCase("SHARP broadcast completion counts each GPU once") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t numGpus = 4;
+        const uint64_t dataSize = 8;
+
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+
+        Ptr<NvSwitch> sw;
+        auto swNode = helper.GetSwitchNodes().Get(0);
+        for (uint32_t i = 0; i < swNode->GetNDevices(); ++i)
+        {
+            Ptr<NvSwitch> s = DynamicCast<NvSwitch>(swNode->GetDevice(i));
+            if (s) sw = s;
+        }
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(numGpus);
+        sw->SetAllReduceDataSize(dataSize);
+        sw->SetAllReduceNumPartitions(8);
+
+        Ptr<SharpAllReduce> inj = CreateObject<SharpAllReduce>();
+        inj->SetAttribute("UseTransactionModel", BooleanValue(false));
+        inj->Initialize(numGpus, dataSize, eps);
+        bool done = false;
+        inj->SetCompletionCallback([&](uint64_t) { done = true; });
+        // Wrap the receive callbacks AFTER Start (SetupReceiveCallbacks
+        // overwrites earlier wraps): delay GPU 3's whole stream by 100 us
+        // and GPU 0's first fragment (padding, zero effective bytes) by
+        // 5 us. Pre-fix, GPU 0's late padding fragment double-counted GPU 0
+        // and completed the collective before GPU 3's data arrived.
+        inj->Start();
+        for (uint32_t i = 0; i < eps.size(); ++i)
+        {
+            FabricEndpoint::ReceiveCallback cb = eps[i]->GetReceiveCallback();
+            uint32_t delayUs = (i == 3) ? 100 : (i == 0 ? 5 : 0);
+            eps[i]->SetReceiveCallback(
+                [cb, i, delayUs](uint16_t rank, Ptr<Packet> p, FabricHeader h) {
+                    if (delayUs > 0)
+                    {
+                        Simulator::Schedule(MicroSeconds(delayUs), [cb, rank, p, h]() {
+                            cb(rank, p, h);
+                        });
+                        return;
+                    }
+                    cb(rank, p, h);
+                });
+        }
+        Simulator::Stop(MilliSeconds(500));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(inj->IsCompleted(), true,
+            "the SHARP allreduce must complete even with one slow GPU");
+        NS_TEST_ASSERT_MSG_EQ(done, true,
+            "SHARP completion callback must fire");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 21, finding 2) Hierarchical AR/RS at degenerate data sizes
+// (D < N*g) leave ranks with zero-sized chunks: with the old 0->1 threshold
+// clamps nobody sent them anything and the collective stalled to the cap.
+// The pre-credit convention marks zero-obligation ranks complete at each
+// phase start instead.
+class HierarchicalDegeneratePreCreditTest : public TestCase
+{
+  public:
+    HierarchicalDegeneratePreCreditTest()
+        : TestCase("hierarchical AR and RS degenerate grids complete") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 2;
+        const uint32_t numNodes = 2;
+
+        // Two separate fabrics (single receive slot per endpoint): AR
+        // round then RS round, each with every degenerate size.
+        for (int round = 0; round < 2; ++round)
+        {
+            for (uint64_t dataSize : {1ULL, 2ULL, 3ULL, 5ULL})
+            {
+                HybridTopologyHelper helper;
+                helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+                helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+                helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+                helper.Build();
+                helper.PopulateCrossFabricRouting();
+                auto apps = helper.GetAllEndpoints();
+                std::vector<Ptr<FabricEndpoint>> eps;
+                for (uint32_t r = 0; r < apps.GetN(); ++r)
+                {
+                    Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                    ep->SetNumVirtualChannels(1);
+                    ep->SetVcCredits(0, 1000000);
+                    ep->Initialize();
+                    eps.push_back(ep);
+                }
+                bool done = false;
+                if (round == 0)
+                {
+                    Ptr<HierarchicalAllReduce> ar = CreateObject<HierarchicalAllReduce>();
+                    ar->SetGpusPerNode(gpusPerNode);
+                    ar->SetNumNodes(numNodes);
+                    ar->Initialize(numNodes * gpusPerNode, dataSize, eps);
+                    ar->SetCompletionCallback([&](uint64_t) { done = true; });
+                    ar->Start();
+                    Simulator::Stop(MilliSeconds(200));
+                    Simulator::Run();
+                    NS_TEST_ASSERT_MSG_EQ(ar->IsCompleted(), true,
+                        "hierarchical allreduce 2x2 must complete at every degenerate D");
+                    NS_TEST_ASSERT_MSG_EQ(done, true,
+                        "hierarchical allreduce completion callback must fire");
+                }
+                else
+                {
+                    Ptr<HierarchicalReduceScatter> rs = CreateObject<HierarchicalReduceScatter>();
+                    rs->SetGpusPerNode(gpusPerNode);
+                    rs->SetNumNodes(numNodes);
+                    rs->Initialize(numNodes * gpusPerNode, dataSize, eps);
+                    rs->SetCompletionCallback([&](uint64_t) { done = true; });
+                    rs->Start();
+                    Simulator::Stop(MilliSeconds(200));
+                    Simulator::Run();
+                    NS_TEST_ASSERT_MSG_EQ(rs->IsCompleted(), true,
+                        "hierarchical reducescatter 2x2 must complete at every degenerate D");
+                    NS_TEST_ASSERT_MSG_EQ(done, true,
+                        "hierarchical reducescatter completion callback must fire");
+                }
+                Simulator::Destroy();
+            }
+        }
+    }
+};
+
+// (codex round 21, finding 3) Hierarchical AllToAll ignored the startup
+// override: Start() used the protocol-model delay unconditionally (and the
+// sim's wiring never called SetStartupDelay on the injector at all). The
+// override now wins whenever set — a 100-ms override shifts the completion
+// timestamp well past the baseline.
+class HierarchicalAlltoAllStartupOverrideTest : public TestCase
+{
+  public:
+    HierarchicalAlltoAllStartupOverrideTest()
+        : TestCase("hierarchical alltoall startupDelay override shifts completion") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        const uint16_t gpusPerNode = 2;
+        const uint32_t numNodes = 2;
+        const uint64_t dataSize = 65536;
+        const uint64_t overrideNs = 100000000ULL; // 100 ms
+
+        uint64_t durations[2] = {};
+        for (int withOverride = 0; withOverride <= 1; ++withOverride)
+        {
+            HybridTopologyHelper helper;
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", 0, "200Gbps", "400ns");
+            helper.AddNvLinkFabric(gpusPerNode, "fullmesh", gpusPerNode, "200Gbps", "400ns");
+            helper.AddCrossFabricLink(0, 1, 0, gpusPerNode, "100Gbps", "1us");
+            helper.Build();
+            helper.PopulateCrossFabricRouting();
+            auto apps = helper.GetAllEndpoints();
+            std::vector<Ptr<FabricEndpoint>> eps;
+            for (uint32_t r = 0; r < apps.GetN(); ++r)
+            {
+                Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(r));
+                ep->SetNumVirtualChannels(1);
+                ep->SetVcCredits(0, 1000000);
+                ep->Initialize();
+                eps.push_back(ep);
+            }
+            Ptr<HierarchicalAlltoAll> inj = CreateObject<HierarchicalAlltoAll>();
+            inj->SetGpusPerNode(gpusPerNode);
+            inj->SetNumNodes(numNodes);
+            inj->Initialize(numNodes * gpusPerNode, dataSize, eps);
+            if (withOverride)
+            {
+                inj->SetStartupDelay(NanoSeconds(overrideNs));
+            }
+            durations[withOverride] = 0;
+            inj->SetCompletionCallback([&durations, withOverride](uint64_t d) {
+                durations[withOverride] = d;
+            });
+            inj->Start();
+            Simulator::Stop(Seconds(1));
+            Simulator::Run();
+            Simulator::Destroy();
+        }
+        NS_TEST_ASSERT_MSG_EQ(durations[1] > durations[0] + overrideNs / 2, true,
+            "the 100-ms startup override must shift the alltoall completion "
+            "by at least 50 ms (baseline "
+            << durations[0] << " ns, override " << durations[1] << " ns)");
+    }
+};
+
+// (codex round 21, finding 4) Disposing an endpoint cancels the scheduled
+// contention-backlog decrements; the increments already counted, so a
+// SHARED ContentionModel kept a phantom backlog forever. Disposal now
+// balances the ledger for the still-pending decrements.
+class ContentionBacklogDisposalBalanceTest : public TestCase
+{
+  public:
+    ContentionBacklogDisposalBalanceTest()
+        : TestCase("endpoint disposal balances pending contention backlog") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        const uint16_t numGpus = 2;
+        GpuClusterTopologyHelper helper(numGpus, 1);
+        helper.SetLinkDataRate("100Gbps");
+        helper.SetLinkDelay("400ns");
+        helper.SetLinksPerGpu(2);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetVcCredits(0, 10000);
+            ep->SetBypassReorderBuffer(true);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+        Ptr<ContentionModel> shared = CreateObject<ContentionModel>();
+        shared->SetBandwidth(1000000000);
+        eps[0]->SetContentionModel(shared);
+        // Remote-dest P2P bypasses the credit gate and drives straight into
+        // SendPacketOnDevice (increment + scheduled decrement).
+        uint8_t byte = 0xAB;
+        eps[0]->SendP2p(1, &byte, 1, 1, 0);
+        // Dispose BEFORE the serialization decrement fires.
+        eps[0]->Dispose();
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(shared->GetBacklog(TrafficClass::P2P), 0u,
+            "disposal must balance the pending backlog increment — a shared "
+            "model otherwise keeps a phantom P2P backlog forever");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 21, finding 5) Shrinking a credit window below the number
+// of OUTSTANDING credits granted phantom available credits and broke the
+// invariant so the next ReturnCredits aborted. The shrink now clamps
+// pending (the overdraft drains as credits return), never grants.
+class CreditWindowShrinkTest : public TestCase
+{
+  public:
+    CreditWindowShrinkTest()
+        : TestCase("credit window shrink clamps pending not available") {}
+    void DoRun() override
+    {
+        Ptr<CreditManager> cm = CreateObject<CreditManager>();
+        cm->InitializeVc(0, 10);
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            NS_TEST_ASSERT_MSG_EQ(cm->ConsumeCredit(0, i), true,
+                "consuming from a 10-credit window must succeed");
+        }
+        cm->SetTotalCredits(0, 5);
+        NS_TEST_ASSERT_MSG_EQ(cm->GetAvailableCredits(0), 0u,
+            "a shrink below the outstanding count must NOT grant available "
+            "credits (8 outstanding in a 5-credit window)");
+        // The next return must survive the invariant and land as available.
+        cm->ReturnCredits(0, 1);
+        NS_TEST_ASSERT_MSG_EQ(cm->GetAvailableCredits(0), 1u,
+            "the overdraft must absorb the returned credit");
+        // Non-overdraft shrink keeps the arithmetic identity.
+        Ptr<CreditManager> cm2 = CreateObject<CreditManager>();
+        cm2->InitializeVc(0, 10);
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            cm2->ConsumeCredit(0, i);
+        }
+        cm2->SetTotalCredits(0, 6);
+        NS_TEST_ASSERT_MSG_EQ(cm2->GetAvailableCredits(0), 2u,
+            "4 outstanding in a shrunk 6-credit window leaves 2 available");
+    }
+};
+
+// (codex round 21, finding 8) Single-rank collectives (N=1, nonzero D):
+// ring AllReduce built a graph that failed validation; fullmesh AR and
+// ring/fullmesh AG/RS plus AllToAll stalled to the cap. Every injector now
+// trivially completes the degenerate single-rank case.
+class SingleRankRingAllReduceTest : public TestCase
+{
+  public:
+    SingleRankRingAllReduceTest()
+        : TestCase("single-rank ring allreduce completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<RingAllReduce>(), true,
+            "ring allreduce must complete trivially at N=1");
+    }
+};
+
+class SingleRankFullMeshAllReduceTest : public TestCase
+{
+  public:
+    SingleRankFullMeshAllReduceTest()
+        : TestCase("single-rank fullmesh allreduce completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<FullMeshAllReduce>(), true,
+            "fullmesh allreduce must complete trivially at N=1");
+    }
+};
+
+class SingleRankRingAllGatherTest : public TestCase
+{
+  public:
+    SingleRankRingAllGatherTest()
+        : TestCase("single-rank ring allgather completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<RingAllGather>(), true,
+            "ring allgather must complete trivially at N=1");
+    }
+};
+
+class SingleRankFullMeshAllGatherTest : public TestCase
+{
+  public:
+    SingleRankFullMeshAllGatherTest()
+        : TestCase("single-rank fullmesh allgather completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<FullMeshAllGather>(), true,
+            "fullmesh allgather must complete trivially at N=1");
+    }
+};
+
+class SingleRankRingReduceScatterTest : public TestCase
+{
+  public:
+    SingleRankRingReduceScatterTest()
+        : TestCase("single-rank ring reducescatter completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<RingReduceScatter>(), true,
+            "ring reducescatter must complete trivially at N=1");
+    }
+};
+
+class SingleRankFullMeshReduceScatterTest : public TestCase
+{
+  public:
+    SingleRankFullMeshReduceScatterTest()
+        : TestCase("single-rank fullmesh reducescatter completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<FullMeshReduceScatter>(), true,
+            "fullmesh reducescatter must complete trivially at N=1");
+    }
+};
+
+class SingleRankAllToAllTest : public TestCase
+{
+  public:
+    SingleRankAllToAllTest()
+        : TestCase("single-rank alltoall completes trivially") {}
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(RunSingleRankTrivial<AlltoAllInjector>(), true,
+            "alltoall must complete trivially at N=1");
+    }
+};
+
 GpuClusterTestSuite::GpuClusterTestSuite()
     : TestSuite("gpu-cluster", Type::UNIT)
 {
@@ -5496,6 +11203,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new FabricTypeTest, TestCase::Duration::QUICK);
     AddTestCase(new McclProtocolModelTest, TestCase::Duration::QUICK);
     AddTestCase(new RoceProtocolModelTest, TestCase::Duration::QUICK);
+    AddTestCase(new EthernetProtocolModelTest, TestCase::Duration::QUICK);
     AddTestCase(new RocePayloadBuilderTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);
@@ -5525,9 +11233,39 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SwitchTypeSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchSeamTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetSwitchEcnTest, TestCase::Duration::QUICK);
+    AddTestCase(new EthernetSwitchDropTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpReactionTest, TestCase::Duration::QUICK);
+    AddTestCase(new ProtocolFramedDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new DcqcnRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new PerQpCeilingPacerTest, TestCase::Duration::QUICK);
+    AddTestCase(new DcqcnDisposeCancelsTimersTest, TestCase::Duration::QUICK);
+    AddTestCase(new EgressDisposeCancelsDeferredSendsTest, TestCase::Duration::QUICK);
+    AddTestCase(new EgressDisposeCancelsBacklogCallbacksTest, TestCase::Duration::QUICK);
+    AddTestCase(new EgressDisposeCancelsFecReceiveTest, TestCase::Duration::QUICK);
+    AddTestCase(new EgressDisposeCancelsSourceReloadRetransmissionsTest, TestCase::Duration::QUICK);
+    AddTestCase(new DeviceCallbackDetachAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new InjectorStartupEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new FullMeshDegenerateGridTest, TestCase::Duration::QUICK);
+    AddTestCase(new FullMeshReduceScatterPerDestLoadTest, TestCase::Duration::QUICK);
+    AddTestCase(new ZeroChunkBulkTransferTest, TestCase::Duration::QUICK);
+    AddTestCase(new MemoryEventCancelledAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new LlrManagerDetachedAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new ProtocolConfigRunnerDetachTest, TestCase::Duration::QUICK);
+    AddTestCase(new FullMeshRsStandalonePerDestLoadTest, TestCase::Duration::QUICK);
+    AddTestCase(new AlltoallChunkGridCoverageTest, TestCase::Duration::QUICK);
+    AddTestCase(new AlltoallDegenerateGridTest, TestCase::Duration::QUICK);
+    AddTestCase(new AlltoallDegenerateRingModeTest, TestCase::Duration::QUICK);
+    // (codex round 18 responses)
+    AddTestCase(new AlltoallZeroDataStartTest, TestCase::Duration::QUICK);
+    AddTestCase(new AlltoallRingOvershootCarryTest, TestCase::Duration::QUICK);
+    AddTestCase(new CreditManagerDetachedAtDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new NvlsAllGatherRemainderThresholdTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalAlltoallChunkGridTest, TestCase::Duration::QUICK);
+    AddTestCase(new HybridCrossFabricRoutingTest, TestCase::Duration::QUICK);
+    AddTestCase(new HybridLinkDegradationTest, TestCase::Duration::QUICK);
+    AddTestCase(new LlrTimeoutStartsAtWireTest, TestCase::Duration::QUICK);
+    AddTestCase(new LlrRetryArmsAtWireOnRetransmitTest, TestCase::Duration::QUICK);
+    AddTestCase(new RttccRateMachineTest, TestCase::Duration::QUICK);
     AddTestCase(new CnpDispatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SoOnlyPredicateTest, TestCase::Duration::QUICK);
     AddTestCase(new DormantTest, TestCase::Duration::QUICK);
@@ -5545,7 +11283,68 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new AlltoallInjectorCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new SharpAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new NvlsAllGatherCorrectnessTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new SharpUploadDedupTest, TestCase::Duration::QUICK);
+    AddTestCase(new SwitchDisposeCancelsResultMulticastsTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpUploadDedupSurvivesResultTest, TestCase::Duration::QUICK);
+    AddTestCase(new MulticastResultFecExpansionTest, TestCase::Duration::QUICK);
+    AddTestCase(new NcclRingChunkCoverageTest, TestCase::Duration::QUICK);
+    AddTestCase(new RingAllReduceSegmentCoverageTest, TestCase::Duration::QUICK);
+    AddTestCase(new CollectiveInjectorCoverageTest, TestCase::Duration::QUICK);
+    AddTestCase(new RingAllReduceLossyWireLedgerTest, TestCase::Duration::QUICK);
+    AddTestCase(new RingAllReduceChunkRotationTest, TestCase::Duration::QUICK);
+    AddTestCase(new RingAllReduceTransactionInputDependencyTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpResultRetentionTest, TestCase::Duration::QUICK);
+    AddTestCase(new MulticastSeqPerDestTest, TestCase::Duration::QUICK);
     AddTestCase(new HierarchicalAllReduceCorrectnessTest, TestCase::Duration::EXTENSIVE);
+
+    // Codex round 19 regressions.
+    AddTestCase(new CreditManagerAttributeSwapTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalRingReduceScatterVolumeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpEffectiveByteLedgerTest, TestCase::Duration::QUICK);
+    AddTestCase(new NvlsAllGatherDegenerateGridMulticastTest, TestCase::Duration::QUICK);
+    AddTestCase(new FullMeshZeroDataCompletionTest, TestCase::Duration::QUICK);
+
+    // Codex round 20 regressions.
+    AddTestCase(new SharpResultEffectiveOnlyLedgerTest, TestCase::Duration::QUICK);
+    AddTestCase(new InjectorDisposeDetachIfOwnerTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalAllGatherDegenerateGridTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalRemainderGridTest, TestCase::Duration::QUICK);
+    AddTestCase(new CreditManagerSwapWakesQueuedSendsTest, TestCase::Duration::QUICK);
+    AddTestCase(new ContentionBacklogSurvivesModelSwapTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalStartupDelayOverrideTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalReduceScatterSingleNodeGpuTest, TestCase::Duration::QUICK);
+    AddTestCase(new ZeroDataCollectiveCompletionTest, TestCase::Duration::QUICK);
+
+
+// ---------------------------------------------------------------------------
+    // Codex round 21 regressions.
+    AddTestCase(new SharpBroadcastOncePerGpuTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalDegeneratePreCreditTest, TestCase::Duration::QUICK);
+    AddTestCase(new HierarchicalAlltoAllStartupOverrideTest, TestCase::Duration::QUICK);
+    AddTestCase(new ContentionBacklogDisposalBalanceTest, TestCase::Duration::QUICK);
+    AddTestCase(new CreditWindowShrinkTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankRingAllReduceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankFullMeshAllReduceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankRingAllGatherTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankFullMeshAllGatherTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankRingReduceScatterTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankFullMeshReduceScatterTest, TestCase::Duration::QUICK);
+    AddTestCase(new SingleRankAllToAllTest, TestCase::Duration::QUICK);
+
+    // Codex round 22 regressions.
+    AddTestCase(new SharpLegacyMulticastOnceTest, TestCase::Duration::QUICK);
+    AddTestCase(new NcclRingZeroDataTest, TestCase::Duration::QUICK);
+    AddTestCase(new ContentionBacklogLedgerPruningTest, TestCase::Duration::QUICK);
+    AddTestCase(new NvlsPartitionZeroSemanticsTest, TestCase::Duration::QUICK);
+
+    // Codex round 23 regressions.
+    AddTestCase(new DcqcnFlowKeySenderIsolationTest, TestCase::Duration::QUICK);
+
+    // Codex round 24 regressions.
+    AddTestCase(new EcnThresholdZeroDisablesTest, TestCase::Duration::QUICK);
+    AddTestCase(new DcqcnForwardedPacketOriginTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpResultFlowIsolationTest, TestCase::Duration::QUICK);
+    AddTestCase(new BulkWireTransferWideSizeTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);
@@ -5559,6 +11358,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ContentionModelTest, TestCase::Duration::QUICK);
     AddTestCase(new TrafficPatternTest, TestCase::Duration::QUICK);
     AddTestCase(new GatewayEndpointTest, TestCase::Duration::QUICK);
+    AddTestCase(new GatewayForwardingDelayTest, TestCase::Duration::QUICK);
 }
 
 static GpuClusterTestSuite g_gpuClusterTestSuite;

@@ -1,0 +1,176 @@
+{
+  "purpose": "4-preset surrogate vs current ns-3 consistency regression; report, not a pass/fail gate -- each preset's expected band follows its anchoring (see notes)",
+  "num_gpus": 8,
+  "summary": {
+    "ring": {
+      "points": 4,
+      "mape_pct": 1.87,
+      "ratio_min": 0.9593,
+      "ratio_max": 1.0185,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    "tree": {
+      "points": 4,
+      "mape_pct": 11.13,
+      "ratio_min": 0.797,
+      "ratio_max": 1.1094,
+      "note": "ns-3 back-fit (18-link spray fabric)"
+    },
+    "nvls": {
+      "points": 3,
+      "mape_pct": 11.82,
+      "ratio_min": 1.0695,
+      "ratio_max": 1.1668,
+      "note": "preset vs 18-link spray cfg (profile)"
+    },
+    "fullmesh": {
+      "points": 3,
+      "mape_pct": 0.12,
+      "ratio_min": 0.9969,
+      "ratio_max": 0.9998,
+      "note": "ns-3 back-fit (MAPE 0.10%)"
+    }
+  },
+  "rows": [
+    {
+      "preset": "ring",
+      "numGpus": 8,
+      "dataSizeMB": 4,
+      "ns3SimTimeUs": 75.4,
+      "surrogateUs": 72.33,
+      "ratio": 0.9593,
+      "absErrPct": 4.07,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    {
+      "preset": "ring",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 135.0,
+      "surrogateUs": 134.54,
+      "ratio": 0.9966,
+      "absErrPct": 0.34,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    {
+      "preset": "ring",
+      "numGpus": 8,
+      "dataSizeMB": 64,
+      "ns3SimTimeUs": 378.7,
+      "surrogateUs": 383.35,
+      "ratio": 1.0123,
+      "absErrPct": 1.23,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    {
+      "preset": "ring",
+      "numGpus": 8,
+      "dataSizeMB": 256,
+      "ns3SimTimeUs": 1353.6,
+      "surrogateUs": 1378.61,
+      "ratio": 1.0185,
+      "absErrPct": 1.85,
+      "note": "HW back-fit; lower bound vs ns-3"
+    },
+    {
+      "preset": "tree",
+      "numGpus": 8,
+      "dataSizeMB": 4,
+      "ns3SimTimeUs": 145.9,
+      "surrogateUs": 116.29,
+      "ratio": 0.797,
+      "absErrPct": 20.3,
+      "note": "ns-3 back-fit (18-link spray fabric)"
+    },
+    {
+      "preset": "tree",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 275.8,
+      "surrogateUs": 253.36,
+      "ratio": 0.9186,
+      "absErrPct": 8.14,
+      "note": "ns-3 back-fit (18-link spray fabric)"
+    },
+    {
+      "preset": "tree",
+      "numGpus": 8,
+      "dataSizeMB": 64,
+      "ns3SimTimeUs": 762.3,
+      "surrogateUs": 801.63,
+      "ratio": 1.0516,
+      "absErrPct": 5.16,
+      "note": "ns-3 back-fit (18-link spray fabric)"
+    },
+    {
+      "preset": "tree",
+      "numGpus": 8,
+      "dataSizeMB": 256,
+      "ns3SimTimeUs": 2699.4,
+      "surrogateUs": 2994.73,
+      "ratio": 1.1094,
+      "absErrPct": 10.94,
+      "note": "ns-3 back-fit (18-link spray fabric)"
+    },
+    {
+      "preset": "nvls",
+      "numGpus": 8,
+      "dataSizeMB": 4,
+      "ns3SimTimeUs": 36.9,
+      "surrogateUs": 39.47,
+      "ratio": 1.0695,
+      "absErrPct": 6.95,
+      "note": "preset vs 18-link spray cfg (profile)"
+    },
+    {
+      "preset": "nvls",
+      "numGpus": 8,
+      "dataSizeMB": 8,
+      "ns3SimTimeUs": 49.3,
+      "surrogateUs": 55.13,
+      "ratio": 1.1183,
+      "absErrPct": 11.83,
+      "note": "preset vs 18-link spray cfg (profile)"
+    },
+    {
+      "preset": "nvls",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 74.1,
+      "surrogateUs": 86.46,
+      "ratio": 1.1668,
+      "absErrPct": 16.68,
+      "note": "preset vs 18-link spray cfg (profile)"
+    },
+    {
+      "preset": "fullmesh",
+      "numGpus": 8,
+      "dataSizeMB": 16,
+      "ns3SimTimeUs": 25.2,
+      "surrogateUs": 25.12,
+      "ratio": 0.9969,
+      "absErrPct": 0.31,
+      "note": "ns-3 back-fit (MAPE 0.10%)"
+    },
+    {
+      "preset": "fullmesh",
+      "numGpus": 8,
+      "dataSizeMB": 64,
+      "ns3SimTimeUs": 53.1,
+      "surrogateUs": 53.09,
+      "ratio": 0.9998,
+      "absErrPct": 0.02,
+      "note": "ns-3 back-fit (MAPE 0.10%)"
+    },
+    {
+      "preset": "fullmesh",
+      "numGpus": 8,
+      "dataSizeMB": 256,
+      "ns3SimTimeUs": 165.0,
+      "surrogateUs": 164.97,
+      "ratio": 0.9998,
+      "absErrPct": 0.02,
+      "note": "ns-3 back-fit (MAPE 0.10%)"
+    }
+  ]
+}

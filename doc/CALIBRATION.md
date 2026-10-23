@@ -21,8 +21,9 @@ recipe below carries the exact runtime values it uses.
 
 | Surrogate | Calibration set | Metric | Value |
 |-----------|-----------------|--------|-------|
-| Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive (≈0.566× vs 8-GPU ns-3) |
+| Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive; against the 18-link spray fabric (the profile's linksPerGpu=18, the same convention the tree calibration anchors) the preset sits ≈1.07–1.17× ABOVE ns-3 — not a lower bound (the η_nvls=1.2 multicast amplification exceeds the 382500 B/µs trunk); the historical "≈0.566×" note's run conditions were unrecorded and match no current convention — 2026-09 drift finding, see `examples/gpu-cluster/surrogate_ns3_consistency.py` |
 | Theory-derived full-mesh (`surrogate/theory/`) | ns-3-calibrated — `fullmesh_bw=449890 B/µs` back-fit to the ns-3 `FullMeshAllReduce`/`FullMeshAllGather` sweep (η=0.9998 vs the 18×25000 dedicated-bundle physics) | vs ns-3 | MAPE 0.10% on the SIMPLE-regime sweep points (N∈{4,8,16}, 1–256 MiB); parity within 0.3% at N=8 AR+AG {16,64,256} MiB (see the Full-mesh section below) |
+| Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — the ORIGINAL two-parameter form: serial term = α(N)·D/trunk with the STRUCTURAL α(N) = 1/2/3 (single edge / root with two children / interior node; `tree_bw_per_level=275400 B/µs`, η=0.72 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs; `t_min_switch=4.10 µs`) — both constants back-fit jointly to the post-local-rank-fix ns-3 `TreeAllReduce` at the TRUE H200 fabric — `--linksPerGpu=18` separate point-to-point NVLink4 lanes @ 170 Gbps each, spray-routed, aggregate 3060 Gbps trunk, credits unconstrained (`configs/calibration/tree_ns3_sweep.py`; the retired `--linkDataRate=3060` convention collapsed the 18 lanes into ONE pipe — no spray, no per-link queues). The D-dependent pipeline-fill residual is deliberately absorbed into the fitted pair rather than modeled (a dedicated fill term bought 3.96% MAPE but turned the formula into a 5-constant curve fit — rejected) | vs ns-3 | MAPE 12.65% over all 36 fresh sweep points (N∈{4,8,16,32} × 1–256 MiB), 6.97% on the SIMPLE regime, per-N 10.6/11.0/14.0/15.1%; relative-error-weighted (1/T²) joint least squares — no H200 tree HW ground truth exists in this repo |
 
 ## Generate fresh ns-3 baselines
 
@@ -135,24 +136,27 @@ scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
   WAIT node; `OnComplete` computes `durationNs = Now - m_startNs` (runner.cc:185).
   The `latencyNs = 400` is only a config echo, not the measured duration. Proven
   empirically by the ib_write_lat sweep
-  ([`configs/calibration/roce_p2p_ns3_sweep.py`](../configs/calibration/roce_p2p_ns3_sweep.py)):
+  ([`examples/gpu-cluster/roce_p2p_ns3_sweep.py`](../examples/gpu-cluster/roce_p2p_ns3_sweep.py)):
   `simTimeUs` scales with size (2 B → 1.50 µs, 64 KB → 4.40 µs), impossible for
   fixed-dispatch. So `simTimeUs` **is** the single-transfer delivery latency,
   directly comparable to `ib_write_lat`.
 - The inter-node `RoceProtocolModel` **is** wired (scratch/gpu-cluster-sim.cc
   attaches it on every endpoint when `--interNodeFabricType=RoCE`;
-  `FabricEndpoint::GetProtocolModelForDest`, fabric-endpoint.cc:716-726, selects
-  it for non-local dests under the `m_localRankCount > 1` guard). A RoCE P2P run
+  `FabricEndpoint::GetProtocolModelForDest`, fabric-endpoint.cc, selects it for
+  non-local dests — `IsLocalRank` alone decides, so one GPU per node still
+  routes remote traffic on the So model). A RoCE P2P run
   works **today** via `p2p-roce.cfg` + `--interNodeTopology=tor`
   + `--interNodeBandwidth=400 --interNodeLatency=100`, reproducing `ib_write_lat`
   at **MAPE 5.26 %** (sweep best fit; see the sweep JSON). A dedicated
   `h200-roce.profile` PEX bundle is **not** required — `[stack] = h200-ll128`
   governs only the Su model; the RoCE model is wired out-of-band.
-- `--collective=p2p` inline CLI remains a no-op (P2P is reachable via the `.cfg`
-  stencil path). The opt-in per-QP ceiling (`PerQpCeilingGbps` ≈ 49 G) for
+- `--collective=p2p` inline CLI performs a real delivery-gated transfer (NOT a
+  no-op — `--collective=p2p --topology=fullmesh --numGpus=8 --dataSize=1048576
+  --bandwidth=400 --latency=400` completes in ~22.8 µs; the `.cfg` stencil path
+  remains the fuller-featured route). The opt-in per-QP ceiling (`PerQpCeilingGbps` ≈ 49 G) for
   **ib_write_bw** sustained-throughput parity is **DONE**:
   `--perQpCeilingGbps=49` mounts `DcqcnRateMachine`'s true per-flow pacer;
-  [`configs/calibration/roce_p2p_bw_sweep.py`](../configs/calibration/roce_p2p_bw_sweep.py)
+  [`examples/gpu-cluster/roce_p2p_bw_sweep.py`](../examples/gpu-cluster/roce_p2p_bw_sweep.py)
   → converged **MAPE 3.20 %** for sizes ≥64 MB (64 MB 50.74 G +3.5 %, 256 MB
   47.60 G −2.9 % ≈ 49 G per-QP), correcting the 7.1× no-ceiling overestimate
   (256 MB 348.3 G → 47.6 G). Transition zone <64 MB over-estimates (1–7
@@ -167,6 +171,93 @@ scales with size — 2 B → 1.2 µs, 8 MiB → 836.8 µs).
   multi-node/multi-hop scaling (2-node same-switch only); DCQCN/PFC/ECN
   (no congestion data — the blog itself flags this, pointing to the
   SIGCOMM 2015 DCQCN paper).
+
+## Plain Ethernet (scale-out) — lossy, ns-3-anchored lower bound
+
+The plain (non-RoCE) Ethernet So fabric is the **lossy counterpart** to RoCEv2.
+Both ride the same 400GbE L2 wire; the difference is the congestion contract:
+
+- **RoCEv2** is *lossless*: ECN marks the SoHeader on VOQ pressure, DCQCN
+  backs the sender off, PFC would pause — drops are *avoided*, never
+  recovered by retransmission.
+- **Plain Ethernet** is *lossy*: the `EthernetSwitch` **tail-drops** at
+  `VoqDropThreshold` and **emits a NACK back to the source**
+  (`NvSwitch::EmitNackBack`, mirroring the BER-NACK path); the sender
+  retransmits via the LLR/SACK path (`FabricEndpoint::ProcessNackPacket` →
+  `HandleRetryRequest`/`HandleSackRequest`), with `LlrManager::OnRetryTimeout`
+  as the backstop if the NACK itself is lost. `--llrRetryLimit` bounds the
+  retransmit loop; exhausting it fires the permanent-loss fallback (faithful
+  severe-congestion lossy-Ethernet degradation — the thing RoCE's PFC exists
+  to prevent).
+
+### ns-3 model (`EthernetProtocolModel`)
+
+- `WireEfficiency = 1.0` (locked): plain L2 data carries **no RoCE
+  IP/UDP/IB headers**, and ns-3 does not model Ethernet preamble/IFG framing,
+  so the wire rate is the data rate (vs RoCE's 0.95). This is why the
+  surrogate uses `wire_efficiency=1.0`, not 0.95.
+- `GetProtocolId() = 0` (NONE): the non-bulk `SendDataAutoProtocol` path
+  stamps `SetProtocol(protocolId)` unconditionally, so a non-zero id would
+  misroute Ethernet DATA into the NCCL-LL receiver.
+- Store-and-forward NIC driver: `StartupDelayNs=1500`, `PerStepLatencyNs=800`,
+  `ChunkSize=9KiB` (jumbo MTU, smaller than RoCE's bulk path).
+- **`VoqDropThreshold < VoqDepth` invariant**: the lossy-NACK path must fire
+  before the base `NvSwitch` hard-cap drop (else the loss is silent). The sim
+  wires `VoqDepth=10000` (the `--switchVoqDepth` default; the helper
+  applies it to every So switch, superseding the construction-time fallback)
+  with `VoqDropThreshold=8` (default) for the ETH path.
+- **LLR is required** (a fabric precondition, like RoCE's ECN/PFC infra):
+  `--interNodeFabricType=ETH` forces `llrEnabled=1` on **both** the endpoint
+  sender (so `StorePacket` populates the retry buffer and `ProcessNackPacket`
+  can retransmit) **and** the So switch (so `EmitNackBack` does not early-return
+  on `!m_llrEnabled`). Without switch-side LLR the drop is silent and the
+  transfer stalls to the 3600s `Simulator::Stop` ceiling.
+- `--ber=0 --packetLossRate=0` on the ns-3 command line (see the run examples
+  in the `.cfg` headers) so the **only** loss source is VOQ tail-drop
+  (deterministic), isolating the lossy-retransmit path from the BER model.
+- **Config-primary So fabric selection.** The inter-node fabric axes —
+  `interNodeFabricType`, `interNodeTopology`, `interNodeBandwidthGbps`,
+  `interNodeLatencyNs` — are sourced from the `.cfg`'s `[stack]` section (or the
+  `.profile`) into the same CLI variables the inline path consumes, so ONE config
+  adapts across protocols: `interNodeFabricType = ETH` selects the lossy Ethernet
+  So fabric, `RoCE` the lossless variant, with no `--interNode*` CLI flag. Keys
+  absent fall back to the CLI default (backward-compatible). `numNodes`/
+  `gpusPerNode`/`dataSize` stay on the CLI (scale axes). Demo:
+  `configs/protocol_configs/eth-hierarchical.cfg` (a hierarchical allreduce over
+  ETH, fully config-driven); bit-identical to the inline CLI path — gated by
+  `test/parity/test_config_vs_inline_eth.py`.
+
+### Surrogate (`make_h200_ethernet_theory`)
+
+The surrogate is the **uncongested mean** — the lossy drop/NACK/retransmit
+behavior is **ns-3-only** (the same split as RoCE: the surrogate gives the
+uncongested mean while DCQCN/PFC/per-QP-ceiling live in ns-3). The profile is
+spec-derived (store-and-forward `link_latency_us=3.0` / `t_min_switch_us=3.0`
+vs RoCE's cut-through 1.0/1.5; `ring_bw=160000` shared with RoCE; `wire_eff=1.0`).
+It is a **lower bound anchored to ns-3**, not a tight back-fit (no perftest/blog
+ground truth for plain Ethernet, unlike RoCE's `ib_write_lat`). Plugged as the
+So profile of `make_h200_hierarchical_theory` via the `so_factory` seam, the
+measured surrogate/ns-3 ratio is ~0.2 — **identical to the RoCE hierarchical
+anchor's ~0.2**, because the So stage is a small fraction of the uncongested
+hierarchical and the store-and-forward latency is the only So difference (small
+at large sizes). The parity test `test/parity/test_surrogate_vs_ns3_ethernet.py`
+asserts the lower bound (surrogate ≤ ns-3) with a sanity floor, mirroring the
+RoCE hierarchical anchor.
+
+### Config + run
+
+See `configs/protocol_configs/p2p-eth.cfg` (single P2P) and
+`p2p-eth-incast.cfg` (2-flow incast that exercises the full NACK→LLR-retransmit
+→delivery loop; `--dataSize=196608 --voqDropThreshold=2 --llrRetryLimit=64`
+gives 27 drops → 27 retransmits → 0 permanent losses, completing in
+15.5 µs — measured with the `--bulkChunkSize=16384` cap actually enforced
+and the cfg's `[stack] llrMode = sack` override active, i.e. TRUE SACK
+selective retransmit. Before that override the profile's
+`llrMode = gobackn` silently won over the CLI `--llrMode=sack` (profile values
+override CLI flags), so the previously recorded 149/314 numbers were the GBN
+blanket-retransmit regime; at the previous 4 MiB size the cap fix's 256
+fragments/flow drop-storm burns every retry budget, which is lossy-regime
+stress, not a recovery demo).
 
 ## Full-mesh AllReduce/AllGather — ns-3-calibrated
 
@@ -241,3 +332,376 @@ aggregate with no contention. Result in
   surrogate within 0.3% of ns-3 across N=8 AR+AG at {16,64,256} MiB (the
   calibrated [0.95, 1.05] band).
 
+
+## Tree AllReduce — ns-3-calibrated (post-volume-fix)
+
+Recalibration of the surrogate tree preset against the chunk-pipelined
+full-volume `TreeAllReduce` (the 2026-09 volume fix described in the
+Demystifying-NCCL section below made the previous fit — and the historical
+`h200-tree-allreduce.cfg` per-protocol 80/100/50 `linkDataRate` values —
+obsolete: both were compensating the old model's volume deficit).
+
+### Anchor configuration
+
+The TRUE H200 fabric (h200-ll128 profile values, 400 ns, startup 15/25/46 µs):
+`--linksPerGpu=18` builds 18 separate point-to-point GPU↔NVSwitch NVLink4
+lanes at 170 Gbps effective each — aggregate 3060 Gbps trunk (382500 B/µs) —
+with spray routing (the endpoint round-robins 131072-B spray chunks across
+the links; per-link queues). Credits unconstrained
+(`--vcCredits=104857600`) so the surrogate's Φ_credit = 1. The earlier
+`--linkDataRate=3060 --linksPerGpu=1` convention collapsed the 18 lanes into
+ONE p2p pipe (no spray, no per-link queues) and is retired — at N=8/256 MiB
+it measures 2851.1 µs vs 2699.4 µs on the true 18-lane fabric. **ns-3-
+anchored**: no H200 tree hardware ground truth exists in this repo.
+
+### Model shape (original two-parameter form)
+
+The old surrogate serial term `D(N−1)/N / (log₂N · tree_bw)` *decreases*
+with N; the measured ns-3 large-size cost is α·D/trunk with α saturating-
+*increasing* in N. The formula is the physical one:
+
+```
+T = S(D) + 2⌊log₂N⌋ · t_min_switch + α(N) · D / tree_bw
+α(N) = 1.0 (N≤2, single edge) / 2.0 (N≤4, root with two children)
+     / 3.0 (N≥5, interior node: 2D child + 1D parent traffic)
+```
+
+α(N) is the STRUCTURAL busiest GPU↔NVSwitch trunk load in units of D for
+the heap-shaped binary tree (node i → children 2i+1, 2i+2); every tree edge
+carries the full D in each direction and each GPU's trunk carries the sum of
+its tree-edge traffic in the busier direction. Only TWO constants are
+fitted: (`t_min_switch`, `tree_bw`).
+
+The residual against ns-3 is D-structured — at small D ns-3 runs FASTER than
+the structural load predicts (pipeline fill / credit-window ramp-up not yet
+in steady state), at large D slightly slower — and is deliberately absorbed
+into the fitted pair rather than modeled. A dedicated additive fill term
+`min(F·steps, κ·D)` (commits a1fa05d→1fb92ba) drove the MAPE from ~12.7% to
+3.96%, but at the cost of three extra constants and per-N fitted α∞ —
+effectively a curve fit wearing a physics costume. Rejected in favor of the
+original form; the residual is documented, not hidden in constants.
+
+### Sweep + fit (`configs/calibration/tree_ns3_sweep.py`)
+
+N ∈ {4,8,16,32} × 1–256 MiB (36 points, fresh runs on the current binary —
+the 9/18 fit CSV predated the 9/30 single-node local-rank fix e1cdd9c,
+which made all rank pairs exchange credits and shifted tree times up to
+~8%; the constants had to be re-fit regardless of form). Relative-error-
+weighted (1/T²) joint least squares over the two constants. Result:
+`t_min_switch = 4.10 µs`, `tree_bw = 275400 B/µs` (η = 0.72 vs the
+382500 B/µs trunk physics). MAPE 12.65% all-36 / 6.97% SIMPLE regime,
+per-N 10.6/11.0/14.0/15.1%. Raw sweep: `tree_sweep.csv`;
+fit record: `tree_calib.json`.
+
+### Scope + limits
+
+- Looser than the full-mesh fit (0.10%) and looser than the rejected fill
+  form (3.96%): the price of keeping two physical constants. The per-size
+  error is regime-structured (worst single point −36.29% at N=16/8 MiB —
+  the unmodeled pipeline-fill deficit — and +24% at N=32/1 MiB; N≥32 is
+  extrapolation territory, per-N MAPE 15.1%).
+- **Credit convention**: the sweep runs the inline 1-VC fabric model with
+  credits unconstrained (`--vcCredits=104857600`) — NOT the profile's
+  `vcCredits=64` (a PEX-bundle value consumed only by the stencil runner's
+  ApplyBundle). At `--vcCredits=64` the same N=8/256 MiB cell on the 18-link
+  fabric runs 3367.8 µs vs 2699.4 µs here (+24.8%); the surrogate's
+  `credit_bdp_tree_packets=35.5` credit term is untested against the new tree
+  (Φ_credit = 1 at the sweep convention).
+- `make_surrogate_from_wire` derives the trunk as `eta_tree · B_agg` with
+  `eta_tree = 0.61` vs the *physical* 25000 B/µs-per-lane aggregate
+  (0.61 × 450000 = 274500, −0.3% vs the fit).
+- Non-NVLink presets (`make_1024_optical_fattree_theory` 20725,
+  `make_connectx7_p2p_perftest_theory` 24000) keep their historical tree
+  constants; their tree predictions are uncalibrated placeholders (both
+  presets are ring/sendrecv studies).
+
+### Verification
+
+4 unit tests (`surrogate/test/test_theory.py`): the structural α(N) step
+function, the per-step volume α(N)·D/steps (no fill term), ns-3 reproduction
+at 256 MiB (N ∈ {4,8,16,32}, ≤16%), and the shape regression (latency
+non-decreasing in N at fixed D).
+
+
+## Loss recovery under injected packet loss — SRNIC Fig. 11 (measured) vs ns-3
+
+External measured anchor for the **loss-recovery mode** of the RoCE
+scale-out fabric: SRNIC, *"SRNIC: A Scalable Architecture for RDMA NICs"*,
+NSDI 2023, Figure 11
+(<https://www.cse.ust.hk/~kaichen/papers/srnic-nsdi23.pdf>). Testbed: two
+hosts on 100G links, perftest with 4 KB messages, congestion control
+**disabled**, an FPGA in the path injecting uniform random packet drops.
+Two measured curves: ConnectX-6 (go-back-N recovery — "drops rapidly when
+the packet loss rate exceeds 0.1%, and drops to 25 Gbps when the loss rate
+exceeds 1%") and the SRNIC prototype (bitmap selective repeat — "75 Gbps
+goodput under 1% packet loss rate"). Digitized points with provenance:
+[`examples/gpu-cluster/srnic_fig11_cx6_reference.csv`](../examples/gpu-cluster/srnic_fig11_cx6_reference.csv).
+
+This maps directly onto the fabric's two LLR modes — **the ns-3 sweep changes
+only `llrMode`** between arms:
+
+| ns-3 arm | cfg | measured analogue |
+|---|---|---|
+| `llrMode=gobackn` | `configs/protocol_configs/p2p-roce-lossy.cfg` | ConnectX-6 |
+| `llrMode=sack` | `configs/protocol_configs/p2p-roce-lossy-sack.cfg` | SRNIC |
+
+Sweep driver: [`examples/gpu-cluster/eth_gbn_loss_sweep.py`](../examples/gpu-cluster/eth_gbn_loss_sweep.py)
+(RoCE tor 100G, `--gpusPerNode=2` — required, see the cfg header —
+`--bulkChunkSize=4096` for perftest 4 KB granularity, 16 MiB transfer,
+`--llrRetryTimeout=500us`, `--packetLossRate` swept, 3 seeds). Per-arm
+knobs: the SACK arm runs `--soTxWindow=16` (wire BDP); the GBN arm runs
+`--soGbnStrict=1 --soTxWindow=64` (strict go-back-N receive semantics, see
+below). Results in `examples/gpu-cluster/eth_gbn_loss_sweep.json`. The
+comparison is **normalized per curve** (`G(p)/G(0)`): the ns-3 absolute
+plateau (53.2 Gbps: tor 2-link serialization + 4 KB chunk headers)
+intentionally differs from the testbed's single-link 90–97 Gbps.
+
+### Result (normalized goodput, 3-seed mean)
+
+| loss rate | ns-3 GBN (strict) | CX-6 measured | ns-3 SACK | SRNIC measured |
+|---|---|---|---|---|
+| ≤1e-4 | 0.976–0.995 | 1.000 | 1.000 | 1.000 |
+| 1e-3 | 0.919 | 0.933 | 0.979 | 0.990 |
+| 2e-3 | 0.861 | 0.889 | 0.977 | 0.979 |
+| 5e-3 | 0.725 | 0.744 | 0.968 | 0.907 |
+| 1e-2 | 0.580 | 0.467 | **0.814** | **0.773** |
+| 2e-2 | 0.383 | 0.278 | 0.590 | 0.619 |
+
+(The SACK column was re-swept after the SACK retry-timer fix — the source
+reload `readyDelay` is now included when re-arming the retry timer, mirroring
+the GBN path, so a reload-blocked retransmission no longer burns its retry
+budget before reaching the wire. The GBN arm is bit-identical to the
+original sweep.)
+
+What reproduces (the point of the experiment):
+
+- **The SACK arm tracks the measured SRNIC curve within ~6 points at every
+  swept loss rate** (0.814 vs 0.773 at 1%, 0.590 vs 0.619 at 2%). This is
+  the arm whose recovery semantics (per-loss selective retransmit, timer
+  backstop for lost control packets) match its reference hardware.
+- **The strict-GBN arm tracks the measured CX-6 curve within ~3 points up
+  to 0.5% loss** (0.919 vs 0.933 at 0.1%, 0.725 vs 0.744 at 0.5%) and
+  keeps the measured **mode ordering at every loss rate** (GBN below SACK,
+  no inversion — the legacy semantics inverted the arms at 2%).
+- **Recovery-mode retransmit economy**: ns-3 SACK retransmits ≈ the actual
+  drop count (~85 packets at 1%), strict GBN retransmits ~35× more (real
+  rewind blankets) for the same delivered bytes — the defining go-back-N
+  waste.
+
+What deviates, and why (structural, documented rather than tuned away):
+
+- **Strict GBN is still ~10 points optimistic at 1–2% loss** (0.580 vs
+  0.467, 0.383 vs 0.278): no RTO-scale stalls are modeled — a real NIC's
+  drops that produce no NAK (e.g. tail packets, or a lost NAK itself) park
+  the QP for an RTO orders of magnitude longer than our 500 µs timer
+  backstop.
+- GBN `permanentLosses` stays 0 across the sweep at `--llrRetryLimit=64`.
+
+### Strict go-back-N receive semantics (`--soGbnStrict`)
+
+The first fix round left the GBN arm optimistic at high loss (0.820 vs
+0.467 at 1%) with the arms inverting at 2%, because the receive path kept
+the bypass-mode dedup semantics: out-of-order originals were accepted (and
+even re-ACKed), so a blanket retransmission arrived as pure duplicates
+costing only wire time. Reverse-solving `G = 1/(1+n·p)` on the measured
+CX-6 curve gives a per-drop goodput waste of n ≈ 70–130 packets
+(`tx_depth` scale); the legacy semantics gave n ≈ 19–25 (window scale).
+
+`--soGbnStrict=1` (default 0 = legacy, parity-pinned by
+`test/parity/test_so_gbn_strict.py`) switches the **So receive path** in
+`llrMode=gobackn` to a real IB responder's behavior:
+
+- **in-order-only acceptance**: a packet is delivered (and ACKed) only if
+  its sequence number is the per-flow next-expected;
+- **out-of-order arrivals are discarded** — no delivery, no ACK, no state;
+- **one NAK per gap** (further OOO arrivals for the same gap drop
+  silently); a lost NAK is covered by the sender's 500 µs retry-timer
+  backstop;
+- duplicates below the expected sequence are re-ACKed only (their ACK may
+  have been lost);
+- the drop site no longer emits the oracle per-drop NACK for strict flows
+  (a real receiver never sees the dropped packet — the gap is detected on
+  the next arrival), which also removes the R = window × plr NACK cascade
+  that made large windows explode in the first round.
+
+**Su (NVLink) traffic is never affected**: the gate requires a remote
+source rank. On the 18-lane sprayed Su fabric out-of-order arrival is
+normal (the reorder/dedup layer's job) and a gap does not mean loss; real
+NVLink LLR is per-physical-link in-order replay *below* the spray layer.
+All Su calibration and BER-resilience results are unchanged (RoCE parity
+triple re-verified byte-identical).
+
+Under strict semantics the TX window **is** the rewind span (dispatch into
+the device queue is instantaneous, so every dispatched-unACKed chunk is
+both retransmitted *and* its queued original still burns wire time). The
+GBN arm's `w=64` is a **calibrated back-fit against the CX-6 anchor within
+the physical bounds** [wire BDP = 16, testbed `tx_depth` = 128]: w=16 is
+optimistic at high loss (0.464 vs 0.278 at 2%), w=128 pessimistic in the
+mid-range (0.539 vs 0.744 at 0.5%), w=64 matches the reverse-solved
+per-drop waste. The SACK arm keeps the BDP-derived w=16 — selective repeat
+has no rewind, so its window only bounds in-flight.
+
+### TX window + timer fixes exposed by this experiment
+
+Three model bugs found by aligning against Fig. 11, all fixed
+(parity-pinned: every change is inert at defaults):
+
+1. **No TX window** — the bulk sender dispatched *all* ~4300 chunks
+   synchronously at t≈0, so the GBN "window" was the whole remaining
+   message and a single NACK re-blanketed up to the full transfer. New
+   `--soTxWindow=N` (default 0 = legacy): ACK-clocked window over the
+   per-packet LLR ACKs, the NIC send-queue/`tx_depth` analog. The SACK arm
+   uses **16 chunks = wire BDP** (RTT ≈ 4.8 µs × 100G ≈ 60 KB ≈ 15×4 KB);
+   the strict GBN arm uses the calibrated rewind span w=64 (see the
+   `--soGbnStrict` section above). Under the *legacy* (non-strict)
+   semantics the GBN blanket cascade was subcritical only iff
+   R = window × plr < 1 (w=128 at 1%, R=1.28, exploded into a 111 ms
+   retransmit storm with 3283 retry-limit exhaustions) — an artifact of
+   the oracle drop-site NACK that strict semantics removes.
+2. **Retry timers armed at dispatch, not TX** — with the synchronous
+   dispatch, LLR retry timers all started at t≈0, forcing
+   `--llrRetryTimeout` to exceed the *whole transfer* tail (~2.6 ms) or
+   spuriously fire (500 µs at zero loss produced 8761 spurious
+   retransmits). The window fixes this structurally: StorePacket now
+   happens at window-gated TX time, so an RTT-scale timeout is sound. The
+   sweep uses **500 µs ≈ 100×RTT** on both arms (real RNIC RTO ≫ RTT;
+   100–200 µs starts inflating GBN retransmits under blanket load).
+3. **NACK-of-NACK** — the endpoint receive path emitted a NACK for
+   *control* packets dropped by `--packetLossRate` (the loss sample ran
+   before the protocol-control check), so a lost NACK/ACK spawned bogus
+   retry traffic for a sequence number that was never a data packet. Fixed:
+   control packets now drop silently (the switch path already sampled
+   after the control check); recovery of lost control packets is the
+   sender's retry timer, as in real link protocols.
+
+The `--llrTimeoutRetransmit=1` backstop (from the earlier round of this
+experiment) remains required: `LlrManager::OnRetryTimeout` fires a callback
+that only unit tests registered, so production retry timeout was a no-op
+and a lost NACK stalled SACK forever. Both lossy cfgs also raise
+`vcCredits` to effectively-infinite: CREDIT control packets are not
+LLR-protected, and the reference testbed has no link-level credit flow
+control, so a randomly dropped CREDIT under the default 64-credit budget
+would be an artifact stall.
+
+Layer caveat (same as the perftest section above): ns-3 models a bare-metal
+L2 fabric endpoint, not a verbs NIC — the comparison validates the
+*recovery-mode degradation shape*, not absolute goodput.
+
+### Collective-level anchor: attempted, regime mismatch (recorded to avoid re-runs)
+
+A third measured anchor was attempted: a published 4-node × 8×H100 (IB NDR,
+8×400G rails/node) `all_reduce_perf` run
+(<https://saturncloud.io/blog/crusoe-nccl-cluster-validation/>; 2–32 GB,
+algbw 372–377 GB/s ≈ 94% of the 400 GB/s per-node NIC aggregate, busbw
+~700 GB/s flat). The ns-3 counterpart (4 nodes × 8 GPU, hierarchical
+allreduce, `--interNodeBandwidth=3200` aggregated-rail approximation) gives
+74.0 ms for 2 GB vs 5.77 ms measured — a 12.8× gap that is an **algorithm
+regime mismatch, not a calibration error**: at these sizes NCCL runs NVLS
+intra-node phases (~450 GB/s busbw) and the transfer is NIC-bound, while our
+hierarchical injector's intra phases are the calibrated *ring* (~98 GB/s
+busbw) and dominate the total. The packet-level NVLS model cannot cover this
+regime (≥64 MB exceeds practical simulation time), so the collective-level
+comparison at multi-GB sizes is out of reach for ns-3; the surrogate's
+hierarchical model is the right tool there. Not pursued further.
+
+For the figure (`examples/gpu-cluster/crusoe_nccl_busbw.{png,pdf}`, generated
+by `plot_measured_anchors.py`) a 4 GB ns-3 point was added: 147.5 ms, i.e.
+algbw 29.1 GB/s — flat next to the 2 GB point's 29.0 GB/s, as expected for
+the bandwidth-dominated ring-intra regime. Sizes ≥8 GB abort in stock ns-3
+(`Queue::m_nBytes` is a 32-bit byte counter; `queue.h:551` assert), which
+bounds the packet-level range for this comparison at 4 GB.
+
+## NCCL protocol shapes (scale-up) — Demystifying NCCL Fig. 6 (measured) vs ns-3
+
+Third external measured anchor, and the **first for the Su (NVLink) protocol
+axis**: the LL / LL128 / Simple wire-efficiency constants and the ring/tree
+collective shapes had until now only been validated against our own A800/H200
+measurements. *Demystifying NCCL* (arXiv:2507.04786) publishes
+hardware-measured AllReduce runtimes for all three protocols × Ring/Tree on
+CSCS Alps (NCCL 2.19.1, protocols forced via `NCCL_PROTO`, 20 runs/point,
+medians), sizes 2^14–2^32 B. We use the two **intra-node** panels of Fig. 6:
+one Alps node = 4× GH200 fully connected all-to-all, six 200 Gb/s NVLink4
+links per GPU pair = **150 GB/s per direction per pair** (450 GB/s aggregate
+egress per GPU). The inter-node panels are *not* comparable (Cray Slingshot
+Dragonfly + NCCL host-proxy sync — a different fabric from our RoCE/ETH So
+models) and are used only qualitatively.
+
+Reference data: `examples/gpu-cluster/demystify_nccl_fig6_reference.csv`,
+digitized by pixel extraction (gridline-calibrated main panels ±2%, zoom
+insets for ≤2^22; provenance in the file header). Sweep driver:
+`examples/gpu-cluster/demystify_nccl_sweep.py` (60 runs, ~1 min); figure:
+`demystify_nccl_fig6_comparison.{png,pdf}`.
+
+**Mapping (spec-derived, no fitted bandwidth):**
+
+| arm | ns-3 CLI | physics |
+|---|---|---|
+| ring | `--topology=ring --numGpus=4 --numLanes=18 --bandwidth=200` | NCCL multi-channel rings aggregate all 3 pair-links → 450 GB/s per-GPU egress (same modeling decision as the H200 ring preset) |
+| tree | `--topology=fullmesh --numGpus=4 --numLanes=6 --bandwidth=200` | intra-node tree/chain edges are single GPU pairs → 150 GB/s per edge |
+
+The measured data itself confirms the mapping: ring Simple 2^32 busBW =
+4.29 GB × 1.5 / 19.2 ms = **335 GB/s (74% of the 450 GB/s aggregate)**; tree
+Simple 2^32 ≈ D/150 GB/s = 28.6 ms vs 27.5 ms measured (pair-limited).
+
+**Fitted constants: exactly 6 startup intercepts** (algorithm × protocol,
+anchored at 2^14: `startup = measured(2^14) − sim_wire(2^14, startup=0)`;
+ring 10.6/22.6/33.6 µs, tree 13.4/17.5/30.3 µs for LL/LL128/Simple — the
+right magnitude and ordering for NCCL kernel-launch + protocol setup).
+Everything else — LL 0.5 / LL128 0.9375 / Simple 1.0 wire efficiency, chunk
+sizes, credit flow, spraying — is the stock `NcclProtocolModel`. Sizes
+2^16–2^32 are therefore a pure transfer test on third-party hardware.
+
+**TreeAllReduce volume fix (2026-09, motivated by this anchor):** the
+first sweep against this data exposed a structural bug — the old
+`TreeAllReduce` moved only D/N bytes per tree edge per direction, so the
+sim's effective per-edge bandwidth (193.7 GB/s) exceeded the 150 GB/s pair
+spec and the sim *beat the physical bound* D/BW = 28.6 ms (22.2 ms at 2^32).
+The model was rewritten as a chunk-pipelined tree carrying the full D over
+every edge in each direction (reduce up + broadcast down, byte-counted
+progress, forwarding quantized to `clamp(D/(32·depth), 64 KiB, 8 MiB)`).
+Post-fix the tree Simple 2^32 lands at 28.84 ms — 1.007× the physical bound,
+1.047× the measured 27.5 ms (NCCL's split dual-tree keeps both directions of
+each edge busy and sits marginally *under* the naive single-tree bound).
+Note: the historical H200 `h200-tree-allreduce.cfg` per-protocol
+`linkDataRate` values (80/100/50) were fitted against the *old* under-
+transferring model and were compensating the volume deficit; they are
+retired. The recalibration (2026-09, refreshed 2026-10,
+`configs/calibration/tree_ns3_sweep.py`)
+anchors the cfg at the TRUE H200 fabric — `--linksPerGpu=18` separate
+point-to-point NVLink4 lanes × 170 Gbps effective (the full GPU↔NVSwitch
+trunk, 382500 B/µs, spray-routed) — and back-fits the surrogate tree
+preset to the post-fix ns-3 tree — see the Tree AllReduce section above.
+
+**Results (per-curve MAPE over 2^16–2^32):** ring LL 25.1% / LL128 21.1% /
+Simple 18.0%; tree LL 5.8% / LL128 8.1% / Simple 16.3% (pre-fix tree was
+16.9/15.2/26.4% *with* an unphysical volume model). Ring deviation is
+one-sided optimistic, worst in the 2^22–2^26 transition regime (ratio
+0.45–0.73 — real NCCL pays chunk-scheduling/channel-ramp costs there that
+the model does not carry) and mildly optimistic at ≥2^28 (ratio 0.71–0.86;
+measured plateau efficiency ~74% vs the model's ~89%). Post-fix tree is
+near-neutral at large sizes (≥2^26 ratios 0.91–1.13, mildly pessimistic on
+average) with the transition-regime optimism remaining only on tree Simple
+(2^20–2^24 ratio 0.57–0.76).
+
+**Protocol-shape isolation (size-2^32 runtime ratios, bandwidth-independent):**
+
+| ratio | measured | ns-3 | dev |
+|---|---|---|---|
+| tree LL/Simple | 2.005 | 1.998 | −0.3% |
+| tree LL128/Simple | 1.073 | 1.066 | −0.7% |
+| ring LL/Simple | 2.363 | 1.872 | −21% |
+| ring LL128/Simple | 1.089 | 0.996 | −8.5% |
+| tree/ring (Simple) | 1.435 | 1.787 | +24.5% |
+
+On the pair-limited tree path the stock protocol constants transfer to
+within **1%** — independent confirmation of the LL=0.5 / LL128=0.9375 wire
+model. On the aggregated ring path LL undershoots by 21%: our LL efficiency
+is NCCL's theoretical bound, while the paper itself states LL reaches only
+25–50% of peak — multi-channel LL scheduling loses more than the 2× flag
+overhead. Documented, not tuned. The tree/ring cross ratio is now +24.5%
+because the tree arm is honest while the ring arm keeps its untuned plateau
+optimism (sim 89% vs measured 74% efficiency) — pre-fix the two errors
+cancelled to a misleading −4.3%. The one qualitative miss: at ≥2^28 the sim
+has LL128 marginally *faster* than Simple on ring (0.996 vs measured 1.089 —
+a chunk-granularity artifact); ordering elsewhere (LL best small, Simple
+best large, LL crossover at ~2^22, tree slower than ring) all reproduces.

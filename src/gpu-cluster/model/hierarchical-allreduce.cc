@@ -259,6 +259,28 @@ uint16_t HierarchicalAllReduce::GetGlobalRank(uint32_t nodeId, uint16_t localIdx
     return static_cast<uint16_t>(nodeId * m_gpusPerNode + localIdx);
 }
 
+uint64_t HierarchicalAllReduce::LocalSegmentOf(uint16_t localIdx) const
+{
+    // Frozen-grid convention over the LOCAL dimension (codex round 20,
+    // finding 3): local index l's phase-1/4 segment is dataSize/gpusPerNode
+    // plus one extra byte when l < dataSize % gpusPerNode, repeated on every
+    // node. The grid over one node sums to the per-node share, and the
+    // 2-level grid (this + InterChunkOf) sums to exactly dataSize.
+    return m_dataSize / m_gpusPerNode
+           + (localIdx < m_dataSize % m_gpusPerNode ? 1 : 0);
+}
+
+uint64_t HierarchicalAllReduce::InterChunkOf(uint32_t nodeId, uint16_t localIdx) const
+{
+    // Frozen-grid convention over the NODE dimension: within local index
+    // l's segment (LocalSegmentOf(l) bytes), node n's inter-node chunk
+    // carries segment/N plus one extra byte when n < segment % N. Applied
+    // per (node, localIdx) the two grids tile dataSize exactly —
+    // sum over n,l of InterChunkOf(n,l) == dataSize.
+    const uint64_t segment = LocalSegmentOf(localIdx);
+    return segment / m_numNodes + (nodeId < segment % m_numNodes ? 1 : 0);
+}
+
 CollectiveType HierarchicalAllReduce::GetCollectiveType() const { return CollectiveType::ALLREDUCE; }
 bool HierarchicalAllReduce::IsCompleted() const { return m_state == HierarchicalState::COMPLETED; }
 
@@ -270,6 +292,13 @@ HierarchicalAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_numGpus = numGpus;
     m_dataSize = dataSize;
     m_endpoints = endpoints;
+    // Base (floor) sizes for the per-phase DELAY lookups below; the byte
+    // accounting itself uses the remainder-aware grids LocalSegmentOf /
+    // InterChunkOf (codex round 20, finding 3). The old flat division
+    // truncated both levels: 2 nodes x 2 GPUs at dataSize=15 gave
+    // segment=7/inter=3 and the collective moved 80 effective bytes
+    // instead of 90 — 5 bytes of real data never reached the wire, yet the
+    // thresholds shared the same truncation so it still "completed".
     m_segmentSize = dataSize / m_gpusPerNode;
     m_interNodeChunk = m_segmentSize / m_numNodes;
 
@@ -294,9 +323,23 @@ HierarchicalAllReduce::SetStartupDelay(Time delay)
 void
 HierarchicalAllReduce::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&HierarchicalAllReduce::OnPacketReceived, this));
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
-    Object::DoDispose();
+    CollectiveInjector::DoDispose();
 }
 
 void
@@ -321,11 +364,28 @@ HierarchicalAllReduce::Start()
 
     SetupReceiveCallbacks();
 
-    // Schedule first phase after startup delay based on initial data size
-    uint64_t startupNs = GetLocalStartupDelayNs(m_dataSize);
+    // Zero-data collective: every chunk is zero, no send ever fires a
+    // receive to advance the phases — complete immediately instead of
+    // stalling to the 1-hour cap (same rule as HierarchicalAllGather;
+    // codex round 20, finding 10).
+    if (m_dataSize == 0)
+    {
+        Complete();
+        return;
+    }
+
+    // Schedule first phase after startup delay based on initial data size.
+    // An explicit SetStartupDelay OVERRIDES the protocol-derived delay
+    // (codex round 20, finding 8): the override member was written but
+    // never consumed, so --startupDelay=1000000000 left AllReduce timing
+    // identical to the auto value.
+    uint64_t startupNs = (m_startupDelayNs > 0)
+                             ? m_startupDelayNs
+                             : GetLocalStartupDelayNs(m_dataSize);
     uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_segmentSize);
-    Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
-                        &HierarchicalAllReduce::StartLocalReduceScatter, this);
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(startupNs + fullmeshDelay),
+                            &HierarchicalAllReduce::StartLocalReduceScatter, this));
 }
 
 // Phase 1: Local reduce-scatter (NVLink/MetaXLink within each node)
@@ -354,9 +414,14 @@ HierarchicalAllReduce::StartLocalReduceScatter()
                 if (peerLocal == localIdx) continue;
                 uint16_t peerRank = GetGlobalRank(myNodeId, peerLocal);
 
-                if (m_endpoints[gpu] && m_segmentSize > 0)
+                // Destination-sized remainder-aware segment (codex round
+                // 20, finding 3): the sender ships the PEER's segment, so
+                // per-dest load is (g-1)*LocalSegmentOf(destLocalIdx) and
+                // the phase moves every remainder byte.
+                const uint64_t peerSegment = LocalSegmentOf(peerLocal);
+                if (m_endpoints[gpu] && peerSegment > 0)
                 {
-                    m_endpoints[gpu]->SendBulkWireTransfer(peerRank, m_dummyData.data(), m_segmentSize,
+                    m_endpoints[gpu]->SendBulkWireTransfer(peerRank, m_dummyData.data(), peerSegment,
                                                             m_protocolId, m_flowId, 0);
                 }
             }
@@ -364,7 +429,17 @@ HierarchicalAllReduce::StartLocalReduceScatter()
     }
     else
     {
-        // Ring: each GPU sends segmentSize/gpusPerNode to next local peer
+        // Ring reduce-scatter (codex round 19, finding 2): a real ring RS
+        // runs g-1 steps, each moving one full ring chunk (the successor's
+        // remainder-aware segment, codex round 20, finding 3) to the
+        // successor, so each GPU ships (g-1)*LocalSegmentOf(next) bytes
+        // locally — the same volume the fullmesh branch sends. The old code
+        // divided a second time (segmentSize/g per step) AND sent only one
+        // step, under-transferring 12x at g=4 (1 MiB moved locally instead
+        // of 12 MiB) while still completing on a threshold that matched the
+        // under-send. Modeled as one aggregate transfer (per-step pacing is
+        // a latency detail the
+        // surrogate already folds into per-chunk delays).
         for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             uint32_t myNodeId = GetNodeId(gpu);
@@ -372,15 +447,58 @@ HierarchicalAllReduce::StartLocalReduceScatter()
             uint16_t nextLocalIdx = (localIdx + 1) % m_gpusPerNode;
             uint16_t nextRank = GetGlobalRank(myNodeId, nextLocalIdx);
 
-            uint64_t chunkSize = m_segmentSize / m_gpusPerNode;
-            if (chunkSize == 0) chunkSize = 1;
+            // Destination-sized (the successor's remainder-aware segment,
+            // codex round 20, finding 3): the ring ships the successor's
+            // chunk g-1 times, so the aggregate is (g-1)*LocalSegmentOf(next).
+            uint64_t ringVolume = LocalSegmentOf(nextLocalIdx) * (m_gpusPerNode - 1);
 
             if (m_endpoints[gpu])
             {
-                m_endpoints[gpu]->SendBulkWireTransfer(nextRank, m_dummyData.data(), chunkSize,
+                m_endpoints[gpu]->SendBulkWireTransfer(nextRank, m_dummyData.data(), ringVolume,
                                                         m_protocolId, m_flowId, 0);
             }
         }
+    }
+
+    // One GPU per node: the local phase has no peers (the ring's successor
+    // is the GPU itself; fullmesh has nobody to send to), so no receive
+    // callback will ever fire to advance the phase. Every GPU is trivially
+    // complete — schedule the inter-node phase directly instead of stalling
+    // until the 3600s ceiling.
+    if (m_gpusPerNode <= 1)
+    {
+        NS_LOG_INFO("Phase1 (local reduce-scatter) trivially complete (one GPU per node)");
+        uint64_t computeDelay = GetLocalComputeDelayNs(m_segmentSize);
+        uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
+        uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                &HierarchicalAllReduce::StartInterNodeReduceScatter, this));
+        return;
+    }
+
+    // Degenerate grid pre-credit (codex round 21, finding 2): a rank whose
+    // local segment is zero receives nothing from its local peers (every
+    // peer's destination-sized send to it is zero bytes) — the 0->1 clamp
+    // on the threshold left it waiting for a byte nobody sends. Mark such
+    // ranks complete here instead of clamping in the check.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (!m_gpuPhaseComplete[gpu] && LocalSegmentOf(GetLocalIdx(gpu)) == 0)
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+        }
+    }
+    if (m_completedGpuCount >= m_numGpus)
+    {
+        NS_LOG_INFO("Phase1 (local reduce-scatter) trivially complete (degenerate grid)");
+        uint64_t computeDelay = GetLocalComputeDelayNs(m_segmentSize);
+        uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
+        uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                &HierarchicalAllReduce::StartInterNodeReduceScatter, this));
     }
 }
 
@@ -394,18 +512,14 @@ HierarchicalAllReduce::OnLocalReduceScatterChunkReceived(uint16_t destRank, uint
 void
 HierarchicalAllReduce::CheckLocalReduceScatterComplete(uint16_t gpu)
 {
-    uint64_t expectedBytes;
-    if (m_intraNodeAlgorithm == "fullmesh")
-    {
-        // Each GPU receives segmentSize from (gpusPerNode-1) local peers
-        expectedBytes = m_segmentSize * (m_gpusPerNode - 1);
-    }
-    else
-    {
-        // Ring: each GPU receives one chunk of segmentSize/gpusPerNode from predecessor
-        expectedBytes = m_segmentSize / m_gpusPerNode;
-    }
-    if (expectedBytes == 0) expectedBytes = 1;
+    // Each GPU receives its OWN remainder-aware segment from each of its
+    // (gpusPerNode-1) local peers — fullmesh sends destination-sized
+    // segments and the ring's aggregate is the same volume (codex round 20,
+    // finding 3). A zero-segment rank (degenerate dataSize < g local grid)
+    // receives nothing and is PRE-CREDITED at the phase start (codex round
+    // 21, finding 2) — a clamped 1-byte threshold with no sender stalled
+    // the degenerate grids.
+    uint64_t expectedBytes = LocalSegmentOf(GetLocalIdx(gpu)) * (m_gpusPerNode - 1);
 
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {
@@ -419,8 +533,9 @@ HierarchicalAllReduce::CheckLocalReduceScatterComplete(uint16_t gpu)
             uint64_t computeDelay = GetLocalComputeDelayNs(m_segmentSize);
             uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
             uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
-            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
-                                &HierarchicalAllReduce::StartInterNodeReduceScatter, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                    &HierarchicalAllReduce::StartInterNodeReduceScatter, this));
         }
     }
 }
@@ -449,15 +564,46 @@ HierarchicalAllReduce::StartInterNodeReduceScatter()
 
             uint16_t remoteRank = GetGlobalRank(remoteNode, localIdx);
 
-            NS_LOG_DEBUG("Phase2: GPU " << gpu << " sending " << m_interNodeChunk << "B to "
+            // Destination-sized inter-node chunk (codex round 20, finding 3):
+            // the sender ships the REMOTE node's share of this local index's
+            // segment — InterChunkOf(remoteNode, localIdx) — so the phase-2
+            // traffic tiles dataSize's node dimension exactly, remainder
+            // bytes included.
+            const uint64_t remoteChunk = InterChunkOf(remoteNode, localIdx);
+
+            NS_LOG_DEBUG("Phase2: GPU " << gpu << " sending " << remoteChunk << "B to "
                         << remoteRank << " (node" << remoteNode << "/local" << localIdx << ")");
 
-            if (m_endpoints[gpu] && m_interNodeChunk > 0)
+            if (m_endpoints[gpu] && remoteChunk > 0)
             {
-                m_endpoints[gpu]->SendBulkWireTransfer(remoteRank, m_dummyData.data(), m_interNodeChunk,
+                m_endpoints[gpu]->SendBulkWireTransfer(remoteRank, m_dummyData.data(), remoteChunk,
                                                         m_protocolId, m_flowId + 1, 0);
             }
         }
+    }
+
+    // Degenerate grid pre-credit (codex round 21, finding 2): a rank whose
+    // own node share of its local index's segment is zero receives nothing
+    // in phase 2 (every remote sender's destination-sized chunk to it is
+    // zero bytes). The 0->1 threshold clamp stalled such ranks at D=1/2/3
+    // on a 2x2 grid; pre-credit them here instead.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (!m_gpuPhaseComplete[gpu] && InterChunkOf(GetNodeId(gpu), GetLocalIdx(gpu)) == 0)
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+        }
+    }
+    if (m_completedGpuCount >= m_numGpus)
+    {
+        NS_LOG_INFO("Phase2 (inter-node reduce-scatter) trivially complete (degenerate grid)");
+        uint64_t computeDelay = GetInterNodeComputeDelayNs(m_segmentSize);
+        uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
+        uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                &HierarchicalAllReduce::StartInterNodeAllGather, this));
     }
 }
 
@@ -471,9 +617,18 @@ HierarchicalAllReduce::OnInterNodeReduceScatterChunkReceived(uint16_t destRank, 
 void
 HierarchicalAllReduce::CheckInterNodeReduceScatterComplete(uint16_t gpu)
 {
-    // Each GPU receives interNodeChunk from (numNodes-1) remote same-local-rank GPUs
-    uint64_t expectedBytes = m_interNodeChunk * (m_numNodes - 1);
-    if (expectedBytes == 0) expectedBytes = 1;
+    // Phase 2 sends are destination-sized (start of this phase): every
+    // remote same-local-rank sender ships THIS rank's node share, so the
+    // expected volume is the receiver's own share times (numNodes-1)
+    // (codex round 20, finding 3). Summing the REMOTE nodes' shares here —
+    // as the phase-3 threshold correctly does for its own-share sends —
+    // mismatches under a non-uniform grid: at 2x2/D=15 rank 3 (node 1,
+    // share 3B) received its 3B but waited for the 4B the node-0 peer's
+    // grid entry promises. A zero obligation is pre-credited in
+    // StartInterNodeReduceScatter (codex round 21, finding 2) — a fake
+    // 1-byte threshold with no sender stalls exactly the degenerate grids
+    // the pre-credit exists for.
+    uint64_t expectedBytes = InterChunkOf(GetNodeId(gpu), GetLocalIdx(gpu)) * (m_numNodes - 1);
 
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {
@@ -487,8 +642,9 @@ HierarchicalAllReduce::CheckInterNodeReduceScatterComplete(uint16_t gpu)
             uint64_t computeDelay = GetInterNodeComputeDelayNs(m_segmentSize);
             uint64_t interStartup = GetInterNodeStartupDelayNs(m_interNodeChunk);
             uint64_t rampDelay = GetInterNodeRampDelayNs(m_interNodeChunk);
-            Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
-                                &HierarchicalAllReduce::StartInterNodeAllGather, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(computeDelay + interStartup + rampDelay),
+                                    &HierarchicalAllReduce::StartInterNodeAllGather, this));
         }
     }
 }
@@ -518,15 +674,54 @@ HierarchicalAllReduce::StartInterNodeAllGather()
 
             uint16_t remoteRank = GetGlobalRank(remoteNode, localIdx);
 
-            NS_LOG_DEBUG("Phase3: GPU " << gpu << " sending " << m_interNodeChunk << "B to "
+            // Own-node chunk of this local index's segment (codex round 20,
+            // finding 3): phase 3 all-gathers what each node reduced, so the
+            // sender ships ITS node's share — InterChunkOf(myNodeId,
+            // localIdx) — to every remote same-local-rank peer.
+            const uint64_t myChunk = InterChunkOf(myNodeId, localIdx);
+
+            NS_LOG_DEBUG("Phase3: GPU " << gpu << " sending " << myChunk << "B to "
                         << remoteRank);
 
-            if (m_endpoints[gpu] && m_interNodeChunk > 0)
+            if (m_endpoints[gpu] && myChunk > 0)
             {
-                m_endpoints[gpu]->SendBulkWireTransfer(remoteRank, m_dummyData.data(), m_interNodeChunk,
+                m_endpoints[gpu]->SendBulkWireTransfer(remoteRank, m_dummyData.data(), myChunk,
                                                         m_protocolId, m_flowId + 2, 0);
             }
         }
+    }
+
+    // Degenerate grid pre-credit (codex round 21, finding 2): a rank whose
+    // remote receive obligation (the sum of the REMOTE nodes' shares of
+    // its local index's segment) is zero receives nothing in phase 3 —
+    // every remote peer's own-share send is zero bytes. Pre-credit instead
+    // of clamping the threshold 0 -> 1 with no sender.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (m_gpuPhaseComplete[gpu])
+        {
+            continue;
+        }
+        uint64_t remoteObligation = 0;
+        for (uint32_t node = 0; node < m_numNodes; ++node)
+        {
+            if (node == GetNodeId(gpu)) continue;
+            remoteObligation += InterChunkOf(node, GetLocalIdx(gpu));
+        }
+        if (remoteObligation == 0)
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+        }
+    }
+    if (m_completedGpuCount >= m_numGpus)
+    {
+        NS_LOG_INFO("Phase3 (inter-node all-gather) trivially complete (degenerate grid)");
+        uint64_t localStartup = GetLocalStartupDelayNs(m_segmentSize);
+        uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_segmentSize);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(localStartup + fullmeshDelay),
+                                &HierarchicalAllReduce::StartLocalAllGather, this));
     }
 }
 
@@ -540,8 +735,16 @@ HierarchicalAllReduce::OnInterNodeAllGatherChunkReceived(uint16_t destRank, uint
 void
 HierarchicalAllReduce::CheckInterNodeAllGatherComplete(uint16_t gpu)
 {
-    uint64_t expectedBytes = m_interNodeChunk * (m_numNodes - 1);
-    if (expectedBytes == 0) expectedBytes = 1;
+    // Same remainder-aware threshold as phase 2 (codex round 20, finding 3):
+    // the remote nodes' shares of this local index's segment. A zero
+    // obligation is pre-credited in StartInterNodeAllGather (codex round
+    // 21, finding 2).
+    uint64_t expectedBytes = 0;
+    for (uint32_t node = 0; node < m_numNodes; ++node)
+    {
+        if (node == GetNodeId(gpu)) continue;
+        expectedBytes += InterChunkOf(node, GetLocalIdx(gpu));
+    }
 
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {
@@ -554,8 +757,9 @@ HierarchicalAllReduce::CheckInterNodeAllGatherComplete(uint16_t gpu)
             NS_LOG_INFO("Phase3 (inter-node all-gather) complete for all GPUs");
             uint64_t localStartup = GetLocalStartupDelayNs(m_segmentSize);
             uint64_t fullmeshDelay = GetFullmeshStepDelayNs(m_segmentSize);
-            Simulator::Schedule(NanoSeconds(localStartup + fullmeshDelay),
-                                &HierarchicalAllReduce::StartLocalAllGather, this);
+            m_pendingEvents.push_back(
+                Simulator::Schedule(NanoSeconds(localStartup + fullmeshDelay),
+                                    &HierarchicalAllReduce::StartLocalAllGather, this));
         }
     }
 }
@@ -584,14 +788,46 @@ HierarchicalAllReduce::StartLocalAllGather()
 
             uint16_t peerRank = GetGlobalRank(myNodeId, peerLocal);
 
-            NS_LOG_DEBUG("Phase4: GPU " << gpu << " sending " << m_segmentSize << "B to local peer " << peerRank);
+            // Destination-sized remainder-aware segment (codex round 20,
+            // finding 3): phase 4 shares the fully-reduced result, so the
+            // sender ships the PEER's segment.
+            const uint64_t peerSegment = LocalSegmentOf(peerLocal);
 
-            if (m_endpoints[gpu] && m_segmentSize > 0)
+            NS_LOG_DEBUG("Phase4: GPU " << gpu << " sending " << peerSegment << "B to local peer " << peerRank);
+
+            if (m_endpoints[gpu] && peerSegment > 0)
             {
-                m_endpoints[gpu]->SendBulkWireTransfer(peerRank, m_dummyData.data(), m_segmentSize,
+                m_endpoints[gpu]->SendBulkWireTransfer(peerRank, m_dummyData.data(), peerSegment,
                                                         m_protocolId, m_flowId + 3, 0);
             }
         }
+    }
+
+    // One GPU per node: Phase4 has no local peers, so no receive callback
+    // will ever fire to complete the collective — every GPU is trivially
+    // done. (Phase1's gpusPerNode<=1 note applies here too.)
+    if (m_gpusPerNode <= 1)
+    {
+        NS_LOG_INFO("Phase4 (local all-gather) trivially complete (one GPU per node)");
+        Complete();
+        return;
+    }
+
+    // Degenerate grid pre-credit (codex round 21, finding 2): a rank whose
+    // own segment is zero receives nothing from its local peers — same rule
+    // as phase 1.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (!m_gpuPhaseComplete[gpu] && LocalSegmentOf(GetLocalIdx(gpu)) == 0)
+        {
+            m_gpuPhaseComplete[gpu] = true;
+            m_completedGpuCount++;
+        }
+    }
+    if (m_completedGpuCount >= m_numGpus)
+    {
+        NS_LOG_INFO("Phase4 (local all-gather) trivially complete (degenerate grid)");
+        Complete();
     }
 }
 
@@ -605,9 +841,11 @@ HierarchicalAllReduce::OnLocalAllGatherChunkReceived(uint16_t destRank, uint32_t
 void
 HierarchicalAllReduce::CheckLocalAllGatherComplete(uint16_t gpu)
 {
-    // Each GPU receives segmentSize from (gpusPerNode-1) local peers
-    uint64_t expectedBytes = m_segmentSize * (m_gpusPerNode - 1);
-    if (expectedBytes == 0) expectedBytes = 1;
+    // Each GPU receives its OWN remainder-aware segment from each of its
+    // (gpusPerNode-1) local peers (codex round 20, finding 3). A
+    // zero-segment rank is pre-credited at the phase start (codex round
+    // 21, finding 2).
+    uint64_t expectedBytes = LocalSegmentOf(GetLocalIdx(gpu)) * (m_gpusPerNode - 1);
 
     if (m_gpuReceivedBytes[gpu] >= expectedBytes && !m_gpuPhaseComplete[gpu])
     {
@@ -643,6 +881,23 @@ void
 HierarchicalAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
 {
     NS_LOG_FUNCTION(this << srcRank << packet->GetSize());
+
+    // Only DATA counts toward progress. A PERMANENT_LOSS notification (retries
+    // exhausted) carries the original packet's byte counts so the fabric layer
+    // can propagate terminal progress, but the data is gone — counting it
+    // would let the collective report completion with missing data (same rule
+    // as RingAllReduce).
+    if (header.GetPacketType() != FabricPacketType::DATA)
+    {
+        if (header.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+        {
+            m_permanentLossCount++;
+            NS_LOG_INFO("PERMANENT_LOSS: src=" << srcRank << " -> dest="
+                         << header.GetDestRank()
+                         << " (data integrity violated, not counted as progress)");
+        }
+        return;
+    }
 
     uint16_t destRank = header.GetDestRank();
     uint32_t effectiveDataSize = header.GetEffectiveDataSize();

@@ -88,6 +88,195 @@ vcCredits          = 64
 flowControl        = credit
 ```
 
+**Credit is a scale-up (Su) mechanism only.** `vcCredits`/`flowControl` gate
+the intra-node (NVLink) fabric; scale-out (So) traffic bypasses credit on both
+send (`SendBulkWireTransferSize`'s `IsLocalRank(destRank)` guard) and the
+credit-return path (`OnPacketDelivered`). So flow control is the lossless/lossy
+fabric mechanism instead: ECN + DCQCN + per-QP ceiling
+(`--ecnThreshold`/`--dcqcn`/`--perQpCeilingGbps`) for RoCE, VOQ tail-drop +
+LLR retransmit (`--voqDropThreshold`/`--llrMode`/`--llrRetryLimit`) for plain
+Ethernet — matching real hardware (RDMA uses ECN/PFC, not per-packet credits;
+NVLink is credit-based). Tuning `vcCredits` therefore only affects Su latency.
+
+**Lossy RoCE (no-PFC) is an explicit opt-in:** pass `--voqDropThreshold=N`
+(N>0) on a RoCE run to arm VOQ tail-drop + NACK→LLR retransmit beside ECN
+marking (set `--ecnThreshold < N` for mark-before-drop; LLR is
+force-enabled with the opt-in). Without the flag the RoCE fabric is
+lossless — the switch attribute default is 0 and the scratch CLI default 8
+applies only to plain Ethernet. In that lossy regime the DCQCN alpha knobs
+move completion time (GInit/GDecay up to ~8 % swing on a drop-heavy
+allreduce); see `examples/gpu-cluster/collective_topology_dcqcn/README.md`.
+
+**RTTCC delay-based congestion control (`--rttcc`).** DCQCN needs the RoCE
+ECN/CNP loop, which the plain lossy Ethernet fabric does not have (and the
+DCQCN So gate keys on `WireEfficiency<1.0`, which `EthernetProtocolModel`
+locks at 1.0) — so ETH gets a delay-based option instead (NVIDIA RTT-CC /
+Swift-style). With `--rttcc=1`, each So endpoint mounts an `RttccRateMachine`:
+the sender emits at most one `RTT_PROBE` control packet per
+`--rttccProbeIntervalNs` (default 5000) per flow alongside the data, the
+receiver reflects it as an `RTT_RESPONSE`, and each echo becomes an RTT
+sample: at/below `--rttccTargetRttNs` (default 10000) the flow rate ramps by
+`AdditiveIncreaseGbps` (attribute, default 10) toward the line rate; above
+target it decays by `1 − Beta·(rtt−target)/rtt` (Beta default 0.8, floor
+`MinRateGbps`). The rate is enforced as a per-flow pacer at the same egress
+chokepoint as DCQCN and composes with it (`max` of the two delays). Probes
+are control packets: never tail-dropped, BER-bypassed, LLR-skipped — but
+still queued through switch VOQs, so the sampled RTT sees real congestion.
+Default off is byte-identical; RESULT reports `rttccProbesSent` /
+`rttccRttSamples` / `rttccMinRttNs` / `rttccMaxRttNs` / `rttccMinRateGbps`.
+Idealizations: a probe always returns a sample (control path is loss-free at
+BER=0), and reflection is unconditional (no receiver-side machine). Works on
+any So fabric type but only shapes inter-node flows (`numNodes>1`).
+
+**Real-NCCL ring allreduce (`--algorithm=ncclring`, `--ringChannels`).**
+Opt-in alternative to the default multi-node `hierarchical` allreduce
+schedule, modeled on what NCCL's ring algorithm actually does: C parallel
+channels (`--ringChannels`, `0 = auto` → gpusPerNode), each one global
+pipelined ring over all N ranks, rail-rotated so channel c enters each node
+at local GPU c and exits at local GPU (c+g−1)%g — one NIC in / one NIC out
+per ring per node, all rails busy concurrently. Each channel moves S/C
+bytes in 2(N−1) same-direction chunk steps (chunk = S/(C·N)), advanced
+event-driven with no inter-phase barriers, so intra- and inter-node hops
+overlap (max-of-bottleneck instead of the hierarchical sum-of-phases).
+Wins ≥2× at large sizes on switched topologies (741 vs 362 Gbps busbw at
+256 MiB, 16 n × 8 g RoCE 400G); loses below ~16 MiB where the 2(N−1)-step
+latency dominates — the same regime where real NCCL switches to tree.
+Honors the shared per-step knobs (`--perStepSwOverhead`,
+`--swOverheadPerByte`, `--computeBaseLL` / `--computeBaseLL128` /
+`--computeBaseSIMPLE`, `--llThreshold` /
+`--ll128Threshold`, `--startupDelay`). AllReduce only; gate
+`test/parity/test_ncclring.py`.
+
+**So topologies (`--interNodeTopology` + shape knobs).** Eight inter-node
+topologies in three wiring shapes: one-NIC-per-GPU switched (`host`, `tor`,
+`leafspine`), direct rdmaRouteMap + intra-node PXN proxy (`fullmesh`, `rail`),
+and GPU-0 gateway multi-hop (`ring`, `torus2d`, `dragonfly` — these require
+`intraNodeTopology=switched` and funnel all cross-node traffic through each
+node's GPU 0). Shape knobs, all `0 = auto`: `--interNodeSpines` (leafspine
+spine count; auto = gpusPerNode, non-blocking), `--interNodeTorusWidth`
+(torus2d grid width W with height = numNodes/W; auto = largest divisor
+≤ √numNodes), `--interNodeDragonflyGroupSize` (nodes per dragonfly group;
+auto = divisor nearest √numNodes). The lossy-ETH VOQ tail-drop + NACK path
+needs a switch in the inter-node path, i.e. `host`/`tor`/`rail`/`leafspine`;
+the switchless/gateway topologies warn and run the fabric lossless.
+`test/parity/test_so_topologies.py` pins a completion smoke for all eight.
+
+**WFQ contention model (`--contention*Weight`, `--bgP2p*`).** Each endpoint
+carries a `ContentionModel` that does weighted-fair-queuing over three traffic
+classes — COLLECTIVE / MEMORY / P2P (`--contentionCollectiveWeight` /
+`--contentionMemoryWeight` / `--contentionP2pWeight`, defaults 0.7/0.2/0.1).
+The WFQ penalty fires **only when more than one class is concurrently active**
+on the same endpoint's injection side; single-class traffic (a pure collective)
+is byte-identical to the unmounted baseline. As of this release multi-node
+(scale-out) endpoints are wired too — previously only single-node (Su) was.
+
+**Modeling-layer difference.** The two regimes mount the model at *different*
+layers, so their magnitudes are not expected to match: single-node (Su) shares
+ONE `ContentionModel` clone across all the node's endpoints (the helper's
+`AttachContentionModelToEndpoints` — backlog aggregates node-wide, a
+shared-egress view); multi-node (So) mounts an **independent** per-endpoint
+instance (backlog local to that endpoint's injection side). Both use the
+intra-node NVLink rate as the WFQ bandwidth, also for So-bound packets;
+cross-node port contention is additionally covered by the So switch VOQ
+arbiter. Neither layer has a hardware calibration behind it.
+
+**Two mechanisms slow a collective under a background flow**, and they are
+not the same thing: (a) **link sharing** — the background packets FIFO-serialize
+on the same NetDevice / So switch VOQ as the collective's; (b) the **WFQ
+penalty** above, an extra send-side delay when more than one class is active.
+Link sharing dominates every smoke below; the WFQ penalty can be entirely off
+the critical path. To isolate it, set all three weights to 1.0: that makes the
+penalty exactly 0 while leaving the model mounted, so any difference from the
+default-weight run is the WFQ contribution.
+
+To exercise contention, inject a time-offset background P2P flow with
+`--bgP2pEnabled=1 --bgP2pSrc=R --bgP2pDst=R' --bgP2pSizeBytes=B
+--bgP2pStartTimeNs=T`; it is an unlimited self-driven `P2pTraffic` that shares
+the fabric with the primary collective until the collective completes (which
+stops the sim). `--bgP2pIntervalNs=0` means back-to-back = one packet
+serialization time at the **intra-node** bandwidth, clamped to ≥1 ns (a
+literal 0 ns would loop at a fixed sim-time and stall the sim). For a
+cross-node flow that over-drives the inter-node link by the intra/inter rate
+ratio (2× at 800G/400G) and the excess queues at the NIC; pass
+`--bgP2pIntervalNs` explicitly to pace at the inter-node rate. The result block
+reports `bgP2pBytesSent`/`bgP2pPacketsSent` — these count *injection*
+(`SendP2p` calls), not delivery.
+
+Reference numbers (`--RngRun=1`, 16 MiB allreduce, 1 MiB bg packets from
+t=5 µs; all pinned by `test/parity/test_contention_interference.py`):
+
+| regime | bg flow | default weights | weights=1.0 | baseline |
+|--------|---------|-----------------|-------------|----------|
+| 2-node RoCE hierarchical | rank 0→4 (cross-node) | 2776201 | 2776201 | 1248928 |
+| 2-node RoCE hierarchical | rank 0→1 (intra-node) | 1330831 | 1315771 | 1248928 |
+| single-node Su ring | rank 0→2 | 450982 | 405462 | 319658 |
+
+The cross-node +122% is all link sharing (WFQ byte-identical; the bg flow,
+paced at the 800G intra-node rate onto a 400G link, is limited by NIC link
+sharing); the intra-node bg is what discriminates WFQ on the multi-node path.
+The multi-node bg numbers were re-anchored by the HierarchicalAllReduce
+PERMANENT_LOSS/P2P-progress fix (only `FabricPacketType::DATA` advances
+collective phases): the pre-fix values (1353663/1311031) were corrupted by
+phantom progress — the bg flow's P2P packets incremented the same phase
+counters the collective uses, so runs "completed" early on missing collective
+bytes; the fixed runs wait for real data and show the true (much larger)
+interference cost. The single-node weights=1.0 value was re-anchored by the
+ring transaction-graph input-dependency fix (codex round 15, finding 3:
+sends gate on input receipt, matching the wire path; the pre-fix 468378
+recorded sends firing at wire speed without their inputs), so the single-node
++41% is link sharing with a −10% WFQ correction on the P2P class — WFQ
+reshuffles who waits rather than adding latency monotonically. The regimes differ in
+baseline length and link type (credit-gated NVLink vs an over-driven 400G
+NIC), which is what separates their magnitudes, not the WFQ term.
+
+**Uniform-random traffic mode (`--randTraffic`).** Replaces the collective
+injector with a fixed-duration synthetic load: every rank self-schedules
+fixed-interval messages of `--randMsgBytes` (default 64 KiB) to
+uniform-random ranks on OTHER nodes, at `--randInjectionRate` × the
+inter-node line rate per source (interval = msgBytes×8 / (rate × interNodeBW),
+clamped ≥1 ns). The run stops at `--randWarmupNs + --randMeasureNs`
+(defaults 50 µs + 200 µs) and only bytes offered/delivered inside the
+measurement window are counted; per-source random initial phases avoid
+lockstep and everything is `--RngRun`-seeded. On the RoCE fabric the mode
+mounts `RocePayloadBuilder` and sends with protocol `RoceProtocol::SIMPLE`,
+so every data packet carries a SoHeader — the full ECN → CNP → DCQCN chain
+is live wherever an `EthernetSwitch` sits in the So path (switched
+topologies; the gateway shapes ring/torus2d/dragonfly and switchless
+fullmesh never mark). The result block reports `randMsgsSent` /
+`randOfferedBytes` / `randDeliveredBytes` / `randOfferedGbps` /
+`randDeliveredGbps`, plus the always-present `ecnMarkedPackets` /
+`cnpPacketsSent` / `cnpPacketsReceived` counters. Requires `--numNodes>1`;
+default off is parity-safe. Gate: `test/parity/test_random_traffic.py`;
+sweep + figure: `examples/gpu-cluster/random_traffic_dcqcn/`.
+
+**So payload-builder seam (DCQCN on inline collectives).** Inline collective
+runs mount the NCCL payload builder, which never stamps a SoHeader — so the
+switch ECN-mark and receiver CNP-echo guards (both key on
+`RoceProtocol::SIMPLE` + SoHeader) would leave the whole ECN → CNP → DCQCN
+chain dormant. `--dcqcn=1` on a RoCE fabric therefore mounts a dedicated So
+`RocePayloadBuilder` via `FabricEndpoint::SetSoPayloadBuilder`: remote-rank
+bulk sends are framed by it, with the wire protocol id overridden to the So
+protocol model's own id, while local-rank (Su) traffic keeps the NCCL
+builder's framing/timing untouched. The 10-byte SoHeader sits within the
+wire-size budget, so chunk count and egress serialization are unchanged —
+`--dcqcn=0` (default, seam unmounted) is byte-identical to before. Gate:
+`test/parity/test_collective_dcqcn.py`; experiment (2 collectives × 8
+topologies × 5 sizes at 16 n × 8 g): `examples/gpu-cluster/collective_topology_dcqcn/`.
+
+**DCQCN rate-machine knobs.** The `DcqcnRateMachine` TypeId attributes are
+CLI-exposed for parameter sweeps — `--dcqcnTFastNs` (fast-recovery timer,
+default 50000), `--dcqcnFastCycles` (default 5), `--dcqcnTAiNs`
+(additive-increase timer, default 100000), `--dcqcnRai` (default 0.01),
+`--dcqcnGInit` (initial multiplicative backoff g, default 0.5),
+`--dcqcnGDecay` (default 0.5), `--dcqcnAlphaFloor` (default 0.0). Each is
+only `SetAttribute`-ed when given (0 = keep the default), so the default
+path stays byte-identical. When `--dcqcn=1` the machine's `MaxRateBps`
+(the alpha shaping-delay math's rate anchor) is back-filled from
+`--interNodeBandwidth` — the TypeId default 50e9 B/s is only correct for
+400G links. Parameter-sensitivity sweep (host ncclring, the one scenario
+where the chain fires): `examples/gpu-cluster/collective_topology_dcqcn/`
+(`run_dcqcn_param_sweep.py`, `plot_dcqcn_params.py`).
+
 **Fabric hardware + protocol startup + FEC + BER** (sourced into the local CLI
 variables — these are what make a `.cfg` reproduce a calibrated run without
 per-run flags):
@@ -97,7 +286,9 @@ per-run flags):
 bandwidthGbps           = 170     # 8-GPU effective per-link (375 GB/s / 18 lanes)
 latencyNs               = 400
 numLanes                = 18
-linksPerGpu             = 1
+linksPerGpu             = 18      # TRUE H200 fabric: separate p2p GPU<->NVSwitch
+                                 # NVLink4 lanes @ 170 Gbps, spray-routed (the
+                                 # retired linksPerGpu=1 collapsed them into one pipe)
 sprayChunkSize          = 131072
 switchVoqDepth          = 10000
 switchArbIntervalNs     = 100
@@ -139,16 +330,20 @@ python3 -m pytest test/parity/test_config_vs_inline_parity.py -q
 # or: python3 test/parity/test_config_vs_inline_parity.py
 ```
 
-Verified cases (config `==` inline, `simTimeNs`):
+Verified cases (config `==` inline, `simTimeNs`) on the current
+`linksPerGpu=18` fabric convention (all six re-measured at the enforced
+bulk-chunk cap; the 38782/1496204/33634/1284496 ring values recorded in an
+earlier revision of this table were mismeasured — current runs produce the
+values below):
 
 | op | size | GPUs | simTimeNs | measured |
 |----|------|------|-----------|----------|
-| ring | 1 MiB | 8 | 38308 | 37.24 µs |
-| ring | 256 MiB | 8 | 1353580 | 1347.65 µs |
+| ring | 1 MiB | 8 | 38308 | — |
+| ring | 256 MiB | 8 | 1353580 | — |
 | ring | 1 MiB | 4 | 33028 | — |
 | ring | 256 MiB | 4 | 1163404 | — |
-| tree | 1 MiB | 8 | 114794 | — |
-| nvls | 1 MiB | 8 | 80352 | — |
+| tree | 1 MiB | 8 | 55148 | — |
+| nvls | 1 MiB | 8 | 28034 | — |
 
 If you change a sourced profile key, the C++ sourcing block
 (`scratch/gpu-cluster-sim.cc`, after `configMode = true;`), or an injector,

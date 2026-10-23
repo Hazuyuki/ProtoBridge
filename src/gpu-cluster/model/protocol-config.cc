@@ -19,6 +19,7 @@
 #include <cctype>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -208,14 +209,15 @@ class EvalEngine
 };
 
 // Map a kind name to (ProtocolTransactionKind, FabricPacketType).
+// MEMORY_READ / MEMORY_WRITE / COLLECTIVE are parsed by the transaction
+// layer's own grammar but have no send path in ProtocolConfigRunner (it only
+// emits wire DATA) — accepting them here would let a config compile and then
+// abort at runtime, so reject at compile time instead.
 bool
 ParseKind(const std::string& s, ProtocolTransactionKind& kind, FabricPacketType& ptype)
 {
     if (s == "DATA" || s == "SEND_DATA") { kind = ProtocolTransactionKind::DATA_TRANSFER; ptype = FabricPacketType::DATA; return true; }
     if (s == "P2P")        { kind = ProtocolTransactionKind::P2P_TRANSFER; ptype = FabricPacketType::DATA; return true; }
-    if (s == "MEMORY_READ"){ kind = ProtocolTransactionKind::MEMORY_READ; ptype = FabricPacketType::MEMORY_READ; return true; }
-    if (s == "MEMORY_WRITE"){ kind = ProtocolTransactionKind::MEMORY_WRITE; ptype = FabricPacketType::MEMORY_WRITE; return true; }
-    if (s == "COLLECTIVE") { kind = ProtocolTransactionKind::COLLECTIVE_OFFLOAD; ptype = FabricPacketType::ALLREDUCE; return true; }
     return false;
 }
 
@@ -479,11 +481,24 @@ ProtocolConfig::Compile(ProtocolTransactionGraph& graph,
             startupNs = v;
             hasStartup = startupNs > 0;
         }
+        else
+        {
+            // A bad startup expression must fail the compile, not silently
+            // produce a zero-delay graph (misleading latency results).
+            return PROTOCOL_TRANSACTION_INVALID_NODE;
+        }
     }
     uint64_t perStepNs = 0;
     {
         uint64_t v;
-        if (Eval(m_perStepDelay, vars, v, error)) perStepNs = v;
+        if (Eval(m_perStepDelay, vars, v, error))
+        {
+            perStepNs = v;
+        }
+        else
+        {
+            return PROTOCOL_TRANSACTION_INVALID_NODE;
+        }
     }
 
     // --- 6. emit the graph -------------------------------------------------
@@ -594,6 +609,24 @@ ProtocolConfig::Compile(ProtocolTransactionGraph& graph,
             req.effectiveBytes = bytes;
             req.responseBytes = response;
             req.stageId = stageCounter;
+            // The wire flow id is a 16-bit field and the runner RECONSTRUCTS
+            // stageId as flowId - baseFlowId, so baseFlowId + stage must
+            // stay inside the 16-bit range: a stencil with more stages than
+            // the remaining id space would wrap (stage 65535 sending under
+            // the same flow id as stage 0 -- its delivery can never satisfy
+            // the wrapped stage's WAIT) and the op silently never completes.
+            // Fail loudly at compile time instead.
+            if (static_cast<uint64_t>(baseFlowId) + stageCounter >
+                std::numeric_limits<uint16_t>::max())
+            {
+                if (error)
+                {
+                    *error = "flow id overflow: baseFlowId " + std::to_string(baseFlowId)
+                           + " + stage " + std::to_string(stageCounter)
+                           + " exceeds the 16-bit flow-id space; reduce the stage count";
+                }
+                return PROTOCOL_TRANSACTION_INVALID_NODE;
+            }
             req.flowId = static_cast<uint16_t>(baseFlowId + stageCounter);
             req.hasProtocolId = false; // auto: protocol derived from effectiveBytes
             req.label = "t" + std::to_string(tidx) + "-g" + std::to_string(src)

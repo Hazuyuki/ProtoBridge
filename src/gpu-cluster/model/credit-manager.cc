@@ -200,6 +200,19 @@ CreditManager::SetTotalCredits(uint8_t vcId, uint32_t credits)
     {
         it->second.availableCredits = it->second.totalCredits;
     }
+    // The credit invariant is available + pending == total. Shrinking a
+    // window that has MORE credits outstanding than the new total holds
+    // (overdraft) must clamp PENDING, not grant phantom AVAILABLE: leaving
+    // available=5 with pending=8 broke the invariant and the next
+    // ReturnCredits aborted — and a grant of 5 while 8 are in flight lets
+    // the sender DOUBLE-spend the window (codex round 21, finding 5). The
+    // overdraft is transient: returned credits land in pending first
+    // (ReturnCredits caps at total) and drain the overdraft as they arrive.
+    if (it->second.pendingCredits > it->second.totalCredits)
+    {
+        it->second.pendingCredits = it->second.totalCredits;
+        it->second.availableCredits = 0;
+    }
 }
 
 uint32_t
@@ -212,6 +225,34 @@ void
 CreditManager::SetCreditAvailableCallback(CreditAvailableCallback cb)
 {
     m_creditAvailableCallback = cb;
+}
+
+CreditManager::CreditAvailableCallback
+CreditManager::GetCreditAvailableCallback() const
+{
+    return m_creditAvailableCallback;
+}
+
+void
+CreditManager::DetachFromEndpoint(CreditAvailableCallback owner)
+{
+    NS_LOG_FUNCTION(this);
+    // Ownership check (codex round 19, findings 1 and 7): when the caller
+    // names the callback it installed, clear ONLY that binding — a later
+    // owner that re-bound the callback keeps its notifications. A default
+    // (null) owner means plain cleanup: detach unconditionally.
+    if (!owner.IsNull())
+    {
+        // IsEqual dereferences both impls; a null stored binding can never
+        // match a non-null owner, so short-circuit that case first.
+        if (!m_creditAvailableCallback.IsNull()
+            && m_creditAvailableCallback.IsEqual(owner))
+        {
+            m_creditAvailableCallback = MakeNullCallback<void, uint8_t>();
+        }
+        return;
+    }
+    m_creditAvailableCallback = MakeNullCallback<void, uint8_t>();
 }
 
 } // namespace ns3

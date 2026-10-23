@@ -107,6 +107,11 @@ private:
     uint16_t GetLocalIdx(uint16_t globalRank) const;
     uint16_t GetGlobalRank(uint32_t nodeId, uint16_t localIdx) const;
     uint64_t GetPhaseStartupDelayNs(uint64_t chunkSize) const;
+    // Frozen chunk-grid convention (codex rounds 18/19): rank r owns
+    // dataSize/numGpus bytes plus one extra byte when r < dataSize%numGpus;
+    // degenerate dataSize < numGpus puts one byte on each of the first
+    // dataSize ranks. The grid sums to exactly dataSize.
+    uint64_t ChunkSizeOf(uint16_t rank) const;
 
     uint16_t m_numGpus;
     uint64_t m_dataSize;
@@ -119,6 +124,7 @@ private:
 
     // Data sizes for each phase
     uint64_t m_chunkSize;       // dataSize / totalGpus (per-GPU chunk)
+    uint64_t m_chunkRemainder;  // dataSize % numGpus (first ranks carry one extra byte)
     uint64_t m_nodeChunkSize;   // chunkSize * gpusPerNode (per-node combined chunk)
 
     HierAllGatherState m_state;

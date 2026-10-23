@@ -68,6 +68,8 @@ RingAllReduce::RingAllReduce()
       m_llThreshold(8192),
       m_ll128Threshold(2 * 1024 * 1024),
       m_chunkSize(0),
+      m_segmentRemainder(0),
+      m_sentDataBytes(0),
       m_gpuDoneCount(0),
       m_permanentLossCount(0),
       m_reduceScatterSteps(0),
@@ -96,7 +98,22 @@ RingAllReduce::DoDispose()
     m_transactionGraph.Clear();
     m_transactionGpuByNode.clear();
     m_transactionStepByNode.clear();
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&RingAllReduce::OnPacketReceived, this));
+        }
+    }
     m_endpoints.clear();
+    m_ringPos.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
 }
@@ -109,10 +126,20 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
+    // Segment grid: rank r's base segment is dataSize/numGpus bytes, with the
+    // first dataSize % numGpus segments carrying one extra byte, so the grid
+    // sums to exactly dataSize (codex round 13, finding 3: plain integer
+    // division silently dropped dataSize % numGpus bytes — 4 ranks / 15 B
+    // reported complete after 72 effective bytes where 2(N-1)*D = 90).
     m_segmentSize = dataSize / numGpus;
+    m_segmentRemainder = dataSize % numGpus;
     if (m_segmentSize == 0)
     {
+        // Degenerate dataSize < numGpus: keep the legacy fallback (each rank
+        // transmits the whole dataSize every step) — an empty-segment grid
+        // would need zero-byte steps the receive ledger cannot close.
         m_segmentSize = dataSize;
+        m_segmentRemainder = 0;
     }
     m_chunkSize = m_segmentSize;
 
@@ -120,8 +147,11 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_allGatherSteps = numGpus - 1;
     m_totalSteps = 2 * (numGpus - 1);
 
+    ComputeRingPositions();
+
     m_gpuCompletedStep.resize(numGpus, 0);
-    m_gpuStepReceivedBytes.resize(numGpus, 0);
+    m_gpuStepReceivedBytes.assign(numGpus,
+                                  std::vector<uint64_t>(m_totalSteps, 0));
     m_gpuDoneCount = 0;
 
     m_flowId = 1;
@@ -145,6 +175,58 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
                 << " totalSteps=" << m_totalSteps
                 << " protocol=" << static_cast<int>(wireProto)
                 << " startupDelay=" << m_startupDelayNs << "ns");
+}
+
+void
+RingAllReduce::ComputeRingPositions()
+{
+    // Walk the reduce-scatter (clockwise) direction from rank 0, reading
+    // the SAME topology-embedded neighbors GetSendTarget uses, so the
+    // ownership grid and the physical send targets stay consistent. The
+    // walk must visit every rank exactly once; anything else (no embedding,
+    // 0xFFFF sentinel, or a partial/tangled graph) falls back to the
+    // identity map, which reproduces the legacy rank-keyed arithmetic.
+    m_ringPos.assign(m_numGpus, 0);
+    bool identity = true;
+    if (m_endpoints.size() >= m_numGpus)
+    {
+        std::vector<bool> seen(m_numGpus, false);
+        uint16_t cur = 0;
+        uint16_t pos = 0;
+        identity = false;
+        do
+        {
+            if (cur >= m_numGpus || seen[cur])
+            {
+                identity = true; // not a single cycle: tangle or short loop
+                break;
+            }
+            seen[cur] = true;
+            m_ringPos[cur] = pos++;
+            uint16_t next = 0xFFFF;
+            if (m_endpoints[cur])
+            {
+                next = m_endpoints[cur]->GetRingNext();
+            }
+            if (next >= m_numGpus)
+            {
+                identity = true; // no embedding (0xFFFF) or out-of-range rank
+                break;
+            }
+            cur = next;
+        } while (cur != 0 && pos < m_numGpus);
+        if (!identity && pos != m_numGpus)
+        {
+            identity = true; // walk closed early: does not cover all ranks
+        }
+    }
+    if (identity)
+    {
+        for (uint16_t r = 0; r < m_numGpus; ++r)
+        {
+            m_ringPos[r] = r;
+        }
+    }
 }
 
 void
@@ -212,6 +294,29 @@ RingAllReduce::Start()
 
     NS_LOG_INFO("Starting Pipelined Ring AllReduce with startup delay " << m_startupDelayNs << " ns");
 
+    // Zero-data collective (codex round 20, finding 10): with dataSize == 0
+    // the transaction graph's wait nodes carry zero thresholds and
+    // Validate() aborts ("wait node has no completion threshold"), while
+    // the legacy path sends nothing and stalls to the 1-hour cap. Every
+    // chunk is zero — complete immediately.
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("Ring AllReduce trivially complete (zero data)");
+        Complete();
+        return;
+    }
+
+    // Single-rank collective (codex round 21, finding 8): N=1 has no ring
+    // successor, no peer receives, and the transaction graph degenerates to
+    // nodes that cannot affect completion (Validate aborts). The reduction
+    // of one rank's buffer is that buffer — trivially complete.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("Ring AllReduce trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
     if (m_useTransactionModel)
     {
         BuildTransactionGraph();
@@ -219,7 +324,10 @@ RingAllReduce::Start()
         return;
     }
 
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs), &RingAllReduce::TriggerInitialSends, this);
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &RingAllReduce::TriggerInitialSends, this));
 }
 
 void
@@ -239,10 +347,27 @@ RingAllReduce::BuildTransactionGraph()
     const uint16_t invalidGpu = std::numeric_limits<uint16_t>::max();
     const uint32_t invalidStep = std::numeric_limits<uint32_t>::max();
 
-    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    // A ring step is a permutation: every GPU receives exactly one transfer
+    // per step (the send whose GetSendTarget IS that GPU). The transaction
+    // graph must gate each GPU's step s+1 send on DELIVERY of its step-s
+    // input — the same receive-driven rule the wire path applies in
+    // OnGpuStepReceiveComplete — not on delivery of the GPU's own outgoing
+    // step-s transfer (codex round 15, finding 3: the old gpu-major loop
+    // chained dependency = own previous wait node, so a rank transmitted at
+    // wire speed regardless of input arrival — with three 1-us links and one
+    // 100-us link, transaction and receive-driven runs disagreed by ~100 us
+    // per slow-link traversal). Step-major construction keeps every input
+    // wait node of step s-1 available when step s's sends are wired.
+    std::vector<ProtocolTransactionNodeId> sendDependency(m_numGpus, startup);
+    const uint64_t swOverheadNs = GetPerStepSwOverheadNs(m_chunkSize);
+
+    for (uint32_t step = 0; step < m_totalSteps; ++step)
     {
-        ProtocolTransactionNodeId dependency = startup;
-        for (uint32_t step = 0; step < m_totalSteps; ++step)
+        // Wait node of the transfer DELIVERED to each GPU at this step
+        // (startUp sentinel for GPUs no transfer targets — a broken ring
+        // embedding — degrades to fire-immediately rather than deadlock).
+        std::vector<ProtocolTransactionNodeId> deliveredTo(m_numGpus, startup);
+        for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             ProtocolTransactionRequest request;
             request.kind = ProtocolTransactionKind::DATA_TRANSFER;
@@ -251,35 +376,50 @@ RingAllReduce::BuildTransactionGraph()
             request.destinationRank = GetSendTarget(gpu, step);
             request.flowId = m_flowId + step;
             request.virtualChannel = 0;
-            request.effectiveBytes = m_segmentSize;
+            request.effectiveBytes = SegmentSizeOf(gpu, step);
             request.stageId = step;
             request.hasProtocolId = true;
             request.protocolId = m_protocolId;
             request.label = "gpu-" + std::to_string(gpu) + "-step-" + std::to_string(step);
 
             const auto wait =
-                protocolModel->AddTransaction(m_transactionGraph, request, {dependency});
+                protocolModel->AddTransaction(m_transactionGraph, request, {sendDependency[gpu]});
             if (m_transactionGpuByNode.size() <= wait)
             {
                 m_transactionGpuByNode.resize(wait + 1, invalidGpu);
                 m_transactionStepByNode.resize(wait + 1, invalidStep);
             }
-            m_transactionGpuByNode[wait] = gpu;
+            // The wait node tracks delivery TO the destination rank: node
+            // completion means that RECEIVER finished the step (the wire
+            // path's LogStepComplete(receiver, ...) semantics).
+            m_transactionGpuByNode[wait] = request.destinationRank;
             m_transactionStepByNode[wait] = step;
+            if (request.destinationRank < m_numGpus)
+            {
+                deliveredTo[request.destinationRank] = wait;
+            }
+        }
 
+        for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+        {
             if (step + 1 < m_totalSteps)
             {
-                dependency = m_transactionGraph.AddDelay(
-                    NanoSeconds(GetPerStepSwOverheadNs(m_chunkSize)),
-                    {wait},
+                // Post-receive software overhead before this GPU's next
+                // send, mirroring OnGpuStepReceiveComplete's scheduled
+                // SendGpuStepData(gpu, step + 1).
+                sendDependency[gpu] = m_transactionGraph.AddDelay(
+                    NanoSeconds(swOverheadNs),
+                    {deliveredTo[gpu]},
                     "gpu-" + std::to_string(gpu) + "-step-delay");
             }
             else
             {
-                dependency = wait;
+                // A GPU is done when its LAST step's input is delivered —
+                // the same condition the wire path counts in
+                // OnGpuStepReceiveComplete.
+                finalSteps.push_back(deliveredTo[gpu]);
             }
         }
-        finalSteps.push_back(dependency);
     }
     m_transactionGraph.AddCompletion(finalSteps);
     m_transactionGpuByNode.resize(m_transactionGraph.GetNodeCount(), invalidGpu);
@@ -364,7 +504,7 @@ RingAllReduce::IsAllGatherStep(uint32_t step) const
 }
 
 uint16_t
-RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step)
+RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step) const
 {
     if (IsReduceScatterStep(step))
     {
@@ -396,6 +536,47 @@ RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step)
     }
 }
 
+uint64_t
+RingAllReduce::SegmentSizeOf(uint16_t gpu, uint32_t step) const
+{
+    // Which segment the GPU holds at this step, keyed on ring POSITION —
+    // the GPU's slot along the topology-embedded reduce-scatter ring, NOT
+    // its numeric rank. With a reordered ring such as 0->1->3->2, rank 2
+    // sits at position 3 and must transmit the position-3 chunk; keying on
+    // the numeric rank made it forward a different-sized chunk than it
+    // received (codex round 15, finding 4: at 4 GPUs / 259 B, rank 2 sent
+    // 65 B to rank 0 at step 0 while rank 0 forwarded 64 B at step 1).
+    // Reduce-Scatter sends run clockwise (to ring next): ownership of
+    // chunk c sits at position (c + s) mod N, so position p holds chunk
+    // (p - s) mod N. The AllGather phase REVERSES the send direction
+    // (counterclockwise, to ring prev), so ownership keeps rotating in
+    // the SAME physical direction the bytes flow: continuing (p - s) mod N
+    // across the reversal let the index drift backwards and chunks changed
+    // size as they traveled (codex round 14, finding 4: at 4 GPUs / 259 B,
+    // rank 1 received a 64-B chunk at step 3 and forwarded 65 B at step
+    // 4). From the first AG step s0 = N-1 the offset advances +1 per step
+    // instead: idx = (p + s - 2(N-1)) mod N, which preserves the chunk
+    // invariant — a rank forwards at step s+1 exactly the chunk it
+    // received at step s. That expression simplifies algebraically to
+    // (p + s + 2) mod N; the simplified form is what gets evaluated
+    // because the direct one wraps in unsigned arithmetic (s - 2(N-1) is
+    // negative throughout AG, and 2^32 mod N != 0 for N = 3 or 5, which
+    // silently shifted the index). The base size is uniform with the
+    // first dataSize % numGpus segments one byte larger.
+    const uint32_t n = m_numGpus;
+    const uint32_t pos = (gpu < m_ringPos.size()) ? m_ringPos[gpu] : gpu;
+    uint32_t idx;
+    if (step < n - 1)
+    {
+        idx = (pos + n - (step % n)) % n;
+    }
+    else
+    {
+        idx = (pos + step + 2) % n;
+    }
+    return m_segmentSize + (idx < m_segmentRemainder ? 1 : 0);
+}
+
 void
 RingAllReduce::SendGpuStepData(uint16_t gpu, uint32_t step)
 {
@@ -405,12 +586,14 @@ RingAllReduce::SendGpuStepData(uint16_t gpu, uint32_t step)
     }
 
     uint16_t target = GetSendTarget(gpu, step);
+    uint64_t segmentBytes = SegmentSizeOf(gpu, step);
+    m_sentDataBytes += segmentBytes;
 
     // Use a unique flowId per step to avoid reorder buffer confusion
     uint16_t stepFlowId = m_flowId + step;
 
     m_endpoints[gpu]->SendBulkWireTransferSize(
-        target, m_segmentSize, m_protocolId, stepFlowId, 0);
+        target, segmentBytes, m_protocolId, stepFlowId, 0);
 
     NS_LOG_DEBUG("GPU " << gpu << " sending step " << step
                  << " to GPU " << target
@@ -419,7 +602,7 @@ RingAllReduce::SendGpuStepData(uint16_t gpu, uint32_t step)
 }
 
 void
-RingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
+RingAllReduce::OnPacketReceived(uint16_t receiverRank, Ptr<Packet> packet, FabricHeader header)
 {
     if (header.GetPacketType() != FabricPacketType::DATA
         && header.GetPacketType() != FabricPacketType::PERMANENT_LOSS)
@@ -427,7 +610,11 @@ RingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHead
         return;
     }
 
-    uint16_t destRank = header.GetDestRank();
+    // The callback's first argument is the RECEIVING endpoint's rank; the
+    // sender is in the header (the wire hops are single-switch, so the
+    // original source rank survives unmodified).
+    uint16_t srcRank = header.GetSourceRank();
+    uint16_t destRank = receiverRank;
 
     uint32_t effectiveSize = header.GetEffectiveDataSize();
     if (effectiveSize == 0)
@@ -481,26 +668,65 @@ RingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHead
         return;
     }
 
-    m_gpuStepReceivedBytes[destRank] += effectiveSize;
+    // The step this packet belongs to is encoded in the flowId
+    // (stepFlowId = m_flowId + step): the sender's step counter runs
+    // independently of this receiver's currentStep in the pipeline — the
+    // sender may already be a step ahead.
+    const uint32_t senderStep = (header.GetFlowId() >= m_flowId)
+                                    ? header.GetFlowId() - m_flowId
+                                    : 0;
+
+    // Per-STEP ledger, keyed by the SENDER's step (codex round 14,
+    // finding 3). A single per-dest counter mixed bytes of different
+    // steps whenever the pipelined senders drifted ahead of the
+    // receiver, or a retransmission delivered a late copy after the
+    // counter had already advanced — the mixed counter could cross one
+    // step's threshold with another step's bytes and then starve a later
+    // step, stalling the collective despite zero permanent losses.
+    if (senderStep >= m_totalSteps)
+    {
+        return; // malformed/late flowId: ignore rather than corrupt ledgers
+    }
+    m_gpuStepReceivedBytes[destRank][senderStep] += effectiveSize;
 
     NS_LOG_DEBUG("Packet: src=" << srcRank << " -> dest=" << destRank
                      << " wireSize=" << packet->GetSize()
                      << " effectiveSize=" << effectiveSize
-                     << " totalReceived=" << m_gpuStepReceivedBytes[destRank]
+                     << " totalReceived=" << m_gpuStepReceivedBytes[destRank][senderStep]
                      << " step=" << currentStep);
 
-    // Check if this GPU has received its full segment for the current step
-    if (m_gpuStepReceivedBytes[destRank] >= m_segmentSize)
+    // A step is complete when its own ledger entry reaches the SENDER's
+    // segment size at that step; steps complete in order (currentStep).
+    while (m_gpuCompletedStep[destRank] < m_totalSteps &&
+           m_gpuStepReceivedBytes[destRank][m_gpuCompletedStep[destRank]]
+               >= StepExpectedBytes(destRank, m_gpuCompletedStep[destRank]))
     {
         // GPU completed receiving its segment for this step
-        m_gpuStepReceivedBytes[destRank] = 0;
-        m_gpuCompletedStep[destRank] = currentStep + 1;
+        const uint32_t completedStep = m_gpuCompletedStep[destRank];
+        m_gpuCompletedStep[destRank] = completedStep + 1;
 
-        NS_LOG_INFO("GPU " << destRank << " completed step " << currentStep
+        NS_LOG_INFO("GPU " << destRank << " completed step " << completedStep
                      << " (now at step " << m_gpuCompletedStep[destRank] << ")");
 
-        OnGpuStepReceiveComplete(destRank, currentStep);
+        OnGpuStepReceiveComplete(destRank, completedStep);
     }
+}
+
+uint64_t
+RingAllReduce::StepExpectedBytes(uint16_t destRank, uint32_t step) const
+{
+    // Bytes destRank must receive at `step`: the segment the SENDER at
+    // that step holds. The sender is the ring predecessor (RS clockwise
+    // sends; AG counterclockwise sends), so it is the GPU whose step-step
+    // send targets destRank.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        if (GetSendTarget(gpu, step) == destRank)
+        {
+            return SegmentSizeOf(gpu, step);
+        }
+    }
+    return m_segmentSize;
 }
 
 void
@@ -521,12 +747,14 @@ RingAllReduce::OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step)
     uint64_t swOverhead = GetPerStepSwOverheadNs(m_chunkSize);
     if (swOverhead > 0)
     {
-        Simulator::Schedule(NanoSeconds(swOverhead),
-                            &RingAllReduce::SendGpuStepData, this, gpu, step + 1);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(swOverhead),
+                                &RingAllReduce::SendGpuStepData, this, gpu, step + 1));
     }
     else
     {
-        Simulator::ScheduleNow(&RingAllReduce::SendGpuStepData, this, gpu, step + 1);
+        m_pendingEvents.push_back(
+            Simulator::ScheduleNow(&RingAllReduce::SendGpuStepData, this, gpu, step + 1));
     }
 }
 

@@ -692,6 +692,9 @@ GpuClusterTopologyHelper::BuildFullyConnected()
     {
         Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_endpoints.Get(i));
         endpointHelper.SetRank(m_endpoints.Get(i), i);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(i))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
 
         // Set device type if overridden
         auto it = m_deviceTypes.find(static_cast<uint16_t>(i));
@@ -737,6 +740,9 @@ GpuClusterTopologyHelper::BuildFullyConnected()
             nvSwitch->AddStaticRoute(gpuMacs[gpu][0], gpuSwitchPorts[gpu][0]);
             // Spray: all ports to this GPU
             nvSwitch->AddSprayPorts(gpuMacs[gpu][0], gpuSwitchPorts[gpu]);
+            // Rank->port registration: multicast results must also reach
+            // zero-chunk ranks that never upload (codex round 19, finding 6).
+            nvSwitch->AddRankPort(static_cast<uint16_t>(gpu), gpuSwitchPorts[gpu][0]);
         }
     }
     else if (nvSwitch)
@@ -745,6 +751,7 @@ GpuClusterTopologyHelper::BuildFullyConnected()
         for (uint32_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             nvSwitch->AddStaticRoute(gpuMacs[gpu][0], gpuSwitchPorts[gpu][0]);
+            nvSwitch->AddRankPort(static_cast<uint16_t>(gpu), gpuSwitchPorts[gpu][0]);
         }
     }
 
@@ -887,6 +894,9 @@ GpuClusterTopologyHelper::BuildFatTree(uint32_t radix)
         leafGpuPorts[leafId][localIdx] = portIdx;
         gpuMacs[i] = Mac48Address::ConvertFrom(devices.Get(0)->GetAddress());
         endpointHelper.SetRank(m_endpoints.Get(i), i);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(i))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
 
         // Set device type if overridden
         auto it = m_deviceTypes.find(static_cast<uint16_t>(i));
@@ -1125,6 +1135,9 @@ GpuClusterTopologyHelper::BuildRailOptimizedFatTree(uint32_t numRails,
 
         Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_endpoints.Get(gpu));
         endpointHelper.SetRank(m_endpoints.Get(gpu), gpu);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(gpu))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         ep->SetNodeId(leaf);
         ep->SetFabricType(static_cast<FabricType>(m_fabricType));
         auto type = m_deviceTypes.find(static_cast<uint16_t>(gpu));
@@ -1364,6 +1377,9 @@ GpuClusterTopologyHelper::BuildRing()
     for (uint32_t i = 0; i < m_numGpus; ++i)
     {
         endpointHelper.SetRank(m_endpoints.Get(i), i);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(i))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         auto it = m_deviceTypes.find(static_cast<uint16_t>(i));
         if (it != m_deviceTypes.end())
         {
@@ -1508,6 +1524,9 @@ GpuClusterTopologyHelper::BuildFullMesh()
     for (uint32_t i = 0; i < m_numGpus; ++i)
     {
         endpointHelper.SetRank(m_endpoints.Get(i), i);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(i))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         auto it = m_deviceTypes.find(static_cast<uint16_t>(i));
         if (it != m_deviceTypes.end())
         {
@@ -1760,6 +1779,7 @@ GpuClusterTopologyHelper::BuildNvl72(uint32_t numSwitchPlanes, uint32_t gpusPerG
         for (uint32_t gpu = 0; gpu < m_numGpus; ++gpu)
         {
             nvSw->AddStaticRoute(gpuMacs[gpu], switchGpuPorts[sw][gpu][0]);
+            nvSw->AddRankPort(static_cast<uint16_t>(gpu), switchGpuPorts[sw][gpu][0]);
         }
 
         nvSw->SetSprayRouting(true);
@@ -2087,6 +2107,9 @@ GpuClusterTopologyHelper::BuildTorus(uint32_t dimX, uint32_t dimY, uint32_t dimZ
     for (uint32_t idx = 0; idx < numNodes; ++idx)
     {
         endpointHelper.SetRank(m_endpoints.Get(idx), idx);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(idx))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_endpoints.Get(idx));
         auto it = m_deviceTypes.find(static_cast<uint16_t>(idx));
         if (it != m_deviceTypes.end())
@@ -2272,6 +2295,9 @@ GpuClusterTopologyHelper::BuildMesh2D(uint32_t rows, uint32_t cols)
     for (uint32_t idx = 0; idx < numNodes; ++idx)
     {
         endpointHelper.SetRank(m_endpoints.Get(idx), idx);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(idx))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_endpoints.Get(idx));
         auto it = m_deviceTypes.find(static_cast<uint16_t>(idx));
         if (it != m_deviceTypes.end())
@@ -2394,6 +2420,9 @@ GpuClusterTopologyHelper::BuildHypercube(uint32_t dimensions)
     for (uint32_t idx = 0; idx < numNodes; ++idx)
     {
         endpointHelper.SetRank(m_endpoints.Get(idx), idx);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(idx))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_endpoints.Get(idx));
         auto it = m_deviceTypes.find(static_cast<uint16_t>(idx));
         if (it != m_deviceTypes.end())
@@ -2740,6 +2769,9 @@ GpuClusterTopologyHelper::Build2DFullMesh(uint32_t rows, uint32_t cols)
     for (uint32_t i = 0; i < numNodes; ++i)
     {
         endpointHelper.SetRank(m_endpoints.Get(i), i);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(i))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_endpoints.Get(i));
         ep->SetFabricType(static_cast<FabricType>(m_fabricType));
         auto it = m_deviceTypes.find(static_cast<uint16_t>(i));
@@ -2892,6 +2924,9 @@ GpuClusterTopologyHelper::BuildNDFullMesh(const std::vector<uint32_t>& dims)
     for (uint32_t i = 0; i < numNodes; ++i)
     {
         endpointHelper.SetRank(m_endpoints.Get(i), i);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(i))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_endpoints.Get(i));
         ep->SetFabricType(static_cast<FabricType>(m_fabricType));
         auto it = m_deviceTypes.find(static_cast<uint16_t>(i));
@@ -3009,6 +3044,9 @@ GpuClusterTopologyHelper::Build2DFullMeshClos(uint32_t rackRows, uint32_t rackCo
     for (uint32_t i = 0; i < totalNpus; ++i)
     {
         endpointHelper.SetRank(m_endpoints.Get(i), i);
+        // Single-node fabric: every peer rank is local (Su credit domain).
+        DynamicCast<FabricEndpoint>(m_endpoints.Get(i))
+            ->SetLocalRankRange(0, static_cast<uint16_t>(m_numGpus));
         Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(m_endpoints.Get(i));
         ep->SetFabricType(static_cast<FabricType>(m_fabricType));
         auto it = m_deviceTypes.find(static_cast<uint16_t>(i));

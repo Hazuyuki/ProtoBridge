@@ -28,10 +28,10 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduc
 | `b_link_bytes_per_us` | single NVLink unidirectional wire rate | 25000 |
 | `num_lanes` | NVLink links per GPU | 18 |
 | `algo` | ring / tree / nvls / fullmesh | — |
-| `eta_ring`, `eta_tree`, `eta_nvls`, `eta_fullmesh` (optional, defaulted) | efficiency factors | 0.40 / 1.05 / 1.20 / 1.0 |
+| `eta_ring`, `eta_tree`, `eta_nvls`, `eta_fullmesh` (optional, defaulted) | efficiency factors | 0.40 / 0.61 / 1.20 / 1.0 |
 
 Derived bandwidths: `ring_bw = packet_bw = eta_ring * B_agg`,
-`tree_bw = (B_agg / num_lanes) * eta_tree`, `nvls_bw = eta_nvls * B_agg`
+`tree_bw = eta_tree * B_agg`, `nvls_bw = eta_nvls * B_agg`
 (all within 2% of the calibrated H200 values; the efficiency factors are
 N-independent — N enters only the collective topology in `predict()`, see
 Section 3 and Section 11).
@@ -41,6 +41,12 @@ The `make_h200_ring_theory` / `make_h200_tree_theory` /
 calibrated H200 numbers — use them when you want the measured values rather
 than the wire-rate derivation. `predict()` then takes the operation inputs
 (`data_bytes`, `num_gpus`, `algo`, `credits`, ...) described in Section 2.
+The scale-out (So) presets `make_h200_roce_theory` (lossless RoCEv2) and
+`make_h200_ethernet_theory` (its lossy plain-Ethernet counterpart — same
+400GbE wire, store-and-forward switch latency) are So stages composed under a
+`HierarchicalSurrogate` via the `so_factory` seam; their lossy-congestion
+behavior (ECN/DCQCN for RoCE; VOQ tail-drop → NACK → LLR/SACK retransmit for
+Ethernet) is ns-3-only, the surrogate being the uncongested mean.
 
 ## 1. Design Rule
 
@@ -110,7 +116,7 @@ The current H200 profile uses:
 | Schedule | Effective transfer quantity |
 |---|---:|
 | Ring | 177,000 bytes/us |
-| Tree | 26,250 bytes/us per active level |
+| Tree | 275,400 bytes/us per active level (ns-3-calibrated trunk; 0.61 × B_agg) |
 | NVLS | 535,500 bytes/us aggregate work bandwidth |
 
 Ring uses link propagation for `T_fixed`. Tree uses the switched-path pipeline
@@ -132,14 +138,18 @@ explicitly (omitting it raises `TypeError`; an invalid name raises `ValueError`)
 | `collective` | `algorithm` | `steps` | `B_step` (bytes/step) | per-GPU volume |
 |---|---|---:|---|---|
 | `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
-| `allreduce` | `tree` | `2⌊log₂N⌋` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allreduce` | `tree` | `2⌊log₂N⌋` | `α(N)·D / steps` | `α(N)·D` |
 | `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
 | `alltoall` | `ring` / `collnetdirect` | `N-1` | `D/N` | `D(N-1)/N` |
 | `alltoall` | `tree` | `⌈log₂N⌉` | `D(N-1)/N / steps` | `D(N-1)/N` |
 | `sendrecv` | any | `1` | `D` | `D` (single hop) |
 
 AllReduce scatters `D(N-1)/N` per GPU over its `2(N-1)` ring steps
-(reduce-scatter + all-gather); AllGather via NVLS multicast moves `D/N` per
+(reduce-scatter + all-gather); the tree's per-step volume is `α(N)·D/steps`
+with the STRUCTURAL trunk-load `α(N)` = 1/2/3 (N≤2 single edge / N≤4 root
+with two children / N≥5 interior node — the busiest GPU↔switch trunk of the
+heap-shaped chunk-pipelined tree; zero free parameters, the tree analogue of
+ring's (N-1)/N); AllGather via NVLS multicast moves `D/N` per
 step over 2 steps; AlltoAll permutes `D(N-1)/N` per GPU — the volume
 correction the DSE analytical model (`bw_model_predict`) describes in comments
 but does not apply. The AlltoAll step count is `N-1` permutation phases
@@ -168,7 +178,11 @@ Phi_credit = max(1, C_bdp / C)
 The ratio `C / C_bdp` is the fraction of path bandwidth sustainable by the
 credit window. The current H200 profile uses 91.5 packets for ring and 35.5
 packets for tree. NVLS does not apply the endpoint credit factor in the
-evaluated profile.
+evaluated profile. The scale-out (So) presets (`make_h200_roce_theory`,
+`make_h200_ethernet_theory`) pin both BDPs to infinity: the ns-3 So
+(inter-node) path bypasses the per-VC credit gate — scale-out traffic is
+governed by ECN/DCQCN or VOQ tail-drop + LLR, not credits — so the So stage
+must not inherit the NVLink credit window.
 
 ## 5. FEC
 
@@ -230,6 +244,14 @@ consumed by concurrent traffic using that bottleneck. Residual capacity is
 ```text
 Phi_share = 1 / (1 - rho_shared)
 ```
+
+`BW_eff` is the capacity the serial term actually serializes over — the
+collective's schedule rate (ring rate for alltoall/sendrecv phases, tree/NVLS
+trunk otherwise) already capped by any topology bisection/egress bottleneck.
+Computing `rho_shared` against the uncapped link rate understates the penalty
+exactly when the bottleneck is tightest (25 GB/s competing on a 50 GB/s-capped
+link doubles the transfer; against the raw 177 GB/s rate it would barely
+register).
 
 Disjoint routes use `rho_shared = 0`. Source injection rate is not substituted
 for bottleneck utilization.
@@ -307,13 +329,14 @@ efficiency factors, with no per-bandwidth calibration:
 ```text
 B_agg = num_lanes * b_link                       (per-GPU NVLink aggregate)
 ring_bw = packet_bw = eta_ring * B_agg           ~0.40 (AllReduce algorithm bw)
-tree_bw = (B_agg / num_lanes) * eta_tree         ~1.05 (one link + NCCL/FEC, ~= n/k)
+tree_bw = eta_tree * B_agg                       ~0.61 (ns-3 back-fit 275,400 = 0.61 x B_agg)
 nvls_bw = eta_nvls * B_agg                       ~1.20 (NVSwitch multicast gain)
 ```
 
 For H200 (b_link = 25,000 B/us, num_lanes = 18, B_agg = 450,000), the
-defaults eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20 yield ring/packet =
-180,000 (calibrated 177,000, +1.7%), tree = 26,250 (exact), nvls = 540,000
+defaults eta_ring=0.40, eta_tree=0.61, eta_nvls=1.20 yield ring/packet =
+180,000 (calibrated 177,000, +1.7%), tree = 274,500 (ns-3-calibrated
+275,400, -0.3%), nvls = 540,000
 (calibrated 535,500, +0.8%) -- all within 2%. The ring-bus bandwidth
 2(N-1)/N * alBw = 0.69 * B_agg falls in NCCL's typical 60-80% utilization
 band, anchoring eta_ring in physics rather than as a fit coefficient. The
@@ -362,11 +385,18 @@ match the bandwidth parameters.
 
 Omitting `topology` (or passing `Topology()` with defaults) is byte-identical
 to the ideal-fabric model, so the calibrated H200 numbers in Section 11 are
-unchanged. The bisection cap applies to the mean serialization term
-(`T_serial`); the `ber > 0` retransmission path keeps the construction
-bandwidth, so for the common `ber = 0` (calibration) regime the mean path is
-fully topology-aware. The two physical numbers can be supplied by hand, or —
-preferred — computed from a topology name via Section 13.
+unchanged. The bisection cap applies to the serialization rate itself, and
+every term built on that rate follows it: the mean serialization term
+(`T_serial`) **and** the `ber > 0` retransmission overhead, whose
+retransmitted fragments re-serialize at the same capped rate
+(`_retry_overhead` receives the topology-capped `T_serial_step`, and
+`_gbn_cascade` serializes its retransmitted chunks at
+`min(BW_link, bisection)` — codex round 22, finding 6). At
+16 MiB / 8-GPU ring / BER 1e-7 / retry limit 3 / LLR-SACK, adding a
+50-GB/s bisection cap moves the prediction from ~223 µs to ~737 µs — the
+retransmissions serialize at the capped rate. The two physical numbers can
+be supplied by hand, or — preferred — computed from a topology name via
+Section 13.
 
 ## 13. Topology from a Name
 

@@ -208,6 +208,21 @@ class LinkDegradationModel : public Object
     bool ProcessPacket(Ptr<Packet> packet);
 
     /**
+     * @brief Process a packet through BER/burst sampling only
+     *
+     * Skips the packet-loss-rate draw (the link-down check is retained — it
+     * is idempotent): use this when the caller has already sampled the loss
+     * rate itself (NVSwitch and FabricEndpoint receive paths do, so that FEC
+     * decode can replace BER sampling). Calling ProcessPacket there would
+     * draw the loss rate twice per packet, compounding the effective loss
+     * probability.
+     *
+     * @param packet The packet to process
+     * @return True if packet should be delivered, false if dropped
+     */
+    bool ProcessPacketBerOnly(Ptr<Packet> packet);
+
+    /**
      * @brief Schedule a degradation event
      * @param delay Time until degradation
      * @param trigger Degradation trigger

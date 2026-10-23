@@ -3,7 +3,8 @@
 > **Repo scope.** This repository bundles the full ns-3.47 framework, so it
 > builds standalone — `./ns3` and `CMakeLists.txt` are the ns-3 build system.
 > The ProtoBridge-specific code is `src/gpu-cluster/` (OTP + PEX + NVSwitch +
-> injectors), `surrogate/` (latency model), `configs/`, and the two `scratch/`
+> injectors), `surrogate/` (latency model), `configs/`,
+> `examples/gpu-cluster/` (alignment demos), and the two `scratch/`
 > entry points; everything else is stock ns-3.
 
 Larger LLMs and longer contexts exceed the memory of a single GPU, so serving
@@ -253,7 +254,8 @@ All calibration is H200 NVLink4 (no A800). Under `surrogate/calibration/`:
 ```
 src/gpu-cluster/        OTP + PEX + NVSwitch + collective injectors + tests
 scratch/                gpu-cluster-sim.cc (simulator entry), protocol-profile-demo.cc
-configs/                protocol_profiles/ (h200-ll128.profile), protocol_configs/ (.cfg), dse/topo_specs.csv
+configs/                protocol_profiles/ (h200-ll128.profile), protocol_configs/ (.cfg), dse/topo_specs.csv, calibration/ (fit machinery)
+examples/gpu-cluster/   alignment demos vs measured/external references (see its README)
 surrogate/              theory/  calibration/  test/
 test/parity/            test_config_vs_inline_parity.py (config-vs-inline bit-identity gate)
 doc/                    ARCHITECTURE / CALIBRATION / CONFIG_GUIDE / SURROGATE (+ ns-3 manual)

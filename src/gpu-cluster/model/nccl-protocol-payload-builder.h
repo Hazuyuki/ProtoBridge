@@ -99,21 +99,25 @@ public:
      * Extract data from an LL line
      *
      * @param packet Packet containing LL line
-     * @param outData Output buffer for data (must be at least 64 bytes)
-     * @return Number of data bytes extracted (0-64)
+     * @param outData Output buffer for data
+     * @param maxDataSize Capacity of outData in bytes (extract is clamped to it)
+     * @return Number of data bytes extracted (0-min(64, maxDataSize))
      */
-    static uint64_t ExtractLLLine(Ptr<Packet> packet, uint8_t* outData);
+    static uint64_t ExtractLLLine(Ptr<Packet> packet, uint8_t* outData,
+                                  uint64_t maxDataSize = LL_DATA_PER_LINE);
 
     /**
      * Extract data from an LL128 chunk
      *
      * @param packet Packet containing LL128 chunk
-     * @param outData Output buffer for data (must be at least 120 bytes)
+     * @param outData Output buffer for data
      * @param outChunkIndex Optional output for chunk index
-     * @return Number of data bytes extracted (0-120)
+     * @param maxDataSize Capacity of outData in bytes (extract is clamped to it)
+     * @return Number of data bytes extracted (0-min(120, maxDataSize))
      */
     static uint64_t ExtractLL128Chunk(Ptr<Packet> packet, uint8_t* outData,
-                                      uint32_t* outChunkIndex = nullptr);
+                                      uint32_t* outChunkIndex = nullptr,
+                                      uint64_t maxDataSize = LL128_DATA_PER_LINE);
 
 private:
     // Constants for protocol structure

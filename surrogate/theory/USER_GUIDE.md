@@ -14,10 +14,11 @@ step model:
 pass `collective=` to `predict()` (`'allreduce'` / `'allgather'` /
 `'alltoall'` / `'sendrecv'`). It is a **required** argument — not inferred from
 the algorithm, so the caller must name the operation explicitly. It is a
-first-principles physical derivation, so for ring/tree/NVLS it is a **lower
-bound** on ns-3 — the full-mesh algorithm is the ns-3-calibrated exception
-(within ~0.1%; see §7 recipe M). Use it for **ordering and trend analysis
-across a design space**, not for absolute single-point prediction.
+first-principles physical derivation fitted to ns-3, not a one-sided bound:
+ring sits below ns-3 in the calibrated range, while tree can sit ABOVE it
+(e.g. +15% at N=4/D=256 MiB — see [CALIBRATION.md](../../doc/CALIBRATION.md)).
+Use it for **ordering and trend analysis across a design space**, not for
+absolute single-point prediction.
 
 ---
 
@@ -60,7 +61,7 @@ fabric whose bisection bandwidth or path length differs from ideal NVSwitch.
 
 ```python
 make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
-                         eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20,
+                         eta_ring=0.40, eta_tree=0.61, eta_nvls=1.20,
                          eta_fullmesh=1.0, **overrides)
 ```
 
@@ -73,7 +74,7 @@ efficiency factors. No per-bandwidth calibration needed.
 | `b_link_bytes_per_us` | single NVLink unidirectional wire rate | `25000` (25 GB/s) |
 | `num_lanes` | NVLink links per GPU | `18` |
 | `algo` | `ring` / `tree` / `nvls` / `fullmesh` (`fm`) | — |
-| `eta_ring` / `eta_tree` / `eta_nvls` / `eta_fullmesh` | efficiency factors (defaulted) | 0.40 / 1.05 / 1.20 / 1.0 |
+| `eta_ring` / `eta_tree` / `eta_nvls` / `eta_fullmesh` | efficiency factors (defaulted) | 0.40 / 0.61 / 1.20 / 1.0 |
 
 Derived bandwidths land within ~2% of the calibrated H200 values (see §11 of
 `WHITEBOX_SURROGATE.md`). This is the entry point for any new platform where
@@ -113,11 +114,11 @@ The full `__init__` parameter list (21 knobs, all defaulted) is in the
 | Parameter | Units | Affects | H200 ring |
 |-----------|-------|---------|-----------|
 | `ring_bw_bytes_per_us` | bytes/µs | ring serialization | 177000 |
-| `tree_bw_per_level_bytes_per_us` | bytes/µs | tree serialization | 26250 |
+| `tree_bw_per_level_bytes_per_us` | bytes/µs | tree GPU↔NVSwitch trunk (ns-3-calibrated) | 275400 |
 | `nvls_bw_bytes_per_us` | bytes/µs | NVLS serialization | 535500 |
 | `fullmesh_bw_bytes_per_us` | bytes/µs | full-mesh serialization (ns-3-calibrated) | 449890 |
 | `link_latency_us` | µs (400 ns = 0.4) | ring/nvls/fullmesh propagation | 0.4 |
-| `t_min_switch_us` | µs | tree fixed (NVSwitch fill) | 1.1 |
+| `t_min_switch_us` | µs | tree fixed (NVSwitch pipeline cost) | 4.10 |
 | `credit_bdp_ring_packets` | packets | ring credit pressure Φ_credit | 91.5 |
 | `credit_bdp_tree_packets` | packets | tree credit pressure Φ_credit | 35.5 |
 | `startup_us` / `nvls_startup_us` | µs | protocol startup (fixed) | 15.0 / 23.0 |
@@ -152,7 +153,7 @@ s.predict(data_bytes, num_gpus, algo, credits, ber=0, ..., topology=None, *, col
 
 | Group | Parameters |
 |---|---|
-| Reliability / retransmission | `ber`, `fec_enabled`, `llr_enabled`, `fec_n`/`fec_k`/`fec_t`, `retry_mode` (`'gobackn'`/`'sack'`), `retry_buffer_entries`/`retry_buffer_bytes`, `retry_limit`, `strict_reliability` |
+| Reliability / retransmission | `ber`, `fec_enabled`, `llr_enabled`, `fec_n`/`fec_k`/`fec_t`, `retry_mode` (`'gobackn'`/`'sack'`), `retry_buffer_entries`/`retry_buffer_bytes`, `retry_limit`, `strict_reliability`. For NVLS/SHARP collectives the retry-latency term fragments at the collective spray geometry (`SendCollectiveBulk`, e.g. 128 x 128 KiB at 4 GPU / 64 MiB AllGather), not the DATA bulk path — matching the reliability model. |
 | Optical links | `optical_fraction`, `optical_hops` |
 | Contention | `competing_bw` (traffic on the shared bottleneck) |
 | Memory | `mem_bw` |
@@ -173,7 +174,8 @@ mapping (full formulas in §6 of `WHITEBOX_SURROGATE.md`):
 | `collective` | `algo` | steps | per-step volume | per-GPU volume |
 |---|---|---|---|---|
 | `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
-| `allreduce` | `tree` | `2⌊log₂N⌋` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allgather` | `ring` | `N-1` (one pass) | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allreduce` | `tree` | `2⌊log₂N⌋` | `α(N)·D/steps` (α(N)=1.0/2.0/3.0 structural trunk load: single edge / root with two children / interior node) | `α(N)·D` per trunk |
 | `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
 | `allreduce` | `fullmesh` | `2` | `D/N` | `D/N` per peer (N−1 concurrent) |
 | `allgather` | `fullmesh` | `1` | `D/N` | `D/N` per peer (N−1 concurrent) |
@@ -331,10 +333,22 @@ Su (NVLink) stage:
 | `ring_bw_bytes_per_us` | NVLink schedule bw | Ethernet schedule bw (e.g. 160000 = 400GbE × 8 NIC) | per-fabric wire rate |
 | `num_lanes` | NVLink links/GPU (18) | NICs/node (8) | So counts NICs, not NVLink lanes |
 | `link_latency_us` | 0.4 | ~1.0 | per-hop propagation |
-| `t_min_switch_us` | 1.1 (NVSwitch) | ~1.5 (Ethernet pipeline) | switch fill |
+| `t_min_switch_us` | 4.10 (NVSwitch) | ~1.5 (Ethernet pipeline) | switch fill |
 | `startup_us` | 15 (NCCL) | ~40 (RDMA) | software launch |
 | `wire_efficiency` | 1.0 (no L3/L4 header) | 0.95 (Eth+IP+UDP+IB) | header overhead on T_serial |
 | `tree_bw` / `nvls_bw` | used on Su | inherited, unused on So | So stage runs the ring path |
+
+**Plain (non-RoCE) lossy Ethernet So fabric.** `make_h200_ethernet_theory()`
+is the lossy counterpart to `make_h200_roce_theory()`: the same 400GbE L2 wire
+(`ring_bw=160000`), but a **store-and-forward** switch pipeline
+(`link_latency_us=3.0`, `t_min_switch_us=3.0` vs RoCE's cut-through 1.0/1.5)
+and `wire_efficiency=1.0` (plain L2 data carries no RoCE IP/UDP/IB headers —
+mirroring the ns-3 `EthernetProtocolModel`, which locks `WireEfficiency=1.0`).
+The lossy drop/NACK/LLR-retransmit behavior is **ns-3-only** — the surrogate
+is the uncongested mean (the same split as RoCE/DCQCN). To use it as the So
+stage of a hierarchical collective, pass it via the `so_factory` seam:
+`make_h200_hierarchical_theory(so_factory=make_h200_ethernet_theory)` (the
+default is `make_h200_roce_theory`). See recipe N.
 
 ### So topology — `so_topology`
 
@@ -363,8 +377,8 @@ how the Su and So stages compose:
 | `collective` | Decomposition | So-stage volume |
 |---|---|---|
 | `allreduce` | Su(rs) + So(rs) + So(ag) + Su(ag) — 4 phases | `D/n_su` (per-node reduced chunk) |
-| `allgather` | Su(ag) + So(ag) + Su(ag) — 3 phases | `D` (full) on inter-node + final |
-| `alltoall` | Su + So — 2 phases | full `D` |
+| `allgather` | Su(ag) + So(ag) — 2 phases (ns-3 `Complete()` fires at end of inter-node AG; no third local broadcast) | full `D` (each GPU exchanges the gathered node buffer `D/n_so` with its `n_so−1` peers: `D·(n_so−1)/n_so` per GPU) |
+| `alltoall` | Su + So — 2 phases | full `D` (each GPU sends its `D/(n_su·n_so)` chunk to every GPU on the other nodes: `D·(n_so−1)/n_so` per GPU; the Su stage moves `D/n_so` total — the local-peer share `D·(n_su−1)/(n_su·n_so)` per GPU) |
 | `sendrecv` | So only — 1 phase | no Su stage (single inter-node hop) |
 
 Worked examples (non-H200) are recipes J/K/L below.
@@ -484,7 +498,7 @@ so = TheoryDerivedSurrogate(packet_bw_bytes_per_us=40000, ring_bw_bytes_per_us=4
 so_topo = make_topology_from_family("so_fullmesh", N=4, links_per_gpu=4, per_link_gbps=25.0)
 h = HierarchicalSurrogate(su, so, gpus_per_node=6, num_nodes=4, so_topology=so_topo)
 h.predict(D, "ring", 128, collective="allreduce")     # ~450.39 us
-h.predict(D, "ring", 128, collective="allgather")     # ~540.76 us
+h.predict(D, "ring", 128, collective="allgather")     # ~413.76 us
 ```
 
 ### L. Hierarchical — reuse a non-H200 preset as the Su stage
@@ -508,10 +522,11 @@ h.predict(D, "ring", 128, collective="allreduce")     # ~701.85 us
 The full-mesh algorithm ships its own preset, `make_h200_fullmesh_theory()`,
 whose `fullmesh_bw=449890` is back-fit to the ns-3 `FullMeshAllReduce` /
 `FullMeshAllGather` sweep (η=0.9998 vs the `18×25000` dedicated-bundle
-physics, MAPE 0.10%). Unlike ring/tree/NVLS (wire-rate derivations, which are
-one-sided lower bounds on ns-3), this one is **ground-truth-calibrated to
-ns-3** — a least-squares back-fit that straddles ns-3 within ~0.1% (above at
-some points, below at others), not a one-sided bound. It still omits
+physics, MAPE 0.10%). Unlike ring/tree/NVLS (wire-rate derivations with
+fitted constants — ring runs below ns-3 in the calibrated range, tree can
+run above it), this one is **ground-truth-calibrated to ns-3** — a
+least-squares back-fit that straddles ns-3 within ~0.1% (above at some
+points, below at others). It still omits
 per-packet credit flow, VOQ arbitration and the inter-phase barrier ns-3
 models; the residual is the ~0.1% gap in either direction.
 
@@ -538,6 +553,34 @@ full-mesh bisection, so the bisection cap never binds and `topology=None` is
 byte-identical. Calibration details + the ns-3 sweep are in
 [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Full-mesh”.
 
+### N. Plain (non-RoCE) Ethernet So fabric — the lossy RoCE counterpart
+
+`make_h200_ethernet_theory()` is the lossy counterpart to
+`make_h200_roce_theory()`: the same 400GbE L2 wire (`ring_bw=160000`) but a
+**store-and-forward** switch pipeline instead of RoCE's cut-through RDMA path,
+and `wire_efficiency=1.0` (plain L2 data carries no RoCE IP/UDP/IB headers —
+mirroring the ns-3 `EthernetProtocolModel`, which locks `WireEfficiency=1.0`).
+
+```python
+from surrogate.theory.whitebox_surrogate_v2 import make_h200_ethernet_theory, make_h200_hierarchical_theory
+# Plain-Ethernet So stage in a hierarchical 2-node allreduce (the lossy
+# counterpart to the RoCE So stage). The lossy drop/NACK/LLR-retransmit
+# behavior is ns-3-only; the surrogate is the uncongested mean (same split
+# as RoCE/DCQCN).
+h = make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
+                                  so_factory=make_h200_ethernet_theory)
+h.predict(256 * 1024 * 1024, "ring", credits=128, collective="allreduce")
+```
+
+The store-and-forward latency (`link_latency_us=3.0`, `t_min_switch_us=3.0`
+vs RoCE's 1.0/1.5) dominates at small messages; at large messages the serial
+term dominates and plain Ethernet is marginally faster (no RoCE header
+overhead). The profile is a spec-derived **lower bound anchored to ns-3** (no
+perftest/blog ground truth for plain Ethernet, unlike RoCE's `ib_write_lat`);
+the parity test asserts surrogate ≤ ns-3 with a sanity floor. Calibration +
+the ns-3 lossy model (VOQ tail-drop → switch NACK → LLR/SACK retransmit) are
+in [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Plain Ethernet”.
+
 ---
 
 ## 8. What it does and does not model
@@ -547,18 +590,20 @@ byte-identical. Calibration details + the ns-3 sweep are in
 - Real-fabric bisection cap + hop propagation (when `topology=` is given).
 - Credit pressure, FEC coding overhead, GBN/SACK retransmission, contention,
   optical link protection, LLR buffer reload — each enabled by setting the
-  corresponding optional input.
+  corresponding optional input. With `topology=` given, retransmissions
+  serialize at the bisection-capped rate just like the mean path
+  (`_retry_overhead` receives the topology-capped `T_serial_step`; a
+  50-GB/s cap moves a 16 MiB / 8-GPU / BER 1e-7 / SACK prediction from
+  ~223 µs to ~737 µs — see §12 of `WHITEBOX_SURROGATE.md`).
 - N-independent efficiency factors; N enters through the explicit collective
   topology (`(N-1)/N` ring steps, `log2(N)` tree levels, NVLS N-cancellation).
 
 **Does not (by design):**
-- Model firmware / arbiter / VOQ drain overhead → it is a **lower bound**
-  (a lower bound on ns-3; the theory/ns-3 ratio is credit-sensitive — see
+- Model firmware / arbiter / VOQ drain overhead → the fitted constants absorb
+  them on average, so per-point error is two-sided (ring mostly below ns-3,
+  tree can be above; the theory/ns-3 ratio is credit-sensitive — see
   [CALIBRATION.md](../../doc/CALIBRATION.md)). Use it for ordering/trends, not
   absolutes.
-- The `ber > 0` retransmission path keeps the **construction** bandwidth
-  (topology's effect on retransmission is second-order); only the `ber = 0`
-  mean path is fully topology-aware. See §12 of `WHITEBOX_SURROGATE.md`.
 - Replace packet simulation near a design frontier — surrogate winners are
   re-verified in ns-3.
 
@@ -567,7 +612,7 @@ byte-identical. Calibration details + the ns-3 sweep are in
 ## 9. Tests
 
 ```bash
-python3 -m pytest surrogate/test/ -q          # 61 passed
+python3 -m pytest surrogate/test/ -q          # 72 passed
 python3 test/parity/test_surrogate_vs_ns3_fullmesh.py   # fullmesh vs ns-3 (6 pts)
 ```
 

@@ -31,10 +31,12 @@ build_lib(
     model/ub-protocol-model.cc
     model/ub-payload-builder.cc
     model/roce-protocol-model.cc
+    model/ethernet-protocol-model.cc
     model/roce-payload-builder.cc
     model/so-header.cc
     model/ethernet-switch.cc
     model/dcqcn-rate-machine.cc
+    model/rttcc-rate-machine.cc
     model/llr-manager.cc
     model/ring-allreduce.cc
     model/sharp-allreduce.cc
@@ -52,6 +54,7 @@ build_lib(
     model/hierarchical-allgather.cc
     model/hierarchical-reducescatter.cc
     model/hierarchical-alltoall.cc
+    model/nccl-ring-allreduce.cc
     helper/gpu-cluster-helper.cc
     helper/hybrid-topology-helper.cc
     helper/multi-node-topology-helper.cc
@@ -90,10 +93,12 @@ build_lib(
     model/ub-protocol-model.h
     model/ub-payload-builder.h
     model/roce-protocol-model.h
+    model/ethernet-protocol-model.h
     model/roce-payload-builder.h
     model/so-header.h
     model/ethernet-switch.h
     model/dcqcn-rate-machine.h
+    model/rttcc-rate-machine.h
     model/llr-manager.h
     model/ring-allreduce.h
     model/sharp-allreduce.h
@@ -111,6 +116,7 @@ build_lib(
     model/hierarchical-allgather.h
     model/hierarchical-reducescatter.h
     model/hierarchical-alltoall.h
+    model/nccl-ring-allreduce.h
     helper/gpu-cluster-helper.h
     helper/hybrid-topology-helper.h
     helper/multi-node-topology-helper.h

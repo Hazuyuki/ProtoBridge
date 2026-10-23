@@ -75,6 +75,20 @@ SharpAllReduce::DoDispose()
         m_transactionExecutor = nullptr;
     }
     m_transactionGraph.Clear();
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&SharpAllReduce::OnPacketReceived, this));
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
@@ -89,6 +103,7 @@ SharpAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_endpoints = endpoints;
 
     m_gpuBroadcastReceivedBytes.resize(numGpus, 0);
+    m_gpuBroadcastDone.assign(numGpus, false);
     m_reduceDoneCount = 0;
     m_broadcastDoneCount = 0;
 
@@ -144,6 +159,18 @@ SharpAllReduce::Start()
 
     NS_LOG_INFO("Starting SHARP AllReduce with startup delay " << m_startupDelayNs << " ns");
 
+    // Zero-data collective (codex round 20, finding 10): with dataSize == 0
+    // the transaction graph's wait nodes carry zero thresholds and
+    // Validate() aborts ("wait node has no completion threshold"), while
+    // the legacy path's SendCollectiveBulk aborts on the zero-size upload.
+    // Complete immediately.
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("SHARP AllReduce trivially complete (zero data)");
+        Complete();
+        return;
+    }
+
     if (m_useTransactionModel)
     {
         BuildTransactionGraph();
@@ -151,7 +178,10 @@ SharpAllReduce::Start()
         return;
     }
 
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs), &SharpAllReduce::TriggerReducePhase, this);
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &SharpAllReduce::TriggerReducePhase, this));
 }
 
 void
@@ -262,11 +292,18 @@ SharpAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHea
         return;
     }
 
+    // Effective bytes ONLY on the result-multicast path (codex round 20,
+    // finding 1). Every result producer stamps SetEffectiveDataSize — the
+    // switch's three multicast builders (result, partition, retransmit) all
+    // carry the stored effective size, and a padding fragment legitimately
+    // holds ZERO effective bytes. The old zero -> packet-size fallback
+    // credited padding fragments as real data, so a 4-GPU/2-link/8-B/8-
+    // partition loss-free AllReduce completed with effective result totals
+    // [1,1,1,0] instead of [8,8,8,8] — padding alone crossed the m_dataSize
+    // threshold before the real data arrived. (The upload direction already
+    // counts effective-only: ProcessAllReduce dropped its fallback in
+    // round 19, finding 3.)
     uint32_t effectiveSize = header.GetEffectiveDataSize();
-    if (effectiveSize == 0)
-    {
-        effectiveSize = packet->GetSize();
-    }
 
     if (m_useTransactionModel)
     {
@@ -298,6 +335,19 @@ SharpAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHea
 void
 SharpAllReduce::OnGpuBroadcastReceiveComplete(uint16_t gpu)
 {
+    // Once-per-GPU guard (codex round 21, finding 1): every fragment that
+    // arrives after the threshold already crossed — padding fragments
+    // (zero effective bytes, totalReceived unchanged) included — re-fires
+    // this check, so a GPU could be counted into m_broadcastDoneCount
+    // MULTIPLE times. With one slow GPU a single late padding fragment at
+    // a fast GPU completed the collective with the slow GPU's result
+    // totals still at zero. The per-GPU done flag makes the count
+    // count DISTINCT GPUs.
+    if (m_gpuBroadcastDone[gpu])
+    {
+        return;
+    }
+    m_gpuBroadcastDone[gpu] = true;
     m_broadcastDoneCount++;
 
     NS_LOG_INFO("GPU " << gpu << " received SHARP broadcast result"

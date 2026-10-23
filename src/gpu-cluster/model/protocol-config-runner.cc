@@ -23,7 +23,32 @@ namespace ns3
 NS_LOG_COMPONENT_DEFINE("ProtocolConfigRunner");
 
 ProtocolConfigRunner::ProtocolConfigRunner() = default;
-ProtocolConfigRunner::~ProtocolConfigRunner() = default;
+
+ProtocolConfigRunner::~ProtocolConfigRunner()
+{
+    // Detach the receive callbacks BEFORE the runner's memory goes away:
+    // they hold this object's raw `this`, and the endpoints survive it. A
+    // delivered packet after the runner is destroyed invoked
+    // OnPacketReceived on freed memory — valgrind-confirmed invalid reads
+    // at the m_executor guard and the header field loads (codex round 17,
+    // finding 4; a 64-B transfer over a 100-us link with the runner
+    // destroyed at 1 us). Only the callback this runner INSTALLED is
+    // cleared: a later injector/runner may have re-bound the endpoint,
+    // and nulling its callback would silently drop its deliveries.
+    const FabricEndpoint::ReceiveCallback ours =
+        MakeCallback(&ProtocolConfigRunner::OnPacketReceived, this);
+    for (const auto& ep : m_endpoints)
+    {
+        if (!ep) continue;
+        // Null-safe ownership check (codex round 20, finding 5): a cleared
+        // endpoint (SetReceiveCallback(MakeNullCallback(...)) after init)
+        // stores a null binding, and Callback::IsEqual dereferences both
+        // impls — comparing against it aborted with "Attempted to
+        // dereference zero pointer" during runner teardown. The endpoint's
+        // ownership-checked helper short-circuits null on either side.
+        ep->DetachReceiveCallbackIfOwner(ours);
+    }
+}
 
 void
 ProtocolConfigRunner::ApplyBundle(const std::vector<Ptr<FabricEndpoint>>& endpoints,

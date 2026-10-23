@@ -97,6 +97,20 @@ class GatewayEndpoint : public FabricEndpoint
   protected:
     void DoDispose() override;
 
+    /**
+     * @brief Cross-fabric forwarding decision for received transit packets
+     *
+     * Overrides the base class's same-fabric immediate re-send: a gateway
+     * consults m_hybridRoutingTable FIRST (cross-fabric routes never land in
+     * the base m_routingTable, so the old base path delivered the packet
+     * locally or ignored the gateway entirely) and routes matched packets
+     * through ScheduleForwarding, which applies GatewayDelay (codex round
+     * 24, finding 6: a configured 100-µs delay produced a ~1204-ns
+     * traversal, and 0->gateway->2 delivered locally at the gateway with
+     * rank 2 receiving nothing).
+     */
+    bool TryForwardReceivedPacket(Ptr<Packet> pkt, FabricHeader& header) override;
+
   private:
     void StartApplication() override;
     void StopApplication() override;

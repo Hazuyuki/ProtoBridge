@@ -118,8 +118,9 @@ per_step_delay = 0
 
 # The transfer stencil, evaluated per instance with gpu/step/N/segment in
 # scope. flowId and stageId are assigned by the compiler (baseFlowId +
-# stage counter). kind ∈ DATA (alias SEND_DATA) | P2P | MEMORY_READ |
-# MEMORY_WRITE | COLLECTIVE (collective offload → ALLREDUCE).
+# stage counter). kind ∈ DATA (alias SEND_DATA) | P2P. (MEMORY_READ /
+# MEMORY_WRITE / COLLECTIVE exist in the transaction layer's grammar but
+# have no send path in the config runner and are rejected at compile time.)
 transfer.0.kind  = DATA
 transfer.0.src   = gpu
 transfer.0.dst   = (gpu + 1) mod N

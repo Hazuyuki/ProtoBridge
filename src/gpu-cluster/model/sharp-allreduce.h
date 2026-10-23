@@ -81,6 +81,9 @@ class SharpAllReduce : public CollectiveInjector
 
     // Track received bytes per GPU for broadcast phase
     std::vector<uint64_t> m_gpuBroadcastReceivedBytes;
+    /// Per-GPU broadcast completion flag (once-per-GPU guard for
+    /// m_broadcastDoneCount; codex round 21, finding 1).
+    std::vector<bool> m_gpuBroadcastDone;
     uint32_t m_broadcastDoneCount;
 
     uint64_t m_startTimeNs;

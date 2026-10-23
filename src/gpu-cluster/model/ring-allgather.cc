@@ -34,12 +34,14 @@ RingAllGather::RingAllGather()
     : m_numGpus(0),
       m_dataSize(0),
       m_segmentSize(0),
+      m_segmentRemainder(0),
       m_flowId(1),
       m_state(AllGatherState::IDLE),
       m_startupDelayNs(0),
       m_perStepSwOverheadNs(0),
       m_gpuDoneCount(0),
       m_totalSteps(0),
+      m_sentDataBytes(0),
       m_startTimeNs(0),
       m_endTimeNs(0)
 {
@@ -52,7 +54,22 @@ RingAllGather::~RingAllGather()
 void
 RingAllGather::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&RingAllGather::OnPacketReceived, this));
+        }
+    }
     m_endpoints.clear();
+    m_ringPos.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
 }
@@ -65,11 +82,21 @@ RingAllGather::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
+    // Segment grid: rank r's base segment is dataSize/numGpus bytes, with
+    // the first dataSize % numGpus segments carrying one extra byte, so
+    // the grid sums to exactly dataSize (codex round 15, finding 7: plain
+    // integer division silently dropped dataSize % numGpus bytes — the
+    // same truncation RingAllReduce fixed in round 13, finding 3).
     m_segmentSize = dataSize / numGpus;
+    m_segmentRemainder = dataSize % numGpus;
     if (m_segmentSize == 0)
     {
+        // Degenerate dataSize < numGpus: keep the legacy fallback (each
+        // rank transmits the whole dataSize every step).
         m_segmentSize = dataSize;
+        m_segmentRemainder = 0;
     }
+    ComputeRingPositions();
 
     m_totalSteps = numGpus - 1;
 
@@ -99,6 +126,102 @@ RingAllGather::Initialize(uint16_t numGpus, uint64_t dataSize,
                 << " totalSteps=" << m_totalSteps
                 << " protocol=" << static_cast<int>(wireProto)
                 << " startupDelay=" << m_startupDelayNs << "ns");
+}
+
+void
+RingAllGather::ComputeRingPositions()
+{
+    // AllGather sends run counterclockwise (to ring prev), but the
+    // POSITION table walks the reduce-scatter (clockwise, ring-next)
+    // direction from rank 0 — the same convention RingAllReduce uses, so
+    // ownership indices stay comparable across injectors. Identity
+    // fallback when no embedding is installed or the embedding is not a
+    // single cycle covering every rank.
+    m_ringPos.assign(m_numGpus, 0);
+    bool identity = true;
+    if (m_endpoints.size() >= m_numGpus)
+    {
+        std::vector<bool> seen(m_numGpus, false);
+        uint16_t cur = 0;
+        uint16_t pos = 0;
+        identity = false;
+        do
+        {
+            if (cur >= m_numGpus || seen[cur])
+            {
+                identity = true;
+                break;
+            }
+            seen[cur] = true;
+            m_ringPos[cur] = pos++;
+            uint16_t next = 0xFFFF;
+            if (m_endpoints[cur])
+            {
+                next = m_endpoints[cur]->GetRingNext();
+            }
+            if (next >= m_numGpus)
+            {
+                identity = true;
+                break;
+            }
+            cur = next;
+        } while (cur != 0 && pos < m_numGpus);
+        if (!identity && pos != m_numGpus)
+        {
+            identity = true;
+        }
+    }
+    if (identity)
+    {
+        for (uint16_t r = 0; r < m_numGpus; ++r)
+        {
+            m_ringPos[r] = r;
+        }
+    }
+}
+
+uint64_t
+RingAllGather::SegmentSizeOf(uint16_t gpu, uint32_t step) const
+{
+    // Which segment the GPU transmits at this step, keyed on ring POSITION
+    // (the GPU's slot along the topology-embedded ring), not numeric rank
+    // — the same rule RingAllReduce applies (codex round 15, finding 4).
+    // AllGather sends run counterclockwise (to ring prev), so ownership
+    // advances one position counterclockwise per step: position p holds
+    // segment (p + step) mod N at step s. The receiver (position p-1) at
+    // step s+1 evaluates (p-1 + s+1) = (p + s): the SAME segment — a rank
+    // forwards exactly the chunk it received.
+    const uint32_t n = m_numGpus;
+    const uint32_t pos = (gpu < m_ringPos.size()) ? m_ringPos[gpu] : gpu;
+    const uint32_t idx = (pos + step) % n;
+    return m_segmentSize + (idx < m_segmentRemainder ? 1 : 0);
+}
+
+uint64_t
+RingAllGather::StepExpectedBytes(uint16_t destRank, uint32_t step) const
+{
+    // Bytes destRank must receive at `step`: the segment the SENDER at
+    // that step holds. AllGather sends to ring prev, so the sender is the
+    // GPU whose ring next (or rank-arithmetic successor) is destRank.
+    for (uint16_t gpu = 0; gpu < m_numGpus; ++gpu)
+    {
+        uint16_t target;
+        if (gpu < m_endpoints.size() && m_endpoints[gpu])
+        {
+            uint16_t prev = m_endpoints[gpu]->GetRingPrev();
+            target = (prev != 0xFFFF) ? prev
+                                      : (gpu - 1 + m_numGpus) % m_numGpus;
+        }
+        else
+        {
+            target = (gpu - 1 + m_numGpus) % m_numGpus;
+        }
+        if (target == destRank)
+        {
+            return SegmentSizeOf(gpu, step);
+        }
+    }
+    return m_segmentSize;
 }
 
 void
@@ -140,7 +263,32 @@ RingAllGather::Start()
 
     NS_LOG_INFO("Starting Ring AllGather with startup delay " << m_startupDelayNs << " ns");
 
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs), &RingAllGather::TriggerInitialSends, this);
+    // Zero-data collective (codex round 20, finding 10): every chunk is
+    // zero, no send ever fires a receive to advance the steps — complete
+    // immediately instead of stalling to the 1-hour cap (same convention as
+    // NvlsAllGather / FullMeshAllGather, round 19).
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("Ring AllGather trivially complete (zero data)");
+        Complete();
+        return;
+    }
+
+    // Single-rank collective (codex round 21, finding 8): N=1 has no ring
+    // successor — nothing is ever sent or received, and the rank already
+    // holds the entire gathered buffer. Complete now instead of stalling
+    // to the cap.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("Ring AllGather trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
+    // Tracked in m_pendingEvents so DoDispose cancels it (raw-`this` target).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &RingAllGather::TriggerInitialSends, this));
 }
 
 void
@@ -166,8 +314,10 @@ RingAllGather::SendGpuStepData(uint16_t gpu, uint32_t step)
     uint16_t target = (prev != 0xFFFF) ? prev : (gpu - 1 + m_numGpus) % m_numGpus;
     uint16_t stepFlowId = m_flowId + step;
 
+    const uint64_t segmentBytes = SegmentSizeOf(gpu, step);
+    m_sentDataBytes += segmentBytes;
     m_endpoints[gpu]->SendBulkWireTransferSize(
-        target, m_segmentSize, m_protocolId, stepFlowId, 0);
+        target, segmentBytes, m_protocolId, stepFlowId, 0);
 
     NS_LOG_DEBUG("GPU " << gpu << " sending step " << step
                  << " to GPU " << target
@@ -215,9 +365,11 @@ RingAllGather::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHead
                  << " currentStep=" << currentStep);
 
     while (currentStep < m_totalSteps
-           && m_gpuReceivedBytesByStep[destRank][currentStep] >= m_segmentSize)
+           && m_gpuReceivedBytesByStep[destRank][currentStep]
+               >= StepExpectedBytes(destRank, currentStep))
     {
-        m_gpuReceivedBytesByStep[destRank][currentStep] -= m_segmentSize;
+        m_gpuReceivedBytesByStep[destRank][currentStep] -=
+            StepExpectedBytes(destRank, currentStep);
         m_gpuStepReceivedBytes[destRank] = 0;
         m_gpuCompletedStep[destRank] = currentStep + 1;
 
@@ -247,15 +399,17 @@ RingAllGather::OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step)
 
     if (m_perStepSwOverheadNs > 0)
     {
-        Simulator::Schedule(NanoSeconds(m_perStepSwOverheadNs),
-                            &RingAllGather::SendGpuStepData,
-                            this,
-                            gpu,
-                            step + 1);
+        m_pendingEvents.push_back(
+            Simulator::Schedule(NanoSeconds(m_perStepSwOverheadNs),
+                                &RingAllGather::SendGpuStepData,
+                                this,
+                                gpu,
+                                step + 1));
     }
     else
     {
-        Simulator::ScheduleNow(&RingAllGather::SendGpuStepData, this, gpu, step + 1);
+        m_pendingEvents.push_back(
+            Simulator::ScheduleNow(&RingAllGather::SendGpuStepData, this, gpu, step + 1));
     }
 }
 

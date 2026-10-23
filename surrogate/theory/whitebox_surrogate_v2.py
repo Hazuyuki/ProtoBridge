@@ -22,7 +22,7 @@ Key derivations (see WHITEBOX_SURROGATE.md for the complete equations):
 
 3. Schedule transfer work:
    T_ring = D(N-1)/(N B_ring)
-   T_tree = D(N-1)/(N B_tree log2(N))
+   T_tree = alpha(N) * D / B_tree     (structural alpha(N) = 1/2/3 by N)
    T_nvls = 2D/B_nvls
 
 4. Shared-resource contention:
@@ -77,11 +77,11 @@ class TheoryDerivedSurrogate:
       Bandwidth — serialized-bytes term (bytes/µs):
         packet_bw_bytes_per_us         (177000)  retransmission chunk serialize (ber>0)
         ring_bw_bytes_per_us           (177000)  ring per-step transfer        [ring mean]
-        tree_bw_per_level_bytes_per_us (26250)   tree per-level transfer       [tree mean]
+        tree_bw_per_level_bytes_per_us (275400)  tree GPU<->NVSwitch trunk     [tree mean]
         nvls_bw_bytes_per_us           (535500)  NVLS aggregate transfer       [nvls mean]
       Latency — fixed term (µs unless noted):
         link_latency_us                (0.4 = 400 ns) per-hop propagation  [ring/nvls mean]
-        t_min_switch_us                 (1.1)    NVSwitch pipeline fill      [tree mean]
+        t_min_switch_us                 (4.10)   NVSwitch fixed pipeline cost [tree mean]
         startup_us                      (15.0)   protocol startup (LL/LL128) [all mean]
         nvls_startup_us                 (23.0)   NVLS startup (used for nvls) [nvls mean]
         fec_encode_ns / fec_decode_ns   (50 / 80 ns) FEC pipeline latency   [FEC on]
@@ -104,7 +104,7 @@ class TheoryDerivedSurrogate:
     def __init__(self,
                  packet_bw_bytes_per_us=177000,
                  ring_bw_bytes_per_us=177000,
-                 tree_bw_per_level_bytes_per_us=26250,
+                 tree_bw_per_level_bytes_per_us=275400,
                  nvls_bw_bytes_per_us=535500,
                  fullmesh_bw_bytes_per_us=449890,
                  link_latency_us=0.4,
@@ -113,7 +113,7 @@ class TheoryDerivedSurrogate:
                  spray_chunk_bytes=131072,
                  bulk_chunk_bytes=8 * 1024 * 1024,
                  num_lanes=18,
-                 t_min_switch_us=1.1,
+                 t_min_switch_us=4.10,
                  fec_n=544, fec_k=514, fec_t=15,
                  fec_symbol_bits=10,
                  fec_encode_ns=50, fec_decode_ns=80,
@@ -121,6 +121,8 @@ class TheoryDerivedSurrogate:
                  nvls_startup_us=23.0,
                  retry_source_bw_bytes_per_us=4_800_000,
                  retry_source_latency_us=0.3,
+                 nvls_num_partitions=8,
+                 nvls_switch_result_retry_limit=64,
                  wire_efficiency=1.0):
         # Fixed profile parameters from hardware, ns-3 configuration, or
         # one-time platform calibration.
@@ -133,6 +135,7 @@ class TheoryDerivedSurrogate:
         self.credit_bdp_ring = credit_bdp_ring_packets
         self.credit_bdp_tree = credit_bdp_tree_packets
         self.chunk_size = spray_chunk_bytes
+        self.spray_chunk_bytes = spray_chunk_bytes
         self.bulk_chunk_size = bulk_chunk_bytes
         self.num_lanes = num_lanes
         self.T_min_switch = t_min_switch_us
@@ -147,6 +150,18 @@ class TheoryDerivedSurrogate:
         self.S_nvls_startup = nvls_startup_us
         self.retry_source_bw = retry_source_bw_bytes_per_us
         self.retry_source_latency = retry_source_latency_us
+        # NVLS AllReduce result-multicast partitions (the switch's
+        # allReduceNumPartitions; gpu-cluster-sim's default is 8). The
+        # pipelined result path fragments per partition, not over the full D.
+        self.nvls_num_partitions = nvls_num_partitions
+        # Switch-side result retransmission budget (nvswitch.h's
+        # SHARP_RESULT_RETRY_LIMIT = 64). Multicast results are repaired by
+        # the SWITCH from its own result store on a receiver NACK, NOT by the
+        # sending endpoint's LLR retry budget: with the endpoint retry limit
+        # at 0, results still get 64 switch retransmissions (+1 for the
+        # original) — attempts on the result side are this constant + 1,
+        # independent of retry_limit (codex round 14, finding 5).
+        self.nvls_switch_result_retry_limit = nvls_switch_result_retry_limit
         # Per-transfer wire efficiency (<1 accounts for L3/L4/transport header
         # overhead, e.g. RoCEv2 Eth+IP+UDP+IB ~0.95). Applied to the serial
         # bandwidth (T_serial /= wire_efficiency); 1.0 is byte-identical to the
@@ -174,7 +189,11 @@ class TheoryDerivedSurrogate:
         """Sequential transfer phases for (collective, algorithm).
 
         AllReduce: ring 2(N-1), tree 2*floor(log2 N)  (reduce-scatter + gather)
-        AllGather: nvls 2                              (scatter-reduce + gather)
+        AllGather: ring N-1 (a single ring pass — ns-3 RingAllGather runs
+                   m_totalSteps = N-1, not the allreduce's 2(N-1); inheriting
+                   the allreduce's doubled count charged 5.6 us instead of
+                   2.8 us of fixed per-step latency at 0.4-us links, codex
+                   round 16, finding 7); nvls 2 (scatter-reduce + gather)
         AlltoAll:  ring/collnetdirect N-1 permutation phases; tree ceil(log2 N)
                    recursive-doubling rounds
         Send-Recv: 1                                   (single point-to-point hop)
@@ -196,7 +215,40 @@ class TheoryDerivedSurrogate:
             return 2 * max(1, int(math.log2(N)))
         if algo == 'nvls':
             return 2
-        return 2 * (N - 1)
+        if collective == 'allgather':
+            # Ring AllGather is ONE pass of N-1 steps (each rank forwards
+            # every other rank's segment once). The allreduce's second pass
+            # is the reduce-scatter half, which allgather does not have.
+            return max(1, N - 1)
+        # Ring AllReduce 2(N-1), clamped to >= 1 so N=1 degenerates to a
+        # single (zero-volume) step instead of dividing by zero in
+        # ``_per_step`` — a single-rank prediction is startup + one step
+        # latency, all finite (codex round 22, finding 3).
+        return max(1, 2 * (N - 1))
+
+    @staticmethod
+    def _tree_trunk_load(N):
+        """Busiest GPU<->NVSwitch trunk load, in units of D, for the tree.
+
+        ns-3 ``TreeAllReduce`` (post volume-fix) is a heap-shaped binary tree
+        (node i -> children 2i+1, 2i+2) with overlapped reduce-up +
+        broadcast-down chunk pipelines; every tree edge carries the full D in
+        each direction, and each GPU's single switch trunk carries the sum of
+        its tree-edge traffic in the busier direction:
+
+          N <= 2: single edge, load D
+          N <= 4: the root receives 2D (two children) and sends 2D
+          N >= 5: an interior node moves 2D child + 1D parent traffic
+
+        The residual pipeline-fill cost (credit-window ramp-up + chunk
+        pipelines warming up, which decays with D) is absorbed into the fitted
+        ``t_min_switch`` / trunk efficiency rather than modeled separately.
+        """
+        if N <= 2:
+            return 1.0
+        if N <= 4:
+            return 2.0
+        return 3.0
 
     def _per_step(self, D, N, algo, steps, collective=None):
         """Bytes moved in one phase of (collective, algorithm).
@@ -204,7 +256,10 @@ class TheoryDerivedSurrogate:
         AlltoAll moves D*(N-1)/N per GPU (each GPU ships (N-1)/N of its data,
         split over its N-1 partner phases -> D/N per phase); Send-Recv moves
         the full D in its single hop. AllReduce/AllGather keep the legacy
-        volume D*(N-1)/N (ring/tree) or D/N (nvls multicast share).
+        volume D*(N-1)/N (ring) or D/N (nvls multicast share). Tree AllReduce
+        moves alpha(N)*D/steps: the full-volume chunk-pipelined tree carries
+        the whole D over every edge, so the busiest GPU<->NVSwitch trunk
+        serializes alpha(N)*D total (see ``_tree_trunk_load``).
         """
         collective = self._validate_collective(collective)
         if collective == 'sendrecv':
@@ -215,6 +270,8 @@ class TheoryDerivedSurrogate:
             # concurrent, so the per-step serialized volume is D/N, not the
             # ring's D*(N-1)/N).
             return D / N
+        if algo == 'tree' and collective == 'allreduce':
+            return self._tree_trunk_load(N) * D / steps
         return D * (N - 1) / N / steps
 
     def _bdp(self, N, algo, collective=None):
@@ -237,7 +294,9 @@ class TheoryDerivedSurrogate:
         (AlltoAll and Send-Recv serialize over the per-link wire rate, same as
         the ring schedule; AlltoAll contention is captured via the topology
         bisection cap, not a separate bandwidth constant.)
-        Tree: T_step = T_min_switch + per_step / (B_tree × log₂N)
+        Tree: T_step = T_min_switch + per_step / B_tree  (B_tree is the
+        GPU<->NVSwitch trunk rate; per_step already carries the alpha(N)
+        trunk-load factor via ``_per_step``)
         NVLS: T_step = (N × per_step) / B_nvls + lat
 
         With ``topology`` the schedule bandwidth is capped by the fabric
@@ -249,8 +308,7 @@ class TheoryDerivedSurrogate:
         hop = topology.hop_count if topology is not None else 1.0
         extra_lat = (hop - 1.0) * self.lat
         if algo == 'tree':
-            log2N = max(1, int(math.log2(N)))
-            bw_tree = min(self.tree_bw_per_level * log2N, bsec)
+            bw_tree = min(self.tree_bw_per_level, bsec)
             return self.T_min_switch + extra_lat + per_step / bw_tree
         elif algo == 'nvls':
             return extra_lat + self.lat + (per_step * N) / min(self.nvls_bw, bsec)
@@ -261,6 +319,20 @@ class TheoryDerivedSurrogate:
             return extra_lat + self.lat + per_step / min(self.fullmesh_bw, bsec)
         else:
             return extra_lat + self.lat + per_step / min(self.ring_bw, bsec)
+
+    def _one_hop_step_time(self, per_step, N, algo, topology=None, collective=None):
+        """Per-step time for AlltoAll partner phases and Send-Recv single hops.
+
+        Each phase ships its bytes over one link at the per-link serial rate
+        (the ring-schedule bandwidth), regardless of ``algo``: the tree/NVLS
+        bandwidth forms describe their own collective structures (per-level
+        trunk / N-fold multicast amplification) and must NOT apply to a
+        one-hop transfer.
+        """
+        bsec = (topology.bisection_bw_bytes_per_us
+                if topology is not None else float('inf'))
+        hop = topology.hop_count if topology is not None else 1.0
+        return (hop - 1.0) * self.lat + self.lat + per_step / min(self.ring_bw, bsec)
 
     # ---- Credit pressure (Phi_credit) ----
 
@@ -324,40 +396,351 @@ class TheoryDerivedSurrogate:
         optical_fraction = min(1.0, max(0.0, optical_fraction))
         return 1.0 + optical_fraction * (n_symbols / k_symbols - 1.0)
 
+    def _nccl_protocol_for(self, payload_bytes):
+        """NCCL wire protocol the C++ side picks for ``payload_bytes``.
+
+        Mirrors ``NcclProtocolModel::GetProtocolForSize`` (thresholds 8 KiB
+        and 2 MiB): LL below 8 KiB, LL128 below 2 MiB, SIMPLE above.
+        """
+        if payload_bytes < 8192:
+            return 'LL'
+        if payload_bytes < 2 * 1024 * 1024:
+            return 'LL128'
+        return 'SIMPLE'
+
+    def _nccl_wire_bytes(self, payload_bytes, protocol):
+        """Wire bytes ``NcclProtocolModel::GetWireSize`` emits for a payload.
+
+        LL: 64 data + 64 flag bytes per 128 B line; LL128: 120 data + 8
+        header per 128 B line; SIMPLE: payload as-is (efficiency 1.0).
+        """
+        if protocol == 'LL':
+            return math.ceil(payload_bytes / 64) * 128
+        if protocol == 'LL128':
+            return math.ceil(payload_bytes / 120) * 128
+        return payload_bytes
+
     def _wire_bytes_per_transfer(self, data_bytes, num_gpus, algo,
                                  collective=None):
         """Wire bytes in one protocol transfer before FEC encoding.
 
         AllReduce/AllGather ring-tree step and AlltoAll partner exchange each
         carry data/num_gpus (D/N) per transfer; Send-Recv carries the full D.
+        The tree's chunk-pipelined schedule carries the FULL D over every
+        edge (see ``_per_step`` / ``_tree_trunk_load``): its per-transfer
+        volume is D, not D/N — reliability must count the bytes actually on
+        the wire, or it underestimates expected losses by ~alpha(N).
+
+        The tree also picks its wire protocol from the per-rank chunk D/N
+        (``TreeAllReduce`` selects once by m_chunkSize = D/N), not from the
+        full per-edge D: e.g. at N=8/D=32 KiB the wire protocol is LL
+        (4 KiB per-rank < 8 KiB), so each edge carries ceil(D/64)*128 = 64 KiB
+        of LL line framing — LL128 selected by total D would count 35,072 B.
         """
         collective = self._validate_collective(collective)
+        if algo == 'tree' and collective == 'allreduce':
+            per_rank = max(1, data_bytes // max(1, num_gpus))
+            if data_bytes < num_gpus:
+                per_rank = data_bytes
+            protocol = self._nccl_protocol_for(per_rank)
+            return self._nccl_wire_bytes(data_bytes, protocol)
         transfer_bytes = (data_bytes if collective == 'sendrecv'
-                           else data_bytes / max(1, num_gpus))
+                          else data_bytes / max(1, num_gpus))
         if algo == 'nvls':
             return transfer_bytes
-        if transfer_bytes < 8192:
-            return math.ceil(transfer_bytes / 64) * 128
-        if transfer_bytes < 2 * 1024 * 1024:
-            return math.ceil(transfer_bytes / 120) * 128
-        return transfer_bytes
+        protocol = self._nccl_protocol_for(transfer_bytes)
+        return self._nccl_wire_bytes(transfer_bytes, protocol)
+
+    def _tree_pipe_chunk(self, data_bytes, num_gpus):
+        """``TreeAllReduce`` m_pipeChunkSize: clamp(D/(32*depth), 64 KiB, 8 MiB).
+
+        depth = ceil(log2(N)) (heap-shaped binary tree). The tree quantizes
+        each edge's full-D forwarding into ceil(D/pipe) pipe chunks, each
+        sprayed across the lanes as one bulk transfer.
+        """
+        depth = max(1, math.ceil(math.log2(max(2, num_gpus))))
+        pipe = data_bytes // (32 * depth)
+        return min(max(pipe, 64 * 1024), 8 * 1024 * 1024)
+
+    def _bulk_fragment_count(self, wire_bytes, data_bytes):
+        """Fragments ``SendBulkWireTransferSize`` emits for one transfer.
+
+        Mirrors the C++ fragment loops exactly: numChunks =
+        max(lanes, ceil(wire/bulk_chunk)); wireChunkSize = ceil(wire/numChunks);
+        a fragment is emitted only when BOTH its wire offset is inside the
+        wire span AND its data offset is inside the data span (trailing
+        lane-pad and wire-padding fragments are skipped). At
+        wire == data (SIMPLE, efficiency 1.0) the two filters coincide; under
+        LL/LL128 framing (wire > data) the data filter can drop extra trailing
+        fragments.
+        """
+        if wire_bytes <= 0:
+            return 1
+        num_chunks = max(self.num_lanes,
+                         math.ceil(wire_bytes / self.bulk_chunk_size))
+        wire_chunk = math.ceil(wire_bytes / num_chunks)
+        sent_chunks = math.ceil(wire_bytes / wire_chunk)
+        data_chunk = math.ceil(data_bytes / max(1, sent_chunks))
+        emitted = 0
+        for i in range(num_chunks):
+            if i * wire_chunk >= wire_bytes:
+                continue  # trailing lane-pad fragment past the wire end
+            if i * data_chunk >= data_bytes:
+                break  # wire-padding fragment: no data bytes left to send
+            emitted += 1
+        return max(1, emitted)
+
+    def _switch_multicast_fragments(self, data_bytes):
+        """(count, bytes) of one switch-side multicast partition delivery.
+
+        Mirrors NvSwitch::MulticastAllReducePartition's spray loop: the
+        switch ALWAYS fragments a result partition at ~128-KiB chunks
+        (numChunks = max(ports per GPU, ceil(wire/128 KiB)), then the
+        >512-MiB coalescing path), REGARDLESS of the endpoint upload side's
+        single-link whole-packet rule. Using the endpoint rule on the
+        result side modeled a 4-MiB partition as ONE 2-MiB packet (p ~ 1
+        per attempt) where the switch actually sends 16 x 128-KiB chunks —
+        0.571 predicted permanent losses at BER 2.1e-7 / retry 10000 /
+        strict inf, where ns-3 seeds 1-3 report zero (codex round 23,
+        finding 2). Fragment geometry follows the same ``offset >= wire
+        end`` skip as ``_spray_fragments``.
+        """
+        if data_bytes <= 0:
+            return 1, 1
+        spray_chunk = 128 * 1024
+        max_chunk = 8 * 1024 * 1024
+        coalesce_threshold = 512 * 1024 * 1024
+        min_chunks = max(1, self.num_lanes)  # ports per GPU
+        num_chunks = max(min_chunks,
+                         math.ceil(data_bytes / spray_chunk))
+        coalesced = math.ceil(data_bytes / max_chunk)
+        if data_bytes > coalesce_threshold and coalesced > min_chunks:
+            path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
+            num_chunks = max(min_chunks,
+                             min(num_chunks, path_balanced))
+        sent = sum(1 for i in range(num_chunks)
+                   if i * math.ceil(data_bytes / num_chunks) < data_bytes)
+        frag_bytes = math.ceil(data_bytes / num_chunks) if num_chunks else 1
+        return max(1, sent), max(1, frag_bytes)
+
+    def _spray_fragments(self, data_bytes):
+        """(count, bytes) of one SendCollectiveBulk sprayed transfer.
+
+        Mirrors the collective spray loop. The C++ gates fragmentation on
+        NEEDING it (fabric-endpoint-send.cc): needFragmentColl =
+        (spray links > 1) OR (wire size > 500 MiB). A single-link fabric
+        sends the whole transfer as ONE packet of the full size — a 4-GPU /
+        16-MiB AllGather over one link uploads one 4-MiB packet per rank,
+        not 32 x 128-KiB fragments (codex round 13, finding 6: the always-
+        fragment helper predicted 0.06285 permanent losses at BER 1e-7 /
+        3 retries where a 4-MiB packet fails with p ~ 0.965 per attempt and
+        ns-3 reports the collective incomplete with 3 permanent losses).
+        With multiple links, numChunks = max(lanes, ceil(bytes/spray_chunk))
+        (at least one fragment per lane so the transfer uses the aggregate
+        bandwidth), each fragment ceil(bytes/numChunks) — the geometry
+        NvSwitch's result multicast mirrors chunk-for-chunk. The RETURNED
+        count is the fragments actually SENT (the C++ spray loop skips
+        trailing lane-pad fragments whose offset is past the wire end), so
+        a transfer smaller than numChunks*fragBytes counts fewer than
+        numChunks. Distinct from
+        _bulk_fragment_count, which models the DATA path's bulk_chunk
+        granularity and protocol framing.
+        """
+        if data_bytes <= 0:
+            return 1, 1
+        overflow_threshold_collective = 500 * 1024 * 1024
+        coalesce_threshold = 512 * 1024 * 1024
+        max_chunk_bytes = 8 * 1024 * 1024
+        min_chunks = max(1, self.num_lanes)
+        if self.num_lanes <= 1 and data_bytes <= overflow_threshold_collective:
+            # Single-link (or single-QP) fabric below the overflow
+            # threshold: one packet carries the entire transfer.
+            return 1, math.ceil(data_bytes)
+        num_chunks = max(min_chunks,
+                         math.ceil(data_bytes / self.spray_chunk_bytes))
+        # ... but the C++ spray loop SKIPS trailing lane-pad fragments whose
+        # offset is past the wire end (fabric-endpoint-send.cc: `offset >=
+        # wireSize -> continue`): chunkSize = ceil(wire/numChunks), so a
+        # transfer smaller than numChunks*ceil(...) emits fewer fragments
+        # than numChunks — 32 wire bytes over 18 lanes is 16 x 2-byte
+        # fragments, not 18 (codex round 18, finding 6: counting the two
+        # phantom fragments over-stated expected losses 0.506 vs 0.450 at
+        # BER 2.2e-4 / retry 0, crossing the strict-reliability threshold).
+        sent_fragments = sum(
+            1 for i in range(num_chunks)
+            if i * math.ceil(data_bytes / num_chunks) < data_bytes
+        )
+        # Large-transfer coalescing (codex round 14, finding 2): above
+        # 512 MiB the C++ caps the event count by coalescing into
+        # ~8 MiB path-balanced chunks — coalesced = ceil(wire/8 MiB),
+        # pathBalanced = ceil(coalesced/minChunks) * minChunks,
+        # numChunks = max(minChunks, min(sizeBased, pathBalanced)). A
+        # 2-GPU / 2-GiB AllGather uploads 144 fragments of ~7.46 MiB,
+        # NOT 8,192 x 128 KiB — the un-coalesced helper modeled ~57x too
+        # many fragments (0.000582 predicted permanent losses at BER
+        # 1e-8 / 3 retries, accepting a strict completion ns-3 rejects
+        # with 13 permanent losses). The threshold is the C++
+        # COALESCE_THRESHOLD (512 MiB), DISTINCT from the 500-MiB
+        # OVERFLOW_THRESHOLD_COLLECTIVE above (codex round 15, finding 6:
+        # reusing the 500-MiB overflow threshold coalesced a 504-MiB
+        # 2-GPU / 1008-MiB-AllGather upload into 72 x 7-MiB fragments
+        # where the C++ emits 4,032 x 128-KiB — the modeled fragments
+        # were ~32x too few and ~56x too large, and strict_reliability
+        # returned infinity for a config ns-3 completes in 4,251.879 us
+        # with zero permanent losses).
+        if data_bytes > coalesce_threshold:
+            coalesced = math.ceil(data_bytes / max_chunk_bytes)
+            if coalesced > min_chunks:
+                path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
+                num_chunks = max(min_chunks,
+                                 min(num_chunks, path_balanced))
+                # Recompute after coalescing changes numChunks: the skip rule
+                # (offset >= wire end) applies to the FINAL chunk geometry.
+                sent_fragments = sum(
+                    1 for i in range(num_chunks)
+                    if i * math.ceil(data_bytes / num_chunks) < data_bytes
+                )
+        frag_bytes = math.ceil(data_bytes / num_chunks)
+        return sent_fragments, frag_bytes
 
     def _packets_per_transfer(self, data_bytes, num_gpus, algo, collective=None):
+        """Fragments the C++ fabric actually emits for one transfer.
+
+        Non-tree algorithms spray the transfer's wire bytes across the lanes
+        in bulk-chunk-sized fragments (at least one per lane). The tree is
+        different: each edge's full-D volume moves as ceil(D/pipe) pipe
+        chunks, EACH of which is its own sprayed bulk transfer — at
+        N=8/D=16 MiB that is 97 chunks x 18 fragments + a 16-fragment tail =
+        1744 fragments per edge (ns-3 counts exactly 1744), not 18. Counting
+        fragments at the whole-transfer granularity understates expected
+        permanent losses by the same ~alpha(N) factor (19.2 vs 8.7e-5 at
+        BER 1e-7 / retry 3).
+        """
+        collective = self._validate_collective(collective)
+        if algo == 'tree' and collective == 'allreduce':
+            # Zero-byte transfer (codex round 20, finding 12): the loop
+            # below emits no fragments (there is nothing to send), and the
+            # division in _packet_bytes_per_transfer then hits
+            # ZeroDivisionError during retry-buffer sizing. A zero-byte
+            # collective transfers nothing — report zero packets (callers
+            # already treat a zero-byte budget as trivially sufficient).
+            if data_bytes <= 0:
+                return 0
+            pipe = self._tree_pipe_chunk(data_bytes, num_gpus)
+            per_rank = max(1, data_bytes // max(1, num_gpus))
+            if data_bytes < num_gpus:
+                per_rank = data_bytes
+            protocol = self._nccl_protocol_for(per_rank)
+            fragments = 0
+            remaining = data_bytes
+            while remaining > 0:
+                chunk = min(pipe, remaining)
+                chunk_wire = self._nccl_wire_bytes(chunk, protocol)
+                fragments += self._bulk_fragment_count(chunk_wire, chunk)
+                remaining -= chunk
+            return fragments
         wire_bytes = self._wire_bytes_per_transfer(
             data_bytes, num_gpus, algo, collective)
-        size_limited = math.ceil(wire_bytes / self.bulk_chunk_size)
-        return max(1, self.num_lanes, size_limited)
+        return self._bulk_fragment_count(
+            wire_bytes,
+            data_bytes if collective == 'sendrecv'
+            else data_bytes / max(1, num_gpus))
 
     def _packet_bytes_per_transfer(self, data_bytes, num_gpus, algo,
                                    collective=None):
         wire_bytes = self._wire_bytes_per_transfer(
             data_bytes, num_gpus, algo, collective)
-        return wire_bytes / self._packets_per_transfer(
+        packets = self._packets_per_transfer(
+            data_bytes, num_gpus, algo, collective)
+        # Zero-byte transfer (codex round 20, finding 12): no packets are
+        # emitted, so wire bytes are zero too and the fragment size is 0/0.
+        # No fragment is ever retained, so any size trivially suffices;
+        # return 1 so the byte->entry conversion stays finite instead of
+        # raising ZeroDivisionError.
+        if packets <= 0:
+            return 1.0
+        return wire_bytes / packets
+
+    def _rank_upload_chunks(self, data_bytes, num_gpus):
+        """Per-rank upload chunk sizes of an NVLS AllGather (codex round 22,
+        finding 4).
+
+        The switch allgathers rank r's ``D//N + (r < D%N)`` bytes, so the
+        upload grid is heterogeneous: D=73/N=4 sends chunks [19,18,18,18],
+        not four uniform 18.25s. Retained-fragment counts, sizes, and retry
+        budgets must fragment each rank's ACTUAL integer chunk — the
+        uniform D/N undercounts (10 entries where the busiest rank retains
+        18, so a 16-entry buffer overflows in ns-3 across seeds 1-3).
+        """
+        if data_bytes <= 0:
+            return []
+        base = data_bytes // max(1, num_gpus)
+        remainder = data_bytes % max(1, num_gpus)
+        return [base + (1 if r < remainder else 0)
+                for r in range(num_gpus)]
+
+    def _retry_buffer_fragment_bytes(self, data_bytes, num_gpus, algo,
+                                     collective):
+        """Fragment size of the RETAINED packets a retry buffer holds.
+
+        NVLS/SHARP collectives retain SendCollectiveBulk's sprayed upload
+        fragments (one fast-copy entry per fragment — D allreduce, D/N
+        allgather), so the byte->entry conversion must divide by the spray
+        fragment size. Every other algorithm retains the DATA bulk path's
+        fragments, whose size _packet_bytes_per_transfer already models.
+        Dividing an NVLS byte capacity by the DATA bulk fragment (~932 KiB
+        at D=64 MiB) turned a 16-MiB buffer into 18 entries where the C++
+        scratch sim's llrBufferSizeBytes/sprayChunkSize conversion and the
+        required sizing (128 x 128 KiB) both give 128 — predict() then added
+        a source-reload penalty ns-3 does not take (codex round 14,
+        finding 6).
+        """
+        collective = self._validate_collective(collective)
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            if collective == 'allreduce':
+                return self._spray_fragments(data_bytes)[1]
+            # AllGather: each endpoint retains fragments of its OWN grid
+            # chunk (codex round 22, finding 4). Report the largest fragment
+            # any uploading rank retains — the same conservative size the
+            # expected-loss model uses for per-fragment failure probability.
+            frag_bytes = 1
+            for chunk in self._rank_upload_chunks(data_bytes, num_gpus):
+                if chunk <= 0:
+                    continue
+                frag_bytes = max(frag_bytes, self._spray_fragments(chunk)[1])
+            return frag_bytes
+        return self._packet_bytes_per_transfer(
             data_bytes, num_gpus, algo, collective)
 
     def required_retry_buffer_entries(self, data_bytes, num_gpus, algo,
                                       collective=None):
-        """Maximum packets an endpoint may need to retain for one tree step."""
+        """Maximum packets an endpoint may need to retain for one tree step.
+
+        NVLS/SHARP collectives are the exception: their uploads move via
+        SendCollectiveBulk's SPRAY (one retry-buffer fast copy per sprayed
+        fragment of this endpoint's own upload — D for allreduce, D/N for
+        allgather), not the DATA bulk path. At 4 GPU / 64 MiB AllGather an
+        endpoint uploads 128 fragments of 128 KiB, so a 32-entry buffer
+        evicts fast copies and lost fragments need source reloads (ns-3:
+        2 reloads at 32 entries, 0 at 128). The DATA-bulk count of 18
+        wrongly called 32 entries sufficient (codex round 13, finding 7).
+        """
+        collective = self._validate_collective(collective)
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            if collective == 'allreduce':
+                return self._spray_fragments(data_bytes)[0]
+            # AllGather: the retry buffer holds THIS endpoint's own sprayed
+            # upload fragments, so the requirement is the busiest rank's
+            # fragment count over the integer chunk grid — D=73/N=4/18 lanes
+            # gives per-rank counts [10,18,18,18], so 18 entries (the old
+            # uniform D/N returned 10 and a 16-entry buffer overflowed,
+            # codex round 22, finding 4).
+            entries = 1
+            for chunk in self._rank_upload_chunks(data_bytes, num_gpus):
+                if chunk <= 0:
+                    continue
+                entries = max(entries, self._spray_fragments(chunk)[0])
+            return entries
         packets = self._packets_per_transfer(
             data_bytes, num_gpus, algo, collective)
         return 2 * packets if algo == 'tree' else packets
@@ -365,6 +748,20 @@ class TheoryDerivedSurrogate:
     def required_retry_buffer_bytes(self, data_bytes, num_gpus, algo,
                                     collective=None):
         """Bytes needed to retain the modeled transfer fragments."""
+        collective = self._validate_collective(collective)
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            if collective == 'allreduce':
+                frags, frag_bytes = self._spray_fragments(data_bytes)
+                return frags * frag_bytes
+            # AllGather: bytes the busiest endpoint must retain for its own
+            # grid-chunk fragments (codex round 22, finding 4).
+            required = 1
+            for chunk in self._rank_upload_chunks(data_bytes, num_gpus):
+                if chunk <= 0:
+                    continue
+                frags, frag_bytes = self._spray_fragments(chunk)
+                required = max(required, frags * frag_bytes)
+            return required
         return (
             self.required_retry_buffer_entries(
                 data_bytes, num_gpus, algo, collective)
@@ -373,10 +770,27 @@ class TheoryDerivedSurrogate:
         )
 
     def _retry_buffer_capacity_entries(self, retry_buffer_entries=None,
-                                       retry_buffer_bytes=None):
+                                       retry_buffer_bytes=None,
+                                       fragment_bytes=None):
+        """Entry capacity of a byte-capped retry buffer.
+
+        ``retry_buffer_bytes`` limits how many RETAINED FRAGMENTS the buffer
+        holds, so the conversion divides by the fragment size the transfer
+        actually uses (``fragment_bytes``, defaulting to the spray chunk
+        size) — not by the 128 KiB spray size unconditionally. Retained
+        fragments can be as large as the 8 MiB coalesced chunks (or the
+        whole transfer when it fits one fragment), and dividing by the wrong
+        size over- or under-counts the reload penalty.
+        """
         if retry_buffer_bytes is None:
             return retry_buffer_entries
-        byte_limited_entries = max(0, int(retry_buffer_bytes // self.chunk_size))
+        frag = self.chunk_size if fragment_bytes is None else fragment_bytes
+        # Zero-byte transfer (codex round 20, finding 12): the fragment size
+        # is 0 (nothing is in flight), so no byte cap can evict anything —
+        # the entry count stands unclamped instead of dividing by zero.
+        if frag <= 0:
+            return retry_buffer_entries
+        byte_limited_entries = max(0, int(retry_buffer_bytes // frag))
         if retry_buffer_entries is None:
             return byte_limited_entries
         return min(retry_buffer_entries, byte_limited_entries)
@@ -413,8 +827,21 @@ class TheoryDerivedSurrogate:
     def expected_permanent_losses(self, data_bytes, num_gpus, algo, ber,
                                   retry_limit, fec_enabled=False, fec_n=None,
                                   fec_k=None, fec_t=None, optical_fraction=1.0,
-                                  optical_hops=1.0, collective=None):
+                                  optical_hops=1.0, collective=None,
+                                  llr_enabled=True):
         """Expected packets that exhaust the configured retry limit."""
+        # With LLR disabled there is NO retransmit machinery anywhere: every
+        # lost packet is permanent on its first attempt, whatever
+        # retry_limit says (the same rule predict()'s strict-reliability
+        # gate applies — codex round 18, finding 9: a direct call with
+        # llr_enabled=False / retry_limit=3 granted 4 attempts and reported
+        # 6.17 expected losses where the one-attempt truth is 153.48).
+        # Normalize BEFORE the None/-1 early return: LLR-off with an
+        # unspecified retry_limit means exactly one attempt, not zero risk
+        # (codex round 19, finding 9 — the old order returned 0.0 for
+        # llr_enabled=False / retry_limit=None).
+        if not llr_enabled:
+            retry_limit = 0
         if retry_limit is None or retry_limit < 0:
             return 0.0
         packet_bytes = self._packet_bytes_per_transfer(
@@ -427,14 +854,198 @@ class TheoryDerivedSurrogate:
         packets_per_transfer = self._packets_per_transfer(
             data_bytes, num_gpus, algo, collective)
         collective = self._validate_collective(collective)
+        # Whole-COLLECTIVE transfer counts: the expected-loss estimate
+        # aggregates the risk of EVERY transfer the collective issues, not
+        # just the ones one rank participates in. The old per-rank counts
+        # (ring: 2(N-1) steps, alltoall: N-1 partners) covered only the
+        # local rank's slice, understating expected permanent losses by
+        # ~N x -- at N=8/D=16 MiB/BER 2e-7/retry 3 the ring model reported
+        # 0.2108 losses against 1.6865 when all ranks were counted, so
+        # ``strict_reliability`` wrongly returned a finite latency for a
+        # config that cannot complete.
         if collective == 'sendrecv':
             transfer_count = 1
         elif collective == 'alltoall':
-            transfer_count = max(1, num_gpus - 1)
-        elif algo in ('tree', 'ring'):
-            transfer_count = 2 * (num_gpus - 1)
+            # Every rank exchanges with every other rank: N(N-1) transfers.
+            transfer_count = num_gpus * (num_gpus - 1)
+        elif collective == 'allreduce':
+            if algo == 'nvls':
+                # NVLS/SHARP: every rank uploads once and the switch
+                # multicasts once -- N uploads + N result deliveries.
+                transfer_count = 2 * num_gpus
+            elif algo == 'tree':
+                # Tree allreduce: the tree has N-1 edges and each carries the
+                # FULL D per direction (D up during reduce, D down during
+                # broadcast — see _wire_bytes_per_transfer's tree branch,
+                # which also counts full-D fragments per edge). The transfer
+                # count is therefore 2(N-1), NOT 2N(N-1): the old multiplier
+                # overcounted tree losses by N (at N=8/D=16 MiB/BER 6e-7/
+                # retry 3 it reported 0.80997 expected losses instead of
+                # 0.10125, and strict_reliability wrongly returned infinity).
+                transfer_count = 2 * (num_gpus - 1)
+            else:
+                # Ring/fullmesh allreduce = reduce-scatter + all-gather.
+                # Ring: every rank does 2(N-1) chunk steps -> 2N(N-1);
+                # fullmesh: every rank sends D/N to N-1 peers per phase
+                # -> 2N(N-1).
+                transfer_count = 2 * num_gpus * (num_gpus - 1)
+        elif collective == 'allgather':
+            if algo == 'ring':
+                # Ring allgather: every rank passes D/N around the ring
+                # through N-1 peers -> N(N-1) transfers.
+                transfer_count = num_gpus * (num_gpus - 1)
+            elif algo == 'nvls':
+                # NVLS allgather: N uploads + N multicast deliveries.
+                transfer_count = 2 * num_gpus
+            else:
+                # Fullmesh allgather: every rank sends D/N to all N-1 peers.
+                transfer_count = num_gpus * (num_gpus - 1)
         else:
             transfer_count = num_gpus
+        # NVLS/SHARP needs per-SIDE packet counts: uploads and result
+        # deliveries fragment differently, and (for allreduce) at DIFFERENT
+        # granularities. The two collectives' C++ geometry (sharp-allreduce /
+        # NvSwitch::MulticastAllReducePartition) differs:
+        #
+        #   allgather: each of the N ranks uploads frag(D/N); the switch
+        #   re-multicasts every received upload chunk to every dest, so a
+        #   dest's result stream carries N * frag(D/N) chunks at the upload
+        #   chunk sizes — 8 GPU / 16 MiB gives 144 upload + 1,152 result
+        #   chunks (9.75x the risk of counting uploads alone).
+        #
+        #   allreduce: every rank uploads the FULL D (frag(D) chunks —
+        #   sharp-allreduce.cc uploads D before any partitioning), and the
+        #   switch's result multicast is PIPELINED over nvlsNumPartitions
+        #   (default 8): each dest receives P partitions of D/P each,
+        #   re-fragmented at frag(D/P) — 8 GPU / 16 MiB / P=8 gives
+        #   1,024 upload chunks + 1,152 result chunks, NOT the naive
+        #   N * N * frag(D) = 8,192 results the upload-mirroring formula
+        #   produced (codex round 13, finding 5). With D=16 MiB the result
+        #   partition fragment (~116.5 KB) also differs from the upload
+        #   fragment (128 KB), so each side needs its own p_frag.
+        #
+        # The fragment geometry is SendCollectiveBulk's spray, NOT the DATA
+        # bulk path: numChunks = max(lanes, ceil(bytes/spray_chunk)) over the
+        # ACTUAL side size. Calling _packets_per_transfer here double-divided
+        # by N and borrowed the DATA path's packet bytes (~932 KB fragments
+        # at D=128 MiB, ~1370x the failure probability of the real 128 KB
+        # spray chunks): 8 GPU / 128 MiB allgather / BER 5e-8 / retry 3
+        # reported 12.1577 expected losses where the C++ geometry gives 0.0627
+        # and the ns-3 run completes with zero permanent losses (codex round
+        # 12, finding 6).
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            # Uploads and results have DIFFERENT repair budgets. An upload
+            # the switch fails to receive is NACKed back to the endpoint and
+            # retransmitted from its LLR source store — retry_limit + 1
+            # attempts. A multicast RESULT is repaired by the switch itself
+            # from its own result store (NvSwitch::HandleSwitchNack, bounded
+            # by SHARP_RESULT_RETRY_LIMIT = 64), completely independent of
+            # the endpoint's retry limit: with endpoint retry 0, a lost
+            # result still has 64 switch retransmissions available (codex
+            # round 14, finding 5: 8 GPU / 16 MiB allgather / BER 1e-9 /
+            # endpoint retry 0 — ns-3 seed 3 completes at 79.2 us including
+            # one switch result repair, so the loss model must predict
+            # ~0.1342, not the 1.2074 the shared attempts count produced).
+            upload_attempts = retry_limit + 1
+            # The switch's result store only exists when LLR is on:
+            # StoreMulticastResult skips outright when !m_llrEnabled, so
+            # HandleSwitchNack has nothing to retransmit and every result
+            # loss is permanent on its first attempt (codex round 15,
+            # finding 5: 8 GPU / 16 MiB allgather / BER 8e-4 / RS(544,514,15)
+            # / LLR off — ns-3 seed 2 stays incomplete after two
+            # uncorrectable result packets while the LLR-on budget of 65
+            # attempts predicted only 0.303 expected losses).
+            result_attempts = (self.nvls_switch_result_retry_limit + 1
+                               if llr_enabled else 1)
+            if collective == 'allgather':
+                # Uploads come only from ranks holding a NONZERO chunk on
+                # the frozen grid (codex round 20, finding 11): rank r owns
+                # D/N bytes plus one extra when r < D%N, so D < N leaves
+                # ranks past D with zero bytes — NvlsAllGather's send loop
+                # skips them (a zero-chunk rank uploads nothing). The old
+                # uniform D/N attribution invented an upload from EVERY
+                # rank: at D=1/N=4 it counted 20 packets (4 invented uploads
+                # + 16 result fragments) where ns-3 sends 1 upload + 4
+                # one-chunk results, inflating expected losses 0.7613 vs
+                # the true 0.1903 and wrongly reporting infinite strict
+                # latency for a run ns-3 completes.
+                uploading_ranks = min(num_gpus, math.ceil(data_bytes)) if data_bytes > 0 else 0
+                # Fragment at the ACTUAL per-rank integer chunk sizes, not
+                # the uniform D/N (codex round 21, finding 6): the grid is
+                # [D/N + 1] x (D%N) then [D/N] x (N - D%N), and each rank
+                # sprays ITS OWN chunk. The old uniform-D/N fragmentation
+                # invented fractional bytes: at D=5/N=4/18 lanes it counted
+                # 8 upload + 32 result fragments (p x 40) where the [2,1,1,1]
+                # grid sends 5 upload fragments and mirrors 5 result
+                # fragments to each of the 4 dests (p x 25 = 0.3776 at BER
+                # 0.0016 / RS(544,514,15) / LLR off, vs 0.6042 predicted) —
+                # strict latency went infinite for a run ns-3 seeds 1-3 all
+                # complete.
+                base_chunk = data_bytes // max(1, num_gpus)
+                remainder = data_bytes % max(1, num_gpus)
+                upload_frags = 0
+                upload_frag_bytes = 1
+                for r in range(uploading_ranks):
+                    chunk = base_chunk + (1 if r < remainder else 0)
+                    if chunk <= 0:
+                        continue
+                    frags, frag_bytes = self._spray_fragments(chunk)
+                    upload_frags += frags
+                    # Conservative fragment size: the largest fragment any
+                    # uploading rank sends (per-fragment failure probability
+                    # is monotonically increasing in size).
+                    upload_frag_bytes = max(upload_frag_bytes, frag_bytes)
+                # Result side per destination: the switch re-multicasts
+                # every RECEIVED upload chunk, so a dest's stream carries
+                # upload_frags fragments in total (mirroring the
+                # heterogeneous upload streams chunk-for-chunk).
+                result_frags_per_dest = upload_frags
+                p_frag = self._packet_failure_probability(
+                    ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
+                p_path_frag = 1.0 - (1.0 - p_frag) ** max(1.0, optical_hops)
+                return ((upload_frags * p_path_frag ** upload_attempts
+                         + num_gpus * result_frags_per_dest
+                         * p_path_frag ** result_attempts)
+                        * min(1.0, max(0.0, optical_fraction)))
+            # AllReduce: full-D uploads + partitioned result multicast.
+            upload_frags, upload_frag_bytes = self._spray_fragments(data_bytes)
+            num_partitions = max(1, self.nvls_num_partitions)
+            if self.nvls_num_partitions <= 1:
+                # LEGACY single-multicast mode: NvSwitch falls back to
+                # MulticastAllReduceResult, which replays the UPLOADS' chunk
+                # sizes (``chunkSizes`` copied from the first GPU's stored
+                # upload records) -- NOT the switch's own 128-KiB spray. On
+                # a single-link fabric the result is one WHOLE 4-MiB packet
+                # per dest, p ~ 1 per attempt, so 65 switch-side result
+                # retries still leave ~1.89 expected permanent losses at
+                # N=2 / D=4 MiB / BER 2.1e-7 -- where the partition-spray
+                # geometry below (16 x 128-KiB chunks) predicted 0.000330
+                # and strict latency stayed finite for a run ns-3 leaves
+                # incomplete (codex round 24, finding 1).
+                result_frags_per_dest = upload_frags
+                result_frag_bytes = upload_frag_bytes
+            else:
+                # Result partitions are sprayed by the SWITCH at its own
+                # 128-KiB multicast geometry, not the endpoint upload rule
+                # (codex round 23, finding 2): a single-link fabric's
+                # uploads stay whole packets while each result partition
+                # still fragments at ceil(D/P/128KiB) x 128-KiB chunks.
+                result_frags, result_frag_bytes = self._switch_multicast_fragments(
+                    data_bytes / num_partitions)
+                # Each dest receives every partition: P x frag(D/P) chunks.
+                result_frags_per_dest = num_partitions * result_frags
+            p_upload_frag = self._packet_failure_probability(
+                ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
+            p_result_frag = self._packet_failure_probability(
+                ber, fec_enabled, fec_n, fec_k, fec_t, result_frag_bytes)
+            p_path_upload = 1.0 - (1.0 - p_upload_frag) ** max(
+                1.0, optical_hops)
+            p_path_result = 1.0 - (1.0 - p_result_frag) ** max(
+                1.0, optical_hops)
+            return ((num_gpus * upload_frags * p_path_upload ** upload_attempts
+                     + num_gpus * result_frags_per_dest
+                     * p_path_result ** result_attempts)
+                    * min(1.0, max(0.0, optical_fraction)))
         attempts = retry_limit + 1
         return (transfer_count * packets_per_transfer
                 * min(1.0, max(0.0, optical_fraction))
@@ -442,24 +1053,47 @@ class TheoryDerivedSurrogate:
 
     # ---- Shared-resource contention (Phi_share) ----
 
-    def _shared_contention(self, algo, cr, competing_bw, D, N):
+    def _shared_contention(self, algo, cr, competing_bw, D, N, collective=None,
+                          bisection_bw=None):
         """Residual-capacity penalty at a shared bottleneck.
 
         ``competing_bw`` is the traffic rate, in GB/s, that uses the same
         bottleneck as the modeled transfer. The expression has no fitted
         contention coefficient.
+
+        The schedule bandwidth must match the serial term it penalizes — two
+        dimensions of that match are load-bearing:
+
+        1. The COLLECTIVE dimension: alltoall / sendrecv phases serialize over
+           the per-link (ring) rate — their ``predict`` T_serial uses
+           ``ring_bw`` regardless of ``algo`` — so the contention divisor must
+           too, else ``algo='tree'`` undercuts the penalty (rho computed against
+           the faster tree trunk while the transfer actually runs at ring
+           rate).
+        2. The TOPOLOGY dimension: when a topology caps the serial rate (a
+           bisection / egress bottleneck below the fabric's own link rate),
+           the competing traffic eats into the CAPPED rate, not the raw link
+           rate — a 25 GB/s flow sharing a link capped to 50 GB/s leaves
+           25 GB/s of residual, a 2x penalty, not 1.16x. Using the uncapped
+           rate understates the penalty exactly when the bottleneck is
+           tightest.
         """
         if competing_bw <= 0:
             return 1.0
 
-        if algo == 'tree':
-            schedule_bw = self.tree_bw_per_level * max(1, int(math.log2(N)))
+        collective = self._validate_collective(collective)
+        if collective in ('alltoall', 'sendrecv'):
+            schedule_bw = self.ring_bw
+        elif algo == 'tree':
+            schedule_bw = self.tree_bw_per_level
         elif algo == 'nvls':
             schedule_bw = self.nvls_bw
         elif algo == 'fullmesh':
             schedule_bw = self.fullmesh_bw
         else:
             schedule_bw = self.ring_bw
+        if bisection_bw is not None:
+            schedule_bw = min(schedule_bw, bisection_bw)
         schedule_bw_GB = schedule_bw / 1000.0
         rho = min(0.99, competing_bw / max(schedule_bw_GB, 1e-9))
         return 1.0 / (1.0 - rho)
@@ -499,8 +1133,54 @@ class TheoryDerivedSurrogate:
         collective = self._validate_collective(collective)
         if ber <= 0 or not llr_enabled:
             return 0.0
-        packets = self._packets_per_transfer(D, N, algo, collective)
-        packet_bytes = self._packet_bytes_per_transfer(D, N, algo, collective)
+        # NVLS/SHARP uploads and result deliveries move via
+        # SendCollectiveBulk's SPRAY, not the DATA bulk path the generic
+        # helpers model. For H200 NVLS AllGather at 4 GPU / 64 MiB the DATA
+        # path counts 18 fragments of ~932 KB where the actual geometry is
+        # 128 x 128 KiB (the reliability model already uses the spray
+        # geometry; the mean retry latency is the outlier — codex round 17,
+        # finding 6: 1510.95 us pre-fix vs 738.89 us with the real
+        # geometry). Model the UPLOAD side (per-rank D for allreduce, D/N
+        # for allgather) at its spray fragmentation; the per-dest result
+        # stream carries N upload-sized streams at the same chunk sizes,
+        # so the max-of-geometrics over the upload fragment count is the
+        # right "slowest fragment" driver for the step-extension term.
+        if algo == 'nvls' and collective in ('allreduce', 'allgather'):
+            if collective == 'allreduce':
+                packets, packet_bytes = self._spray_fragments(D)
+            else:
+                # AllGather: the per-dest result stream mirrors the
+                # per-rank upload grid (D/N + (r < D%N) each), so the
+                # slowest-fragment driver must use the REAL streams — the
+                # uniform D/N modeled 19 x 124,174-B fragments at
+                # D=9,437,185/N=4 where three ranks actually send
+                # 18 x 131,072-B (expected max attempts 8.60 vs 8.17
+                # modeled, 326.94 vs 311.77 µs; codex round 23, finding 3).
+                # The dominant stream maximizes the expected max attempt
+                # count E[max] over its (count, size) — at D=9,437,185 the
+                # 18 x 131,072-B streams dominate the 19 x 124,174-B one
+                # (8.60 vs 8.17 expected attempts: the larger fragment's
+                # failure probability outweighs the extra fragment).
+                best_attempts = 0.0
+                packets, packet_bytes = 1, 1
+                for chunk in self._rank_upload_chunks(D, N):
+                    if chunk <= 0:
+                        continue
+                    frags, frag_bytes = self._spray_fragments(chunk)
+                    p_frag = self._packet_failure_probability(
+                        ber, fec_enabled, fec_n, fec_k, fec_t, frag_bytes)
+                    attempts = self._expected_max_attempts(p_frag,
+                                                           float(frags))
+                    if attempts > best_attempts:
+                        best_attempts = attempts
+                        packets, packet_bytes = frags, frag_bytes
+                if best_attempts == 0.0:
+                    packets, packet_bytes = self._spray_fragments(D / max(1, N))
+            packets = float(packets)
+        else:
+            packets = self._packets_per_transfer(D, N, algo, collective)
+            packet_bytes = self._packet_bytes_per_transfer(
+                D, N, algo, collective)
         p_packet = self._packet_failure_probability(
             ber, fec_enabled, fec_n, fec_k, fec_t, packet_bytes)
         optical_fraction = min(1.0, max(0.0, optical_fraction))
@@ -520,7 +1200,7 @@ class TheoryDerivedSurrogate:
 
     def _gbn_cascade(self, T_step, steps, D, N, algo, cr, ber, llr_enabled,
                      retry_mode='gobackn', retry_buffer_entries=None,
-                     collective=None):
+                     collective=None, bw_eff=None):
         """Link-retry overhead (additive, in microseconds).
 
         Only applies when llr_enabled=True AND ber>0 (after FEC reduction).
@@ -558,6 +1238,16 @@ class TheoryDerivedSurrogate:
             total_chunks = D * (N - 1) / N / self.chunk_size
         P_error_total = total_chunks * P_chunk
 
+        # Zero transfer work (D=0): no chunks are in flight, so no error can
+        # occur and there is no Go-Back-N overhead — return BEFORE the
+        # window computation. The packet count is also 0 at D=0, so the
+        # window<=0 branch below would otherwise report infinity for a
+        # transfer with literally nothing to retransmit (codex round 21,
+        # finding 7: predict/predict_tail returned inf for D=0/tree/BER
+        # 1e-7/LLR on where ns-3's zero-data guard completes trivially).
+        if P_error_total <= 0:
+            return 0.0
+
         bdp = self._bdp(N, algo, collective)
         if bdp == float('inf'):
             window = cr
@@ -570,7 +1260,17 @@ class TheoryDerivedSurrogate:
         if window <= 0:
             return float('inf')
 
-        chunk_serial = self.chunk_size / self.BW_link  # time to send one chunk
+        # Serialize retransmitted chunks at the TOPOLOGY-CAPPED rate when a
+        # bisection cap is in play (codex round 22, finding 6): a fabric whose
+        # bisection bottlenecks the schedule bandwidth bottlenecks a
+        # retransmission just the same — the doc contract says retransmitted
+        # fragments re-serialize at the capped rate, and the SACK path already
+        # receives the capped T_serial_step. Using the raw BW_link here left
+        # the legacy-GBN retry penalty unchanged (2.0435 µs) when a 50-GB/s
+        # cap was added.
+        if bw_eff is None:
+            bw_eff = self.BW_link
+        chunk_serial = self.chunk_size / bw_eff  # time to send one chunk
 
         if retry_mode.lower() == 'sack':
             retransmitted_chunks = 1.0
@@ -623,11 +1323,13 @@ class TheoryDerivedSurrogate:
     def _step_variance(self, T_step, D, N, algo, cr, ber, competing_bw, llr_enabled,
                        fec_enabled=False, fec_n=None, fec_k=None, fec_t=None,
                        retry_mode='gobackn', retry_buffer_entries=None,
-                       collective=None):
+                       optical_fraction=1.0, collective=None, topology=None):
         """Per-step delay variance from retransmission + queuing.
 
         Uses post-FEC BER when FEC is enabled (variance from corrected errors
         is near-zero; only uncorrectable errors trigger retransmission).
+        BER is scaled by optical_fraction to mirror predict()'s retransmission
+        arm: only the optical (error-bearing) fraction of traffic retries.
 
         Pipeline absorption factor: the Binomial variance K*p*(1-p)*Δ²
         computes the FULL retransmission delay variance, but only a fraction
@@ -642,10 +1344,21 @@ class TheoryDerivedSurrogate:
         where effective_delay accounts for credit slack: when cr > BDP,
         spare credits absorb part of the retransmission, reducing the
         effective delay that propagates.
+
+        Retransmissions serialize at the TOPOLOGY-CAPPED rate
+        min(BW_link, bisection) (codex round 24, finding 8): both delay
+        terms below divided by the raw BW_link, so a 50-GB/s bisection cap
+        left the low-BER p99-minus-mean increment unchanged at 1.736 µs
+        (16 MiB / N=8 ring / 32 credits / BER 1e-8 / SACK) where the
+        capped rate gives 5.371 µs -- the same capped-retransmission
+        contract the mean path (round 22, finding 6) and the heavy-tail
+        branch (round 23, finding 4) already follow. ``topology=None`` is
+        byte-identical to the legacy behavior.
         """
         collective = self._validate_collective(collective)
         effective_ber = (self._post_fec_ber(ber, fec_n, fec_k, fec_t)
                          if fec_enabled else ber)
+        effective_ber *= min(1.0, max(0.0, optical_fraction))
         if effective_ber <= 0 and competing_bw <= 0:
             return 0.0
 
@@ -664,7 +1377,11 @@ class TheoryDerivedSurrogate:
             P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk
             retry_chunks = (1.0 if retry_mode.lower() == 'sack'
                             else (window + 1.0) / 2.0)
-            delay_per_error = retry_chunks * self.chunk_size / self.BW_link
+            # Topology-capped retransmission rate (see docstring).
+            bsec = (topology.bisection_bw_bytes_per_us
+                    if topology is not None else float('inf'))
+            bw_retx = min(self.BW_link, bsec)
+            delay_per_error = retry_chunks * self.chunk_size / bw_retx
 
             # Pipeline absorption: compute effective delay after credit slack
             # and the propagation fraction.
@@ -673,7 +1390,7 @@ class TheoryDerivedSurrogate:
                 excess_chunks = max(0.0, window - spare_credits)
             else:
                 excess_chunks = window
-            effective_delay = excess_chunks * self.chunk_size / self.BW_link
+            effective_delay = excess_chunks * self.chunk_size / bw_retx
 
             if T_step > 0 and effective_delay > 0:
                 f_prop = T_step / (T_step + effective_delay)
@@ -705,7 +1422,9 @@ class TheoryDerivedSurrogate:
         if competing_bw is None:
             competing_bw = mem_bw
         retry_buffer_entries = self._retry_buffer_capacity_entries(
-            retry_buffer_entries, retry_buffer_bytes)
+            retry_buffer_entries, retry_buffer_bytes,
+            self._retry_buffer_fragment_bytes(
+                data_bytes, num_gpus, algo, collective))
         mean = self.predict(
             data_bytes, num_gpus, algo, credits, ber=ber, mem_bw=mem_bw,
             startup_us=startup_us, fec_enabled=fec_enabled,
@@ -718,23 +1437,39 @@ class TheoryDerivedSurrogate:
         if not math.isfinite(mean):
             return mean
         steps = self._steps(num_gpus, algo, collective)
-        T_step = self._step_time(
+        T_step = self._one_hop_step_time(
             self._per_step(data_bytes, num_gpus, algo, steps, collective),
-            num_gpus, algo, topology, collective)
+            num_gpus, algo, topology, collective) \
+            if self._validate_collective(collective) in ('alltoall', 'sendrecv') \
+            else self._step_time(
+                self._per_step(data_bytes, num_gpus, algo, steps, collective),
+                num_gpus, algo, topology, collective)
         var_step = self._step_variance(T_step, data_bytes, num_gpus, algo,
                                         credits, ber, competing_bw, llr_enabled,
                                         fec_enabled, fec_n, fec_k, fec_t,
                                         retry_mode, retry_buffer_entries,
-                                        collective=collective)
+                                        optical_fraction, collective,
+                                        topology)
 
         if var_step <= 0:
             return mean
 
+        # Scale BER by the optical (error-bearing) fraction, mirroring
+        # predict()'s retransmission arm (line ~962): with optical_fraction=0
+        # there are no error-bearing hops, so the tail must collapse to the
+        # BER-zero value, not inherit the full-BER retry cascade.
         effective_ber = (self._post_fec_ber(ber, fec_n, fec_k, fec_t)
                          if fec_enabled else ber)
+        effective_ber *= min(1.0, max(0.0, optical_fraction))
         bits_per_chunk = self.chunk_size * 8
         P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk if effective_ber > 0 else 0
-        is_heavy_tail = P_chunk > 0.1
+        # The heavy-tail branch models a RETRANSMISSION cascade (expected
+        # retry delay per chunk error). With LLR disabled there are no
+        # retransmissions — a lost chunk is a permanent failure the mean
+        # already handles (strict_reliability) — so BER must not add tail
+        # here no matter how large P_chunk is. Gating on llr_enabled mirrors
+        # _step_variance's retransmission term, which has the same guard.
+        is_heavy_tail = P_chunk > 0.1 and llr_enabled
 
         if not is_heavy_tail:
             from scipy.stats import norm
@@ -744,8 +1479,26 @@ class TheoryDerivedSurrogate:
         else:
             bdp = self._bdp(num_gpus, algo, collective)
             window = min(credits, bdp) if bdp != float('inf') else credits
-            delay_per_error = window * self.chunk_size / self.BW_link
-            lam = P_chunk / (1 - P_chunk) / delay_per_error if P_chunk < 1 else 1e6
+            # Retransmissions serialize at the TOPOLOGY-CAPPED rate (codex
+            # round 23, finding 4): the heavy-tail branch's delay_per_error
+            # divided by the raw BW_link, so a 50-GB/s bisection cap left
+            # the p99-minus-mean increment unchanged at 560.39 µs — the
+            # same capped-retransmission contract the mean path (round 22,
+            # finding 6) and _step_variance already follow.
+            bsec = (topology.bisection_bw_bytes_per_us
+                    if topology is not None else float('inf'))
+            delay_per_error = window * self.chunk_size / min(self.BW_link,
+                                                             bsec)
+            # Exponential tail approximating the geometric retry cascade: the
+            # expected extra delay is (P/(1-P)) * delay_per_error (retries per
+            # success), so the exponential rate is its reciprocal:
+            # lam = (1-P)/P / delay_per_error. The old P/(1-P) form inverted
+            # the dependence -- a HIGHER loss probability produced a SHORTER
+            # tail (p99 shrank 19680 -> 382 us as BER rose 1.1e-7 -> 2e-6).
+            if P_chunk < 1:
+                lam = (1.0 - P_chunk) / P_chunk / delay_per_error
+            else:
+                lam = 1e-6  # every chunk fails: tail diverges
             p_target = (percentile / 100) ** (1 / steps)
             step_tail = -math.log(1 - p_target) / lam
             return mean + steps * step_tail
@@ -772,11 +1525,17 @@ class TheoryDerivedSurrogate:
         ``collective='alltoall'`` or ``'sendrecv'`` to model those operations.
 
         ``phase`` (default ``'full'``) selects a sub-collective pass for the
-        hierarchical decomposition: ``'rs'`` (reduce-scatter) / ``'ag'``
-        (allgather) halve the step count (a single pass moves the same total
-        volume over half the steps, so the serial term is unchanged and only
-        the fixed per-step latency halves). ``'full'`` (default) is the
-        two-pass allreduce / allgather -- byte-identical to prior behavior.
+        hierarchical decomposition: for ``collective='allreduce'``,
+        ``'rs'`` (reduce-scatter) / ``'ag'`` (allgather) halve the step count
+        (the allreduce's step count covers its two ring passes; a single
+        pass moves the same total volume over half the steps, so the serial
+        term is unchanged and only the fixed per-step latency halves). For
+        ``collective='allgather'`` the halving does NOT apply: ring
+        AllGather's step count already IS one pass (N-1), so ``phase='ag'``
+        is byte-identical to ``phase='full'`` — passing ``'rs'``/``'ag'``
+        there is accepted but inert. ``'full'`` (default) is the two-pass
+        allreduce / single-pass allgather -- byte-identical to prior
+        behavior.
 
         L = S_startup
             + steps × T_fixed
@@ -788,14 +1547,20 @@ class TheoryDerivedSurrogate:
         if competing_bw is None:
             competing_bw = mem_bw
         retry_buffer_entries = self._retry_buffer_capacity_entries(
-            retry_buffer_entries, retry_buffer_bytes)
+            retry_buffer_entries, retry_buffer_bytes,
+            self._retry_buffer_fragment_bytes(
+                data_bytes, num_gpus, algo, collective))
         optical_fraction = min(1.0, max(0.0, optical_fraction))
         resolved = self._validate_collective(collective)
         S = startup_us if startup_us is not None else (
             self.S_nvls_startup if resolved == 'allgather'
             and algo == 'nvls' else self.S_startup)
         steps = self._steps(num_gpus, algo, collective)
-        if phase in ('rs', 'ag'):
+        # The rs/ag halving is an ALLREDUCE concept: the allreduce's step
+        # count covers its two ring passes, so one pass is half. Ring
+        # allgather's step count already IS one pass (N-1) — halving it again
+        # would undercount the hierarchical allgather stages by 2x.
+        if phase in ('rs', 'ag') and collective == 'allreduce':
             steps = max(1, steps // 2)
         per_step = self._per_step(data_bytes, num_gpus, algo, steps, collective)
 
@@ -804,9 +1569,8 @@ class TheoryDerivedSurrogate:
         hop = topology.hop_count if topology is not None else 1.0
 
         if algo == 'tree':
-            log2N = max(1, int(math.log2(num_gpus)))
             T_fixed_step = self.T_min_switch + (hop - 1.0) * self.lat
-            T_serial_step = per_step / min(self.tree_bw_per_level * log2N, bsec)
+            T_serial_step = per_step / min(self.tree_bw_per_level, bsec)
         elif algo == 'nvls':
             T_fixed_step = self.lat + (hop - 1.0) * self.lat
             T_serial_step = (per_step * num_gpus) / min(self.nvls_bw, bsec)
@@ -814,6 +1578,19 @@ class TheoryDerivedSurrogate:
             T_fixed_step = self.lat + (hop - 1.0) * self.lat
             T_serial_step = per_step / min(self.fullmesh_bw, bsec)
         else:
+            T_fixed_step = self.lat + (hop - 1.0) * self.lat
+            T_serial_step = per_step / min(self.ring_bw, bsec)
+        # AlltoAll partner phases and Send-Recv single hops are ONE-HOP
+        # transfers: each phase ships its bytes over one link at that link's
+        # serial rate and pays the single-hop fixed latency (lat + extra hops),
+        # exactly as _one_hop_step_time (used by predict_tail) models them.
+        # The tree/NVLS forms above describe their own collective structures
+        # (the tree's per-level T_min_switch pipeline, NVLS's N-fold multicast
+        # amplification) and must NOT apply — with algo='nvls' a sendrecv
+        # would otherwise scale its single-hop latency by N, and with
+        # algo='tree' it would inherit the multi-level switch pipeline's fixed
+        # cost.
+        if resolved in ('alltoall', 'sendrecv'):
             T_fixed_step = self.lat + (hop - 1.0) * self.lat
             T_serial_step = per_step / min(self.ring_bw, bsec)
         # RoCEv2 (and any L3 fabric) pays per-transfer header overhead: the
@@ -829,16 +1606,38 @@ class TheoryDerivedSurrogate:
             if fec_enabled and include_fec else 1.0)
         Phi_share = (
             self._shared_contention(
-                algo, credits, competing_bw, data_bytes, num_gpus)
+                algo, credits, competing_bw, data_bytes, num_gpus, collective,
+                bsec)
             if include_contention else 1.0)
 
-        if strict_reliability and llr_enabled and retry_limit is not None:
-            expected_losses = self.expected_permanent_losses(
-                data_bytes, num_gpus, algo, ber, retry_limit,
-                fec_enabled and include_fec, fec_n, fec_k, fec_t,
-                optical_fraction, optical_hops, collective)
-            if expected_losses >= 0.5:
-                return float('inf')
+        if strict_reliability:
+            # With LLR disabled there is no retransmission machinery: every
+            # lost packet is permanent on its first attempt, whatever
+            # retry_limit says (the effective attempt count is 1). The old
+            # `and llr_enabled` gate skipped this check entirely for LLR-off
+            # fabrics, letting a run with dozens of expected permanent losses
+            # report a finite completion time. The outer `retry_limit is not
+            # None` gate had the same hole: with LLR off the effective retry
+            # limit is 0 regardless of the parameter, so the check must run
+            # even when retry_limit is omitted (the LLR-off default).
+            # LLR-on fabrics keep retry_limit's meaning: None means "model
+            # default" and the permanent-loss expectation is skipped, exactly
+            # as before.
+            if not llr_enabled:
+                # LLR off: every loss is permanent (no retransmit machinery).
+                eff_retry_limit = 0
+            elif retry_limit is not None:
+                eff_retry_limit = retry_limit
+            else:
+                eff_retry_limit = None
+            if eff_retry_limit is not None:
+                expected_losses = self.expected_permanent_losses(
+                    data_bytes, num_gpus, algo, ber, eff_retry_limit,
+                    fec_enabled and include_fec, fec_n, fec_k, fec_t,
+                    optical_fraction, optical_hops, collective,
+                    llr_enabled=llr_enabled)
+                if expected_losses >= 0.5:
+                    return float('inf')
         T_step = T_fixed_step + T_serial_step
         if include_retransmission:
             effective_ber = (
@@ -855,7 +1654,8 @@ class TheoryDerivedSurrogate:
                 T_gbn_legacy = self._gbn_cascade(
                     T_step, steps, data_bytes, num_gpus, algo, credits,
                     effective_ber, llr_enabled, retry_mode,
-                    retry_buffer_entries, collective)
+                    retry_buffer_entries, collective,
+                    bw_eff=min(self.BW_link, bsec))
                 sack_floor = self._retry_overhead(
                     T_serial_step, steps, data_bytes, num_gpus, algo, credits,
                     ber, llr_enabled, fec_enabled and include_fec,
@@ -894,7 +1694,7 @@ def make_h200_ring_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=275400,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=0.4,
         credit_bdp_ring_packets=91.5,
@@ -902,7 +1702,7 @@ def make_h200_ring_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=4,
-        t_min_switch_us=1.1,
+        t_min_switch_us=4.10,
         startup_us=15.0,
     )
     defaults.update(overrides)
@@ -910,8 +1710,20 @@ def make_h200_ring_theory(**overrides):
 
 
 def make_h200_tree_theory(**overrides):
-    """H200 tree profile: NVSwitch bisection bandwidth + link credit pressure.
+    """H200 tree profile: chunk-pipelined binary tree through the NVSwitch.
 
+    Calibrated to the post-local-rank-fix ns-3 ``TreeAllReduce`` at the TRUE
+    H200 fabric (``--linksPerGpu=18`` separate NVLink4 lanes @ 170 Gbps,
+    spray-routed; every tree edge carries the full D; see
+    ``configs/calibration/tree_ns3_sweep.py`` / ``tree_calib.json``). TWO
+    fitted parameters: ``tree_bw_per_level`` = 275400 B/us the GPU<->NVSwitch
+    trunk rate (eta = 0.72 vs the 18 x 170 Gbps = 382500 B/us trunk physics)
+    and ``t_min_switch`` = 4.10 us the fixed per-step cost (which also absorbs
+    the D-dependent pipeline-fill residual -- at small D ns-3 runs faster than
+    the structural alpha(N)=1/2/3 trunk load predicts, at large D slightly
+    slower, see CALIBRATION.md). MAPE 12.65% over the 36-point
+    N={4,8,16,32} x 1-256 MB ns-3 sweep (per-N 10.6/11.0/14.0/15.1%). ns-3
+    anchored -- no H200 tree hardware ground truth exists in this repo.
     Accepts the same ``overrides`` as the ring profile (defaults to
     ``num_lanes=18``).
     """
@@ -927,7 +1739,7 @@ def make_h200_nvls_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=275400,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=0.4,
         credit_bdp_ring_packets=91.5,
@@ -935,7 +1747,7 @@ def make_h200_nvls_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=18,
-        t_min_switch_us=1.1,
+        t_min_switch_us=4.10,
         startup_us=23.0,
         nvls_startup_us=23.0,
     )
@@ -954,15 +1766,17 @@ def make_h200_fullmesh_theory(**overrides):
     (no ``*N`` factor). ``fullmesh_bw`` is back-fit to the ns-3 sweep
     (``configs/calibration/fullmesh_ns3_sweep.py``); the model omits
     per-packet credit flow, VOQ arbitration and the inter-phase barrier that
-    ns-3 models, so it sits at or just below ns-3 (a lower-bound back-fit,
-    like the ring preset). Scoped to the SIMPLE wire regime (chunk D/N >= 2
+    ns-3 models, so the least-squares fit STRADDLES ns-3 (slightly above at
+    some fit points, below at others — a calibrated back-fit, not a bound;
+    see CALIBRATION.md's "straddles ns-3" note). Scoped to the SIMPLE wire
+    regime (chunk D/N >= 2
     MB); the LL/LL128 small-message regime is out of scope (same scope as the
     ring preset). Accepts the same ``overrides`` as the ring profile.
     """
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=275400,
         nvls_bw_bytes_per_us=535500,
         fullmesh_bw_bytes_per_us=449890,
         link_latency_us=0.4,
@@ -971,7 +1785,7 @@ def make_h200_fullmesh_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=18,
-        t_min_switch_us=1.1,
+        t_min_switch_us=4.10,
         startup_us=15.0,
     )
     defaults.update(overrides)
@@ -1019,7 +1833,7 @@ def make_h200_roce_theory(**overrides):
     Spec-derived, UNCALIBRATED lower bound (anchored to ns-3, not real HW):
     400GbE per-link unidirectional wire rate (50 GB/s = 50000 B/us), 8 NICs
     per node, ~1 us per-hop propagation (vs NVLink 0.4), ~1.5 us Ethernet
-    switch pipeline (vs NVSwitch 1.1), ~40 us RDMA startup (vs NCCL 15), and
+    switch pipeline (vs NVSwitch 4.10), ~40 us RDMA startup (vs NCCL 15), and
     0.95 wire efficiency (Eth+IP+UDP+IB header overhead -- mirrors the ns-3
     RoceProtocolModel's GetWireSize = data/0.95). The schedule bandwidths
     derive from the Ethernet wire rate the same way NVLink does (ring_bw =
@@ -1032,17 +1846,75 @@ def make_h200_roce_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=160000,
         ring_bw_bytes_per_us=160000,
-        tree_bw_per_level_bytes_per_us=26250,
+        tree_bw_per_level_bytes_per_us=275400,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=1.0,
-        credit_bdp_ring_packets=91.5,
-        credit_bdp_tree_packets=35.5,
+        # Credit-UNCONSTRAINED: the ns-3 So (inter-node) path bypasses the
+        # per-VC credit gate (SendBulkWireTransferSize's IsLocalRank guard --
+        # scale-out traffic is governed by ECN/DCQCN or VOQ tail-drop + LLR,
+        # not credits), so the So stage must not inherit the NVLink credit
+        # BDP. float('inf') disables _credit_pressure on the ring path (the
+        # tree BDP below is unused: the So schedule is the inter-node ring).
+        credit_bdp_ring_packets=float('inf'),
+        credit_bdp_tree_packets=float('inf'),
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=8,
         t_min_switch_us=1.5,
         startup_us=40.0,
         wire_efficiency=0.95,
+    )
+    defaults.update(overrides)
+    return TheoryDerivedSurrogate(**defaults)
+
+
+def make_h200_ethernet_theory(**overrides):
+    """H200-class plain (non-RoCE) Ethernet scale-out (So) fabric profile.
+
+    The lossy counterpart to :func:`make_h200_roce_theory`: same 400GbE L2
+    wire (``ring_bw`` is identical -- the physical link is the same), but a
+    STORE-AND-FORWARD switch pipeline instead of RoCE's cut-through RDMA path.
+    The store-and-forward latency dominates at small messages (the key
+    physical difference vs RoCE); at large messages the serial term dominates
+    and plain Ethernet is marginally faster (no RoCE IP/UDP/IB header
+    overhead).
+
+    Spec-derived, anchored to ns-3 (NOT real HW -- there is no perftest/blog
+    ground truth for plain Ethernet, unlike RoCE's ib_write_lat):
+
+    * ``wire_efficiency=1.0`` mirrors the ns-3 ``EthernetProtocolModel``,
+      which locks ``WireEfficiency=1.0`` (ns-3 does not model Ethernet
+      preamble/IFG framing, and plain L2 data carries no RoCE
+      IP/UDP/IB headers). For ns-3 parity the surrogate must reproduce the
+      ns-3 mean it is derived from, so 1.0 -- not RoCE's 0.95.
+    * ``link_latency_us=3.0`` / ``t_min_switch_us=3.0`` model a commodity
+      store-and-forward switch pipeline (cut-through RoCE uses 1.0 / 1.5).
+    * ``startup_us=40``, ``ring_bw=160000``, ``num_lanes=8`` are shared with
+      the RoCE profile (same wire, same NCCL inter-node startup).
+
+    The surrogate is the UNCONGESTED MEAN. Lossy congestion behavior -- VOQ
+    tail-drop, the switch-emitted NACK, and LLR/SACK retransmission -- is
+    ns-3-only (the same split as RoCE: the surrogate gives the uncongested
+    mean while DCQCN/PFC/per-QP-ceiling live in ns-3). Accepts ``**overrides``
+    to tune any ``__init__`` param.
+    """
+    defaults = dict(
+        packet_bw_bytes_per_us=160000,
+        ring_bw_bytes_per_us=160000,
+        tree_bw_per_level_bytes_per_us=275400,
+        nvls_bw_bytes_per_us=535500,
+        link_latency_us=3.0,
+        # Credit-UNCONSTRAINED -- same reason as the RoCE profile (the ns-3 So
+        # path bypasses VC credits; plain Ethernet So is governed by VOQ
+        # tail-drop + LLR retransmit).
+        credit_bdp_ring_packets=float('inf'),
+        credit_bdp_tree_packets=float('inf'),
+        spray_chunk_bytes=131072,
+        bulk_chunk_bytes=8 * 1024 * 1024,
+        num_lanes=8,
+        t_min_switch_us=3.0,
+        startup_us=40.0,
+        wire_efficiency=1.0,
     )
     defaults.update(overrides)
     return TheoryDerivedSurrogate(**defaults)
@@ -1131,7 +2003,7 @@ def make_surrogate(algo, **overrides):
 
 
 def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
-                             eta_ring=0.40, eta_tree=1.05, eta_nvls=1.20,
+                             eta_ring=0.40, eta_tree=0.61, eta_nvls=1.20,
                              eta_fullmesh=1.0, **overrides):
     """Derive every schedule bandwidth from ONE NVLink wire-rate input.
 
@@ -1144,8 +2016,12 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
                            ~0.40 (AllReduce algorithm-bandwidth realization;
                                   bus bw 2(N-1)/N * alBw ~= 0.69 * B_agg,
                                   in NCCL's typical 60-80% band)
-      tree_bw = (B_agg / num_lanes) * eta_tree
-                           ~1.05 (one NVLink + NCCL/FEC overhead; ~= n_fec/k_fec)
+      tree_bw = eta_tree * B_agg
+                           ~0.61 (effective GPU<->NVSwitch trunk realization:
+                                  the ns-3 back-fit 275400 B/us over the
+                                  382500 B/us trunk = eta 0.72 vs the
+                                  effective 170 Gbps/lane rate, i.e. 0.61 of
+                                  the 25000 B/us physical wire aggregate)
       nvls_bw = eta_nvls * B_agg
                            ~1.20 (NVSwitch hardware multicast amplification)
       fullmesh_bw = eta_fullmesh * B_agg
@@ -1154,10 +2030,10 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
                                   serialization, unlike nvls)
 
     For H200 (b_link=25000 B/us, num_lanes=18, B_agg=450000) this yields
-    ring/packet=180000 (calibrated 177000, +1.7%), tree=26250 (exact),
-    nvls=540000 (calibrated 535500, +0.8%), fullmesh=450000 (ns-3-calibrated,
-    the dedicated 18-lane-per-pair bundle within the fit band). Pass
-    ``ring_bw_bytes_per_us=`` etc.
+    ring/packet=180000 (calibrated 177000, +1.7%), tree=274500 (ns-3-calibrated
+    275400, -0.3%), nvls=540000 (calibrated 535500, +0.8%), fullmesh=450000
+    (ns-3-calibrated, the dedicated 18-lane-per-pair bundle within the fit
+    band). Pass ``ring_bw_bytes_per_us=`` etc.
     in ``overrides`` to override any derived value. The calibrated
     ``make_h200_*`` factories still ship the exact measured values; this is
     the single-parameter entry point for new platforms where only the
@@ -1167,7 +2043,7 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
     derived = dict(
         packet_bw_bytes_per_us=eta_ring * b_agg,
         ring_bw_bytes_per_us=eta_ring * b_agg,
-        tree_bw_per_level_bytes_per_us=(b_agg / num_lanes) * eta_tree,
+        tree_bw_per_level_bytes_per_us=eta_tree * b_agg,
         nvls_bw_bytes_per_us=eta_nvls * b_agg,
         fullmesh_bw_bytes_per_us=eta_fullmesh * b_agg,
         num_lanes=num_lanes,
@@ -1442,13 +2318,19 @@ def make_topology_from_family(family, N, links_per_gpu=None,
             f"expected one of {_TOPO_FAMILIES}")
     if N < 2:
         return make_topology()                         # degenerate: no fabric
-    if per_link_gbps is None:
-        if family in _NONBLOCKING_FAMILIES:
-            return make_topology(bisection_gbps=None, hop_count=1.0)
+    if per_link_gbps is None and family not in _NONBLOCKING_FAMILIES:
         raise ValueError(
             f"per_link_gbps is required for {family!r} "
             "(per-link unidirectional GB/s, e.g. 25 for H200 NVLink4 "
             "= b_link_bytes_per_us / 1000)")
+    if family in _NONBLOCKING_FAMILIES:
+        # A non-blocking NVSwitch fabric's bisection never caps the schedule
+        # rate (both guides promise this), so per_link_gbps — supplied or
+        # omitted — never enters the result. The old code fell through to
+        # _bisection_bw_gbps when the rate was supplied, which routed
+        # multiplane to the leaf-tier oversubscription formula (N*lpg*rate/8)
+        # and capped a fabric that is documented as uncapped.
+        return make_topology(bisection_gbps=None, hop_count=1.0)
     lpg = links_per_gpu or _default_links_per_gpu(family, N, **params)
     bisection_gbps = _bisection_bw_gbps(family, N, lpg, per_link_gbps, **params)
     hop = _hop_count(family, N, **params)
@@ -1482,7 +2364,7 @@ class HierarchicalSurrogate:
     of a single pass):
 
       allreduce (4-phase): L = L_su(rs) + L_so(rs) + L_so(ag) + L_su(ag)
-      allgather (3-phase): L = L_su(ag) + L_so(ag) + L_su(ag)
+      allgather (2-phase): L = L_su(ag) + L_so(ag)
       alltoall  (2-phase): L = L_su(alltoall) + L_so(alltoall)
       sendrecv          : L = L_so(sendrecv)  (single inter-node hop, no Su stage)
 
@@ -1491,8 +2373,17 @@ class HierarchicalSurrogate:
     per-node reduced chunk ``D/n_su`` (after intra-node reduce-scatter each
     node holds ``D/n_su``, matching ``ns-3 hierarchical-allreduce.cc``); the
     allgather first intra-node stage gathers the per-node share ``D/n_so``
-    (each GPU starts with ``D/N``) while its inter-node stage and final
-    broadcast move the full ``D``; alltoall ships the full ``D`` on both
+    (each GPU starts with ``D/N``) while its inter-node stage allgathers the
+    FULL ``D`` across the n_so same-local-rank groups (each GPU exchanges the
+    node buffer D/n_so with each of its n_so-1 peers: per-GPU So volume
+    D*(n_so-1)/n_so) — two phases, matching ``ns-3 hierarchical-allgather.cc``
+    whose ``Complete()`` fires at the end of ``INTER_ALLGATHER`` (no third
+    local broadcast); alltoall ships ``D*(n_su-1)/(n_su*n_so)`` on the Su
+    stage and ``D*(n_so-1)/n_so`` on the So stage (each GPU's own chunk is
+    ``D/(n_su*n_so)``: the Su stage delivers it to the node's ``n_su-1``
+    other GPUs, and the So stage carries it to the ``n_su`` GPUs on each of
+    the ``n_so-1`` remote nodes), matching
+    ``ns-3 hierarchical-alltoall.cc``.
     stages. Each stage's bus-factor volume ``D_phase*(N-1)/N`` then comes from
     the ring per-step model. ``collective`` is a REQUIRED keyword-only argument
     to ``predict`` (never inferred from ``algo``), consistent with
@@ -1532,9 +2423,17 @@ class HierarchicalSurrogate:
                 data_bytes, self.n_so, algo, credits, collective='sendrecv',
                 topology=self.so_topology, **kw)
         if collective == 'alltoall':
-            # 2-phase: local shuffle across n_su GPUs, then inter-node
-            # permutation across n_so nodes (each a full alltoall).
-            return (self.su.predict(data_bytes, self.n_su, algo, credits,
+            # 2-phase, matching ns-3 hierarchical-alltoall.cc: every GPU
+            # starts with the per-GPU chunk D/(n_su*n_so) (dataSize/numGpus).
+            # Su phase: each GPU sends its chunk to its n_su-1 local peers —
+            # per-GPU volume D*(n_su-1)/(n_su*n_so), which is what an alltoall
+            # of data D/n_so over n_su GPUs models. So phase: each GPU sends
+            # its chunk to ALL GPUs on the other nodes (n_so-1 nodes x n_su
+            # GPUs) — per-GPU volume D*(n_so-1)/n_so, i.e. a full alltoall of
+            # the FULL D across n_so "super-participants" (each GPU's egress
+            # is its node's exit trunk).
+            su_chunk = data_bytes // self.n_so
+            return (self.su.predict(su_chunk, self.n_su, algo, credits,
                                    collective='alltoall', **kw)
                     + self.so.predict(data_bytes, self.n_so, algo, credits,
                                       collective='alltoall',
@@ -1553,22 +2452,28 @@ class HierarchicalSurrogate:
                                   credits, self.so_topology, 'allreduce', **kw)
                     + self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
                                   credits, None, 'allreduce', **kw))
-        # allgather (3-phase): local AG -> inter-node AG -> local AG.
-        # Phase 1 gathers the per-node share D/n_so intra-node (each GPU
-        # starts with D/N); phase 2 gathers the full D across nodes; phase 3
-        # broadcasts the full D within the node.
+        # allgather (2-phase): local AG -> inter-node AG, matching
+        # ns-3 hierarchical-allgather.cc (Complete() fires at the end of
+        # INTER_ALLGATHER). Phase 1 gathers the per-node share D/n_so
+        # intra-node (each GPU starts with D/N; the ring model's D for that
+        # stage is the gathered node buffer D/n_so). Phase 2 is an allgather
+        # across the n_so same-local-rank groups where the gathered buffer is
+        # the FULL D: each GPU exchanges the node buffer D/n_so with each of
+        # its n_so-1 remote peers, per-GPU So volume D*(n_so-1)/n_so — the
+        # ring model must get the FULL data_bytes here, not the node share
+        # (passing node_share would divide by n_so twice). No third
+        # local-broadcast phase.
         node_share = data_bytes // self.n_so
         return (self._phase(node_share, self.n_su, self.su, algo, 'ag',
                             credits, None, 'allgather', **kw)
                 + self._phase(data_bytes, self.n_so, self.so, algo, 'ag',
-                              credits, self.so_topology, 'allgather', **kw)
-                + self._phase(data_bytes, self.n_su, self.su, algo, 'ag',
-                              credits, None, 'allgather', **kw))
+                              credits, self.so_topology, 'allgather', **kw))
 
 
 def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
                                  so_topology_family='so_fullmesh',
                                  so_per_link_gbps=50.0, so_links_per_gpu=8,
+                                 so_factory=make_h200_roce_theory,
                                  **so_overrides):
     """H200-class hierarchical (Su NVLink + So Ethernet RoCEv2) profile.
 
@@ -1578,7 +2483,9 @@ def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
     (``so_fullmesh`` non-blocking lower bound by default; ``so_spineleaf`` /
     ``so_fattree`` for oversubscribed fabrics whose bisection caps the So
     schedule rate). The So term is an uncalibrated lower bound anchored to
-    ns-3.
+    ns-3. Pass ``so_factory=make_h200_ethernet_theory`` to swap the So stage
+    to a plain (non-RoCE) lossy Ethernet fabric (same wire, store-and-forward
+    switch latency); the default remains RoCEv2.
 
     Parameters
     ----------
@@ -1592,16 +2499,32 @@ def make_h200_hierarchical_theory(gpus_per_node=8, num_nodes=2,
         So per-link unidirectional wire rate (50 = 400GbE).
     so_links_per_gpu : int
         NICs per node (the So ``links_per_gpu``; N is node count).
+    so_factory : callable, optional
+        Factory building the So (scale-out) profile (default
+        :func:`make_h200_roce_theory`). Pass :func:`make_h200_ethernet_theory`
+        to model a plain (non-RoCE) lossy Ethernet So fabric instead of RoCE.
     **so_overrides
-        Forwarded to :func:`make_h200_roce_theory` to tune So startup /
-        latency / wire-efficiency / bandwidth.
+        Forwarded to ``so_factory`` to tune So startup / latency /
+        wire-efficiency / bandwidth.
 
     ``collective`` stays required at ``predict`` time (pass it explicitly --
     it is not inferred from ``algo``); the decomposition is selected by the
     collective, not the algorithm.
     """
     su = make_h200_ring_theory()
-    so = make_h200_roce_theory(**so_overrides)
+    # The So hardware args must shape the So SURROGATE, not just the topology
+    # cap: the RoCE profile's bandwidth constants are the 8-NIC 400GbE
+    # aggregate (ring_bw = 160000 B/us), so a different NIC count or wire rate
+    # rescales them. Without this, 1 vs 8 NICs predicted identically as long
+    # as the topology bisection did not bind.
+    nic_scale = so_links_per_gpu / 8.0
+    wire_scale = so_per_link_gbps / 50.0
+    so_args = dict(so_overrides)
+    so_args.setdefault('num_lanes', so_links_per_gpu)
+    if (nic_scale * wire_scale) != 1.0 and 'ring_bw_bytes_per_us' not in so_args:
+        so_args['ring_bw_bytes_per_us'] = 160000 * nic_scale * wire_scale
+        so_args.setdefault('packet_bw_bytes_per_us', 160000 * nic_scale * wire_scale)
+    so = so_factory(**so_args)
     so_topo = make_topology_from_family(
         so_topology_family, num_nodes,
         links_per_gpu=so_links_per_gpu, per_link_gbps=so_per_link_gbps)

@@ -7,6 +7,8 @@
 
 #include "nvswitch.h"
 
+#include <algorithm>
+
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/packet.h"
@@ -122,6 +124,33 @@ void
 NvSwitch::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    // Cancel every pending deferred-result event: each targets raw `this`
+    // (bound member call or lambda capture) and dereferences the buffers and
+    // ports cleared below — a survivor fired after disposal crashed in
+    // MulticastAllReduceResult (codex round 15, finding 2, valgrind-confirmed
+    // UAF/SIGSEGV after disposing the switch mid-aggregation-delay).
+    for (const EventId& ev : m_deferredResultEvents)
+    {
+        if (!ev.IsExpired())
+        {
+            Simulator::Cancel(ev);
+        }
+    }
+    m_deferredResultEvents.clear();
+    // Detach the port promisc callbacks BEFORE clearing the port list: they
+    // hold raw `this`, so a packet arriving on any port channel after this
+    // switch is gone would invoke ReceiveFromPort on freed memory (codex
+    // round 16, finding 2 — a 64-B packet over a 100-us link, with the
+    // receiving switch disposed and released at 1 us, produced
+    // valgrind-confirmed invalid reads AND writes at the 100-us arrival).
+    for (const auto& port : m_ports)
+    {
+        if (port)
+        {
+            port->SetPromiscReceiveCallback(
+                MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+        }
+    }
     m_ports.clear();
     m_voqs.clear();
     m_portDegradationModels.clear();
@@ -131,9 +160,12 @@ NvSwitch::DoDispose()
     m_sprayRoundRobin.clear();
     m_allReduceBuffer.clear();
     m_allReduceReceivedBytes.clear();
+    m_allReduceLegacyMulticastDone.clear();
     m_portRankMap.clear();
+    m_rankPortMap.clear();
     m_allGatherBuffer.clear();
     m_allGatherReceivedBytes.clear();
+    m_seenUploadSeqs.clear();
     Simulator::Cancel(m_arbitrationEvent);
     NetDevice::DoDispose();
 }
@@ -341,6 +373,43 @@ NvSwitch::AddStaticRoute(Mac48Address addr, uint32_t port)
 }
 
 void
+NvSwitch::AddRankPort(uint16_t rank, uint32_t port)
+{
+    NS_LOG_FUNCTION(this << rank << port);
+    auto& ports = m_rankPortMap[rank];
+    if (std::find(ports.begin(), ports.end(), port) == ports.end())
+    {
+        ports.push_back(port);
+    }
+}
+
+std::unordered_map<uint16_t, std::vector<uint32_t>>
+NvSwitch::BuildRankPorts() const
+{
+    // The learned map is authoritative for ranks that uploaded: a GPU's ports
+    // may include links added after registration, and upload ingress is the
+    // ground truth for which port actually reaches it. Registered ports fill
+    // the gaps (and are appended, deduped, for spraying).
+    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts;
+    for (const auto& entry : m_portRankMap)
+    {
+        rankPorts[entry.second].push_back(entry.first);
+    }
+    for (const auto& entry : m_rankPortMap)
+    {
+        auto& ports = rankPorts[entry.first];
+        for (uint32_t port : entry.second)
+        {
+            if (std::find(ports.begin(), ports.end(), port) == ports.end())
+            {
+                ports.push_back(port);
+            }
+        }
+    }
+    return rankPorts;
+}
+
+void
 NvSwitch::AddSourceBasedRoute(Mac48Address dstMac, uint16_t srcRank, uint32_t port)
 {
     NS_LOG_FUNCTION(this << dstMac << srcRank << port);
@@ -394,6 +463,74 @@ NvSwitch::IsPortOperational(uint32_t port) const
     return port >= m_portDegradationModels.size()
            || !m_portDegradationModels[port]
            || m_portDegradationModels[port]->IsLinkUp();
+}
+
+bool
+NvSwitch::RegisterUploadSeq(uint16_t flowId, uint16_t srcRank, uint32_t seqNum)
+{
+    auto& seen = m_seenUploadSeqs[flowId][srcRank];
+    if (!seen.insert(seqNum).second)
+    {
+        m_sharpDuplicateUploads++;
+        NS_LOG_DEBUG("Duplicate upload ignored: flowId=" << flowId
+                     << " srcRank=" << srcRank << " seq=" << seqNum);
+        return false;
+    }
+    return true;
+}
+
+void
+NvSwitch::InjectAggregateUpload(uint16_t flowId, uint16_t srcRank, uint32_t seqNum,
+                                uint32_t effectiveSize, bool allGather)
+{
+    FabricPacketType type = allGather ? FabricPacketType::ALLGATHER
+                                      : FabricPacketType::ALLREDUCE;
+    FabricHeader fh;
+    fh.SetPacketType(type);
+    fh.SetFlowId(flowId);
+    fh.SetSourceRank(srcRank);
+    fh.SetDestRank(0xFFFF);
+    fh.SetSequenceNumber(seqNum);
+    fh.SetPayloadSize(effectiveSize);
+    fh.SetEffectiveDataSize(effectiveSize);
+    Ptr<Packet> pkt = Create<Packet>(effectiveSize);
+    pkt->AddHeader(fh);
+    if (allGather)
+    {
+        ProcessAllGather(pkt, fh, 0);
+    }
+    else
+    {
+        ProcessAllReduce(pkt, fh, 0);
+    }
+}
+
+bool
+NvSwitch::InjectResultNack(uint16_t requestingRank, uint32_t seqNum)
+{
+    FabricHeader nh;
+    nh.SetPacketType(FabricPacketType::NACK);
+    nh.SetFlowId(1);
+    nh.SetSourceRank(requestingRank);
+    nh.SetDestRank(0xFFFF);
+    nh.SetSequenceNumber(seqNum);
+    return HandleSwitchNack(nh, 0);
+}
+
+size_t
+NvSwitch::GetSharpResultStoreSize(uint16_t destRank) const
+{
+    // Sum every flow's window for the dest (concurrent flows keep
+    // independent windows — see StoreMulticastResult's retention note).
+    size_t total = 0;
+    for (const auto& kv : m_sharpResultStore)
+    {
+        if ((kv.first >> 16) == destRank)
+        {
+            total += kv.second.size();
+        }
+    }
+    return total;
 }
 
 bool
@@ -475,7 +612,10 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
         }
         else
         {
-            failed = !linkModel->ProcessPacket(pkt);
+            // ProcessPacketBerOnly (not ProcessPacket): the loss-rate draw
+            // already happened above — ProcessPacket would draw the loss
+            // rate a second time, compounding the effective loss.
+            failed = !linkModel->ProcessPacketBerOnly(pkt);
         }
 
         if (failed)
@@ -545,6 +685,18 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
         if (m_allGatherEnabled && fabricHeader.GetPacketType() == FabricPacketType::ALLGATHER)
         {
             ProcessAllGather(pkt, fabricHeader, inPort);
+            return true;
+        }
+
+        // NACK addressed to the switch sentinel rank (0xFFFF): the receiver
+        // lost a multicast result packet and is asking THIS switch to retry.
+        // Must be intercepted before routing — its DestRank is the sentinel,
+        // not a routable GPU, and flooding it to every port would only feed
+        // every endpoint a NACK whose seq matches nothing (retry misses).
+        if (fabricHeader.GetPacketType() == FabricPacketType::NACK &&
+            fabricHeader.GetDestRank() == 0xFFFF)
+        {
+            HandleSwitchNack(fabricHeader, inPort);
             return true;
         }
     }
@@ -706,11 +858,20 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
                   << " depth=" << m_voqDepth);
 
     // Congestion hook: let a subclass (EthernetSwitch) mark the SoHeader ECN
-    // bit on enqueue, before the fast-path / push. The depth here is the queue
-    // the packet is arriving into (excluding itself); the empty-VOQ fast-path
-    // below sees depth 0 and so produces no mark -- matching RoCE marking
+    // bit on enqueue (RoCE lossless) or tail-drop with a NACK (plain Ethernet
+    // lossy), before the fast-path / push. The depth here is the queue the
+    // packet is arriving into (excluding itself); the empty-VOQ fast-path below
+    // sees depth 0 and so produces no mark/drop -- matching RoCE marking
     // semantics where only packets arriving behind a backlog get marked.
-    OnPacketEnqueue(entry.packet, outPort, m_voqs[outPort].size());
+    // A false return drops the packet (caller counts a VOQ drop); true admits.
+    if (!OnPacketEnqueue(entry.packet, outPort, entry.inPort,
+                         m_voqs[outPort].size()))
+    {
+        m_dropTrace(entry.packet);
+        m_droppedPackets++;
+        m_voqDrops++;
+        return;
+    }
 
     // For non-blocking switch with egress serialization:
     // If VOQ is empty and output port is free, forward immediately with
@@ -724,14 +885,49 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
     m_voqs[outPort].push(entry);
 }
 
-void
-NvSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort, size_t voqDepth)
+bool
+NvSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
+                          uint32_t inPort, size_t voqDepth)
 {
-    // Default no-op: NVSwitch (scale-up fabric) does no ECN marking, so Su
-    // parity is unaffected. EthernetSwitch overrides to mark the SoHeader.
+    // Default no-op: NVSwitch (scale-up fabric) does no ECN marking or lossy
+    // drop, so Su parity is unaffected. EthernetSwitch overrides to mark the
+    // SoHeader (RoCE) or tail-drop with a NACK (plain Ethernet). Returning
+    // true admits the packet (the caller pushes it to the VOQ).
     (void)packet;
     (void)outPort;
+    (void)inPort;
     (void)voqDepth;
+    return true;
+}
+
+void
+NvSwitch::EmitNackBack(const FabricHeader& orig, uint32_t returnPort,
+                       Mac48Address destMac)
+{
+    // No retransmission machinery active -> a NACK would be unprocessable.
+    // Mirrors the BER-NACK gate in ReceiveFromPort (m_llrEnabled).
+    if (!m_llrEnabled)
+    {
+        return;
+    }
+    if (returnPort >= m_ports.size())
+    {
+        return;
+    }
+    FabricHeader nackHeader;
+    nackHeader.SetPacketType(FabricPacketType::NACK);
+    nackHeader.SetFabricType(orig.GetFabricType());
+    nackHeader.SetSourceRank(orig.GetDestRank());
+    nackHeader.SetDestRank(orig.GetSourceRank());
+    nackHeader.SetSequenceNumber(orig.GetSequenceNumber());
+    nackHeader.SetFlowId(orig.GetFlowId());
+    nackHeader.SetVirtualChannel(orig.GetVirtualChannel());
+    nackHeader.SetSourceMac(orig.GetDestMac());
+    nackHeader.SetDestMac(orig.GetSourceMac());
+
+    Ptr<Packet> nackPkt = Create<Packet>(0);
+    nackPkt->AddHeader(nackHeader);
+    m_ports[returnPort]->Send(nackPkt, destMac, 0x0800);
 }
 
 void
@@ -857,7 +1053,15 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
     // models the full packet traversal including per-port contention.
     // Cut-through: header starts after pipeline delay, tail finishes after
     // serialization. Completion time (for credit/dependency) uses full duration.
-    if (p2pOut && m_cutThroughDelayNs > 0)
+    // The scheduled path must also run for FEC-active egress when cut-through
+    // is disabled: outDevice->Send() serializes the RAW packet, discarding the
+    // FEC wire expansion (wireSize) and codec latency computed above. With
+    // m_cutThroughDelayNs == 0 the pipeline term is zero, so the scheduled
+    // arrival is startTime + serialization(encoded) + codec + propagation —
+    // store-and-forward timing with FEC applied. Non-FEC ports keep the
+    // Send() fallback below unchanged.
+    const bool fecActiveEgress = p2pOut && m_fecOpticalOnly && PortUsesFec(outPort);
+    if (p2pOut && (m_cutThroughDelayNs > 0 || fecActiveEgress))
     {
         Ptr<Channel> rawChannel = p2pOut->GetChannel();
         Ptr<PointToPointChannel> channel = DynamicCast<PointToPointChannel>(rawChannel);
@@ -917,16 +1121,35 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
     uint16_t flowId = header.GetFlowId();
     uint16_t srcRank = header.GetSourceRank();
 
+    // Dedup gate: a retransmitted upload (its LLR ack lost) must not count
+    // as a new contribution. Still re-ACK so the sender purges its retry
+    // entry, but the aggregation ledgers below advance only once per seq.
+    if (!RegisterUploadSeq(flowId, srcRank, header.GetSequenceNumber()))
+    {
+        SendSharpLlrAck(header, inPort);
+        return;
+    }
+
     // Learn port-to-rank mapping for multicast
     m_portRankMap[inPort] = srcRank;
 
-    // Track bytes received per (flowId, srcRank)
+    // Track bytes received per (flowId, srcRank). Effective bytes only: the
+    // collective spray path stamps each fragment's share of the effective
+    // payload (fabric-endpoint-send.cc), and a padding fragment legitimately
+    // carries ZERO effective bytes while holding real wire bytes. The old
+    // zero → payloadSize fallback credited such fragments with their full
+    // wire payload, so a rank's ledger hit its threshold from padding alone
+    // and the switch aggregated before the rank's real data arrived (codex
+    // round 19, finding 3: 4-GPU/1-byte AllReduce, rank 0's effective-byte
+    // lane delayed 100 µs — completed at 2 µs with rank 0 at 0/1 bytes).
+    // Every upload producer stamps the field; zero means zero.
     uint32_t effectiveSize = header.GetEffectiveDataSize();
-    if (effectiveSize == 0)
-    {
-        effectiveSize = header.GetPayloadSize();
-    }
     m_allReduceReceivedBytes[flowId][srcRank] += effectiveSize;
+
+    // LLR ack the accepted upload so the sender purges its retry entry
+    // (uploads ARE stored endpoint-side now; without an ack every entry
+    // would live until the retry limit declared a false permanent loss).
+    SendSharpLlrAck(header, inPort);
 
     // Store chunk sizes only (not full Packet objects) to avoid memory explosion.
     // Data content is dummy; only sizes are needed for multicast result creation.
@@ -944,11 +1167,14 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
     // each partition as soon as all GPUs have sent enough cumulative bytes.
     // This models real NVLS where the switch reduces data element-by-element
     // as it arrives and starts multicasting reduced partitions immediately.
+    // 0 means SINGLE-MULTICAST (legacy) mode, per the header contract
+    // ("0=old single-multicast mode, >=2=pipelined") — substituting the
+    // threshold here made 0 behave as N partitions, so --nvlsNumPartitions=0
+    // and =N produced identical pipelined runs (34.5 us / 48 switch
+    // transmissions at 4 GPU / 1 MiB / 2 links) while the sim's help text
+    // promised "0=single" (codex round 22, finding 7). 1 is also single
+    // (one partition covers the whole buffer), >= 2 pipelined.
     uint32_t numPartitions = m_allReduceNumPartitions;
-    if (numPartitions == 0 && m_allReduceThreshold > 0)
-    {
-        numPartitions = m_allReduceThreshold; // default: partition by numGpus
-    }
 
     if (numPartitions >= 2 && m_allReduceDataSize > 0 && sourceCount >= m_allReduceThreshold)
     {
@@ -998,17 +1224,38 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
                 receivedWireBytes += chunk.wireBytes;
                 receivedEffectiveBytes += chunk.effectiveBytes;
             }
-            uint64_t ratioWhole = receivedWireBytes / receivedEffectiveBytes;
-            uint64_t ratioRemainder = receivedWireBytes % receivedEffectiveBytes;
-            uint64_t wirePartitionSize =
-                thisPartitionSize * ratioWhole +
-                (thisPartitionSize * ratioRemainder +
-                 receivedEffectiveBytes - 1) /
-                    receivedEffectiveBytes;
-            Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
-                                &NvSwitch::MulticastAllReducePartition, this,
-                                flowId, k, thisPartitionSize, wirePartitionSize,
-                                numPartitions);
+            // Padding fragments carry wire bytes but zero effective bytes
+            // (codex round 19, finding 3): a source whose accepted uploads
+            // are all padding sums to receivedEffectiveBytes == 0, and the
+            // wire/effective ratio below would divide by zero. That cannot
+            // happen when the partition check runs on effective ledgers
+            // (every source has >= requiredBytes effective before we get
+            // here), but guard anyway — a zero-effective source maps its
+            // partition to wire bytes at the ratio 1 (no expansion).
+            uint64_t ratioWhole;
+            uint64_t ratioRemainder;
+            uint64_t wirePartitionSize;
+            if (receivedEffectiveBytes == 0)
+            {
+                ratioWhole = 1;
+                ratioRemainder = 0;
+                wirePartitionSize = thisPartitionSize;
+            }
+            else
+            {
+                ratioWhole = receivedWireBytes / receivedEffectiveBytes;
+                ratioRemainder = receivedWireBytes % receivedEffectiveBytes;
+                wirePartitionSize =
+                    thisPartitionSize * ratioWhole +
+                    (thisPartitionSize * ratioRemainder +
+                     receivedEffectiveBytes - 1) /
+                        receivedEffectiveBytes;
+            }
+            m_deferredResultEvents.push_back(
+                Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+                                    &NvSwitch::MulticastAllReducePartition, this,
+                                    flowId, k, thisPartitionSize, wirePartitionSize,
+                                    numPartitions));
         }
 
         m_allReduceCompletedPartitions[flowId] = currentCompleted;
@@ -1035,11 +1282,21 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
             allComplete = true;
         }
 
-        if (allComplete)
+        if (allComplete
+            && m_allReduceLegacyMulticastDone.find(flowId)
+                   == m_allReduceLegacyMulticastDone.end())
         {
-            Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
-                                &NvSwitch::MulticastAllReduceResult, this,
-                                flowId, sourceCount);
+            // Mark BEFORE scheduling (codex round 22, finding 1): the
+            // allComplete test re-runs on every later upload — late padding
+            // fragments that land after this multicast clears the buffer
+            // would schedule a SECOND result event onto the cleared buffer
+            // (empty begin() deref, SIGSEGV). The collective is one-shot;
+            // once its result has gone out, later fragments are wire noise.
+            m_allReduceLegacyMulticastDone.insert(flowId);
+            m_deferredResultEvents.push_back(
+                Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+                                    &NvSwitch::MulticastAllReduceResult, this,
+                                    flowId, sourceCount));
         }
     }
 }
@@ -1053,19 +1310,17 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
 
     // Each GPU sent dataSize bytes. The switch reduces all N contributions
     // element-wise, producing a single result of dataSize. We use one GPU's
-    // chunk sizes to create result packets of the same sizes.
+    // chunk sizes to create result packets of the same sizes. Copy the chunk
+    // sizes BEFORE clearing the buffer: gpuBuffers.clear() destroys the map
+    // values the reference would dangle into.
     auto firstGpu = gpuBuffers.begin();
-    const auto& chunkSizes = firstGpu->second;
+    const auto chunkSizes = firstGpu->second;
 
     // Clear buffer before multicast
     gpuBuffers.clear();
 
     // Group ports by GPU rank for spraying chunks across multiple links per GPU
-    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts;
-    for (const auto& entry : m_portRankMap)
-    {
-        rankPorts[entry.second].push_back(entry.first);
-    }
+    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts = BuildRankPorts();
 
     // Multicast result packets to each GPU. Create new packets from stored
     // chunk sizes (data content is dummy — only size matters for timing).
@@ -1086,20 +1341,36 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisEffectiveSize);
-            resultHeader.SetSequenceNumber(m_multicastSeqNum++);
+            // Per-(dest,flow) seq: reorder buffers expect each
+            // (vc,flow,source) stream to start at 0 (see m_multicastSeqNums'
+            // note).
+            resultHeader.SetSequenceNumber(
+                m_multicastSeqNums[(uint64_t{destRank} << 16) | flowId]++);
+            m_multicastSeqNum++;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
             pkt->AddHeader(resultHeader);
 
             // Spray chunks across this GPU's ports
             uint32_t portIdx = ports[chunkIdx % ports.size()];
-            m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            StoreMulticastResult(destRank, flowId, portIdx,
+                                 resultHeader.GetSequenceNumber(), pkt);
+            SendMulticastResultOnPort(portIdx, pkt);
         }
     }
 
     NS_LOG_INFO("SHARP AllReduce: multicast " << chunkSizes.size()
                 << " result packets for flowId=" << flowId
                 << " to " << rankPorts.size() << " GPUs");
+
+    // Flow complete: retire the byte ledgers. The upload dedup ledger
+    // (m_seenUploadSeqs) deliberately SURVIVES the result: a retransmitted
+    // upload whose LLR ack raced the multicast must still be rejected, or
+    // the replay re-accumulates the ledgers and the switch multicasts a
+    // second full result from bytes it already holds (codex round 12,
+    // finding 5). It is one uint32 per accepted upload, cleared in
+    // DoDispose with the other per-flow state.
+    m_allReduceReceivedBytes.erase(flowId);
 }
 
 void
@@ -1112,11 +1383,7 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
                          << wirePartitionSize << numPartitions);
 
     // Group ports by GPU rank for spraying chunks across multiple links per GPU
-    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts;
-    for (const auto& entry : m_portRankMap)
-    {
-        rankPorts[entry.second].push_back(entry.first);
-    }
+    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts = BuildRankPorts();
 
     // Create result packets totaling wirePartitionSize, sprayed across GPU's ports.
     // Ensure at least one chunk per link (like SendCollective) so all links are
@@ -1167,16 +1434,25 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisEffectiveSize);
-            resultHeader.SetSequenceNumber(m_multicastSeqNum++);
+            // Per-(dest,flow) seq: reorder buffers expect each
+            // (vc,flow,source) stream to start at 0 (see m_multicastSeqNums'
+            // note).
+            resultHeader.SetSequenceNumber(
+                m_multicastSeqNums[(uint64_t{destRank} << 16) | flowId]++);
+            m_multicastSeqNum++;
 
             pkt->AddHeader(resultHeader);
 
             uint32_t portIdx = ports[chunkIdx % ports.size()];
-            m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            StoreMulticastResult(destRank, flowId, portIdx,
+                                 resultHeader.GetSequenceNumber(), pkt);
+            SendMulticastResultOnPort(portIdx, pkt);
         }
     }
 
-    // Clean up buffer after last partition is multicast
+    // Clean up buffer after last partition is multicast. m_seenUploadSeqs
+    // survives (see the non-partitioned path): late replays of the flow's
+    // upload seqs must stay rejected after the result, not re-counted.
     if (partitionIdx == numPartitions - 1)
     {
         m_allReduceBuffer.erase(flowId);
@@ -1368,16 +1644,26 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
     uint16_t flowId = header.GetFlowId();
     uint16_t srcRank = header.GetSourceRank();
 
+    // Dedup gate: mirror ProcessAllReduce — a retransmitted upload must not
+    // advance the aggregation ledgers (re-ACK only).
+    if (!RegisterUploadSeq(flowId, srcRank, header.GetSequenceNumber()))
+    {
+        SendSharpLlrAck(header, inPort);
+        return;
+    }
+
     // Learn port-to-rank mapping
     m_portRankMap[inPort] = srcRank;
 
-    // Track bytes received per (flowId, srcRank)
+    // Track bytes received per (flowId, srcRank) — effective bytes only,
+    // same rule as ProcessAllReduce (codex round 19, finding 3): padding
+    // fragments stamp zero effective bytes and must contribute zero, not
+    // their wire payload.
     uint32_t effectiveSize = header.GetEffectiveDataSize();
-    if (effectiveSize == 0)
-    {
-        effectiveSize = header.GetPayloadSize();
-    }
     m_allGatherReceivedBytes[flowId][srcRank] += effectiveSize;
+
+    // LLR ack the accepted upload (see ProcessAllReduce's SendSharpLlrAck note).
+    SendSharpLlrAck(header, inPort);
 
     // Store chunk sizes only (not full Packet objects) to avoid memory explosion.
     m_allGatherBuffer[flowId][srcRank].push_back(effectiveSize);
@@ -1388,16 +1674,44 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
                  << " sources=" << sourceCount << "/" << m_allGatherThreshold
                  << " bytes=" << m_allGatherReceivedBytes[flowId][srcRank]);
 
-    // Check if all GPUs have sent their chunk
+    // Check if all GPUs have sent their FULL chunk. The injectors upload the
+    // frozen chunk grid — base dataSize/numGpus plus one extra byte for the
+    // first dataSize%numGpus ranks (NvlsAllGather's TriggerSendPhase) — so a
+    // source's expected bytes are chunk + (src < remainder ? 1 : 0), not the
+    // uniform chunkSize. Requiring only the uniform floor let a 4-GPU / 9-B
+    // AllGather aggregate after the switch saw 2 bytes from rank 0 (its
+    // third byte still in flight on a delayed lane): the multicast carried
+    // 8 bytes, the ledger was retired, and the trailing byte started a new
+    // aggregation that never completed — every receiver stuck at 8/9 (codex
+    // round 18, finding 3). When dataSize was set, derive the per-source
+    // expectation from it; fall back to the uniform chunk otherwise.
+    //
+    // Degenerate grid (codex round 19, finding 6): ranks at or past dataSize
+    // hold a ZERO-sized chunk and never upload — sourceCount never reaches
+    // the threshold and the aggregation stalled to the 1-hour cap (D=3/N=4
+    // stopped at 3/4 sources; D=1 at 1/4). When dataSize is known, a rank
+    // with expected == 0 is satisfied by construction, so the gate counts
+    // sources with actual traffic plus zero-chunk ranks that owe nothing.
     bool allComplete = false;
     if (m_allGatherChunkSize > 0)
     {
-        if (sourceCount >= m_allGatherThreshold)
+        uint64_t numGpus = m_allGatherThreshold;
+        uint64_t satisfied = sourceCount;
+        if (m_allGatherDataSize > 0 && m_allGatherDataSize < numGpus)
+        {
+            satisfied += numGpus - m_allGatherDataSize; // zero-chunk ranks owe nothing
+        }
+        if (satisfied >= numGpus)
         {
             allComplete = true;
             for (const auto& src : m_allGatherReceivedBytes[flowId])
             {
-                if (src.second < m_allGatherChunkSize)
+                uint64_t expected = m_allGatherChunkSize;
+                if (m_allGatherDataSize > 0)
+                {
+                    expected += (src.first < (m_allGatherDataSize % numGpus)) ? 1 : 0;
+                }
+                if (src.second < expected)
                 {
                     allComplete = false;
                     break;
@@ -1407,14 +1721,20 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
     }
     else
     {
-        allComplete = (sourceCount >= m_allGatherThreshold);
+        uint64_t satisfied = sourceCount;
+        if (m_allGatherDataSize > 0 && m_allGatherDataSize < m_allGatherThreshold)
+        {
+            satisfied += m_allGatherThreshold - m_allGatherDataSize;
+        }
+        allComplete = (satisfied >= m_allGatherThreshold);
     }
 
     if (allComplete)
     {
-        Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
-                            &NvSwitch::MulticastAllGatherResult, this,
-                            flowId, sourceCount);
+        m_deferredResultEvents.push_back(
+            Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+                                &NvSwitch::MulticastAllGatherResult, this,
+                                flowId, sourceCount));
     }
 }
 
@@ -1438,11 +1758,7 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
     gpuBuffers.clear();
 
     // Group ports by GPU rank for spraying
-    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts;
-    for (const auto& entry : m_portRankMap)
-    {
-        rankPorts[entry.second].push_back(entry.first);
-    }
+    std::unordered_map<uint16_t, std::vector<uint32_t>> rankPorts = BuildRankPorts();
 
     // Multicast all concatenated chunks to each GPU. Create new packets from
     // stored chunk sizes (data content is dummy — only size matters for timing).
@@ -1462,19 +1778,215 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
             resultHeader.SetDestRank(destRank);
             resultHeader.SetPayloadSize(thisChunkSize);
             resultHeader.SetEffectiveDataSize(thisChunkSize);
-            resultHeader.SetSequenceNumber(m_multicastSeqNum++);
+            // Per-(dest,flow) seq: reorder buffers expect each
+            // (vc,flow,source) stream to start at 0 (see m_multicastSeqNums'
+            // note).
+            resultHeader.SetSequenceNumber(
+                m_multicastSeqNums[(uint64_t{destRank} << 16) | flowId]++);
+            m_multicastSeqNum++;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
             pkt->AddHeader(resultHeader);
 
             uint32_t portIdx = ports[chunkIdx % ports.size()];
-            m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+            StoreMulticastResult(destRank, flowId, portIdx,
+                                 resultHeader.GetSequenceNumber(), pkt);
+            SendMulticastResultOnPort(portIdx, pkt);
         }
     }
 
     NS_LOG_INFO("NVLS AllGather: multicast " << allChunkSizes.size()
                 << " result chunks for flowId=" << flowId
                 << " to " << rankPorts.size() << " GPUs");
+
+    // Flow complete: retire the byte ledger. m_seenUploadSeqs deliberately
+    // survives the result multicast (see the AllReduce path's note): a late
+    // replay of an accepted (flow, src, seq) must stay a rejected duplicate,
+    // not re-accumulate the ledger into a second result.
+    m_allGatherReceivedBytes.erase(flowId);
+}
+
+void
+NvSwitch::SendSharpLlrAck(const FabricHeader& uploadHeader, uint32_t inPort)
+{
+    // No LLR on the fabric -> the sender has no retry entry to purge, and an
+    // unsolicited ack would be counted by the endpoint as a retry miss.
+    if (!m_llrEnabled)
+    {
+        return;
+    }
+    if (inPort >= m_ports.size())
+    {
+        return;
+    }
+    FabricHeader ackHeader;
+    ackHeader.SetPacketType(FabricPacketType::ACK);
+    ackHeader.SetFabricType(uploadHeader.GetFabricType());
+    // SourceRank mirrors the upload's DestRank (the switch-addressed
+    // destination): the endpoint's ProcessAckPacket removes its stored entry
+    // under (seq, dest, flow, vc) — the same key space the switch's BER NACK
+    // already uses — so this must NOT use the 0xFFFF result sentinel.
+    ackHeader.SetSourceRank(uploadHeader.GetDestRank());
+    ackHeader.SetDestRank(uploadHeader.GetSourceRank());
+    ackHeader.SetSequenceNumber(uploadHeader.GetSequenceNumber());
+    ackHeader.SetFlowId(uploadHeader.GetFlowId());
+    ackHeader.SetVirtualChannel(uploadHeader.GetVirtualChannel());
+
+    Ptr<Packet> ackPkt = Create<Packet>(0);
+    ackPkt->AddHeader(ackHeader);
+    m_ports[inPort]->Send(ackPkt, Mac48Address::GetBroadcast(), 0x0800);
+}
+
+void
+NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
+{
+    if (portIdx >= m_ports.size() || !m_ports[portIdx])
+    {
+        return;
+    }
+
+    // FEC egress for the multicast result path. These sends are direct port
+    // Sends, so without this they bypass FEC entirely: with RS(544,514,15) a
+    // 65,536-B result fragment serialized as 65,536 wire bytes where
+    // GetEncodedSize requires 70,040 (codex round 12, finding 7). Mirror the
+    // endpoint egress convention exactly: pad the body to the encoded size
+    // (the FEC receiver strips parity via header.GetPayloadSize()), and hold
+    // the send for the codec latency like ForwardPacket's scheduled path.
+    // The un-padded packet still goes to StoreMulticastResult: repairs
+    // re-expand from the header's payload size on their own pass through
+    // here.
+    uint64_t wireSize = pkt->GetSize();
+    Time codingLatency = Seconds(0);
+    if (m_fecModel && m_fecModel->IsEnabled() && PortUsesFec(portIdx))
+    {
+        FabricHeader header;
+        if (pkt->PeekHeader(header))
+        {
+            uint32_t payloadSize = pkt->GetSize() - header.GetSerializedSize();
+            uint32_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
+            if (encodedPayloadSize > payloadSize)
+            {
+                uint32_t padding = encodedPayloadSize - payloadSize;
+                pkt->AddAtEnd(Create<Packet>(padding));
+                wireSize = header.GetSerializedSize() + encodedPayloadSize;
+            }
+            codingLatency = m_fecModel->GetEncodeLatency()
+                            + m_fecModel->GetDecodeLatency();
+        }
+    }
+    m_txTrace(pkt);
+    m_txPackets++;
+    m_txBytes += wireSize;
+
+    if (codingLatency > Seconds(0))
+    {
+        m_deferredResultEvents.push_back(
+            Simulator::Schedule(codingLatency, [this, portIdx, pkt]() {
+                if (portIdx < m_ports.size() && m_ports[portIdx])
+                {
+                    m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+                }
+            }));
+    }
+    else
+    {
+        m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+    }
+}
+
+void
+NvSwitch::StoreMulticastResult(uint16_t destRank, uint16_t flowId,
+                               uint32_t portIdx, uint32_t seqNum, Ptr<Packet> pkt)
+{
+    // Only needed for NACK-driven retransmit; skip when LLR is off (results
+    // are best-effort in that regime, matching legacy behavior).
+    if (!m_llrEnabled)
+    {
+        return;
+    }
+    // Keep the stamped header only — the body is dummy bytes (only sizes
+    // matter for timing), so a retransmit rebuilds it from the header's
+    // payload size. A full copy per fragment forced the old 512-entry window,
+    // which evicted fragments before their first delivery at real scales
+    // (1,024 fragments/dest on an 8-GPU 128-MiB allgather).
+    FabricHeader header;
+    if (!pkt->PeekHeader(header))
+    {
+        return;
+    }
+    // Entries belong to a FLOW and the store is keyed per (dest, flow), so
+    // concurrent flows keep INDEPENDENT windows — each bounded by
+    // SHARP_RESULT_WINDOW on its own. The old wholesale erase of the
+    // previous flow's window assumed "a new flow's results imply the old
+    // flow completed", but completion is not DELIVERY: flow 2 could
+    // aggregate and multicast while flow 1's results are still in flight,
+    // and the erase destroyed flow 1's repair state — a later NACK for
+    // flow 1/seq 0 then fell back to flow 2's window and retransmitted the
+    // WRONG flow's fragment while flow 1's loss stayed unrecoverable
+    // (codex round 24, finding 4). Eviction of an old flow's window now
+    // happens only through its own bound (the safety valve) or DoDispose;
+    // seq streams are per-(dest, flow), so cross-flow key collisions are
+    // impossible.
+    uint64_t key = (static_cast<uint64_t>(destRank) << 16) | flowId;
+    auto& window = m_sharpResultStore[key];
+    m_lastResultFlow[destRank] = flowId;
+    window.push_back({seqNum, portIdx, 0, header});
+    while (window.size() > SHARP_RESULT_WINDOW)
+    {
+        window.pop_front();
+    }
+}
+
+bool
+NvSwitch::HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort)
+{
+    (void)inPort;
+    uint16_t requestingRank = nackHeader.GetSourceRank();
+    uint32_t seqNum = nackHeader.GetSequenceNumber();
+
+    // The store is keyed per (dest, flow) and the NACK NAMES the flow it
+    // lost a fragment of: repair must serve THAT flow's window only. The
+    // old fallback to the dest's last stored flow silently re-keyed a
+    // flow-1 NACK onto flow 2's window after flow 1's entries were dropped
+    // — retransmitting the wrong flow's fragment while the requested one
+    // stayed unrecoverable (codex round 24, finding 4). A named-flow miss
+    // (stale/evicted/bogus flow id) is a genuine repair failure: false.
+    uint16_t flowId = nackHeader.GetFlowId();
+    auto destIt = m_sharpResultStore.find(
+        (static_cast<uint64_t>(requestingRank) << 16) | flowId);
+    if (destIt == m_sharpResultStore.end())
+    {
+        return false;
+    }
+    auto& window = destIt->second;
+    for (auto& entry : window)
+    {
+        if (entry.seqNum != seqNum)
+        {
+            continue;
+        }
+        if (entry.portIdx >= m_ports.size() || !IsPortOperational(entry.portIdx))
+        {
+            return false;
+        }
+        if (entry.retransmits >= SHARP_RESULT_RETRY_LIMIT)
+        {
+            NS_LOG_WARN("Switch result retransmit limit reached for seq "
+                        << seqNum << " destRank " << requestingRank);
+            return false;
+        }
+        entry.retransmits++;
+        // Rebuild the body (dummy bytes — only the size matters) and stamp
+        // the stored header so the retransmit is wire-identical in shape.
+        // Re-expands FEC parity on FEC ports like the original multicast.
+        Ptr<Packet> pkt = Create<Packet>(entry.header.GetPayloadSize());
+        pkt->AddHeader(entry.header);
+        SendMulticastResultOnPort(entry.portIdx, pkt);
+        NS_LOG_DEBUG("Switch retransmit multicast result seq " << seqNum
+                     << " to rank " << requestingRank);
+        return true;
+    }
+    return false;
 }
 
 } // namespace ns3

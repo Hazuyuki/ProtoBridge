@@ -19,6 +19,7 @@
 #include "ns3/callback.h"
 
 #include <vector>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <queue>
@@ -95,12 +96,51 @@ class LlrManager : public Object
     bool StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank);
 
     /**
+     * @brief (Re)arm the retry-timeout on a stored source entry for a packet
+     *        that is only NOW reaching the wire.
+     *
+     * StorePacket arms the timer at enqueue time, but several gates can hold
+     * a packet after StorePacket and before its first transmission: the
+     * DCQCN/RTTCC per-flow pacer (shapingDelay schedules the NetDevice send
+     * into the future), WFQ contention service time, and FEC encode latency.
+     * A timeout shorter than that hold makes the retry budget expire for a
+     * packet that was never lost — it degrades to permanent loss on a
+     * loss-free link (codex round 12, finding 4). The egress sites call
+     * this at the moment the packet actually leaves.
+     */
+    void ArmRetryTimeoutAtTransmission(uint32_t seqNum, uint16_t destRank,
+                                       uint16_t flowId, uint8_t vcId = 0);
+
+    /**
      * @brief Remove a packet from the retry buffer (individual ACK received)
      * @param seqNum Sequence number of the ACKed packet
      * @param destRank Destination rank of the ACKed packet
      * @param flowId Flow ID of the packet
+     * @return true if an entry was actually removed (the ACK retired a live
+     *         retry entry); false for a duplicate ACK whose entry is gone
      */
-    void RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    bool RemovePacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
+
+    /**
+     * @brief Peek the FabricHeader packet type of a live outstanding entry.
+     *
+     * Credit bookkeeping on ACK/permanent-loss needs to know whether the
+     * ACKed sequence actually consumed a credit on send. NVLS/SHARP uploads
+     * (ALLREDUCE/ALLGATHER) bypass credit, yet the switch's LLR ack for them
+     * now travels the same ProcessAckPacket path — without the type check
+     * the ack-side recovery would return a credit the send never drew and
+     * grow the VC pool past its total.
+     *
+     * @param seqNum Sequence number of the stored packet
+     * @param destRank Destination rank of the stored packet
+     * @param flowId Flow ID of the stored packet
+     * @param vcId Virtual channel of the stored packet
+     * @param outType Set to the entry's FabricHeader packet type
+     * @return true when a live entry was found (outType valid)
+     */
+    bool PeekOutstandingPacketType(uint32_t seqNum, uint16_t destRank,
+                                   uint16_t flowId, uint8_t vcId,
+                                   uint8_t& outType) const;
 
     /**
      * @brief Remove all packets up to a sequence number (cumulative ACK)
@@ -108,7 +148,7 @@ class LlrManager : public Object
      * @param destRank Destination rank of the packets
      * @param flowId Flow ID of the packets
      */
-    void RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    void RemovePacketsUpTo(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     /**
      * @brief Remove specifically ACKed packets (SACK block)
@@ -116,7 +156,7 @@ class LlrManager : public Object
      * @param destRank Destination rank of the packets
      * @param flowId Flow ID of the packets
      */
-    void RemoveSackedPackets(const std::unordered_set<uint32_t>& ackedSeqNums, uint16_t destRank, uint16_t flowId);
+    void RemoveSackedPackets(const std::unordered_set<uint32_t>& ackedSeqNums, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     // --- Retransmission ---
 
@@ -125,23 +165,27 @@ class LlrManager : public Object
      * @param seqNum Sequence number of the failed packet
      * @param sourceRank Rank that sent the retry request
      * @param flowId Flow ID of the failed packet
+     * @param vcId Virtual channel of the failed packet (from the NACK header)
      * @return Retransmissions and their source-read delays
      */
     std::vector<Retransmission> HandleRetryRequest(uint32_t seqNum,
                                                    uint16_t sourceRank,
-                                                   uint16_t flowId);
+                                                   uint16_t flowId,
+                                                   uint8_t vcId);
 
     /**
      * @brief Handle a SACK retry request from a peer
      * @param nackSeqNums Set of sequence numbers that need retransmission
      * @param sourceRank Rank that sent the SACK
      * @param flowId Flow ID of the packets
+     * @param vcId Virtual channel of the packets (from the NACK header)
      * @return Retransmissions and their source-read delays
      */
     std::vector<Retransmission> HandleSackRequest(
         const std::unordered_set<uint32_t>& nackSeqNums,
         uint16_t sourceRank,
-        uint16_t flowId);
+        uint16_t flowId,
+        uint8_t vcId);
 
     // --- Retry limit ---
 
@@ -159,8 +203,22 @@ class LlrManager : public Object
      * @brief Set callback invoked when a retry timeout fires
      * The callback receives (seqNum, destRank, flowId) and should trigger retransmission
      */
-    typedef Callback<void, uint32_t, uint16_t, uint16_t> TimeoutCallback;
+    typedef Callback<void, uint32_t, uint16_t, uint16_t, uint8_t> TimeoutCallback;
     void SetTimeoutCallback(TimeoutCallback cb);
+
+    /**
+     * @brief Sever every endpoint-binding and cancel every armed timer.
+     *
+     * Called by the owning FabricEndpoint::DoDispose BEFORE it drops its
+     * m_llrManager reference. The timeout and permanent-loss callbacks hold
+     * the endpoint's raw `this`, and the per-entry retry timers can outlive
+     * the endpoint when an external holder keeps the manager alive via
+     * GetLlrManager() — a firing timer then invokes OnLlrRetryTimeout on
+     * freed endpoint memory (codex round 17, finding 3). Nulling the
+     * callbacks makes a late OnRetryTimeout a no-op; Clear() cancels the
+     * timers outright.
+     */
+    void DetachFromEndpoint();
 
     // --- Buffer size ---
 
@@ -168,7 +226,7 @@ class LlrManager : public Object
     uint32_t GetMaxBufferSize() const;
     uint32_t GetBufferSize() const;
     uint32_t GetPeakBufferSize() const;
-    bool HasOutstandingPacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId) const;
+    bool HasOutstandingPacket(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0) const;
     uint64_t GetRetransmittedPackets() const;
     uint64_t GetOverflowCount() const;
     uint64_t GetPermanentLossCount() const;
@@ -209,7 +267,6 @@ class LlrManager : public Object
     {
         Ptr<Packet> packet;
         uint16_t destRank;
-        EventId timeoutEvent;
     };
 
     struct SourceEntry
@@ -217,12 +274,24 @@ class LlrManager : public Object
         Ptr<Packet> packet;
         uint16_t destRank;
         uint32_t retryCount;
+        // True once the packet's retry-timeout countdown has started (first
+        // wire transmission, or a NACK/timeout retransmission). A fresh send
+        // held by the egress pacer/contention/FEC gates has NOT started its
+        // countdown — starting it at enqueue time expiring the retry budget
+        // for a packet that was never lost (codex round 12, finding 4).
+        bool wireArmed{false};
+        // The retry-timeout timer lives on the SOURCE entry, not the
+        // retry-buffer entry: the source store is the packet's lifetime
+        // (until ACK), while a retry-buffer copy can be evicted by
+        // EnforceBufferLimit or refused outright by DROP_NEWEST -- either
+        // would strand an un-ACKed packet with no timeout backstop.
+        EventId timeoutEvent;
     };
 
     /**
      * @brief Handle retry timeout for a specific packet
      */
-    void OnRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId);
+    void OnRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId = 0);
 
     /**
      * @brief Enforce buffer size limit by evicting entries
@@ -230,17 +299,45 @@ class LlrManager : public Object
      */
     bool EnforceBufferLimit();
     Time ReserveSourceReload(uint32_t bytes);
-    void RemoveOutstandingPacket(uint64_t key);
 
-    // Retry buffer key: (destRank << 48) | (flowId << 32) | seqNum
-    // This prevents collisions between different flows/destinations that produce the same seqNum.
-    typedef uint64_t RetryKey;
-    static RetryKey MakeRetryKey(uint32_t seqNum, uint16_t destRank, uint16_t flowId)
+    // Retry buffer key: the FULL (destRank, vcId, flowId, seqNum) tuple.
+    // Previously packed into a uint64 as (destRank << 56) | (vc << 48) |
+    // (flow << 32) | seq — but destRank is 16 bits, so only its low 8 bits
+    // survived the shift and destinations 1 and 257 collided. The struct
+    // carries every field at full width.
+    struct RetryKey
     {
-        return (static_cast<uint64_t>(destRank) << 48) | (static_cast<uint64_t>(flowId) << 32) | seqNum;
+        uint32_t seqNum;
+        uint16_t destRank;
+        uint16_t flowId;
+        uint8_t vcId;
+        bool operator==(const RetryKey& o) const
+        {
+            return seqNum == o.seqNum && destRank == o.destRank
+                && flowId == o.flowId && vcId == o.vcId;
+        }
+    };
+    static RetryKey MakeRetryKey(uint32_t seqNum, uint16_t destRank, uint16_t flowId,
+                                 uint8_t vcId = 0)
+    {
+        return RetryKey{seqNum, destRank, flowId, vcId};
     }
-    std::unordered_map<uint64_t, RetryEntry> m_retryBuffer;
-    std::unordered_map<uint64_t, SourceEntry> m_sourceStore;
+    struct RetryKeyHash
+    {
+        size_t operator()(const RetryKey& k) const
+        {
+            // seqNum is the discriminating field for entries that share a
+            // (dest, vc, flow); mix it with the flow identity.
+            return std::hash<uint64_t>()(
+                (static_cast<uint64_t>(k.destRank) << 48)
+                ^ (static_cast<uint64_t>(k.vcId) << 40)
+                ^ (static_cast<uint64_t>(k.flowId) << 24)
+                ^ k.seqNum);
+        }
+    };
+    std::unordered_map<RetryKey, RetryEntry, RetryKeyHash> m_retryBuffer;
+    std::unordered_map<RetryKey, SourceEntry, RetryKeyHash> m_sourceStore;
+    void RemoveOutstandingPacket(const RetryKey& key);
     uint32_t m_retryLimit;
     Time m_retryTimeout;
     LlrMode m_llrMode;

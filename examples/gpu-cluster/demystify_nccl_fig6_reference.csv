@@ -1,0 +1,75 @@
+# Demystifying NCCL (arXiv:2507.04786) Figure 6 -- AllReduce runtime,
+# INTRA-NODE panels (right column), digitized via pixel extraction.
+# Testbed (paper Sec. VII): CSCS Alps, one node = 4x GH200 fully connected
+# all-to-all, six 200 Gb/s NVLink4 links per GPU pair = 150 GB/s per
+# direction per pair (=> 450 GB/s aggregate egress per GPU); NCCL 2.19.1,
+# 20 runs per point, intra-node curves are medians (low variance).
+# Protocols forced via NCCL_PROTO (LL / LL128 / Simple); algorithm via
+# NCCL_ALGO (Ring / Tree). Sizes 2^14..2^32 bytes.
+# Digitization: main-panel y calibrated on the 10-ms gridlines
+# (tree: row 328=0ms, 51.0 px/10ms; ring: row 331=0ms, 62.3 px/10ms);
+# sizes <= 2^22 read from the zoom insets (inset1 0-0.05 ms for 2^14/2^16,
+# inset2 0-0.1 ms for 2^18/2^20/2^22, tick rows pixel-measured).
+# Estimated digitization error: ~2% (main panel), ~0.002 ms (insets).
+# Columns: algorithm,size_bytes,protocol,runtime_ms,source
+algorithm,size_bytes,protocol,runtime_ms,source
+tree,16384,simple,0.031934,inset1
+tree,65536,simple,0.036874,inset1
+tree,262144,simple,0.038948,inset2
+tree,1048576,simple,0.052956,inset2
+tree,4194304,simple,0.109142,inset2
+tree,16777216,simple,0.226108,main
+tree,67108864,simple,0.547606,main
+tree,268435456,simple,1.801802,main
+tree,1073741824,simple,7.034093,main
+tree,4294967296,simple,27.535260,main
+tree,16384,ll,0.015504,inset1
+tree,65536,ll,0.016663,inset1
+tree,262144,ll,0.020690,inset2
+tree,1048576,ll,0.032141,inset2
+tree,4194304,ll,0.073511,inset2
+tree,16777216,ll,0.220044,main
+tree,67108864,ll,0.929330,main
+tree,268435456,ll,3.333333,main
+tree,1073741824,ll,13.749020,main
+tree,4294967296,ll,55.216817,main
+tree,16384,ll128,0.019178,inset1
+tree,65536,ll128,0.020016,inset1
+tree,262144,ll128,0.021552,inset2
+tree,1048576,ll128,0.029121,inset2
+tree,4194304,ll128,0.057210,inset2
+tree,16777216,ll128,0.100040,main
+tree,67108864,ll128,0.514463,main
+tree,268435456,ll128,2.039904,main
+tree,1073741824,ll128,7.721251,main
+tree,4294967296,ll128,29.557823,main
+ring,16384,simple,0.035531,inset1
+ring,65536,simple,0.032882,inset1
+ring,262144,simple,0.034173,inset2
+ring,1048576,simple,0.037069,inset2
+ring,4194304,simple,0.051632,inset2
+ring,16777216,simple,0.160514,main
+ring,67108864,simple,0.393471,main
+ring,268435456,simple,1.294141,main
+ring,1073741824,simple,4.854105,main
+ring,4294967296,simple,19.184932,main
+ring,16384,ll,0.012544,inset1
+ring,65536,ll,0.012728,inset1
+ring,262144,ll,0.013793,inset2
+ring,1048576,ll,0.019583,inset2
+ring,4194304,ll,0.050377,inset2
+ring,16777216,ll,0.274657,main
+ring,67108864,ll,0.856073,main
+ring,268435456,ll,2.897435,main
+ring,1073741824,ll,11.396469,main
+ring,4294967296,ll,45.336533,main
+ring,16384,ll128,0.024458,inset1
+ring,65536,ll128,0.025210,inset1
+ring,262144,ll128,0.026264,inset2
+ring,1048576,ll128,0.028000,inset2
+ring,4194304,ll128,0.043417,inset2
+ring,16777216,ll128,0.178530,main
+ring,67108864,ll128,0.468827,main
+ring,268435456,ll128,1.379854,main
+ring,1073741824,ll128,5.304313,main
+ring,4294967296,ll128,20.891342,main

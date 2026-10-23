@@ -137,6 +137,12 @@ private:
     bool IsLocalRank(uint16_t rank) const;
     uint16_t GetLocalIdx(uint16_t globalRank) const;
     uint16_t GetGlobalRank(uint32_t nodeId, uint16_t localIdx) const;
+    /// Remainder-aware phase-1/4 segment of local index l (frozen grid:
+    /// D/g + (l < D%g); codex round 20, finding 3).
+    uint64_t LocalSegmentOf(uint16_t localIdx) const;
+    /// Remainder-aware phase-2/3 inter-node chunk of (node n, local index
+    /// l): segment(l)/N + (n < segment(l)%N). The two grids tile D exactly.
+    uint64_t InterChunkOf(uint32_t nodeId, uint16_t localIdx) const;
     uint64_t GetPhaseStartupDelayNs(uint64_t chunkSize) const;
 
     uint16_t m_numGpus;
@@ -191,6 +197,7 @@ private:
     std::vector<uint64_t> m_gpuReceivedBytes;
     std::vector<bool> m_gpuPhaseComplete;
     uint32_t m_completedGpuCount;
+    uint32_t m_permanentLossCount = 0; // permanently lost packets (not progress)
 
     // Per-GPU tracking for which local ranks have sent their inter-node data
     std::vector<bool> m_gpuInterNodeSendDone;

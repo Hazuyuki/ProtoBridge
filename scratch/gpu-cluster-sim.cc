@@ -13,6 +13,7 @@
 #include "ns3/gpu-cluster-helper.h"
 #include "ns3/fabric-endpoint.h"
 #include "ns3/nvswitch.h"
+#include "ns3/ethernet-switch.h"
 #include "ns3/ring-allreduce.h"
 #include "ns3/sharp-allreduce.h"
 #include "ns3/nvls-allgather.h"
@@ -29,6 +30,7 @@
 #include "ns3/hierarchical-allgather.h"
 #include "ns3/hierarchical-reducescatter.h"
 #include "ns3/hierarchical-alltoall.h"
+#include "ns3/nccl-ring-allreduce.h"
 #include "ns3/multi-node-topology-helper.h"
 #include "ns3/device-type.h"
 #include "ns3/fabric-type.h"
@@ -39,15 +41,19 @@
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/ub-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
+#include "ns3/ethernet-protocol-model.h"
 #include "ns3/dcqcn-rate-machine.h"
+#include "ns3/rttcc-rate-machine.h"
 #include "ns3/protocol-payload-builder.h"
 #include "ns3/nccl-protocol-payload-builder.h"
+#include "ns3/roce-payload-builder.h"
 #include "ns3/ub-payload-builder.h"
 
 #include "ns3/link-degradation.h"
 #include "ns3/fec-model.h"
 #include "ns3/llr-manager.h"
 #include "ns3/contention-model.h"
+#include "ns3/p2p-traffic.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/point-to-point-net-device.h"
 #include "ns3/point-to-point-channel.h"
@@ -56,6 +62,7 @@
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <queue>
 #include <unordered_map>
 #include <vector>
@@ -66,6 +73,48 @@ NS_LOG_COMPONENT_DEFINE("GpuClusterSim");
 
 static uint64_t g_durationNs = 0;
 static bool g_collectiveCompleted = false;
+
+// ---------------------------------------------------------------------------
+// Wire-transfer patterns (p2p / fanout / incast): bare point-to-point bulk
+// transfers on the SAME credit-gated bulk path (SendBulkWireTransferSize)
+// the collectives use — the credit-BDP experiment's non-collective arms.
+// Unlike the collective injectors there is no NCCL startup (bare-transfer
+// semantics, p2p-single.cfg precedent): completion = last chunk delivered.
+// Patterns (root = --rootRank, default 0):
+//   p2p     : one flow      root -> (root+1)%N
+//   fanout  : N-1 flows     root -> every other rank       (1-to-many)
+//   incast  : N-1 flows     every other rank -> root       (many-to-1)
+// ---------------------------------------------------------------------------
+static uint64_t g_patternExpectedBytes = 0;
+static uint64_t g_patternReceivedBytes = 0;
+static uint64_t g_patternStartNs = 0;
+
+void OnCollectiveComplete(uint64_t durationNs);  // defined below
+
+static void
+PatternReceive(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
+{
+    (void)srcRank;
+    // Control-plane packets (CREDIT/ACK/NACK) do not advance a transfer, and
+    // permanently lost data cannot complete a delivery (mirrors the
+    // collective injectors; only reachable at ber>0 / lossy fabrics, which
+    // these lossless experiments do not use).
+    if (header.GetPacketType() != FabricPacketType::DATA)
+    {
+        return;
+    }
+    uint64_t bytes = header.GetEffectiveDataSize();
+    if (bytes == 0)
+    {
+        bytes = packet->GetSize();
+    }
+    g_patternReceivedBytes += bytes;
+    if (g_patternExpectedBytes > 0
+        && g_patternReceivedBytes >= g_patternExpectedBytes)
+    {
+        OnCollectiveComplete(Simulator::Now().GetNanoSeconds() - g_patternStartNs);
+    }
+}
 
 // Adaptive algorithm selection (NCCL-like): pick the collective algorithm
 // from (topology, message size, N). Small/latency-bound messages favor tree
@@ -109,6 +158,71 @@ OnCollectiveComplete(uint64_t durationNs)
     g_durationNs = durationNs;
     g_collectiveCompleted = true;
     Simulator::Stop();
+}
+
+// ---------------------------------------------------------------------------
+// Random-traffic mode (--randTraffic): fixed-duration uniform-random So load.
+// Every rank injects fixed-size messages at a fixed interval derived from
+// --randInjectionRate (fraction of the inter-node line rate), each message to
+// a uniformly random rank on ANOTHER node. Messages go through
+// SendBulkWireTransferSize — the same SoHeader/ECN/DCQCN data path the
+// collectives use (SendP2p carries no SoHeader, so DCQCN would be inert).
+// Offered/delivered bytes are counted only inside the measurement window
+// [warmup, warmup+measure); the sim stops at the window end.
+// ---------------------------------------------------------------------------
+static bool g_randTrafficRan = false;
+static uint64_t g_randWindowStartNs = 0;
+static uint64_t g_randWindowEndNs = 0;
+static uint64_t g_randOfferedBytes = 0;
+static uint64_t g_randDeliveredBytes = 0;
+static uint64_t g_randMsgsSent = 0;
+
+static void
+RandTrafficReceive(uint16_t /*rank*/, Ptr<Packet> packet, FabricHeader header)
+{
+    uint64_t now = Simulator::Now().GetNanoSeconds();
+    if (now < g_randWindowStartNs || now >= g_randWindowEndNs)
+    {
+        return;
+    }
+    // A PERMANENT_LOSS callback is a terminal-loss NOTICE (a synthetic empty
+    // packet carrying the lost chunk's metadata), not a delivery: counting
+    // its effectiveDataSize as delivered goodput reported 1363.149 Gbps on a
+    // 2-node / 4-GPU / leafspine / drop-threshold-1 / retry-0 run whose true
+    // payload goodput is 298.844 Gbps — 203 of 260 counted "messages" were
+    // loss notices (codex round 24, finding 3).
+    if (header.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+    {
+        return;
+    }
+    uint32_t bytes = header.GetEffectiveDataSize();
+    if (bytes == 0 && packet)
+    {
+        bytes = packet->GetSize();
+    }
+    g_randDeliveredBytes += bytes;
+}
+
+static void
+RandTrafficSend(Ptr<FabricEndpoint> ep,
+                std::vector<uint16_t> remoteRanks,
+                Ptr<UniformRandomVariable> destPick,
+                uint32_t msgBytes, uint64_t intervalNs, uint8_t protocolId)
+{
+    uint64_t now = Simulator::Now().GetNanoSeconds();
+    if (now >= g_randWindowEndNs)
+    {
+        return;
+    }
+    uint16_t dest = remoteRanks[destPick->GetInteger(0, remoteRanks.size() - 1)];
+    if (now >= g_randWindowStartNs)
+    {
+        g_randOfferedBytes += msgBytes;
+        g_randMsgsSent++;
+    }
+    ep->SendBulkWireTransferSize(dest, msgBytes, protocolId, ep->GetRank(), 0);
+    Simulator::Schedule(NanoSeconds(intervalNs), &RandTrafficSend, ep,
+                        remoteRanks, destPick, msgBytes, intervalNs, protocolId);
 }
 
 int
@@ -243,6 +357,9 @@ main(int argc, char* argv[])
     uint64_t llrBufferSizeBytes = 0;  // Phase A.2: packets = llrBufferSizeBytes / sprayChunkSize
     std::string llrOverflowPolicyStr = "dropoldest";  // dropoldest/dropnewest
     uint64_t llrRetryTimeoutNs = 0;
+    bool llrTimeoutRetransmit = false;  // opt-in sender-side timeout retransmit backstop
+    uint32_t soTxWindow = 0;  // opt-in So bulk TX window in chunks (perftest tx_depth analog; 0=unbounded)
+    bool soGbnStrict = false; // opt-in strict So go-back-N receive semantics (in-order-only + one NAK/gap)
     uint64_t llrReloadBandwidthGBps = 4800;
     uint64_t llrReloadLatencyNs = 300;
 
@@ -258,6 +375,9 @@ main(int argc, char* argv[])
     uint32_t numNodes = 1;
     uint32_t gpusPerNode = 8;
     std::string interNodeTopology = "fullmesh";
+    uint32_t interNodeSpines = 0;
+    uint32_t interNodeTorusWidth = 0;
+    uint32_t interNodeDragonflyGroupSize = 0;
     uint64_t interNodeBandwidthGbps = 400;
     uint64_t interNodeLatencyNs = 10000;
     std::string interNodeFabricTypeStr = "RoCE";
@@ -268,6 +388,11 @@ main(int argc, char* argv[])
     // off = parity-safe); ECN marking itself is live (Phase B): the switch
     // marks SoHeader ECN at this VOQ depth on enqueue.
     uint32_t ecnThreshold = 8;
+    // Plain-Ethernet lossy VOQ tail-drop threshold (pkts); 0=off. Must be <
+    // NvSwitch::VoqDepth (the ETHERNET branch raises that to 1024) so the
+    // NACK path fires before the base hard-cap drop. Default 8 = the
+    // EthernetSwitch Attribute default (parity-neutral).
+    uint32_t voqDropThreshold = 8;
     // DCQCN rate machine (Phase B). Off by default: with no DcqcnRateMachine
     // mounted, CNPs are no-ops and SendPacketOnDevice adds zero shaping delay,
     // so all So runs stay bit-identical to the Phase-A baseline. On, a shared
@@ -280,14 +405,34 @@ main(int argc, char* argv[])
     // DCQCN rate machine (its true per-flow pacer enforces the cap) even when
     // --dcqcn is off. Calibrated to the ~49 Gbps single-QP ib_write_bw ceiling.
     double perQpCeilingGbps = 0.0;
+    // DCQCN rate-machine knobs (0/negative = keep the TypeId default; set
+    // via SetAttribute only when the user overrides, so the default path is
+    // byte-identical).
+    uint64_t dcqcnTFastNs = 0;        // 0 = default 50000 ns
+    uint32_t dcqcnFastCycles = 0;     // 0 = default 5
+    uint64_t dcqcnTAiNs = 0;          // 0 = default 100000 ns
+    double dcqcnRai = 0.0;            // 0 = default 0.01
+    double dcqcnGInit = 0.0;          // 0 = default 0.5
+    double dcqcnGDecay = 0.0;         // 0 = default 0.5
+    double dcqcnAlphaFloor = 0.0;     // 0 = default 0.0 (negative = no-op)
+    // RTTCC (RTT-probe-based congestion control, NVIDIA RTT-CC / Swift
+    // style). Off by default: no RttccRateMachine mounted => no probes, no
+    // pacing, byte-identical baseline. On, each So endpoint mounts its OWN
+    // machine (the flow key carries no source rank, so a shared machine
+    // would merge per-flow state across incast senders). Fabric-agnostic:
+    // unlike DCQCN it needs no ECN/CNP loop, so it is the congestion-control
+    // option for the plain lossy Ethernet fabric (and also runs on RoCE).
+    bool enableRttcc = false;
+    uint64_t rttccTargetRttNs = 0;      // 0 = machine default (10000 ns)
+    uint64_t rttccProbeIntervalNs = 0;  // 0 = machine default (5000 ns)
     std::string intraNodeTopology = "switched";
     std::string intraNodeAlgorithm = "fullmesh";
 
 
     CommandLine cmd;
     cmd.AddValue("topology", "Topology: ring/fullmesh/switched/fattree/railfattree/leafspine/nvl72/torus/mesh/hypercube/2dfullmesh/ndfullmesh/2dfullmeshclos", topology);
-    cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce", collective);
-    cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain", algorithm);
+    cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce/p2p/fanout/incast", collective);
+    cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain/hierarchical/ncclring", algorithm);
     cmd.AddValue("protocolModel", "Protocol model type: ns3::NcclProtocolModel/ns3::UbProtocolModel/ns3::McclProtocolModel", protocolModelType);
     cmd.AddValue("protocolWireEfficiency", "Protocol payload bytes divided by transmitted bytes", protocolWireEfficiency);
     cmd.AddValue("fabricType", "Fabric type: NVLink/ETH/ICI/HCCS/xGMI/MetaXLink/RoCE/UB", fabricTypeStr);
@@ -405,6 +550,25 @@ main(int argc, char* argv[])
                  llrBufferSizeBytes);
     cmd.AddValue("llrOverflowPolicy", "LLR overflow policy: dropoldest/dropnewest", llrOverflowPolicyStr);
     cmd.AddValue("llrRetryTimeout", "LLR retry timeout in ns (0=auto)", llrRetryTimeoutNs);
+    cmd.AddValue("llrTimeoutRetransmit",
+                 "Retransmit un-ACKed LLR entries when their retry timer fires (sender-side "
+                 "backstop; required for llrMode=sack under random loss where a lost NACK "
+                 "otherwise deadlocks the flow). Default 0 = timer fires but does nothing "
+                 "(legacy behavior, parity-safe).",
+                 llrTimeoutRetransmit);
+    cmd.AddValue("soTxWindow",
+                 "Bound the number of in-flight So bulk chunks per endpoint "
+                 "(NIC send-queue depth, perftest tx_depth analog; ACK-clocked "
+                 "via LLR per-packet ACKs, so it requires --llrEnabled). "
+                 "Default 0 = legacy unbounded synchronous dispatch.",
+                 soTxWindow);
+    cmd.AddValue("soGbnStrict",
+                 "Strict go-back-N receive semantics for So flows in "
+                 "llrMode=gobackn: in-order-only acceptance, out-of-order "
+                 "arrivals discarded (no ACK), one NAK per gap (IB responder "
+                 "behavior). Su (NVLink) traffic is never affected. "
+                 "Default false = legacy dedup that keeps OOO originals.",
+                 soGbnStrict);
     cmd.AddValue("llrReloadBandwidth",
                  "Backing-source bandwidth in GB/s for retry-buffer misses",
                  llrReloadBandwidthGBps);
@@ -444,18 +608,66 @@ main(int argc, char* argv[])
     cmd.AddValue("contentionCollectiveWeight", "WFQ weight for collective traffic", contentionCollectiveWeight);
     cmd.AddValue("contentionMemoryWeight", "WFQ weight for memory traffic", contentionMemoryWeight);
     cmd.AddValue("contentionP2pWeight", "WFQ weight for P2P traffic", contentionP2pWeight);
+
+    // Background P2P interferer: a self-driven P2pTraffic flow scheduled at
+    // bgP2pStartTimeNs that shares the fabric with the primary collective,
+    // exercising the WFQ contention model (multi-class numActive>1) and the
+    // So switch VOQ arbitration. Default off (parity-identical). The flow is
+    // unlimited (maxPackets=0); the sim stops when the collective completes.
+    bool bgP2pEnabled = false;
+    uint32_t bgP2pSrc = 0;
+    uint32_t bgP2pDst = 1;
+    uint64_t bgP2pSizeBytes = 1048576;   // 1 MiB
+    uint64_t bgP2pIntervalNs = 0;        // 0 = back-to-back
+    uint64_t bgP2pStartTimeNs = 0;       // absolute sim time (ns)
+    cmd.AddValue("bgP2pEnabled", "Inject a background P2P flow as a contention interferer", bgP2pEnabled);
+    cmd.AddValue("bgP2pSrc", "Background P2P source rank", bgP2pSrc);
+    cmd.AddValue("bgP2pDst", "Background P2P destination rank", bgP2pDst);
+    cmd.AddValue("bgP2pSizeBytes", "Background P2P packet size (bytes)", bgP2pSizeBytes);
+    cmd.AddValue("bgP2pIntervalNs", "Background P2P send interval (0=back-to-back)", bgP2pIntervalNs);
+    cmd.AddValue("bgP2pStartTimeNs", "Background P2P start time (ns from sim start)", bgP2pStartTimeNs);
+    // Random-traffic mode: replaces the collective injector with fixed-duration
+    // uniform-random cross-node bulk traffic (see the RandTrafficSend block
+    // above main). Default off (parity-identical). Injection rate is the
+    // per-source offered load as a fraction of the inter-node line rate.
+    bool randTrafficEnabled = false;
+    double randInjectionRate = 0.5;
+    uint32_t randMsgBytes = 65536;
+    uint64_t randWarmupNs = 50000;
+    uint64_t randMeasureNs = 200000;
+    cmd.AddValue("randTraffic", "Enable uniform-random cross-node traffic mode (replaces the collective; fixed-duration run)", randTrafficEnabled);
+    cmd.AddValue("randInjectionRate", "Per-source offered load as a fraction of the inter-node line rate (0,1]", randInjectionRate);
+    cmd.AddValue("randMsgBytes", "Random-traffic message size in bytes", randMsgBytes);
+    cmd.AddValue("randWarmupNs", "Random-traffic warmup before the measurement window (ns)", randWarmupNs);
+    cmd.AddValue("randMeasureNs", "Random-traffic measurement window length (ns); the sim stops at warmup+measure", randMeasureNs);
     cmd.AddValue("numNodes", "Number of GPU nodes (1=single-node, 2+=multi-node)", numNodes);
     cmd.AddValue("gpusPerNode", "GPUs per node (multi-node mode)", gpusPerNode);
-    cmd.AddValue("interNodeTopology", "Inter-node topology: fullmesh/ring/host/tor (tor = single shared leaf, 1 hop, ib_write_lat style)", interNodeTopology);
+    cmd.AddValue("interNodeTopology", "Inter-node topology: fullmesh/ring/host/tor/rail/leafspine/torus2d/dragonfly (tor = single shared leaf, 1 hop, ib_write_lat style; rail = one switch per local rank; leafspine = 2-tier Clos; torus2d/dragonfly = GPU-0-gateway direct topologies)", interNodeTopology);
+    cmd.AddValue("interNodeSpines", "leafspine: spine switch count (0 = auto: gpusPerNode, non-blocking)", interNodeSpines);
+    cmd.AddValue("interNodeTorusWidth", "torus2d: grid width (0 = auto: largest divisor <= sqrt(numNodes))", interNodeTorusWidth);
+    cmd.AddValue("interNodeDragonflyGroupSize", "dragonfly: nodes per group (0 = auto: divisor closest to sqrt(numNodes))", interNodeDragonflyGroupSize);
     cmd.AddValue("interNodeBandwidth", "Inter-node link bandwidth in Gbps", interNodeBandwidthGbps);
     cmd.AddValue("interNodeLatency", "Inter-node link latency in nanoseconds", interNodeLatencyNs);
     cmd.AddValue("interNodeFabricType", "Inter-node fabric type: RoCE/ETH/NVLink", interNodeFabricTypeStr);
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
     cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
+    cmd.AddValue("voqDropThreshold", "Lossy VOQ tail-drop threshold (pkts); 0=off. Plain ETH: always applied (default 8). RoCE: an EXPLICIT flag opts into the lossy/no-PFC regime (unset = lossless). Must be < switchVoqDepth (default 10000); keep > ecnThreshold for mark-before-drop", voqDropThreshold);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
+    cmd.AddValue("dcqcnTFastNs", "DCQCN fast-recovery timer interval in ns (0=default 50000)", dcqcnTFastNs);
+    cmd.AddValue("dcqcnFastCycles", "DCQCN fast-recovery cycles before additive increase (0=default 5)", dcqcnFastCycles);
+    cmd.AddValue("dcqcnTAiNs", "DCQCN additive-increase timer interval in ns (0=default 100000)", dcqcnTAiNs);
+    cmd.AddValue("dcqcnRai", "DCQCN additive Alpha decrement per AI tick (0=default 0.01)", dcqcnRai);
+    cmd.AddValue("dcqcnGInit", "DCQCN initial multiplicative step g on first CNP (0=default 0.5)", dcqcnGInit);
+    cmd.AddValue("dcqcnGDecay", "DCQCN multiplicative decay of g per fast cycle (0=default 0.5)", dcqcnGDecay);
+    cmd.AddValue("dcqcnAlphaFloor", "DCQCN Alpha floor, no shaping at/below (0=default 0.0)", dcqcnAlphaFloor);
+    cmd.AddValue("rttcc", "Enable RTTCC (RTT-probe-based) congestion control on So endpoints (off=parity-safe baseline)", enableRttcc);
+    cmd.AddValue("rttccTargetRttNs", "RTTCC target RTT in ns (0=default 10000); must exceed the base zero-queue RTT", rttccTargetRttNs);
+    cmd.AddValue("rttccProbeIntervalNs", "RTTCC min spacing between RTT probes per flow in ns (0=default 5000)", rttccProbeIntervalNs);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
     cmd.AddValue("intraNodeAlgorithm", "Intra-node algorithm for hierarchical: ring/fullmesh", intraNodeAlgorithm);
+    uint32_t ringChannels = 0;
+    cmd.AddValue("ringChannels", "Channels (parallel rings) for ncclring algorithm, 0=auto(gpusPerNode)", ringChannels);
     std::string stepTraceFile = "";
     cmd.AddValue("stepTraceFile", "Path to write per-step completion CSV (gpu,step,startNs,completeNs,delayNs)", stepTraceFile);
     std::string protocolConfigPath = "";
@@ -532,6 +744,17 @@ main(int argc, char* argv[])
         applyU32(sprayChunkSize, "sprayChunkSize");
         applyU32(switchVoqDepth, "switchVoqDepth");
         applyU64(switchArbIntervalNs, "switchArbIntervalNs");
+        // Inter-node (So) fabric. Lets a `.cfg`/`.profile` select the So
+        // fabric -- RoCE vs ETH -- plus its topology/hardware, so ONE config
+        // adapts across protocols without --interNode* CLI flags (the same
+        // config-primary philosophy as the intra-node axes above). Keys absent
+        // fall back to the CLI default (backward-compatible: existing profiles
+        // without these keys behave exactly as before). numNodes/gpusPerNode
+        // stay on the CLI (scale axes, like numGpus/dataSize).
+        applyS(interNodeFabricTypeStr, "interNodeFabricType");
+        applyS(interNodeTopology, "interNodeTopology");
+        applyU64(interNodeBandwidthGbps, "interNodeBandwidthGbps");
+        applyU64(interNodeLatencyNs, "interNodeLatencyNs");
         // Protocol model + startup + thresholds.
         applyS(protocolModelType, "protocolModel");
         applyU32(forceProtocol, "forceProtocol");
@@ -630,9 +853,9 @@ main(int argc, char* argv[])
     if (collective != "allreduce" && collective != "alltoall" &&
         collective != "allgather" && collective != "reducescatter" &&
         collective != "broadcast" && collective != "reduce" &&
-        collective != "p2p")
+        collective != "p2p" && collective != "fanout" && collective != "incast")
     {
-        NS_ABORT_MSG("Unknown collective: " << collective << ". Supported: allreduce, alltoall, allgather, reducescatter, broadcast, reduce, p2p");
+        NS_ABORT_MSG("Unknown collective: " << collective << ". Supported: allreduce, alltoall, allgather, reducescatter, broadcast, reduce, p2p, fanout, incast");
     }
 
     if (verbose)
@@ -743,6 +966,16 @@ main(int argc, char* argv[])
 
     // Build topology
     std::vector<Ptr<FabricEndpoint>> endpoints;
+    // RTTCC machines (one per So endpoint, --rttcc): kept for RESULT stats.
+    std::vector<Ptr<RttccRateMachine>> rttccMachines;
+    // RTTCC is mounted only on multi-node (So) endpoints -- the shaping gate
+    // is !IsLocalRank(destRank), so a single-node run has nothing to shape.
+    if (enableRttcc && numNodes <= 1)
+    {
+        std::cerr << "Warning: --rttcc has no effect with numNodes=1 (RTTCC "
+                     "shapes only inter-node (So) flows; machines are mounted "
+                     "in the multi-node path).\n";
+    }
 
     // Create protocol model and payload builder based on type
     ObjectFactory protoFactory(protocolModelType);
@@ -800,6 +1033,50 @@ main(int argc, char* argv[])
 
         FabricType interNodeFabricType = FabricTypeFromString(interNodeFabricTypeStr);
 
+        // --voqDropThreshold's CLI default is 8 (the plain-ETH legacy "lossy
+        // by nature" default), so "nonzero" cannot distinguish "user opted
+        // in" from "unset": scan argv for an explicit --voqDropThreshold. Only
+        // an explicit threshold opts RoCE into the lossy-RoCE (no-PFC)
+        // regime; an unset threshold keeps RoCE lossless (ECN-only parity).
+        bool voqDropThresholdSet = false;
+        for (int i = 1; i < argc; ++i)
+        {
+            if (std::string(argv[i]).rfind("--voqDropThreshold", 0) == 0)
+            {
+                voqDropThresholdSet = true;
+            }
+        }
+        const bool lossyRoce = interNodeFabricType == FabricType::ROCE
+                                   && voqDropThresholdSet
+                                   && voqDropThreshold != 0;
+
+        // Plain (non-RoCE) lossy Ethernet REQUIRES link-level retry: the
+        // EthernetSwitch tail-drops at VoqDropThreshold and emits a NACK back
+        // to the source (EmitNackBack), which the sender retransmits via the
+        // LLR/SACK path (StorePacket -> HandleRetryRequest/HandleSackRequest).
+        // Without LLR the drop is silent and the transfer stalls forever.
+        // Force LLR on for the Ethernet path (a fabric precondition, like
+        // RoCE's ECN/PFC infra) -- and for lossy RoCE, which relies on the
+        // same NACK->LLR retransmit path once tail-drop fires. BOTH the
+        // local llrEnabled var AND pbundle.llrEnabled must be set:
+        // ProtocolConfigRunner::ApplyBundle (below) re-applies
+        // pbundle.llrEnabled to every endpoint (protocol-config-runner.cc:53),
+        // so the bundle must carry true or it clobbers this force after the
+        // endpoint loop sets m_llrEnabled.
+        if (interNodeFabricType == FabricType::ETHERNET || lossyRoce)
+        {
+            const bool wasLlr = llrEnabled;
+            llrEnabled = true;
+            pbundle.llrEnabled = true;
+            if (!wasLlr)
+            {
+                std::cerr << "Note: the So fabric is lossy (VOQ tail-drop at "
+                             "threshold " << voqDropThreshold
+                             << ") and requires LLR retransmission; forcing "
+                             "llrEnabled=1.\n";
+            }
+        }
+
         MultiNodeTopologyHelper multiTopo;
         multiTopo.SetNumNodes(numNodes);
         multiTopo.SetGpusPerNode(gpusPerNode);
@@ -812,7 +1089,9 @@ main(int argc, char* argv[])
         multiTopo.SetVcCredits(effectiveVcCredits);
         multiTopo.SetSwitchVoqDepth(switchVoqDepth);
         multiTopo.SetSwitchArbInterval(switchArbIntervalNs);
-        if (switchCutThroughDelayNs > 0) { multiTopo.SetSwitchCutThroughDelay(switchCutThroughDelayNs); }
+        // Always forward the value: 0 is the documented store-and-forward
+        // selector (NvSwitch falls back to Send()), not "leave default".
+        multiTopo.SetSwitchCutThroughDelay(switchCutThroughDelayNs);
         // Select the crossbar arbitration strategy (default roundrobin is the
         // NvSwitch's built-in default, so only override for a non-default type).
         if (arbiterType != "roundrobin" && !arbiterType.empty())
@@ -849,8 +1128,104 @@ main(int argc, char* argv[])
             // on enqueue; the CNP+DCQCN reaction is gated by --dcqcn.
             Config::SetDefault("ns3::EthernetSwitch::EcnThreshold",
                                UintegerValue(ecnThreshold));
+            // Lossy RoCE (no-PFC) opt-in: an explicit --voqDropThreshold=N
+            // (N>0) arms the VOQ tail-drop + NACK->LLR retransmit path
+            // alongside ECN marking (mark at ecnThreshold, drop at
+            // voqDropThreshold; keep ecnThreshold < voqDropThreshold for
+            // mark-before-drop, the real RoCEv2 ordering). Without the
+            // explicit flag the switch's VoqDropThreshold stays at its
+            // lossless default (0) and RoCE keeps byte-identical parity.
+            if (lossyRoce)
+            {
+                NS_ABORT_MSG_IF(
+                    voqDropThreshold >= switchVoqDepth,
+                    "voqDropThreshold (" << voqDropThreshold
+                    << ") must be < switchVoqDepth (" << switchVoqDepth
+                    << ") or 0=off, else the base hard-cap drop fires before "
+                    << "the NACK path and the lossy transfer silently stalls.");
+                Config::SetDefault("ns3::EthernetSwitch::VoqDropThreshold",
+                                   UintegerValue(voqDropThreshold));
+                // The So switch's m_llrEnabled must be true or EmitNackBack
+                // (nvswitch.cc) returns early -- the lossy drop stays silent
+                // and the transfer stalls. The endpoint-side LLR force above
+                // arms the sender; this arms the NACK-originating switch.
+                multiTopo.SetInterNodeSwitchLlrEnabled(true);
+                // The lossy-NACK path lives in EthernetSwitch::OnPacketEnqueue
+                // and only engages when the inter-node topology instantiates a
+                // switch (host / tor / rail / leafspine). fullmesh / ring and
+                // friends build direct P2P links with no switch -- a drop
+                // there is silent. Warn (not abort): a non-incast P2P run on
+                // those topologies is still valid, only the lossy-retransmit
+                // behaviour is unavailable.
+                if (interNodeTopology == "fullmesh" || interNodeTopology == "ring" ||
+                    interNodeTopology == "torus2d" || interNodeTopology == "dragonfly")
+                {
+                    std::cerr << "Warning: --voqDropThreshold=" << voqDropThreshold
+                              << " with --interNodeTopology=" << interNodeTopology
+                              << " has no switch in the inter-node path, so the "
+                                 "lossy VOQ tail-drop + NACK retransmit path is "
+                                 "INERT. Use --interNodeTopology=host, tor, "
+                                 "rail, or leafspine to exercise the lossy "
+                                 "RoCE fabric.\n";
+                }
+            }
+        }
+        else if (interNodeFabricType == FabricType::ETHERNET)
+        {
+            // Plain (non-RoCE) lossy Ethernet So fabric: same EthernetSwitch
+            // subtype (L2 MAC-learning + VOQ + crossbar datapath), but lossy.
+            // VoqDropThreshold < VoqDepth is the lossy-NACK invariant: the
+            // tail-drop + EmitNackBack path (EthernetSwitch::OnPacketEnqueue)
+            // must fire before the base hard-cap drop (NvSwitch at m_voqDepth),
+            // else the loss is silent. The operative So VoqDepth is
+            // `switchVoqDepth` (default 10000): the helper calls
+            // SetVoqDepth(switchVoqDepth) on every So switch after construction,
+            // which supersedes the Config::SetDefault below (a construction-
+            // time fallback only). Enforce the invariant so a user passing
+            // --switchVoqDepth=4 --voqDropThreshold=8 cannot silently stall.
+            NS_ABORT_MSG_IF(
+                voqDropThreshold != 0 && voqDropThreshold >= switchVoqDepth,
+                "voqDropThreshold (" << voqDropThreshold
+                << ") must be < switchVoqDepth (" << switchVoqDepth
+                << ") or 0=off, else the base hard-cap drop fires before the "
+                << "NACK path and the lossy transfer silently stalls.");
+            multiTopo.SetInterNodeSwitchType("ns3::EthernetSwitch");
+            Config::SetDefault("ns3::NvSwitch::VoqDepth",
+                               UintegerValue(1024));
+            Config::SetDefault("ns3::EthernetSwitch::VoqDropThreshold",
+                               UintegerValue(voqDropThreshold));
+            // The lossy-NACK path lives in EthernetSwitch::OnPacketEnqueue, so
+            // it only engages when the inter-node topology instantiates a
+            // switch (host / tor). fullmesh / ring build direct P2P links with
+            // a DropTailQueue and NO switch -- a drop there is silent (no NACK,
+            // no retransmit), so the lossy feature is inert under incast. Warn
+            // (not abort): a non-incast P2P run on fullmesh/ring is still valid,
+            // only the lossy-retransmit behaviour is unavailable.
+            if (interNodeTopology == "fullmesh" || interNodeTopology == "ring" ||
+                interNodeTopology == "torus2d" || interNodeTopology == "dragonfly")
+            {
+                std::cerr << "Warning: --interNodeFabricType=ETH with "
+                             "--interNodeTopology=" << interNodeTopology
+                          << " has no switch in the inter-node path, so the "
+                             "lossy VOQ tail-drop + NACK retransmit path is "
+                             "INERT (a P2P DropTailQueue overflow would drop "
+                             "silently). Use --interNodeTopology=host, tor, "
+                             "rail, or leafspine to exercise the lossy "
+                             "fabric.\n";
+            }
+            // The So switch's m_llrEnabled must be true or EmitNackBack
+            // (nvswitch.cc) returns early -- the lossy drop stays silent and
+            // the transfer stalls. The endpoint-side LLR force above arms the
+            // sender (StorePacket + ProcessNackPacket); this arms the switch
+            // that ORIGINATES the NACK on tail-drop. Default false on the
+            // helper keeps the lossless RoCE path byte-identical (RoCE avoids
+            // drops via ECN, so it never relies on switch-emitted NACKs).
+            multiTopo.SetInterNodeSwitchLlrEnabled(true);
         }
         multiTopo.SetInterNodeTopology(interNodeTopology);
+        multiTopo.SetInterNodeSpines(interNodeSpines);
+        multiTopo.SetInterNodeTorusWidth(interNodeTorusWidth);
+        multiTopo.SetInterNodeDragonflyGroupSize(interNodeDragonflyGroupSize);
         multiTopo.SetIntraNodeTopology(intraNodeTopology);
 
         NodeContainer nodes = multiTopo.Build();
@@ -862,9 +1237,18 @@ main(int argc, char* argv[])
         // traffic keeps the scale-up (NCCL) model. With no So model wired,
         // GetProtocolModelForDest falls back to the Su model (parity-safe).
         Ptr<RoceProtocolModel> roceModel;
+        Ptr<EthernetProtocolModel> ethModel;
         if (interNodeFabricType == FabricType::ROCE)
         {
             roceModel = CreateObject<RoceProtocolModel>();
+        }
+        else if (interNodeFabricType == FabricType::ETHERNET)
+        {
+            // Plain (non-RoCE) lossy Ethernet So model: WireEfficiency=1.0
+            // (no SoHeader encapsulation, no DCQCN/per-QP ceiling -- those are
+            // RDMA concepts), store-and-forward per-step latency. No DcqcnRate
+            // Machine is wired for the Ethernet path below.
+            ethModel = CreateObject<EthernetProtocolModel>();
         }
 
         // DCQCN rate machine (Phase B) + opt-in per-QP ceiling pacer. One shared
@@ -883,6 +1267,62 @@ main(int argc, char* argv[])
             {
                 dcqcnMachine->SetAttribute("PerQpCeilingGbps", DoubleValue(perQpCeilingGbps));
             }
+            // MaxRateBps anchors the alpha shaping math (extra serialization
+            // time at the reduced rate) to the So NIC rate; the TypeId
+            // default 50e9 B/s is only right for 400G links. Inert until a
+            // CNP fires (alpha=0 -> ShapingDelay==0) and unused by the
+            // per-QP pacer, so this backfill is parity-neutral.
+            if (enableDcqcn && interNodeBandwidthGbps > 0)
+            {
+                dcqcnMachine->SetAttribute(
+                    "MaxRateBps",
+                    DoubleValue(interNodeBandwidthGbps * 1.25e8));
+            }
+            // User overrides: only SetAttribute when the flag was given, so
+            // the default path keeps the TypeId defaults byte-identically.
+            if (dcqcnTFastNs > 0)
+            {
+                dcqcnMachine->SetAttribute("TFast", TimeValue(NanoSeconds(dcqcnTFastNs)));
+            }
+            if (dcqcnFastCycles > 0)
+            {
+                dcqcnMachine->SetAttribute("FastRecoveryMaxCycles",
+                                           UintegerValue(dcqcnFastCycles));
+            }
+            if (dcqcnTAiNs > 0)
+            {
+                dcqcnMachine->SetAttribute("TAi", TimeValue(NanoSeconds(dcqcnTAiNs)));
+            }
+            if (dcqcnRai > 0.0)
+            {
+                dcqcnMachine->SetAttribute("RAI", DoubleValue(dcqcnRai));
+            }
+            if (dcqcnGInit > 0.0)
+            {
+                dcqcnMachine->SetAttribute("GInit", DoubleValue(dcqcnGInit));
+            }
+            if (dcqcnGDecay > 0.0)
+            {
+                dcqcnMachine->SetAttribute("GDecay", DoubleValue(dcqcnGDecay));
+            }
+            if (dcqcnAlphaFloor != 0.0)
+            {
+                dcqcnMachine->SetAttribute("AlphaFloor", DoubleValue(dcqcnAlphaFloor));
+            }
+        }
+
+        // So payload builder: opting into DCQCN implies RoCE SoHeader framing
+        // on inter-node sends -- the switch ECN-mark and receiver CNP-echo
+        // guards key on RoceProtocol::SIMPLE + SoHeader, which inline runs'
+        // NCCL builder never stamps (config-mode RoCE profiles mount the RoCE
+        // builder globally; inline collectives would otherwise leave the whole
+        // ECN->CNP->DCQCN chain dormant). The dedicated So builder leaves Su
+        // (intra-node) framing/timing untouched. Off (--dcqcn=0, default) ->
+        // null -> byte-identical.
+        Ptr<RocePayloadBuilder> soPayloadBuilder;
+        if (interNodeFabricType == FabricType::ROCE && enableDcqcn)
+        {
+            soPayloadBuilder = CreateObject<RocePayloadBuilder>();
         }
 
         ApplicationContainer apps = multiTopo.GetAllEndpoints();
@@ -898,9 +1338,39 @@ main(int argc, char* argv[])
             {
                 ep->SetInterNodeProtocolModel(roceModel);
             }
+            if (ethModel)
+            {
+                ep->SetInterNodeProtocolModel(ethModel);
+            }
             if (dcqcnMachine)
             {
                 ep->SetDcqcnRateMachine(dcqcnMachine);
+            }
+            if (soPayloadBuilder)
+            {
+                ep->SetSoPayloadBuilder(soPayloadBuilder);
+            }
+            // RTTCC: one machine PER endpoint (not shared like DCQCN's) —
+            // the flow key (destRank,vc,flowId) carries no source rank, so a
+            // shared machine would merge the per-flow pacer/probe state of
+            // two incast senders targeting the same flow coordinates. The
+            // line rate is the So NIC rate (the link RTTCC paces onto).
+            if (enableRttcc)
+            {
+                Ptr<RttccRateMachine> rttccMachine = CreateObject<RttccRateMachine>();
+                rttccMachine->SetAttribute("LineRateGbps",
+                                           DoubleValue(static_cast<double>(interNodeBandwidthGbps)));
+                if (rttccTargetRttNs > 0)
+                {
+                    rttccMachine->SetAttribute("TargetRtt", TimeValue(NanoSeconds(rttccTargetRttNs)));
+                }
+                if (rttccProbeIntervalNs > 0)
+                {
+                    rttccMachine->SetAttribute("ProbeInterval",
+                                               TimeValue(NanoSeconds(rttccProbeIntervalNs)));
+                }
+                ep->SetRttccRateMachine(rttccMachine);
+                rttccMachines.push_back(rttccMachine);
             }
             ep->SetBulkChunkSize(bulkChunkSize);
             ep->SetDeviceType(deviceType);
@@ -908,6 +1378,28 @@ main(int argc, char* argv[])
             if (syncMemLatencyNs > 0) { ep->SetSyncMemLatencyNs(syncMemLatencyNs); }
             if (asyncMemLatencyNs > 0) { ep->SetAsyncMemLatencyNs(asyncMemLatencyNs); }
             ep->SetLlrEnabled(llrEnabled);
+
+            // Per-endpoint ContentionModel: each endpoint gets an INDEPENDENT
+            // instance (its WFQ backlog is local to this endpoint's injection
+            // side). This DIFFERS from the single-node GpuClusterTopologyHelper,
+            // whose AttachContentionModelToEndpoints creates ONE clone and shares
+            // it across all endpoints (backlog aggregates node-wide) — two
+            // different layers, not a correctness difference. The bandwidth is
+            // the intra-node NVLink injection rate (bandwidthGbps), also for
+            // So-bound packets. The WFQ penalty only fires at numActive>1
+            // (SendPacketOnDevice), so pure-collective So traffic stays
+            // byte-identical (single COLLECTIVE class); the model only engages
+            // when a second class (e.g. a background P2P flow) is concurrently
+            // active on the same endpoint. Note the penalty is an extra delay on
+            // the send path, off the wire's own FIFO queueing: for a cross-node
+            // background flow the So NIC/switch link sharing dominates and the
+            // WFQ term may be entirely off the critical path.
+            Ptr<ContentionModel> cm = CreateObject<ContentionModel>();
+            cm->SetCollectiveWeight(contentionCollectiveWeight);
+            cm->SetMemoryWeight(contentionMemoryWeight);
+            cm->SetP2pWeight(contentionP2pWeight);
+            cm->SetBandwidth(bandwidthGbps * 1000000000ULL / 8);  // Gbps -> bytes/sec
+            ep->SetContentionModel(cm);
 
             endpoints.push_back(ep);
         }
@@ -1053,8 +1545,9 @@ main(int argc, char* argv[])
         // on ingress and sends NACK back, matching real NVLink behavior
         topoHelper.SetSwitchLlrEnabled(llrEnabled);
 
-        // Contention model: configured once, shared via helper for GPU endpoints
-        // and manually attached to memory endpoints (created outside the helper)
+        // Contention model: configured once as a template; the helper's Build*
+        // clones it ONCE and shares that single instance across all endpoints
+        // (backlog aggregates node-wide). Multi-node mounts one per endpoint.
         contentionModel = CreateObject<ContentionModel>();
         contentionModel->SetCollectiveWeight(contentionCollectiveWeight);
         contentionModel->SetMemoryWeight(contentionMemoryWeight);
@@ -1289,6 +1782,18 @@ main(int argc, char* argv[])
                 {
                     llrMgr->SetRetryTimeout(NanoSeconds(llrRetryTimeoutNs));
                 }
+                if (llrTimeoutRetransmit)
+                {
+                    ep->EnableLlrTimeoutRetransmit();
+                }
+                if (soTxWindow > 0)
+                {
+                    ep->SetSoTxWindow(soTxWindow);
+                }
+                if (soGbnStrict)
+                {
+                    ep->SetSoGbnStrict(true);
+                }
             }
         }
     }
@@ -1330,7 +1835,79 @@ main(int argc, char* argv[])
     // sourced the profile's values + the op axes into the local vars above,
     // so it falls through to the validated inline injector branches below
     // (bit-identical to the inline path run with the equivalent CLI flags).
-    if (configMode && pconfig.GetCollective().empty() && pconfig.GetAlgorithm().empty())
+    // Random-traffic mode replaces the collective injector entirely: every
+    // rank self-schedules fixed-interval messages to uniform-random ranks on
+    // other nodes, and the run is fixed-duration (stop at warmup+measure).
+    if (randTrafficEnabled)
+    {
+        NS_ABORT_MSG_IF(numNodes <= 1,
+                        "--randTraffic needs numNodes > 1 (traffic is cross-node only)");
+        NS_ABORT_MSG_IF(randInjectionRate <= 0.0 || randInjectionRate > 1.0,
+                        "--randInjectionRate must be in (0, 1]");
+        NS_ABORT_MSG_IF(interNodeBandwidthGbps == 0,
+                        "--randTraffic needs interNodeBandwidth > 0");
+        // Fixed per-source message interval: msgBytes at the requested fraction
+        // of the inter-node line rate. Clamped to >= 1 ns (same stall footgun
+        // as bgP2pIntervalNs=0: a 0 ns self-reschedule never advances time).
+        double intervalNsF = static_cast<double>(randMsgBytes) * 8.0 /
+                             (randInjectionRate * static_cast<double>(interNodeBandwidthGbps));
+        uint64_t intervalNs = std::max<uint64_t>(1, static_cast<uint64_t>(intervalNsF + 0.5));
+        g_randWindowStartNs = randWarmupNs;
+        g_randWindowEndNs = randWarmupNs + randMeasureNs;
+        g_randTrafficRan = true;
+
+        // DCQCN/ECN chain requirements: EthernetSwitch::MarkEcnIfCongested and
+        // the receiver's CNP echo both require the FabricHeader protocol to be
+        // RoceProtocol::SIMPLE(1) AND an inner SoHeader, and
+        // SendBulkWireTransferSize stamps that SoHeader only when the mounted
+        // payload builder is RocePayloadBuilder (Seam B guard). Inline runs
+        // mount the NCCL builder, so on the RoCE fabric remount the RoCE
+        // builder here — safe because randTraffic replaces the collective and
+        // all its traffic is cross-node So (the Su builder is unused).
+        uint8_t protocolId = static_cast<uint8_t>(NcclProtocol::SIMPLE);
+        Ptr<RocePayloadBuilder> roceBuilder;
+        if (FabricTypeFromString(interNodeFabricTypeStr) == FabricType::ROCE)
+        {
+            protocolId = static_cast<uint8_t>(RoceProtocol::SIMPLE);
+            roceBuilder = CreateObject<RocePayloadBuilder>();
+        }
+        // Per-source RNG streams: destination pick + initial phase offset
+        // (random phase avoids all sources injecting in lockstep). Both are
+        // RngRun-seeded, so a run is reproducible.
+        for (uint16_t rank = 0; rank < numGpus; ++rank)
+        {
+            Ptr<FabricEndpoint> ep = endpoints[rank];
+            if (!ep)
+            {
+                continue;
+            }
+            if (roceBuilder)
+            {
+                ep->SetProtocolPayloadBuilder(roceBuilder);
+            }
+            ep->SetReceiveCallback(MakeCallback(&RandTrafficReceive));
+            std::vector<uint16_t> remoteRanks;
+            for (uint16_t r = 0; r < numGpus; ++r)
+            {
+                if (endpoints[r] && endpoints[r]->GetNodeId() != ep->GetNodeId())
+                {
+                    remoteRanks.push_back(r);
+                }
+            }
+            if (remoteRanks.empty())
+            {
+                continue;
+            }
+            Ptr<UniformRandomVariable> destPick = CreateObject<UniformRandomVariable>();
+            Ptr<UniformRandomVariable> phase = CreateObject<UniformRandomVariable>();
+            uint64_t startNs = phase->GetInteger(0, intervalNs - 1);
+            Simulator::Schedule(NanoSeconds(startNs), &RandTrafficSend, ep,
+                                remoteRanks, destPick, randMsgBytes, intervalNs,
+                                protocolId);
+        }
+        Simulator::Stop(NanoSeconds(g_randWindowEndNs));
+    }
+    else if (configMode && pconfig.GetCollective().empty() && pconfig.GetAlgorithm().empty())
     {
         // Apply the profile's PEX bundle to the endpoints (overrides the inline
         // 1-VC convenience credit setup with the profile's VC count + per-VC
@@ -1441,6 +2018,56 @@ main(int argc, char* argv[])
             {
                 ar->SetInterNodeStartupDelay(NanoSeconds(interNodeLatencyNs));
             }
+            ar->Start();
+            injector = ar;
+        }
+        else if (algo == "ncclring")
+        {
+            // Real-NCCL global pipelined ring: C rail-spread rings spanning all
+            // ranks, chunk-level pipelining (no per-phase barriers). Effective
+            // node geometry derivation mirrors the hierarchical branch.
+            uint32_t effectiveNumNodes = numNodes;
+            uint32_t effectiveGpusPerNode = gpusPerNode;
+            if (topology == "leafspine")
+            {
+                effectiveNumNodes = leafSwitches;
+                effectiveGpusPerNode = numGpus / leafSwitches;
+            }
+            else if (topology == "nvl72")
+            {
+                uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                effectiveNumNodes = numGpus / gpg;
+                effectiveGpusPerNode = gpg;
+            }
+            else if (numNodes <= 1)
+            {
+                effectiveNumNodes = 1;
+                effectiveGpusPerNode = numGpus;
+            }
+            Ptr<NcclRingAllReduce> ar = CreateObject<NcclRingAllReduce>();
+            ar->SetGpusPerNode(effectiveGpusPerNode);
+            ar->SetNumNodes(effectiveNumNodes);
+            ar->SetNumChannels(ringChannels);
+            ar->SetLlThreshold(llThreshold);
+            ar->SetLl128Threshold(ll128Threshold);
+            if (startupDelayNs > 0)
+            {
+                ar->SetStartupDelay(NanoSeconds(startupDelayNs));
+            }
+            if (perStepSwOverheadNs > 0)
+            {
+                ar->SetPerStepSwOverhead(NanoSeconds(perStepSwOverheadNs));
+            }
+            if (swOverheadPerByteNs > 0)
+            {
+                ar->SetSwOverheadPerByteNs(swOverheadPerByteNs);
+            }
+            if (computeBaseLLNs > 0 || computeBaseLL128Ns > 0 || computeBaseSIMPLENs > 0)
+            {
+                ar->SetComputeBaseDelays(NanoSeconds(computeBaseLLNs), NanoSeconds(computeBaseLL128Ns), NanoSeconds(computeBaseSIMPLENs));
+            }
+            ar->Initialize(numGpus, dataSize, endpoints);
+            ar->SetCompletionCallback(MakeCallback(&OnCollectiveComplete));
             ar->Start();
             injector = ar;
         }
@@ -1571,6 +2198,18 @@ main(int argc, char* argv[])
             if (localStartupLLNs > 0 || localStartupLL128Ns > 0 || localStartupSIMPLENs > 0)
             {
                 a2a->SetLocalStartupDelays(NanoSeconds(localStartupLLNs), NanoSeconds(localStartupLL128Ns), NanoSeconds(localStartupSIMPLENs));
+            }
+            // --startupDelay/--startupAlltoAll override the protocol-derived
+            // local startup, exactly as in the plain AlltoAllInjector branch
+            // below (codex round 21, finding 3 — this wiring was missing, and
+            // the injector itself ignored the override).
+            if (startupAlltoAllNs > 0)
+            {
+                a2a->SetStartupDelay(NanoSeconds(startupAlltoAllNs));
+            }
+            else if (startupDelayNs > 0)
+            {
+                a2a->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
             a2a->Start();
             injector = a2a;
@@ -1882,6 +2521,105 @@ main(int argc, char* argv[])
         injector = rd;
     }
 
+    else if (collective == "p2p" || collective == "fanout" || collective == "incast")
+    {
+        // Bare wire-transfer patterns on the credit-gated bulk path (see
+        // PatternReceive above). One SendBulkWireTransferSize per flow; the
+        // wire protocol is picked from the per-flow size exactly as the ring
+        // injectors do (SIMPLE at bulk sizes).
+        Ptr<ProtocolModel> protoModel = endpoints[0]->GetProtocolModel();
+        uint8_t protocolId = static_cast<uint8_t>(
+            protoModel->GetProtocolId(dataSize));
+        std::vector<std::pair<uint16_t, uint16_t>> flows;
+        if (collective == "p2p")
+        {
+            flows.emplace_back(rootRank, (rootRank + 1) % numGpus);
+        }
+        else
+        {
+            for (uint32_t r = 0; r < numGpus; ++r)
+            {
+                if (r == rootRank)
+                {
+                    continue;
+                }
+                if (collective == "fanout")
+                {
+                    flows.emplace_back(rootRank, static_cast<uint16_t>(r));
+                }
+                else  // incast
+                {
+                    flows.emplace_back(static_cast<uint16_t>(r), rootRank);
+                }
+            }
+        }
+        g_patternExpectedBytes = static_cast<uint64_t>(flows.size()) * dataSize;
+        g_patternReceivedBytes = 0;
+        g_patternStartNs = Simulator::Now().GetNanoSeconds();
+        // Zero-byte pattern (codex round 20, finding 10): SendBulkWire-
+        // TransferSize emits nothing at dataSize == 0, so no receive ever
+        // fires and the pattern stalls to the 1-hour cap. A zero-byte
+        // transfer is trivially complete.
+        if (dataSize == 0)
+        {
+            OnCollectiveComplete(0);
+        }
+        for (auto& ep : endpoints)
+        {
+            ep->SetReceiveCallback(MakeCallback(&PatternReceive));
+        }
+        for (uint16_t i = 0; i < flows.size(); ++i)
+        {
+            Simulator::Schedule(NanoSeconds(0),
+                                [src = flows[i].first, dst = flows[i].second,
+                                 endpoints, dataSize, protocolId, i]()
+                                {
+                                    endpoints[src]->SendBulkWireTransferSize(
+                                        dst, dataSize,
+                                        protocolId, static_cast<uint16_t>(i + 1), 0);
+                                });
+        }
+    }
+
+    // Background P2P interferer: a self-driven P2pTraffic flow that shares the
+    // fabric with the primary collective. Scheduled at bgP2pStartTimeNs so it
+    // can overlap (or precede) the collective, exercising multi-class WFQ
+    // contention at the endpoint injection side and So switch VOQ arbitration.
+    // Unlimited (maxPackets=0): the sim stops via OnCollectiveComplete when the
+    // collective finishes, terminating the background flow alongside it.
+    // Declared in main scope so it outlives Simulator::Run() for the report below.
+    Ptr<P2pTraffic> bgP2p;
+    if (bgP2pEnabled
+        && bgP2pSrc < endpoints.size() && bgP2pDst < endpoints.size()
+        && bgP2pSrc != bgP2pDst
+        && endpoints[bgP2pSrc] && endpoints[bgP2pDst])
+    {
+        bgP2p = CreateObject<P2pTraffic>();
+        bgP2p->SetEndpoint(endpoints[bgP2pSrc]);
+        bgP2p->SetDestRank(static_cast<uint16_t>(bgP2pDst));
+        bgP2p->SetPacketSize(bgP2pSizeBytes);
+        uint64_t intervalNs = bgP2pIntervalNs;
+        if (intervalNs == 0)
+        {
+            // back-to-back = one packet serialization time at the intra-node
+            // bandwidth, NOT a literal 0 ns: P2pTraffic::ScheduleNext schedules
+            // the next burst at Now()+interval, so a 0 interval would loop
+            // forever at a fixed sim-time and starve every later event (incl.
+            // the collective completion). ns = bytes*8 / Gbps, using the
+            // intra-node rate even for a cross-node flow (a So flow is then
+            // over-driven by the intra/inter ratio and queues at the NIC; pass
+            // --bgP2pIntervalNs explicitly to pace at the inter-node rate).
+            // Integer division floors sub-ns serialization (<100 B at 800G) to
+            // 0, which would hit the same stall — clamp to >= 1 ns.
+            NS_ABORT_MSG_IF(bandwidthGbps == 0,
+                            "bgP2pIntervalNs=0 needs bandwidthGbps>0 to derive a serialization interval");
+            intervalNs = std::max<uint64_t>(1, bgP2pSizeBytes * 8ULL / bandwidthGbps);
+        }
+        bgP2p->SetInterval(NanoSeconds(intervalNs));
+        bgP2p->SetMaxPackets(0);  // 0 = unlimited background flow
+        Simulator::Schedule(NanoSeconds(bgP2pStartTimeNs), &P2pTraffic::Start, bgP2p);
+    }
+
 
     Simulator::Stop(Seconds(3600));
     Simulator::Run();
@@ -1890,6 +2628,11 @@ main(int argc, char* argv[])
     std::string statusStr;
     if (g_collectiveCompleted) {
         durationUs = g_durationNs / 1000.0;
+        statusStr = "complete";
+    } else if (g_randTrafficRan) {
+        // Fixed-duration random-traffic run: completing the measurement window
+        // IS the success criterion (there is no collective to finish).
+        durationUs = Simulator::Now().GetMicroSeconds();
         statusStr = "complete";
     } else {
         durationUs = Simulator::Now().GetMicroSeconds();
@@ -2016,10 +2759,14 @@ main(int argc, char* argv[])
     std::cout << "reorderMaxOccupancy=" << maxReorderOccupancy << std::endl;
     uint64_t endpointTxPackets = 0;
     uint64_t endpointRxPackets = 0;
+    uint64_t cnpPacketsSent = 0;
+    uint64_t cnpPacketsReceived = 0;
     for (const auto& ep : endpoints)
     {
         endpointTxPackets += ep->GetTxPackets();
         endpointRxPackets += ep->GetRxPackets();
+        cnpPacketsSent += ep->GetCnpPacketsSent();
+        cnpPacketsReceived += ep->GetCnpPacketsReceived();
     }
     uint64_t switchTxPackets = 0;
     uint64_t switchRxPackets = 0;
@@ -2029,6 +2776,7 @@ main(int argc, char* argv[])
     uint64_t switchTtlDrops = 0;
     uint64_t switchVoqDrops = 0;
     uint64_t switchRouteUnavailableDrops = 0;
+    uint64_t ecnMarkedPackets = 0;
     for (auto node = NodeList::Begin(); node != NodeList::End(); ++node)
     {
         for (uint32_t device = 0; device < (*node)->GetNDevices(); ++device)
@@ -2043,6 +2791,11 @@ main(int argc, char* argv[])
             switchTtlDrops += nvSwitch->GetTtlDrops();
             switchVoqDrops += nvSwitch->GetVoqDrops();
             switchRouteUnavailableDrops += nvSwitch->GetRouteUnavailableDrops();
+            Ptr<EthernetSwitch> ethSwitch = DynamicCast<EthernetSwitch>(nvSwitch);
+            if (ethSwitch)
+            {
+                ecnMarkedPackets += ethSwitch->GetEcnMarkedPackets();
+            }
         }
     }
     std::cout << "endpointTxPackets=" << endpointTxPackets << std::endl;
@@ -2091,6 +2844,53 @@ main(int argc, char* argv[])
     std::cout << "fecNoError=" << (fecModel ? fecModel->GetNoErrorCount() : 0) << std::endl;
     std::cout << "fecCorrectable=" << (fecModel ? fecModel->GetCorrectableCount() : 0) << std::endl;
     std::cout << "fecUncorrectable=" << (fecModel ? fecModel->GetUncorrectableCount() : 0) << std::endl;
+    std::cout << "bgP2pEnabled=" << (bgP2pEnabled ? "true" : "false") << std::endl;
+    std::cout << "rttccEnabled=" << (enableRttcc ? "true" : "false") << std::endl;
+    if (!rttccMachines.empty())
+    {
+        uint64_t rttccProbesSent = 0;
+        uint64_t rttccRttSamples = 0;
+        int64_t rttccMinRttNs = std::numeric_limits<int64_t>::max();
+        int64_t rttccMaxRttNs = 0;
+        double rttccMinRateGbps = std::numeric_limits<double>::max();
+        for (const auto& rm : rttccMachines)
+        {
+            rttccProbesSent += rm->GetProbesSent();
+            rttccRttSamples += rm->GetRttSamples();
+            rttccMinRttNs = std::min(rttccMinRttNs, rm->GetMinRttNs());
+            rttccMaxRttNs = std::max(rttccMaxRttNs, rm->GetMaxRttNs());
+            rttccMinRateGbps = std::min(rttccMinRateGbps, rm->GetMinFlowRateGbps());
+        }
+        std::cout << "rttccProbesSent=" << rttccProbesSent << std::endl;
+        std::cout << "rttccRttSamples=" << rttccRttSamples << std::endl;
+        std::cout << "rttccMinRttNs="
+                  << (rttccRttSamples > 0 ? rttccMinRttNs : 0) << std::endl;
+        std::cout << "rttccMaxRttNs=" << rttccMaxRttNs << std::endl;
+        std::cout << "rttccMinRateGbps=" << rttccMinRateGbps << std::endl;
+    }
+    if (bgP2p)
+    {
+        std::cout << "bgP2pBytesSent=" << bgP2p->GetBytesSent() << std::endl;
+        std::cout << "bgP2pPacketsSent=" << bgP2p->GetPacketsSent() << std::endl;
+    }
+    std::cout << "ecnMarkedPackets=" << ecnMarkedPackets << std::endl;
+    std::cout << "cnpPacketsSent=" << cnpPacketsSent << std::endl;
+    std::cout << "cnpPacketsReceived=" << cnpPacketsReceived << std::endl;
+    std::cout << "randTrafficEnabled=" << (randTrafficEnabled ? "true" : "false") << std::endl;
+    if (randTrafficEnabled)
+    {
+        double measureSec = static_cast<double>(g_randWindowEndNs - g_randWindowStartNs) * 1e-9;
+        std::cout << "randMsgsSent=" << g_randMsgsSent << std::endl;
+        std::cout << "randOfferedBytes=" << g_randOfferedBytes << std::endl;
+        std::cout << "randDeliveredBytes=" << g_randDeliveredBytes << std::endl;
+        std::cout << std::setprecision(3);
+        std::cout << "randOfferedGbps="
+                  << (measureSec > 0 ? g_randOfferedBytes * 8.0 / measureSec * 1e-9 : 0)
+                  << std::endl;
+        std::cout << "randDeliveredGbps="
+                  << (measureSec > 0 ? g_randDeliveredBytes * 8.0 / measureSec * 1e-9 : 0)
+                  << std::endl;
+    }
     std::cout << "RESULT_END" << std::endl;
 
     Simulator::Destroy();

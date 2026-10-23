@@ -66,6 +66,11 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         {
             numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
         }
+        // Bound the chunk count by the transfer size: the one-chunk-per-link
+        // spray can otherwise produce trailing fragments whose offset is past
+        // the buffer end (size - offset underflows; Create<Packet> would read
+        // out of bounds). Never more than one 1-byte chunk per data byte.
+        numChunks = std::min(numChunks, std::max<uint32_t>(size, 1));
         uint32_t chunkSize = (size + numChunks - 1) / numChunks;
 
         NS_LOG_INFO("Fragmenting " << size << " bytes to dest " << destRank
@@ -75,6 +80,10 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         for (uint32_t i = 0; i < numChunks; i++)
         {
             uint32_t offset = i * chunkSize;
+            if (offset >= size)
+            {
+                continue; // trailing lane-pad fragment past the buffer end
+            }
             uint32_t thisChunkSize = std::min(chunkSize, size - offset);
 
             // Generate sequence number for each chunk
@@ -96,8 +105,14 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
             header.SetSourceMac(m_address);
             header.SetDestMac(ResolveDestMac(destRank));
 
-            // Check and consume credit before sending (credit-based flow control)
-            if (m_creditManager && !m_creditManager->HasCredits(vcId))
+            // Check and consume credit before sending (credit-based flow
+            // control) — Su (local-dest) traffic only. So (remote-dest) DATA
+            // bypasses credits, mirroring SendBulkWireTransferSize /
+            // SendP2p: the receiver returns credits only for local sources
+            // (OnPacketDelivered's IsLocalRank guard), so a credit-consuming
+            // remote send would drain the VC pool with no return path and
+            // stall after vcCredits sends.
+            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
             {
                 NS_LOG_DEBUG("No credits for DATA chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -114,6 +129,10 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 for (uint32_t j = i + 1; j < numChunks; j++)
                 {
                     uint32_t remOffset = j * chunkSize;
+                    if (remOffset >= size)
+                    {
+                        continue; // trailing lane-pad fragment past the buffer end
+                    }
                     uint32_t remChunkSize = std::min(chunkSize, size - remOffset);
                     uint64_t remSeqKey = MakeSeqKey(destRank, vcId, flowId);
                     uint32_t remSeqNum = m_nextSeqNum[remSeqKey]++;
@@ -143,7 +162,7 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 TrySendQueuedPackets();
                 break;
             }
-            if (m_creditManager)
+            if (m_creditManager && IsLocalRank(destRank))
             {
                 m_creditManager->ConsumeCredit(vcId, seqNum);
             }
@@ -278,6 +297,11 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
         uint64_t sizeBasedChunks =
             (wireSize + m_sprayChunkSize - 1) / m_sprayChunkSize;
         uint64_t numChunks = std::max(minChunks, sizeBasedChunks);
+        // Bound the chunk count by the wire size: the one-chunk-per-link
+        // spray can otherwise produce trailing fragments whose offset is
+        // past the wire end (wireSize - offset underflows). Same clamp as
+        // the DATA spray path.
+        numChunks = std::min(numChunks, std::max<uint64_t>(wireSize, 1));
 
         // Packet event count otherwise grows with every 128 KB spray unit. At
         // multi-GB sizes this dominates wall time. Coalesce only large
@@ -302,10 +326,24 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
         for (uint64_t i = 0; i < numChunks; i++)
         {
             uint64_t offset = i * chunkSize;
+            if (offset >= wireSize)
+            {
+                continue; // trailing lane-pad fragment past the wire end
+            }
             uint32_t thisChunkSize = static_cast<uint32_t>(
                 std::min(chunkSize, wireSize - offset));
-            uint64_t effectiveBegin = i * effectiveSize / numChunks;
-            uint64_t effectiveEnd = (i + 1) * effectiveSize / numChunks;
+            // Partition effective bytes PROPORTIONALLY TO THE WIRE BYTES
+            // ACTUALLY SENT. The old i*effectiveSize/numChunks split
+            // reserved a share for every chunk index including the skipped
+            // trailing lane-pad fragments, so those shares were never
+            // delivered (a 32-byte-per-GPU 256B allgather on 18 links
+            // delivered only 28 bytes and the collective never completed).
+            // Anchoring the boundaries to the wire offsets makes the last
+            // sent chunk absorb whatever the skipped fragments would have
+            // carried and the shares sum to exactly effectiveSize.
+            uint64_t wireSpanEnd = std::min(offset + chunkSize, wireSize);
+            uint64_t effectiveBegin = effectiveSize * offset / std::max<uint64_t>(wireSize, 1);
+            uint64_t effectiveEnd = effectiveSize * wireSpanEnd / std::max<uint64_t>(wireSize, 1);
             uint32_t thisEffectiveSize =
                 static_cast<uint32_t>(effectiveEnd - effectiveBegin);
 
@@ -348,10 +386,19 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                 for (uint64_t j = i + 1; j < numChunks; j++)
                 {
                     uint64_t remOffset = j * chunkSize;
+                    if (remOffset >= wireSize)
+                    {
+                        continue; // trailing lane-pad fragment past the wire end
+                    }
                     uint32_t remChunkSize = static_cast<uint32_t>(
                         std::min(chunkSize, wireSize - remOffset));
-                    uint64_t remEffectiveBegin = j * effectiveSize / numChunks;
-                    uint64_t remEffectiveEnd = (j + 1) * effectiveSize / numChunks;
+                    // Same wire-anchored proportional split as the main loop
+                    // (skipped trailing fragments must not eat a share).
+                    uint64_t remWireSpanEnd = std::min(remOffset + chunkSize, wireSize);
+                    uint64_t remEffectiveBegin =
+                        effectiveSize * remOffset / std::max<uint64_t>(wireSize, 1);
+                    uint64_t remEffectiveEnd =
+                        effectiveSize * remWireSpanEnd / std::max<uint64_t>(wireSize, 1);
                     uint32_t remEffectiveSize =
                         static_cast<uint32_t>(remEffectiveEnd - remEffectiveBegin);
                     uint64_t remSeqKey = MakeSeqKey(destRank, 0, 0);
@@ -476,6 +523,22 @@ FabricEndpoint::SendP2p(uint16_t destRank, const uint8_t* data, uint32_t size,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
+    // Scale-out (remote dest) P2P bypasses the per-VC credit gate — the same
+    // convention SendBulkWireTransferSize applies to So traffic. Credits are
+    // returned by the RECEIVER only for intra-node sources
+    // (OnPacketDelivered's IsLocalRank guard), so a credit-consuming remote
+    // P2P would drain the local VC pool with no return path and stall once
+    // vcCredits exhausts.
+    // IsLocalRank alone decides (no m_localRankCount > 1 gate — one GPU per
+    // node still has remote ranks; see GetProtocolModelForDest).
+    if (!IsLocalRank(destRank))
+    {
+        packet->AddHeader(header);
+        uint32_t deviceIndex = ResolveDeviceIndex(destRank);
+        SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(destRank));
+        return;
+    }
+
     SendQueueEntry entry;
     entry.packet = packet;
     entry.header = header;
@@ -491,7 +554,7 @@ FabricEndpoint::SendMemoryRead(uint16_t destRank, uint64_t address, uint32_t siz
 {
     NS_LOG_FUNCTION(this << destRank << address << size);
 
-    uint64_t seqKey = MakeSeqKey(destRank, 0, 0);
+    uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
     // Pack address and size into payload for memory read request
@@ -504,7 +567,7 @@ FabricEndpoint::SendMemoryRead(uint16_t destRank, uint64_t address, uint32_t siz
     FabricHeader header;
     header.SetPacketType(FabricPacketType::MEMORY_READ);
     header.SetFabricType(GetFabricTypeForDest(destRank));
-    header.SetFlowId(0);
+    header.SetFlowId(MEMORY_FLOW_ID);
     header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetSourceRank(m_rank);
@@ -515,9 +578,12 @@ FabricEndpoint::SendMemoryRead(uint16_t destRank, uint64_t address, uint32_t siz
 
     // Send-gate flow control: dispatches on m_flowControlPolicy. Under the
     // default CREDIT policy this is the existing per-VC credit check + consume;
-    // WINDOW/RATE are seam-only and admit with a warning.
+    // WINDOW/RATE are seam-only and admit with a warning. Remote (So) dests
+    // bypass the credit gate — the receiver returns credits only for local
+    // sources (OnPacketDelivered's IsLocalRank guard), so a remote consume
+    // would never come back and would stall the VC.
     uint8_t vcId = 0;
-    if (!FlowControlGate(vcId, seqNum, false))
+    if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
     {
         NS_LOG_DEBUG("FlowControlGate backpressure for MEMORY_READ on VC "
                      << static_cast<int>(vcId) << ", queuing packet");
@@ -549,7 +615,7 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
 {
     NS_LOG_FUNCTION(this << destRank << address << size);
 
-    uint64_t seqKey = MakeSeqKey(destRank, 0, 0);
+    uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
     // Pack address prefix + data into payload
@@ -563,7 +629,7 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
     FabricHeader header;
     header.SetPacketType(FabricPacketType::MEMORY_WRITE);
     header.SetFabricType(GetFabricTypeForDest(destRank));
-    header.SetFlowId(0);
+    header.SetFlowId(MEMORY_FLOW_ID);
     header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetSourceRank(m_rank);
@@ -572,9 +638,12 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control: check and consume credits before sending
+    // Credit-based flow control: check and consume credits before sending.
+    // Su (local-dest) traffic only — the receiver returns credits solely for
+    // local sources (OnPacketDelivered's IsLocalRank guard), so a remote
+    // memory write would drain the VC pool with no return path.
     uint8_t vcId = 0;
-    if (m_creditManager)
+    if (m_creditManager && IsLocalRank(destRank))
     {
         if (!m_creditManager->HasCredits(vcId))
         {
@@ -609,13 +678,25 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
 {
     NS_LOG_FUNCTION(this << destRank << size);
 
+    // Sequence responses from this endpoint's per-dest memory counter (the
+    // isolated MakeMemorySeqKey namespace shared with SendMemoryRead/Write —
+    // disjoint from DATA's counters, whose reorder tracking never sees
+    // memory seqs). A hard-coded 0 gave every MEMORY_RESP the same LLR
+    // retry key: with two reads in flight the second response's store entry
+    // overwrote the first's packet copy, and its ACK purged the shared
+    // entry — a lost first response was never retransmitted with its own
+    // payload (its data vanished silently). Distinct sequence numbers also
+    // let the receiver's CREDIT advance the GBN cumulative-ack window past 1.
+    uint64_t seqKey = MakeMemorySeqKey(destRank);
+    uint32_t seqNum = m_nextSeqNum[seqKey]++;
+
     Ptr<Packet> packet = Create<Packet>(data, size);
 
     FabricHeader header;
     header.SetPacketType(FabricPacketType::MEMORY_RESP);
     header.SetFabricType(GetFabricTypeForDest(destRank));
-    header.SetFlowId(0);
-    header.SetSequenceNumber(0);
+    header.SetFlowId(MEMORY_FLOW_ID);
+    header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetSourceRank(m_rank);
     header.SetDestRank(destRank);
@@ -623,9 +704,10 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control for MEMORY_RESP
+    // Credit-based flow control for MEMORY_RESP — Su (local-dest) traffic
+    // only (see SendMemoryWrite for the So bypass rationale).
     uint8_t vcId = 0;
-    if (m_creditManager)
+    if (m_creditManager && IsLocalRank(destRank))
     {
         if (!m_creditManager->HasCredits(vcId))
         {
@@ -635,12 +717,12 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
             entry.packet = packet;
             entry.header = header;
             entry.vcId = vcId;
-            entry.seqNum = 0;
+            entry.seqNum = seqNum;
             m_sendQueue.push(entry);
             TrySendQueuedPackets();
             return;
         }
-        m_creditManager->ConsumeCredit(vcId, 0);
+        m_creditManager->ConsumeCredit(vcId, seqNum);
     }
 
     packet->AddHeader(header);
@@ -681,14 +763,23 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
                              ? m_syncMemLatencyNs
                              : m_asyncMemLatencyNs;
 
-    // Send the memory request packet with the access type in the header
-    uint64_t seqKey = MakeSeqKey(destRank, 0, 0);
+    // Send the memory request packet with the access type in the header.
+    // data == nullptr is a READ (the API documents it so): build a
+    // MEMORY_READ carrying address+size, not a MEMORY_WRITE padded with
+    // zeros — the receiving MEMORY endpoint applies MEMORY_WRITE payloads
+    // verbatim, so a zero-padded "read" would overwrite the target with 0s.
+    const bool isRead = (data == nullptr);
+    uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
-    uint32_t payloadSize = 8 + size; // address + data
+    uint32_t payloadSize = isRead ? 12 : 8 + size; // read: address + size
     std::vector<uint8_t> payload(payloadSize, 0);
     std::memcpy(payload.data(), &address, 8);
-    if (data != nullptr && size > 0)
+    if (isRead)
+    {
+        std::memcpy(payload.data() + 8, &size, 4);
+    }
+    else if (size > 0)
     {
         std::memcpy(payload.data() + 8, data, size);
     }
@@ -696,9 +787,10 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     Ptr<Packet> packet = Create<Packet>(payload.data(), payloadSize);
 
     FabricHeader header;
-    header.SetPacketType(FabricPacketType::MEMORY_WRITE);
+    header.SetPacketType(isRead ? FabricPacketType::MEMORY_READ
+                                 : FabricPacketType::MEMORY_WRITE);
     header.SetFabricType(GetFabricTypeForDest(destRank));
-    header.SetFlowId(0);
+    header.SetFlowId(MEMORY_FLOW_ID);
     header.SetSequenceNumber(seqNum);
     header.SetVirtualChannel(0);
     header.SetVirtualLane(0);
@@ -709,9 +801,10 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control for memory semantic packets
+    // Credit-based flow control for memory semantic packets — Su (local-dest)
+    // traffic only (see SendMemoryWrite for the So bypass rationale).
     uint8_t vcId = 0;
-    if (m_creditManager)
+    if (m_creditManager && IsLocalRank(destRank))
     {
         if (!m_creditManager->HasCredits(vcId))
         {
@@ -725,9 +818,17 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
             m_sendQueue.push(entry);
             TrySendQueuedPackets();
             // Still schedule completion — the packet will be sent when credits arrive
-            Simulator::Schedule(NanoSeconds(latencyNs),
-                                &FabricEndpoint::NotifyMemorySemanticComplete,
-                                this, destRank, address, accessType);
+            // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
+            // bound member call targets raw `this` and fires into freed
+            // memory when the endpoint is disposed and released before the
+            // completion latency elapses (codex round 17, finding 2 — with a
+            // 100-us sync latency and dispose+release at 1 us, valgrind
+            // confirmed invalid reads in NotifyMemorySemanticComplete's
+            // callback member access at the 100-us firing).
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(NanoSeconds(latencyNs),
+                                    &FabricEndpoint::NotifyMemorySemanticComplete,
+                                    this, destRank, address, accessType));
             return;
         }
         m_creditManager->ConsumeCredit(vcId, seqNum);
@@ -744,10 +845,14 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     uint32_t deviceIndex = ResolveDeviceIndex(destRank);
     SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(destRank));
 
-    // Schedule completion callback at the memory-semantic latency
-    Simulator::Schedule(NanoSeconds(latencyNs),
-                        &FabricEndpoint::NotifyMemorySemanticComplete,
-                        this, destRank, address, accessType);
+    // Schedule completion callback at the memory-semantic latency.
+    // Tracked in m_deferredEgressEvents so DoDispose cancels it (same
+    // rationale as the credit-blocked path above — codex round 17,
+    // finding 2).
+    m_deferredEgressEvents.push_back(
+        Simulator::Schedule(NanoSeconds(latencyNs),
+                            &FabricEndpoint::NotifyMemorySemanticComplete,
+                            this, destRank, address, accessType));
 }
 
 void
@@ -782,8 +887,13 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         uint32_t thisChunkDataSize = std::min(static_cast<uint32_t>(chunkSize), remaining);
         const uint8_t* chunkData = data + offset;
 
-        // Build protocol-aware chunks using vendor-specific payload builder
-        std::vector<Ptr<Packet>> chunks = m_payloadBuilder->BuildChunks(
+        // Build protocol-aware chunks using the DESTINATION's payload
+        // builder (GetPayloadBuilderForRank mirrors GetProtocolModelForDest's
+        // Su/So split): a remote (So) dest frames with the So builder — the
+        // receiver extracts with GetPayloadBuilderForRank(sourceRank), so an
+        // Su-framed remote packet would be parsed as the wrong wire format
+        // and deliver nothing.
+        std::vector<Ptr<Packet>> chunks = GetPayloadBuilderForRank(destRank)->BuildChunks(
             chunkData, thisChunkDataSize, protocolId, chunkSize);
 
         // For protocols with overhead (LL/LL128), each sub-packet carries a
@@ -796,17 +906,24 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             uint32_t wireSize = pkt->GetSize();
 
             // Compute actual data bytes carried by this sub-packet.
-            // For overhead protocols, use payload builder to extract the
-            // true data size. For SIMPLE (efficiency >= 1), each sub-packet
-            // carries min(chunkSize, remaining) data.
+            // For overhead protocols, use payload builder to extract the true
+            // data size. The extraction buffer is sized to the sub-packet, not
+            // a fixed 256 B: any vendor builder with larger units (e.g. 512 KiB
+            // RoCE segments) would advertise only 256 B per segment and the
+            // receiver would drop the rest (4096 B send delivered 256 B). The
+            // result is capped by the data still unassigned in this chunk: a
+            // fixed-width wire unit (LL line / LL128 chunk) that pads a short
+            // tail otherwise advertises the full unit (64 B for a 50 B tail)
+            // and over-counts the flow.
             uint32_t subPacketDataSize;
             if (efficiency < 1.0)
             {
-                // LL/LL128: extract actual data from the built sub-packet
-                uint8_t tmpBuf[256];
-                uint64_t extracted = m_payloadBuilder->ExtractData(
-                    pkt, protocolId, tmpBuf, sizeof(tmpBuf));
-                subPacketDataSize = static_cast<uint32_t>(extracted);
+                uint32_t dataStillNeeded = thisChunkDataSize - dataAssigned;
+                std::vector<uint8_t> tmpBuf(pkt->GetSize());
+                uint64_t extracted = GetPayloadBuilderForRank(destRank)->ExtractData(
+                    pkt, protocolId, tmpBuf.data(), tmpBuf.size());
+                subPacketDataSize = static_cast<uint32_t>(
+                    std::min<uint64_t>(extracted, dataStillNeeded));
             }
             else
             {
@@ -833,9 +950,16 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             header.SetProtocol(protocolId);
             header.SetEffectiveDataSize(subPacketDataSize);
             header.SetTtl(64);
+            // These chunks came from the payload builder (BuildChunks framed
+            // a vendor header inside the body) — stamp the wire flag the
+            // receiver's ProcessDataPacket dispatch reads.
+            header.SetProtocolFramed(true);
 
-            // Credit-based flow control: check and consume credits before sending
-            if (m_creditManager && !m_creditManager->HasCredits(vcId))
+            // Credit-based flow control: check and consume credits before
+            // sending — Su (local-dest) traffic only (see SendData for the
+            // So bypass rationale; the receiver's return is IsLocalRank-
+            // guarded, so a remote consume would never come back).
+            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
             {
                 NS_LOG_DEBUG("No credits for DATA_INTERNAL chunk on VC " << static_cast<int>(vcId)
                              << ", queuing packet");
@@ -850,7 +974,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                 chunkIndex++;
                 continue;
             }
-            if (m_creditManager)
+            if (m_creditManager && IsLocalRank(destRank))
             {
                 m_creditManager->ConsumeCredit(vcId, seqNum);
             }

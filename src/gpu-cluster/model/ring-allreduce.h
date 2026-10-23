@@ -56,9 +56,28 @@ public:
 
     RingState GetState() const { return m_state; }
 
+    /// Cumulative effective bytes the wire path sent (coverage probe).
+    uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
+
+    /// Test probe: SegmentSizeOf (public wrapper — the chunk-identity
+    /// invariant tests read it without simulating a full collective).
+    uint64_t ProbeSegmentSizeOf(uint16_t gpu, uint32_t step) const
+    {
+        return SegmentSizeOf(gpu, step);
+    }
+
+    /// Test probe: GetSendTarget (public wrapper for the same tests).
+    uint16_t ProbeSendTarget(uint16_t gpu, uint32_t step) const
+    {
+        return GetSendTarget(gpu, step);
+    }
+
 private:
     void DoDispose() override;
     void SetupReceiveCallbacks();
+    /// Fill m_ringPos from the endpoints' embedded ring neighbors (walk the
+    /// reduce-scatter direction from rank 0), with the identity fallback.
+    void ComputeRingPositions();
     void OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header);
     void BuildTransactionGraph();
     void ExecuteTransactionAction(const ProtocolTransactionAction& action);
@@ -68,7 +87,16 @@ private:
     void SendGpuStepData(uint16_t gpu, uint32_t step);
     void OnGpuStepReceiveComplete(uint16_t gpu, uint32_t step);
     void CheckGlobalCompletion();
-    uint16_t GetSendTarget(uint16_t gpu, uint32_t step);
+    uint16_t GetSendTarget(uint16_t gpu, uint32_t step) const;
+    // Segment size (in bytes) that `gpu` transmits at `step`: ownership of
+    // segment (g - s) mod N in Reduce-Scatter and (g + s - 2(N-1)) mod N in
+    // AllGather (the direction reversal), with the first
+    // dataSize % numGpus segments one byte larger so the grid sums to
+    // exactly dataSize.
+    uint64_t SegmentSizeOf(uint16_t gpu, uint32_t step) const;
+    /// Bytes destRank must receive at `step` (the sender's segment size —
+    /// the GPU whose step-`step` send targets destRank).
+    uint64_t StepExpectedBytes(uint16_t destRank, uint32_t step) const;
     bool IsReduceScatterStep(uint32_t step) const;
     bool IsAllGatherStep(uint32_t step) const;
     void Complete();
@@ -90,9 +118,29 @@ private:
     uint64_t m_llThreshold;
     uint64_t m_ll128Threshold;
     uint64_t m_chunkSize;
+    /// Number of one-byte-larger segments in the grid (dataSize % numGpus).
+    uint64_t m_segmentRemainder;
+    /// Ring POSITION of each rank (0 = rank 0's slot), walked from rank 0
+    /// along the reduce-scatter direction of the topology-embedded ring —
+    /// the same neighbor source GetSendTarget reads. Falls back to the
+    /// identity map (position == rank) when no embedding is installed or
+    /// the embedding is not a single cycle covering every rank.
+    /// Ownership math (SegmentSizeOf) keys on position, not numeric rank:
+    /// with a reordered ring such as 0->1->3->2, rank 2 sits at position 3
+    /// and must transmit the position-3 chunk (codex round 15, finding 4).
+    std::vector<uint16_t> m_ringPos;
+    /// Cumulative effective bytes the wire path sent (coverage probe; the
+    /// transaction path derives its byte weights from SegmentSizeOf instead).
+    uint64_t m_sentDataBytes;
 
     std::vector<uint32_t> m_gpuCompletedStep;
-    std::vector<uint64_t> m_gpuStepReceivedBytes;
+    /// Wire-path receive ledger, keyed (dest rank, SENDER step) — the step
+    /// is decoded from the step-encoded flowId, not taken from this
+    /// receiver's own step counter. A single per-dest counter mixed bytes
+    /// of different steps whenever the pipelined senders drifted ahead of
+    /// the receiver, or a retransmission delivered a late copy after the
+    /// counter had already advanced (codex round 14, finding 3).
+    std::vector<std::vector<uint64_t>> m_gpuStepReceivedBytes;
     uint32_t m_gpuDoneCount;
     uint32_t m_permanentLossCount;
     uint32_t m_reduceScatterSteps;

@@ -111,6 +111,32 @@ DcqcnRateMachine::GetOrCreate(FlowKey flowKey)
 }
 
 void
+DcqcnRateMachine::DoDispose()
+{
+    NS_LOG_FUNCTION(this);
+    // Recovery timers capture raw `this` (FastRecovery/AdditiveIncrease).
+    // Unless every armed timer is cancelled here, dropping the last
+    // reference lets the simulator fire into freed memory (codex round 12,
+    // finding 3: OnCnp -> Dispose -> release -> Run crashed ASAN inside
+    // FastRecovery).
+    for (auto& kv : m_flows)
+    {
+        FlowState& s = kv.second;
+        if (s.fastArmed)
+        {
+            Simulator::Cancel(s.fastTimer);
+            s.fastArmed = false;
+        }
+        if (s.aiArmed)
+        {
+            Simulator::Cancel(s.aiTimer);
+            s.aiArmed = false;
+        }
+    }
+    Object::DoDispose();
+}
+
+void
 DcqcnRateMachine::OnCnp(FlowKey flowKey)
 {
     NS_LOG_FUNCTION(this << flowKey);
@@ -210,63 +236,55 @@ DcqcnRateMachine::AdditiveIncrease(FlowKey flowKey)
 Time
 DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
 {
-    // DCQCN congestion backoff: read-only, never creates flow state (so the
-    // ceiling=0 baseline is byte-identical to the pre-pacer machine). At
-    // alpha=0 (no CNP) this is zero.
-    double dcqcnSec = 0.0;
+    // Effective rate for this chunk = the line rate reduced by the DCQCN
+    // congestion backoff (alpha) and capped by the per-QP ceiling. Both
+    // limits are enforced by ONE per-flow pacer: a constant per-chunk offset
+    // (the old alpha model) gives every chunk of a back-to-back burst the
+    // SAME delay, so the burst queues and then drains at the line rate --
+    // the reduced rate is never actually enforced. Only pacing the next
+    // chunk's earliest egress time caps sustained throughput. At alpha=0
+    // (no CNP) and ceiling=0 this is zero and no flow state is created, so
+    // the off baseline is byte-identical (parity-safe).
+    double rateBps = 0.0; // 0 = un-paced (line rate)
     if (m_maxRateBps > 0.0)
     {
         auto it = m_flows.find(flowKey);
         if (it != m_flows.end() && it->second.alpha > m_alphaFloor)
         {
-            double alpha = it->second.alpha;
-            // rateFactor = clamp(1 - alpha/2, 0.5, 1.0): alpha=0 -> 1.0 (no
-            // delay); alpha=1 -> 0.5 (double the serialization time).
-            double rateFactor = std::max(0.5, std::min(1.0, 1.0 - alpha / 2.0));
-            // base serialization time at max rate; extra delay so the
-            // chunk experiences the reduced rate.
-            double baseSeconds = static_cast<double>(chunkBytes) / m_maxRateBps;
-            double d = baseSeconds * (1.0 / rateFactor - 1.0);
-            if (d > 0.0)
-            {
-                dcqcnSec = d;
-            }
+            // rateFactor = clamp(1 - alpha/2, 0.5, 1.0): alpha=0 -> 1.0
+            // (line rate); alpha=1 -> 0.5 (half rate).
+            double rateFactor =
+                std::max(0.5, std::min(1.0, 1.0 - it->second.alpha / 2.0));
+            rateBps = m_maxRateBps * rateFactor;
         }
     }
-
-    // Per-QP ceiling: a TRUE per-flow rate pacer. Spaces consecutive chunks of
-    // the same flow (one QP) so the aggregate rate settles to the ceiling. A
-    // constant per-chunk offset would not cap sustained throughput -- the
-    // NetDevice serializes a back-to-back burst at the link rate; only pacing
-    // the next chunk's earliest egress time does. Only mutates state when the
-    // ceiling is on (> 0), so the off baseline is parity-identical.
-    double paceSec = 0.0;
     if (m_perQpCeilingGbps > 0.0)
     {
         // 1 Gbps = 1e9 bit/s = 1.25e8 B/s (matches MaxRateBps 50e9 == 400 G).
         double ceilingBps = m_perQpCeilingGbps * 1.25e8;
-        FlowState& s = GetOrCreate(flowKey);
-        int64_t nowNs = Simulator::Now().GetNanoSeconds();
-        // Earliest this chunk may egress (ns); 0 before the flow's first chunk.
-        int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
-        // The ceiling-rate slot this chunk occupies (ns).
-        double slotSec = static_cast<double>(chunkBytes) / ceilingBps;
-        int64_t slotNs = static_cast<int64_t>(slotSec * 1e9);
-        if (slotNs < 1)
-        {
-            slotNs = 1; // avoid a zero-slot spin
-        }
-        // The next chunk on this flow may egress one ceiling slot after
-        // this chunk's egress start (nowNs + delayNs).
-        s.nextSendNs = (nowNs + delayNs) + slotNs;
-        paceSec = static_cast<double>(delayNs) / 1e9;
+        rateBps = (rateBps > 0.0) ? std::min(rateBps, ceilingBps) : ceilingBps;
     }
-
-    if (dcqcnSec <= 0.0 && paceSec <= 0.0)
+    if (rateBps <= 0.0)
     {
         return Time(0);
     }
-    return Time::FromDouble(std::max(dcqcnSec, paceSec), Time::S);
+    // Alpha > floor implies a prior CNP created the flow state; the ceiling
+    // path creates it on first send by design.
+    FlowState& s = GetOrCreate(flowKey);
+    int64_t nowNs = Simulator::Now().GetNanoSeconds();
+    // Earliest this chunk may egress (ns); 0 before the flow's first paced chunk.
+    int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
+    // The rate slot this chunk occupies (ns).
+    double slotSec = static_cast<double>(chunkBytes) / rateBps;
+    int64_t slotNs = static_cast<int64_t>(slotSec * 1e9);
+    if (slotNs < 1)
+    {
+        slotNs = 1; // avoid a zero-slot spin
+    }
+    // The next chunk on this flow may egress one slot after this chunk's
+    // egress start (nowNs + delayNs).
+    s.nextSendNs = (nowNs + delayNs) + slotNs;
+    return (delayNs > 0) ? NanoSeconds(delayNs) : Time(0);
 }
 
 double

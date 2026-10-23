@@ -35,11 +35,13 @@ FullMeshAllReduce::FullMeshAllReduce()
     : m_numGpus(0),
       m_dataSize(0),
       m_chunkSize(0),
+      m_chunkRemainder(0),
       m_flowId(1),
       m_state(FullMeshArState::IDLE),
       m_startupDelayNs(0),
       m_reduceScatterDoneCount(0),
       m_allGatherDoneCount(0),
+      m_sentDataBytes(0),
       m_startTimeNs(0),
       m_endTimeNs(0)
 {
@@ -52,6 +54,20 @@ FullMeshAllReduce::~FullMeshAllReduce()
 void
 FullMeshAllReduce::DoDispose()
 {
+    // Detach the receive callbacks BEFORE dropping the endpoint references:
+    // they hold raw `this`, so a packet still in flight after this injector
+    // is disposed would invoke OnPacketReceived on freed memory (same class
+    // of defect as codex round 16, finding 2). Ownership-checked (codex
+    // round 20, finding 6): only the callback THIS injector installed is
+    // cleared — a later injector on the same endpoints keeps its binding.
+    for (auto& ep : m_endpoints)
+    {
+        if (ep)
+        {
+            ep->DetachReceiveCallbackIfOwner(
+                MakeCallback(&FullMeshAllReduce::OnPacketReceived, this));
+        }
+    }
     m_endpoints.clear();
     m_completionCallback = nullptr;
     CollectiveInjector::DoDispose();
@@ -65,13 +81,32 @@ FullMeshAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_dataSize = dataSize;
     m_endpoints = endpoints;
 
+    // Chunk grid: rank r's base chunk is dataSize/numGpus bytes, with the
+    // first dataSize % numGpus chunks carrying one extra byte, so the grid
+    // sums to exactly dataSize (codex round 15, finding 7: plain integer
+    // division silently dropped dataSize % numGpus bytes — the same
+    // truncation RingAllReduce fixed in round 13, finding 3).
     m_chunkSize = dataSize / numGpus;
-    if (m_chunkSize == 0)
+    m_chunkRemainder = dataSize % numGpus;
+    if (m_chunkSize == 0 && dataSize > 0)
     {
-        m_chunkSize = dataSize;
+        // Degenerate dataSize < numGpus: the grid degenerates to one byte
+        // on each of the first dataSize ranks and zero on the rest (still
+        // summing to exactly dataSize), so the completion thresholds stay
+        // positive for every rank that owns a byte. The legacy fallback
+        // (every rank broadcasts the whole dataSize) made
+        // ExpectedBytesPerDest zero for every rank, so the first delivery
+        // flipped the state to AllGather and the second completed the
+        // collective with zero AllGather bytes on the wire (codex round 16,
+        // finding 4). Ranks with a zero chunk send nothing in either phase
+        // and complete on their (dataSize - 0) threshold once the other
+        // ranks' bytes arrive.
+        m_chunkSize = 0;
+        m_chunkRemainder = dataSize;
     }
 
     m_gpuReceivedBytes.resize(numGpus, 0);
+    m_rsReceivedBytes.resize(numGpus, 0);
     m_gpuSrcDoneCount.resize(numGpus, 0);
     m_reduceScatterDoneCount = 0;
     m_allGatherDoneCount = 0;
@@ -130,12 +165,54 @@ FullMeshAllReduce::Start()
 
     NS_LOG_INFO("Starting FullMesh AllReduce with startup delay " << m_startupDelayNs << " ns");
 
-    Simulator::Schedule(NanoSeconds(m_startupDelayNs), &FullMeshAllReduce::TriggerReduceScatterPhase, this);
+    // Tracked in m_pendingEvents so DoDispose cancels it: the event captures
+    // raw `this` and fires long after disposal if the injector is freed
+    // mid-startup (codex round 16, finding 3).
+    m_pendingEvents.push_back(
+        Simulator::Schedule(NanoSeconds(m_startupDelayNs),
+                            &FullMeshAllReduce::TriggerReduceScatterPhase, this));
+}
+
+uint64_t
+FullMeshAllReduce::ChunkSizeOf(uint16_t gpu) const
+{
+    // Chunk `gpu` of the grid: base size plus one byte for the first
+    // dataSize % numGpus chunks.
+    return m_chunkSize + (gpu < m_chunkRemainder ? 1 : 0);
+}
+
+uint64_t
+FullMeshAllReduce::ExpectedBytesPerDest(uint16_t dest) const
+{
+    // Each destination receives the chunks of all N-1 sources: the whole
+    // grid minus its OWN chunk (which it already holds).
+    return m_dataSize - ChunkSizeOf(dest);
 }
 
 void
 FullMeshAllReduce::TriggerReduceScatterPhase()
 {
+    // Zero-data collective: every chunk is zero, so no bulk transfer fires a
+    // receive and neither phase's completion check ever runs — the collective
+    // would stall to the simulation cap. Complete now instead (codex round
+    // 19, finding 8; same convention as NvlsAllGather::TriggerSendPhase).
+    if (m_dataSize == 0)
+    {
+        NS_LOG_INFO("FullMesh AllReduce trivially complete (zero data)");
+        Complete();
+        return;
+    }
+
+    // Single-rank collective (codex round 21, finding 8): N=1 has no peers
+    // to send to and no receives will ever fire — the buffer reduced over
+    // one rank is itself. Complete now instead of stalling to the cap.
+    if (m_numGpus <= 1)
+    {
+        NS_LOG_INFO("FullMesh AllReduce trivially complete (single rank)");
+        Complete();
+        return;
+    }
+
     // Each GPU sends its chunk to all N-1 other GPUs simultaneously
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
@@ -151,12 +228,18 @@ FullMeshAllReduce::TriggerReduceScatterPhase()
                 continue;  // Skip self
             }
 
-            // GPU gpu sends chunk gpu to dest GPU (each GPU gets chunk from each source)
+            // Reduce-scatter: destination dest reduces its OWN chunk, so
+            // every source sends ITS copy of chunk dest. Sizing by the
+            // sender's chunk instead skewed per-rank load: grid [4,4,4,3]
+            // delivered [11,11,11,12] bytes instead of [12,12,12,9]
+            // (codex round 16, finding 6).
+            const uint64_t chunkBytes = ChunkSizeOf(dest);
+            m_sentDataBytes += chunkBytes;
             m_endpoints[gpu]->SendBulkWireTransferSize(
-                dest, m_chunkSize, m_protocolId, m_flowId, 0);
+                dest, chunkBytes, m_protocolId, m_flowId, 0);
 
-            NS_LOG_DEBUG("RS: GPU " << gpu << " sending chunk " << gpu
-                         << " to GPU " << dest << " size=" << m_chunkSize);
+            NS_LOG_DEBUG("RS: GPU " << gpu << " sending chunk " << dest
+                         << " to GPU " << dest << " size=" << chunkBytes);
         }
     }
 
@@ -190,8 +273,10 @@ FullMeshAllReduce::TriggerAllGatherPhase()
                 continue;
             }
 
+            const uint64_t chunkBytes = ChunkSizeOf(gpu);
+            m_sentDataBytes += chunkBytes;
             m_endpoints[gpu]->SendBulkWireTransferSize(
-                dest, m_chunkSize, m_protocolId, m_flowId + 100, 0);
+                dest, chunkBytes, m_protocolId, m_flowId + 100, 0);
 
             NS_LOG_DEBUG("AG: GPU " << gpu << " sending reduced chunk to GPU " << dest);
         }
@@ -216,6 +301,10 @@ FullMeshAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fabric
     }
 
     m_gpuReceivedBytes[destRank] += effectiveSize;
+    if (m_state == FullMeshArState::REDUCE_SCATTER)
+    {
+        m_rsReceivedBytes[destRank] += effectiveSize;
+    }
 
     NS_LOG_DEBUG("Packet: src=" << srcRank << " -> dest=" << destRank
                  << " effectiveSize=" << effectiveSize
@@ -235,11 +324,14 @@ FullMeshAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fabric
 void
 FullMeshAllReduce::CheckReduceScatterComplete()
 {
-    // Each GPU should receive chunks from N-1 sources, total = (N-1) * chunkSize
-    uint64_t expectedTotal = (m_numGpus - 1) * m_chunkSize;
-
+    // Reduce-scatter: each destination receives the other N-1 sources'
+    // copies of its OWN chunk — (N-1)*ChunkSizeOf(dest), not the grid
+    // total minus its chunk (that is the AllGather threshold; conflating
+    // the two is what skewed per-rank load, codex round 16, finding 6).
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
+        const uint64_t expectedTotal =
+            static_cast<uint64_t>(m_numGpus - 1) * ChunkSizeOf(gpu);
         if (m_gpuSrcDoneCount[gpu] == 0 && m_gpuReceivedBytes[gpu] >= expectedTotal)
         {
             m_gpuSrcDoneCount[gpu] = m_numGpus - 1;
@@ -258,11 +350,12 @@ FullMeshAllReduce::CheckReduceScatterComplete()
 void
 FullMeshAllReduce::CheckAllGatherComplete()
 {
-    // Each GPU should receive chunks from N-1 sources, total = (N-1) * chunkSize
-    uint64_t expectedTotal = (m_numGpus - 1) * m_chunkSize;
-
+    // Each GPU receives the chunks of the other N-1 sources: the grid
+    // total minus its own chunk (same as reduce-scatter — each rank
+    // broadcasts its reduced chunk to all others).
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
+        const uint64_t expectedTotal = ExpectedBytesPerDest(gpu);
         if (m_gpuSrcDoneCount[gpu] == 0 && m_gpuReceivedBytes[gpu] >= expectedTotal)
         {
             m_gpuSrcDoneCount[gpu] = m_numGpus - 1;

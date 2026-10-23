@@ -6,6 +6,2237 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 24: eight defects across forwarded-traffic shaping, repair-state isolation, and surrogate tail geometry
+
+1. **Legacy AllReduce results use the upload spray geometry** (medium).
+   The surrogate's AllReduce result arm ran every configuration through
+   the switch's 128-KiB partition spray, but legacy single-multicast
+   mode (`nvls_num_partitions` 0 or 1) replays the UPLOADS' chunk sizes
+   — one whole-D packet per dest on a single lane. N=2 / D=4 MiB /
+   BER 2.1e-7 / LLR / retry 10000 predicted 0.000330 permanent losses
+   and finite strict latency where the correct legacy expectation is
+   1.890 losses (one whole-packet retry stream per dest). The arm now
+   branches: legacy mode reuses the upload fragment geometry,
+   pipelined mode keeps `_switch_multicast_fragments` (round 23 #2).
+   Test: `test_nvls_legacy_allreduce_uses_upload_geometry`.
+2. **Forwarded packets skip the forwarder's rate machines** (medium).
+   DCQCN/RTTCC shaping gated only on packet type, so a transit packet
+   was re-paced on the FORWARDING endpoint's `m_rank` key: on routes
+   0→1→2 and 1→2 (shared dest/vc/flow coordinates, 49-GB/s per-QP
+   ceiling) source 0's stream merged onto source 1's pacer and finished
+   at 1434.2 µs where independent pacing finishes at 714.4 µs. Both
+   shaping gates now add `hdr.GetSourceRank() == m_rank` — the per-QP
+   pacer is a sender-NIC property; the CNP / RTT-response receive paths
+   already keyed on flow origin. Test: `DCQCN forwarded packets skip
+   the forwarder's pacer`.
+3. **Random-traffic goodput excludes permanent-loss notices** (medium).
+   The sim's receive callback counted `PERMANENT_LOSS` terminal notices
+   (synthetic empty packet + original metadata) as delivered payload:
+   with drop threshold 1 / SACK / retry limit 0 / zero warmup, seed 1
+   reported 1363.149 Gbps delivered where actual payload goodput is
+   298.844 Gbps (203 of 260 counted messages were loss notices). The
+   callback now early-returns on the PERMANENT_LOSS packet type.
+   Parity gate `test_random_traffic.py` gained Check 3: delivered bytes
+   must be a multiple of the message size and strictly below the
+   pre-fix value.
+4. **SHARP result store keeps flows' repair state isolated** (medium).
+   `StoreMulticastResult` erased the destination's whole store on every
+   new result flow, and `HandleSwitchNack` fell back to "the last flow
+   seen" when a named-flow lookup missed: a NACK for flow 1/seq 0
+   arriving after flow 2 started was answered with flow 2's sequence 0
+   — flow 1's missing result stayed unrecoverable. The store is now
+   per-(dest, flow) with coexisting bounded windows (~9.4 MB per live
+   flow), and a NACK only ever repairs its own flow's window.
+   Test: `SHARP result store keeps flows' repair state isolated`.
+5. **`SendBulkWireTransfer` carries 64-bit volumes** (medium). The
+   wrapper's dataSize parameter was `uint32_t`, so hierarchical
+   AllReduce's `uint64_t ringVolume` truncated: 3 GPUs/node, D=6 GiB,
+   local ring mode passed 4 GiB & 0xFFFFFFFF = 0 and phase 1 emitted
+   zero packets. The parameter is now `uint64_t` (the wrapper never
+   reads the data pointer; it forwards to SendBulkWireTransferSize).
+   Test: `SendBulkWireTransfer carries 64-bit volumes`.
+6. **GatewayEndpoint forwards cross-fabric traffic through the hybrid
+   table with the gateway delay** (medium). The base receive path never
+   consulted `m_hybridRoutingTable`: 0→gateway 1→2 delivered locally
+   at rank 1 (rank 2 received nothing), and forcing a base routing
+   entry still bypassed `GatewayDelay` (100 µs configured, 0.204 µs
+   traversal). A new virtual `TryForwardReceivedPacket` lets
+   `GatewayEndpoint` route via `LookupRoute` + `ScheduleForwarding`
+   (delay applied), falling back to the base same-fabric forward when
+   the hybrid table has no route. Test: `GatewayEndpoint forwards
+   cross-fabric routes with gateway delay`.
+7. **`ecnThreshold=0` disables ECN marking** (low).
+   `MarkEcnIfCongested` gated only on `voqDepth < m_ecnThreshold`, and
+   `0 < 0` is false — a quiescent 64-byte P2P run with dcqcn=1 /
+   ecnThreshold=0 produced one ECN mark and one CNP despite the CLI's
+   documented "0=off". The zero-disable guard now matches the
+   voqDropThreshold one above it. Test: `EcnThreshold=0 disables ECN
+   marking`.
+8. **Tail-variance retransmission serialization honors the topology
+   cap** (low). `_step_variance` divided both retransmission delay
+   terms by the raw `BW_link`, so a 50-GB/s bisection cap left the
+   low-BER p99-minus-mean increment unchanged at 1.736 µs (16 MiB /
+   N=8 ring / 32 credits / BER 1e-8 / SACK) where the capped rate
+   gives 5.371 µs — the same contract the mean path (round 22 #6) and
+   the heavy-tail branch (round 23 #4) already follow. The capped rate
+   is `min(BW_link, bisection)`; `topology=None` stays byte-identical.
+   Test: `test_tail_variance_topology_cap_scales_retransmission`.
+
+Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
+5 PASS, surrogate pytest 96 passed (2 new round-24 tests), 14/14 parity
+scripts (test_random_traffic.py extended with a goodput-excludes-losses
+check), valgrind QUICK exit 0 with zero errors.
+
+### Fixed — codex round 23: four defects in flow-key isolation and switch-side surrogate geometry
+
+1. **DCQCN/RTTCC flow keys carry the sender rank** (medium). The
+   rate-machine flow key was `MakeSeqKey(dest, vc, flow)` — no source
+   rank — so with the sim's single shared machine (single-NIC modeling)
+   two senders sharing flow coordinates merged onto ONE pacer: the
+   second sender inherited the first's pacing debt and finished at
+   1434.8 µs where independent state finishes at 715.1 µs (codex's
+   probe: 2 senders / 4 MiB each / 49-GB/s per-QP ceiling, identical
+   (dest, flow, vc)). A new `MakeRateFlowKey(source, dest, vc, flow)`
+   (source rank in bits 40-55, clear of MakeSeqKey and bit 63's memory
+   namespace) is now used at all four key sites: DCQCN shaping,
+   RTTCC shaping/probe, CNP receive, and RTT-response receive.
+   Single-flow behavior is byte-identical (parity suites unchanged).
+   Test: `DCQCN shared machine keeps per-sender flow state isolated`.
+2. **SHARP AllReduce result reliability uses the switch multicast
+   geometry** (medium). The surrogate's result arm modeled each
+   partition with the ENDPOINT single-link rule (one whole 2-MiB packet
+   at 1 lane) while `NvSwitch::MulticastAllReducePartition` always
+   sprays at ~128-KiB chunks: N=2 / D=4 MiB / 2 partitions / BER 2.1e-7 /
+   retry 10000 predicted 0.571 permanent losses and strict latency ∞
+   where ns-3 seeds 1-3 report zero. A new
+   `_switch_multicast_fragments` helper mirrors the C++ spray loop
+   (≥ ceil(wire/128 KiB) chunks, >512-MiB coalescing, trailing-lane-pad
+   skip); predicted losses drop to 3.3e-4 and strict latency is finite.
+   Test: `test_sharp_result_uses_switch_multicast_geometry`.
+3. **NVLS AllGather retry latency uses the rank grid** (low). The
+   `_retry_overhead` arm still fragmented a uniform D/N: at
+   D=9,437,185 / N=4 / 18 lanes it modeled 19 × 124,174-B fragments
+   where three ranks send 18 × 131,072-B — expected max attempts 8.60
+   vs 8.17 modeled, 326.94 vs 311.77 µs. The dominant stream is now
+   selected by its expected max attempt count over the real
+   `_rank_upload_chunks` grid. Test:
+   `test_nvls_allgather_retry_latency_rank_grid`.
+4. **Heavy-tail retransmission serialization honors the topology cap**
+   (low). `predict_tail`'s heavy-tail branch divided `delay_per_error`
+   by the raw `BW_link`, so a 50-GB/s bisection cap left the
+   p99-minus-mean increment unchanged at 560.39 µs (16 MiB / N=8 ring /
+   32 credits / BER 2e-7 / SACK) — the same contract the mean path
+   (round 22 #6) already follows. It now divides by
+   `min(BW_link, bisection)`; the capped increment rises to 1983.8 µs.
+   Test: `test_heavy_tail_topology_cap_scales_retransmission`.
+
+Suite state: EXTENSIVE 136 PASS / 0 FAIL (1 new C++ test), integration
+5 PASS, surrogate pytest 94 passed (3 new round-23 tests), 14/14 parity
+scripts, valgrind QUICK exit 0 with zero errors.
+
+### Fixed — codex round 22: seven defects across legacy multicast, degenerate collectives, and surrogate consistency
+
+1. **Legacy SHARP multicast result fires once per flow** (high).
+   `NvSwitch::ProcessAllReduce` (single-multicast branch) re-ran the
+   `allComplete` test on EVERY late upload — padding fragments included —
+   so after the first multicast cleared the buffer, a second
+   `MulticastAllReduceResult` event dereferenced the empty `begin()`:
+   SIGSEGV (codex's probe: 4 GPU / D=1 / two delayed lanes / 10-µs
+   aggregation). The flow is now marked done (`m_allReduceLegacyMulticastDone`,
+   an unordered_set) BEFORE the result event is scheduled, so later
+   fragments are wire noise; DoDispose clears the set with the other
+   per-flow maps. Test: `SHARP legacy multicast result fires once per
+   flow`.
+2. **NcclRingAllReduce zero-data trivial completion** (medium). D=0 fell
+   into the degenerate-grid floor (`m_chunkSize = 1`), fabricating one-
+   byte chunks: the CLI repro (`--numNodes=2 --gpusPerNode=2
+   --algorithm=ncclring --collective=allreduce --dataSize=0`) reported 48
+   endpoint transmissions and a 103-µs completion for a zero-byte
+   operation. The floor now applies only when `dataSize > 0`; a
+   `m_trivialZeroData` flag (set at Initialize, consumed at Start)
+   mirrors the single-rank seam and completes with nothing on the wire
+   (fixed: endpointTxPackets=0, simTimeUs=0). Test: `NcclRing zero-data
+   allreduce emits no packets`.
+3. **Single-rank ring prediction no longer divides by zero** (medium).
+   `_steps()` returned `2*(N-1) == 0` at N=1, which `_per_step()` used as
+   a divisor — `predict(65536, 1, "ring", 128, collective="allreduce")`
+   raised ZeroDivisionError. The ring-allreduce step count is clamped to
+   ≥ 1, so every N=1 prediction (ring/tree/nvls/fullmesh × allreduce/
+   allgather/alltoall/sendrecv) is finite (startup + one zero-volume
+   step). Test: `test_single_rank_prediction_finite`.
+4. **NVLS AllGather retry-buffer sizing follows the rank grid**
+   (medium). `required_retry_buffer_entries` / `..._bytes` /
+   `_retry_buffer_fragment_bytes` fragmented a uniform `D/N` while the
+   loss model (round 21 #6) already fragmented the integer grid: at
+   D=73/N=4/18 lanes the chunks [19,18,18,18] spray [10,18,18,18]
+   fragments, so the busiest endpoint retains 18 — the sizing returned 10
+   and a 16-entry buffer overflowed in ns-3 across seeds 1–3. All three
+   functions now size at the per-rank grid (shared
+   `_rank_upload_chunks` helper); the exactly-divisible regime is
+   unchanged. Tests: `test_nvls_allgather_retry_buffer_rank_grid`.
+5. **Backlog-decrement ledger prunes fired entries** (medium). The
+   round-21 ledger was append-only until disposal: after 10,000 delivered
+   packets it still held 10,000 stale entries (each an EventId + model
+   reference), so memory grew with cumulative traffic — and a fired
+   EventId can alias a reused UID after wraparound, which would break
+   the disposal balance. `TrackBacklogDecrement` (now the single append
+   path for all three increment sites) erases expired entries on every
+   append, keeping the ledger O(in-flight wire depth). Probe: 2,100
+   drained sends leave backlog 0, and a mid-flight disposal still
+   balances the pending entries; valgrind clean. Test: `backlog ledger
+   prunes fired entries and stays balanced`.
+6. **Legacy GBN retransmissions serialize at the topology-capped rate**
+   (low). `_gbn_cascade` used the raw `self.BW_link` for its chunk
+   serialization while the SACK path received the topology-capped
+   `T_serial_step` — adding a 50-GB/s bisection cap left the GBN retry
+   penalty unchanged (2.0435 µs at 18 lanes / 1 MiB / N=8 / BER 1e-7),
+   contradicting WHITEBOX_SURROGATE §12's contract that retransmitted
+   fragments re-serialize at the capped rate. `_gbn_cascade` now takes
+   `bw_eff` (caller passes `min(BW_link, bisection)`); the capped legacy
+   term rises to 7.23 µs. Test:
+   `test_gbn_topology_cap_scales_retry_penalty`.
+7. **`--nvlsNumPartitions=0` selects the single multicast it documents**
+   (low). `NvSwitch::ProcessAllReduce` substituted the threshold for a
+   zero partition count (0 → N partitions), so the sim's documented
+   "0=single, 8=pipelined" knob produced identical pipelined runs for 0
+   and N (4 GPU / 1 MiB / 2 links: 34.5 µs and 48 switch transmissions
+   for both) while 1 gave the single-multicast behavior (36.9 µs / 36).
+   The header contract ("0=old single-multicast mode") is now honored:
+   0 and 1 both run single multicast (36.9 µs / 36), ≥ 2 pipelines.
+   Test: `NVLS AllReduce partition 0 equals single multicast`.
+
+Suite state: EXTENSIVE 135 PASS / 0 FAIL (4 new round-22 tests),
+integration 5 PASS, surrogate pytest 91 passed (3 new round-22 tests),
+14/14 parity scripts, valgrind QUICK exit 0 with zero errors. (The
+round-21 note recorded "132 / 6"; the suite registers 131 cases at
+f83a724 and 5 integration cases — those earlier counts included a stale
+grep match.)
+
+### Fixed — codex round 21: eight defects across broadcast ledgers, degenerate grids, and surrogate reliability
+
+1. **Legacy SHARP counts each GPU's broadcast completion once** (high).
+   `SharpAllReduce::OnGpuBroadcastReceiveComplete` re-fired its threshold
+   check on EVERY result fragment after the threshold crossed — padding
+   fragments with zero effective bytes included — so one GPU could be
+   counted multiple times (`m_broadcastDoneCount` advancing past
+   `numGpus` on a single rank). With one slow GPU, a late padding
+   fragment completed the collective with the slow GPU's totals still at
+   zero (probe: completion at 71.3 µs with GPU 0 counted twice; the fixed
+   build completes at 166 µs after GPU 3's 100-µs-delayed stream lands).
+   A once-per-GPU guard (`m_gpuBroadcastDone`) now short-circuits every
+   fragment after the first completion. Test: `SHARP broadcast completion
+   counts each GPU once`.
+2. **Hierarchical AR/RS pre-credit degenerate ranks at every phase**
+   (medium). The remaining 0→1 expected-byte clamps (hierarchical
+   allreduce phases 1–4, hierarchical reducescatter phases 1–2, and the
+   ring-branch volume clamp) had no sender at degenerate grids — ranks
+   with zero-sized chunks stalled the collective to the 3600-s cap at
+   2×2/D=1..15. The frozen convention is now pre-crediting:
+   zero-obligation ranks are marked complete at each phase START (local
+   segment, inter-node chunk, remote-obligation sum, or flat chunk ==
+   0), with no clamps anywhere. Test: `hierarchical AR and RS degenerate
+   grids complete`.
+3. **Hierarchical AllToAll honors the startup override** (medium).
+   `Start()` used the protocol-model delay unconditionally AND the sim's
+   hierarchical-alltoall branch never called `SetStartupDelay` at all, so
+   `--startupDelay`/`--startupAlltoAll` left the completion time frozen
+   (2×2/D=65536: 118.4 µs with or without a 1-s override). The override
+   now wins whenever set (mirroring the round-20 #8 rule), and the sim
+   wires both knobs into the injector (fixed: 1000053.4 µs). Test:
+   `hierarchical alltoall startupDelay override shifts completion`.
+4. **Endpoint disposal balances the contention-backlog ledger**
+   (medium). `DoDispose` canceled the scheduled `DecrementBacklog` events
+   without balancing their already-counted increments — a SHARED
+   `ContentionModel` kept a phantom P2P backlog of 1 forever, drawing an
+   artificial contention penalty for all later traffic. Pending
+   decrements are now tracked (event, model, class) alongside the
+   deferred egress events, and disposal applies every still-pending
+   decrement before canceling (entries whose event already fired are
+   skipped; the balance runs BEFORE the cancel loop because Cancel marks
+   an EventId expired). Test: `endpoint disposal balances pending
+   contention backlog`.
+5. **Credit-window shrink clamps pending, not available** (medium).
+   `SetTotalCredits` adjusted `available` by the window diff and clamped
+   it to the new total — shrinking below the OUTSTANDING count granted
+   phantom available credits (10→5 with 8 outstanding: available=5 while
+   8 are in flight, letting the sender double-spend) and broke the
+   `available + pending == total` invariant so the next `ReturnCredits`
+   aborted (probe: NS_ASSERT at credit-manager.cc). The overdraft case
+   now clamps PENDING to the new total and zeroes available; returned
+   credits drain the overdraft as they arrive. Non-overdraft shrink and
+   grow keep the arithmetic identity. Test: `credit window shrink clamps
+   pending not available`.
+6. **Surrogate NVLS AllGather fragments at the remainder grid** (medium).
+   `expected_permanent_losses` fragmented a uniform `D/N` per rank: at
+   D=5/N=4/18 lanes it counted 40 fragments (8 upload + 32 result)
+   where the `[2,1,1,1]` grid sends 5 uploads and mirrors 5 result
+   fragments to each of the 4 dests (25 total) — 0.6042 predicted
+   expected losses at BER 0.0016 / RS(544,514,15) / LLR off vs the exact
+   0.3776, so strict latency went infinite for a run ns-3 seeds 1–3 all
+   complete. The estimator now fragments each uploading rank's ACTUAL
+   integer chunk (`D/N + (r < D%N)`), sizes the failure probability at
+   the largest fragment, and mirrors the summed upload fragments per
+   dest. The many-rank regime (D%N == 0) is unchanged. Test:
+   `test_nvls_allgather_remainder_grid_fragments`.
+7. **Zero-byte tree predictions finite under Go-Back-N LLR** (medium).
+   `_gbn_cascade` returned infinity when the (zero) packet count drove
+   `window == 0` — despite zero transfer work. A `P_error_total <= 0`
+   early return now precedes the window computation, so D=0 with
+   `llr_enabled=True` and BER>0 is finite in predict, predict_tail, and
+   strict mode (matching the ns-3 zero-data trivial completion). Test:
+   `test_zero_byte_gbn_llr_finite`.
+8. **Single-rank collectives complete trivially** (medium). N=1 with
+   nonzero D: ring AllReduce's transaction graph failed validation
+   ("node that cannot affect completion" abort), NcclRingAllReduce
+   aborted at Initialize, and fullmesh AR plus ring/fullmesh AG/RS and
+   AllToAll waited for receives that cannot occur to the 3600-s cap.
+   Every injector now short-circuits N≤1 (pre-credit at Initialize for
+   AlltoAll; guard at Start for the rest; Initialize+Start flag for
+   NcclRingAllReduce). CLI sweep: all 7 algorithms × 6 collectives
+   status=complete at N=1. Tests: `single-rank <injector> completes
+   trivially` (7 cases). Also: `StartApplication` on an endpoint whose
+   application start was scheduled before a mid-window `Dispose` now
+   returns early instead of dereferencing the nulled managers.
+9. **Test-name hygiene** (round-21 follow-on). One registered test name
+   contained `/` ("Ring AG/RS and FullMesh grids cover the full data
+   size"), which broke `test-runner --test-name` filtering (names cannot
+   contain `/\|?"`). Renamed to "Ring AG-RS and FullMesh grids cover
+   the full data size" — no behavioral change.
+
+Suite state: EXTENSIVE 132 PASS / 0 FAIL (12 new round-21 tests),
+integration 6 PASS, surrogate pytest 88 passed (2 new round-21 tests),
+14/14 parity scripts, valgrind QUICK exit 0 with zero errors.
+
+### Fixed — codex round 20: twelve defects across result ledgers, callback ownership, and hierarchical grids
+
+1. **SHARP/NVLS result receive paths count effective bytes only** (high).
+   Both `SharpAllReduce::OnPacketReceived` and `NvlsAllGather`'s result
+   accounting fell back to `packet->GetSize()` when
+   `effectiveDataSize == 0` — multicast result padding fragments
+   (retransmits excepted, which stamp the field) were credited as real
+   data, so receivers could complete before every rank's EFFECTIVE result
+   bytes arrived. The ledgers are effective-bytes-only now, matching the
+   round-19 switch-side convention. Test: `SHARP result receive counts
+   effective bytes only`.
+2. **Hierarchical AllGather phase-2 pre-credit keys on remote
+   obligation** (medium). The zero-expectation shortcut keyed on the
+   rank's OWN node chunk, so ranks on the NON-degenerate node (nonzero
+   own chunk, zero REMOTE receive obligation) waited for bytes nobody
+   sends — 2×2 AllGather at D=1/2/4 stalled to the 1-hour cap. The
+   pre-credit now sums the REMOTE nodes' chunk obligations, and the
+   phase-2 threshold drops its 0→1 clamp (the pre-credit covers the zero
+   case). Test: `hierarchical allgather degenerate 2x2 grid completes`.
+3. **Hierarchical AR/RS grids are remainder-aware at both levels**
+   (medium). Flat floor division truncated sends AND thresholds: 2×2 at
+   D=15 moved 80 (AR) / 40 (RS) bytes where the grid tiles D exactly —
+   90 / 45. `HierarchicalAllReduce` now uses a two-level grid
+   (`LocalSegmentOf(l) = D/g + (l < D%g)`,
+   `InterChunkOf(n,l) = seg(l)/N + (n < seg(l)%N)`) with
+   destination-sized phase-1 fullmesh sends, phase-2/3 sends paired with
+   matching thresholds, and ring volumes sized to the successor's chunk;
+   `HierarchicalReduceScatter` uses a flat per-rank `ChunkOf(r)` grid the
+   same way. Phase-2's reduce-scatter threshold is the receiver's OWN
+   share × (N−1) (sends are destination-sized), while phase-3's all-gather
+   threshold sums the remote shares (sends are own-share). Test:
+   `hierarchical AR and RS remainder grids tile dataSize exactly`.
+4. **CreditManager replacement drains the queued sends** (medium).
+   `SetCreditManager` installed the binding on the new manager but never
+   re-ran the deferred-send path, so swapping a BLOCKED manager for a
+   credited one left queued sends stranded until another credit event.
+   The setter now calls `TrySendQueuedPackets()` after installing. Test:
+   `credit manager swap drains the queued sends`.
+5. **ProtocolConfigRunner teardown is ownership-checked** (medium). The
+   destructor tested `ep->GetReceiveCallback().IsEqual(ours)` — `IsEqual`
+   dereferences both callbacks' `m_impl` (via `Ptr::operator->`
+   NS_ASSERT), aborting when the endpoint's callback had already been
+   cleared (any injector dispose path). Teardown now uses the new
+   null-safe `FabricEndpoint::DetachReceiveCallbackIfOwner`.
+6. **Injector dispose detaches only its own receive binding** (medium).
+   All 17 injector `DoDispose` methods cleared the endpoint receive
+   callback UNCONDITIONALLY — disposing injector A after injector B
+   initialized clobbered B's binding (packets into a null callback =
+   silent data loss). All converted to
+   `DetachReceiveCallbackIfOwner(MakeCallback(&Self::OnPacketReceived,
+   this))`, which clears only when the stored binding is still ours.
+   Tests: `injector dispose detaches only its own receive binding`.
+7. **Deferred backlog decrements hold the ContentionModel** (medium).
+   The WFQ/FEC/immediate shaping branches' deferred
+   `DecrementBacklog` lambdas captured `this` (the endpoint) and read
+   `m_contentionModel` at fire time — replacing or clearing the model
+   between schedule and fire dereferenced the stale member (use-after-
+   free-class). The lambdas now capture `Ptr<ContentionModel> model` at
+   schedule time. Test: `contention backlog decrement survives model
+   replacement`.
+8. **Hierarchical injectors honor the startupDelay override** (medium).
+   `Start()` unconditionally used the size-derived model delay, so the
+   `--startupDelay` CLI knob (written into `m_startupDelayNs`) never
+   affected hierarchical AR/AG/RS timing. The override now wins whenever
+   set (0 = auto). Test: `hierarchical startupDelay override shifts
+   completion`.
+9. **Hierarchical ReduceScatter handles gpusPerNode=1** (medium).
+   `StartLocalReduceScatter` unconditionally drove the g>1 local-phase
+   machinery (zero peers, threshold clamped 0→1 with no sender) — the
+   collective stalled at the 1-hour cap. The g≤1 shortcut now schedules
+   the inter-node phase directly (same seam as the AR fix).
+10. **Zero-data collectives complete trivially** (medium). Beyond the
+    round-19 fullmesh coverage: ring/SHARP AllReduce built transaction
+    graphs whose wait nodes got zero completion thresholds (Validate
+    aborts "wait node has no completion threshold"); ring AG/RS,
+    fullmesh RS, tree, ring reduce/broadcast, hierarchical AR/AG/RS, and
+    the bare p2p/fanout/incast sim patterns stalled with nothing to
+    send. Every injector now short-circuits `dataSize == 0` to
+    `Complete()` at its first trigger point. Test: `zero-data ring tree
+    and fullmesh collectives complete trivially`.
+11. **Surrogate NVLS AllGather loss model counts uploading ranks**
+    (medium). `expected_permanent_losses` multiplied the FULL GPU count
+    into both the upload and the result-multicast arms — at 1 B / 4 GPUs /
+    FEC RS(544,514,15) / BER 1.8e-3 it predicted 8p vs the exact 5p =
+    0.1903 (the 1-GPU degenerate collective has one uploading rank, not
+    four) with infinite strict latency while ns-3 completes. The
+    uploading-rank count (`min(N, ceil(D))`, 0 when D=0) now scales both
+    arms; the many-rank regime (8 GPUs / 16 MiB / BER 1e-9, ~1.08e-10)
+    is unchanged. Test: `test_nvls_allgather_loss_counts_uploading_ranks`.
+12. **Surrogate zero-byte predict no longer divides by zero** (medium).
+    `make_h200_tree_theory().predict(0, 4, "tree", 128,
+    collective="allreduce")` raised ZeroDivisionError at BER 0: the tree
+    packet count is 0 and `_packet_bytes_per_transfer` divided 0/0.
+    Zero-byte transfers now yield zero tree packets, a trivial fragment
+    size (1) for retry-buffer sizing, and an unclamped entry count (a
+    zero-size fragment can evict nothing). predict/predict_tail/strict
+    paths all return finite values at D=0 for every algorithm. Test:
+    `test_zero_byte_predict_is_finite_everywhere`.
+
+Suite state: EXTENSIVE 120 PASS / 0 FAIL (9 new round-20 tests),
+integration 6 PASS, surrogate pytest 86 passed (2 new round-20 tests),
+14/14 parity scripts, valgrind QUICK exit 0 with zero errors.
+
+### Fixed — codex round 19: nine defects across credit ownership, ring volumes, and degenerate grids
+
+1. **CreditManager attribute swap detaches the old binding** (high). The
+   `CreditManager` pointer attribute used a raw member accessor: swapping
+   the manager rebound the endpoint but left the OLD manager holding the
+   `OnCreditAvailable` callback — credit returns on the retired manager
+   fired into the endpoint after re-swap/dispose. The setter-based
+   accessor detaches only our binding at swap (ownership-checked) and
+   installs it on the new manager immediately. Test: `credit manager
+   attribute swap detaches old binding`.
+2. **Hierarchical ring reduce-scatter moves the full ring volume** (high).
+   The ring branch sent ONE undersized segment instead of the g−1 steps'
+   aggregate: at g=4 / segment 4 MiB each GPU shipped 1 MiB locally
+   instead of 12 MiB (12× under-transfer) while the completion threshold
+   matched the under-send. Both `HierarchicalAllReduce` and
+   `HierarchicalReduceScatter` now send `m_segmentSize * (gpusPerNode−1)`
+   as one aggregate transfer and expect the same volume. Test:
+   `hierarchical ring reduce-scatter moves segment*(g-1) bytes`.
+3. **SHARP/NVLS switch byte ledgers count effective bytes only** (medium).
+   The per-source ledger fell back to `payloadSize` when
+   `effectiveDataSize == 0`, crediting collective-spray padding fragments
+   as real data — the switch could aggregate before every source's
+   EFFECTIVE bytes arrived. Padding now legitimately counts 0 (every real
+   producer stamps the field); the partition ratio divide is guarded
+   against a zero-effective source (SIGFPE). Test: `SHARP switch ledger
+   counts effective bytes only`.
+4. **Zero-data AllToAll re-fires its completion callback at Start()**
+   (medium). `Start()` early-returned on an already-COMPLETED collective
+   without firing the callback registered after `Initialize` — the CLI
+   reported `status=incomplete` at dataSize=0 while the collective itself
+   was complete. `Start()` now re-fires the callback with the recorded
+   duration.
+5. **Hierarchical AllGather covers the full data size** (medium). Uniform
+   `D/N` chunks truncated the remainder (2×2 at 15 B exchanged 36 instead
+   of 45 bytes) and the phase-2 expectation used the rank's OWN node
+   chunk instead of the sum of REMOTE nodes' chunks — rank 0 expected 8
+   bytes but receives node 1's 7, stalling the collective. Now the frozen
+   chunk grid (`ChunkSizeOf`) sizes every send and the phase-2 threshold
+   sums remote node chunks.
+6. **NVLS AllGather degenerate grid reaches zero-chunk ranks** (medium).
+   With `dataSize < numGpus`, ranks past `dataSize` hold zero-sized
+   chunks and never upload, so the switch's learned `m_portRankMap` never
+   saw them — the multicast result loop skipped them and every such
+   receiver stalled at done=N−1 of N (CLI `--dataSize=3` /
+   `--dataSize=1`: status incomplete). New `NvSwitch::AddRankPort`
+   registration seam (populated by the helpers alongside the static
+   route); the multicast builders union the registered map with the
+   learned one, and the switch's completion gate credits zero-chunk
+   ranks. The injector sizes uploads with the frozen grid and skips
+   zero chunks. Test: `NVLS allgather degenerate grid reaches zero-chunk
+   ranks`.
+7. **`CreditManager::DetachFromEndpoint` is ownership-checked** (medium).
+   The detach cleared the stored binding unconditionally, so a shared
+   manager serving two endpoints lost the OTHER endpoint's callback when
+   one disposed. The binding is now cleared only when the owner callback
+   matches (`Callback::IsEqual`), null owner = unconditional.
+8. **Zero-data FullMesh collectives complete** (medium). With
+   `dataSize == 0` every chunk is zero, bulk sends are no-ops, and no
+   receive ever fired the completion check — both FullMeshAllGather and
+   FullMeshAllReduce stalled to the simulation cap (CLI `status=incomplete`
+   at the 1-hour limit). `TriggerSends` / `TriggerReduceScatterPhase` now
+   complete the collective directly, matching the NVLS convention. Test:
+   `zero-data fullmesh collectives complete without wire traffic`.
+9. **Surrogate LLR-off normalization precedes the retry-limit early
+   return** (medium). `expected_permanent_losses` checked
+   `retry_limit is None or < 0` BEFORE the LLR-off normalization, so
+   `llr_enabled=False / retry_limit=None` returned 0.0 — zero risk for a
+   config whose packets have exactly one attempt (strict_reliability
+   blessed incompletable configs). The normalization now runs first.
+   Test: `test_llr_off_retry_limit_none_means_one_attempt`.
+
+Suite state: EXTENSIVE 111 PASS / 0 FAIL, integration 5 PASS, surrogate
+pytest 84 passed, 14/14 parity scripts, valgrind QUICK exit 0 with zero
+errors on the credit-swap / sharp / ring / ag / degenerate-grid probes.
+
+### Fixed — codex round 18: ten defects across endpoint disposal, chunk grids, and the surrogate
+
+1. **Credit manager detached at endpoint dispose** (high). An externally
+   retained `CreditManager` (attribute-supplied) outlives the endpoint;
+   `DoDispose` dropped the reference but left `OnCreditAvailable` bound to
+   the freed endpoint — `ReturnCredits` after disposal read freed memory
+   (valgrind-confirmed in `TrySendQueuedPackets`). New
+   `CreditManager::DetachFromEndpoint()` mirrors the LLR detach. Test:
+   `credit manager callback detached at endpoint dispose`.
+2. **Ring AllToAll carries step-counter overshoot forward** (high). The
+   ring receive path pooled fragments from MULTIPLE steps in one per-dest
+   counter and reset it to zero at a threshold cross, discarding the
+   overshoot — with one lane delayed 100 µs, a dest pooled step-s+1
+   fragments before crossing its step-s threshold and the collective never
+   completed (3 GPU / 300 B / 18 lanes: all 600 bytes sent, status
+   incomplete). The counter now subtracts the threshold (looping when
+   overshoot exceeds a full chunk). Test: `ring alltoall carries
+   step-counter overshoot forward`.
+3. **NVLS AllGather switch waits for each source's full chunk** (high).
+   The switch threshold required only the uniform `dataSize/numGpus` from
+   every source while the injector uploads the frozen chunk grid (first
+   `D%N` ranks carry one extra byte) — a delayed lane let the 4-GPU / 9-B
+   AllGather multicast 8 bytes, retire the ledger, and stall every
+   receiver at 8/9. The per-source expectation is now `chunk +
+   (src < D%N ? 1 : 0)`. Test: `NVLS allgather switch waits for each
+   source's full chunk`.
+4. **Hierarchical AllToAll covers the full data size** (medium). Uniform
+   `D/N` chunks truncated the remainder (2 nodes × 2 GPUs at 15 B sent 36
+   aggregate bytes, not 45) and the degenerate `D < N` grid sent nothing
+   (stall to the 1-hour cap). Now the frozen destination-sized chunk grid
+   with degenerate pre-crediting and a zero-data `Start()` short-circuit.
+   Test: `hierarchical alltoall covers the full data size`.
+5. **Hybrid multi-link gateway routes each fabric on its own device**
+   (medium). Every cross-fabric route used the gateway's LAST attached
+   device, so a gateway with two links routed both remote fabrics over
+   the second link (transfers to the first remote fabric delivered zero
+   bytes). `BuildCrossFabricLinks` now records each link's device index
+   and `PopulateCrossFabricRouting` routes per link. Test: `hybrid
+   multi-link gateway routes each fabric on its own device`.
+6. **Surrogate `_spray_fragments` skips trailing lane-pad fragments**
+   (medium). The helper counted `numChunks = max(lanes, ceil(bytes/
+   chunk))` fragments, but the C++ spray loop skips trailing fragments
+   whose offset is past the wire end — 32 wire bytes over 18 lanes is 16
+   fragments, not 18 (0.506 vs 0.450 expected losses at BER 2.2e-4 /
+   retry 0, crossing the strict-reliability threshold). The returned
+   count is now the fragments actually sent. Tests:
+   `test_spray_fragments_skips_trailing_lane_pad_fragments`.
+7. **Zero-data AllToAll stays completed across `Start()`** (medium).
+   `Initialize(4, 0, ...)` completed during initialization (before the
+   completion callback was registered); `Start()` overwrote COMPLETED
+   with RUNNING and zero-byte sends never completed it again (status
+   incomplete at the 1-hour cap). `Start()` now returns early on a
+   completed collective. Test: `zero-data alltoall stays completed across
+   Start()`.
+8. **Hybrid helper applies its configured degradation model** (medium).
+   `SetLinkDegradationModel` stored a member no build path read — a 0.99
+   packet-loss rate delivered all 4,096 offered bytes and the endpoint
+   attribute stayed null. `Build()` now installs a seeded per-endpoint
+   copy of the shared model (loss-rate only; BER>0 without FEC/LLR stays
+   the pre-existing unrecoverable-config fatal). Test: `hybrid helper
+   applies its configured degradation model`.
+9. **Surrogate permanent-loss estimator grants no retries with LLR off**
+   (medium). The direct `expected_permanent_losses` call granted
+   `retry_limit+1` attempts even for `llr_enabled=False` (6.17 vs 153.48
+   expected losses for a 16-MiB 8-GPU ring AllReduce at BER 1e-7) —
+   `predict()`'s strict-reliability gate already normalized the limit to
+   zero, so the direct call disagreed with the wrapper. The estimator now
+   applies the same one-attempt rule. Test:
+   `test_expected_losses_llr_off_grants_no_retries`.
+10. **Hierarchical docstring states the AllToAll Su volume correctly**
+    (low). The class docstring claimed `D*(n_su-1)/n_su` for the Su stage;
+    the implementation (and the C++ it mirrors) moves `D*(n_su-1)/
+    (n_su*n_so)` per GPU. Doc-only.
+
+Suite state after the round: EXTENSIVE **105 PASS** (7 new tests),
+integration 5 PASS, surrogate pytest **83 passed** (2 new tests), 14/14
+parity scripts, valgrind QUICK zero errors.
+
+### Fixed — surrogate predict docstring drops the stale AllGather halving promise
+
+The `predict` docstring's `phase` paragraph promised step-count halving
+for any sub-collective pass, but the implementation (fixed in round 16,
+finding 7) restricts halving to `collective='allreduce'` — ring
+AllGather's step count already IS one pass (N-1), so `phase='ag'` is
+byte-identical to `phase='full'` there (codex round 17, finding 9;
+8-GPU ring AllGather at 8 MiB, credits=128: **59.269 µs** for both).
+The docstring now states the allgather case explicitly (rs/ag accepted
+but inert). Doc-only; all 81 theory tests unchanged.
+
+### Fixed — p2p-single.cfg documents the actual send path
+
+The cfg header claimed `kind = P2P` "exercises
+`FabricEndpoint::SendP2p` -- the raw single-packet send path", but the
+generic runner routes every SEND_DATA/SEND_P2P action through
+`SendBulkWireTransferSize` (protocol-config-runner.cc `OnAction`) with
+NCCL protocol framing auto-selected from effectiveBytes — at
+`--dataSize=64` the LL framing logs `wireSize=128 efficiency=0.5
+protocol=1` (codex round 17, finding 8). The comment also pointed RoCE
+P2P users at an unwired "follow-up" while `p2p-roce.cfg` already runs
+the inter-node path. Doc-only fix: the header now names the real send
+path and framing behavior and refers RoCE P2P to `p2p-roce.cfg`
+(`SendP2p` remains the background-P2P traffic path). Run behavior is
+unchanged (65536 B switched run: complete, LL128 framing 70016 wire
+bytes at efficiency 0.9375).
+
+### Fixed — AllToAll chunk grid covers the full data size
+
+`AlltoAllInjector` sized every peer transfer with a uniform
+`m_chunkSize = dataSize/numGpus`, falling back to the WHOLE dataSize when
+that quotient was zero (codex round 17, finding 7). Two defects: 15 B
+over 4 GPUs shipped 3-byte chunks and reported completion after **36
+aggregate effective bytes** instead of the required **45** (9 per
+destination instead of [12,12,12,9]); and the degenerate dataSize <
+numGpus case made every GPU send the whole dataSize per peer — 3 B over
+4 GPUs shipped **36 bytes instead of nine**, with the zero-chunk rank
+receiving traffic it should never see. The injector now applies the
+frozen chunk-grid convention (base `dataSize/numGpus` plus one byte for
+the first `dataSize%numGpus` chunks; degenerate grids put one byte on
+each of the first dataSize ranks, zero on the rest) with
+destination-owned sizing at all three send sites (ring step, concurrent,
+2D forward — the 2D first-hop and ring/concurrent thresholds are
+per-destination too), pre-credits zero-chunk ranks at Initialize, and
+drives the pre-credited ring ranks' send chains directly (their sends
+are otherwise chained off receives they never get, which stalled the
+degenerate ring collective to the 1-hour sim cap — found while
+validating the fix across all topology/mode combinations). New probes
+`ProbeChunkSizeOf`/`GetSentDataBytes`/`ProbeReceivedBytes` and a
+`FabricEndpoint::GetTxBytes/GetRxBytes` pair; three new tests pin the
+15-B grid (aggregate 45, per-dest [12,12,12,9]), the degenerate grid
+(aggregate 9, per-dest [3,3,3,0], zero-chunk rank dark), and the
+degenerate ring completion. Pre-fix proof: a standalone probe on
+pre-existing public API measured 36/36 aggregate bytes where the fix
+delivers 45/9 with the exact per-destination grids. Ring/fullmesh/
+switched/2D alltoall sims complete at dataSize 3, 15, and 1 MiB.
+
+### Fixed — surrogate NVLS retry latency uses the collective spray geometry
+
+`_retry_overhead` fragmented every algorithm's transfer with the DATA
+bulk-path helpers (`_packets_per_transfer` /
+`_packet_bytes_per_transfer`), even for NVLS/SHARP collectives whose
+uploads and result deliveries move via `SendCollectiveBulk`'s spray —
+the geometry the reliability model (`expected_permanent_losses`) and
+the retry-buffer sizing already used. For H200 NVLS AllGather at 4 GPU
+/ 64 MiB / BER 1e-7 / SACK it assumed 18 fragments of ~932 KB where
+the wire carries 128 x 128 KiB, predicting **1510.95 µs**; the same
+retry formula on the actual geometry gives **738.89 µs** (codex round
+17, finding 6). NVLS AllReduce/AllGather now fragment the upload side
+(`D` / `D/N` per rank) at `_spray_fragments`, like the reliability
+model; every other algorithm keeps the DATA-path geometry (its real
+wire path). Pinned `463.0972` in the R14F6 byte-capacity test (the
+byte-vs-entry equality invariants are unchanged); new
+`test_nvls_retry_overhead_uses_spray_geometry` pins the corrected
+prediction and the DATA-path ring baseline. All 81 theory tests pass;
+the parity scripts run at BER=0 where the retry term is zero.
+
+### Fixed — standalone fullmesh ReduceScatter sizes contributions by destination chunk
+
+`FullMeshReduceScatter::TriggerSends` sized every peer contribution with
+the SENDER's chunk, but reduce-scatter semantics have destination `dest`
+reduce its own chunk — every source sends its copy of chunk `dest`, so
+per-destination RS load is `(N-1)*ChunkSizeOf(dest)` (the same defect as
+round 16 finding 6, whose fix covered `FullMeshAllReduce`'s RS phase but
+not this standalone injector; codex round 17, finding 5). The 15-B
+[4,4,4,3] grid delivered [11,11,11,12] per-rank bytes instead of
+[12,12,12,9] while whole-collective traffic still totaled 45 B, so the
+coverage test passed while per-rank load and timing were wrong. Sends now
+size by `ChunkSizeOf(dest)` and the completion threshold is
+`(N-1)*ChunkSizeOf(dest)` (the whole-grid-minus-own-chunk formula belongs
+to AllGather). New probes `ProbeReceivedBytes`/
+`ProbeExpectedBytesPerDest` and the new
+`FullMeshRsStandalonePerDestLoadTest` pin the per-destination load (5
+assertions fail pre-fix). Fullmesh surrogate parity (allreduce,
+allgather) unchanged.
+
+### Fixed — ProtocolConfigRunner destructor detaches endpoint callbacks
+
+`~ProtocolConfigRunner` was defaulted, leaving the
+`OnPacketReceived` callback registered on every endpoint it had bound.
+The endpoints survive the runner, so a packet delivered after the
+runner's destruction invoked `OnPacketReceived` on freed runner memory
+(codex round 17, finding 4; a 64-B transfer over a 100-µs link with the
+runner destroyed at 1 µs produced valgrind-confirmed invalid reads at
+the `m_executor` guard and the header field loads). The destructor now
+detaches exactly the callback THIS runner installed: a new
+`FabricEndpoint::GetReceiveCallback()` exposes the current callback, the
+destructor identity-compares it against its own `MakeCallback` binding
+and nulls only a match — a later injector or runner that re-bound the
+endpoint is untouched. Verified with a standalone probe (invalid reads
+pre-fix, zero post-fix) and the new `ProtocolConfigRunnerDetachTest`
+(real p2p-single stencil, runner destroyed at 1 µs, run past the
+delivery, assert both endpoints' callbacks are null). Config-mode sim
+round-trips unchanged (p2p-single 1582 ns, p2p-roce 15036 ns).
+
+### Fixed — LLR manager callbacks and timers detach at endpoint dispose
+
+`FabricEndpoint::DoDispose` dropped `m_llrManager` without detaching its
+endpoint bindings: the timeout callback (`OnLlrRetryTimeout`) and the
+permanent-loss callback (`NotifyPermanentLoss`) both hold the endpoint's
+raw `this`, and the per-entry retry timers keep firing as long as the
+manager lives. An external holder that kept the `GetLlrManager()`
+reference therefore kept the manager (and its timers) alive past the
+endpoint's disposal — a firing timer invoked `OnLlrRetryTimeout` on freed
+endpoint memory (codex round 17, finding 3; valgrind-confirmed invalid
+reads at the `m_llrEnabled`/`m_llrManager` guards, fabric-endpoint.cc:1970).
+The manager now exposes `DetachFromEndpoint()`, and `DoDispose` calls it
+before dropping the reference: null both callbacks (a late
+`OnRetryTimeout` becomes a no-op) and `Clear()` every armed timer.
+Verified with a standalone probe (retained manager + wire-armed 100-µs
+retry timer + dispose/release at 1 µs: invalid reads pre-fix, clean
+post-fix) and the new `LlrManagerDetachedAtDisposeTest`. The LLR
+parity pins (test_so_gbn_strict) are byte-identical.
+
+### Fixed — memory-semantic completion and memory-response events are tracked
+
+The memory-semantic completion event
+(`SendMemorySemantic` → `NotifyMemorySemanticComplete`, both the
+credit-blocked queue path and the normal path) and the memory-device
+read-response event (`OnPacketReceived` → `SendMemoryResponse`) captured
+raw `this` without joining `m_deferredEgressEvents`, so `DoDispose`
+never cancelled them. With a 100-µs sync/memory latency and the endpoint
+disposed and released at 1 µs, both fired into freed memory —
+valgrind-confirmed invalid reads in `NotifyMemorySemanticComplete`
+(fabric-endpoint.cc:857/859) and across `SendMemoryResponse`'s member
+accesses (codex round 17, finding 2). All three schedule sites now push
+their EventId into `m_deferredEgressEvents` like every other deferred
+egress. Verified with a standalone probe (43 invalid reads pre-fix, zero
+post-fix, and the completion callback no longer fires after dispose) and
+the new `MemoryEventCancelledAtDisposeTest` (write + read against a
+MEMORY device, dispose+release both endpoints at 1 µs, run past the
+100-µs expiry, assert zero post-dispose completions).
+
+### Fixed — zero-sized bulk transfers skip the fragment math (SIGFPE)
+
+The degenerate sub-GPU-count chunk grid (round 16, finding 4) gives the
+ranks past `dataSize` a zero chunk. A zero-byte bulk transfer still
+entered `SendBulkWireTransferSize`'s fragmentation path, where LL
+framing of 0 bytes yields `wireSize = 0`, `numChunks` collapses to 1,
+`wireChunkSize = 0`, and `sentChunks` divides by it — SIGFPE on any
+multi-lane fabric (`--numGpus=4 --dataSize=3 --numLanes=18` crashed
+fullmesh AllReduce, AllGather, and ReduceScatter; gdb backtrace at
+fabric-endpoint.cc:3074 with `dataSize=0`, codex round 17, finding 1).
+A zero-byte transfer now returns early: nothing to send, nothing to
+retry, nothing to ledger. A direct probe (multi-device endpoint +
+`SendBulkWireTransferSize(dest, 0, ...)`) crashed with SIGFPE pre-fix
+and survives post-fix; `ZeroChunkBulkTransferTest` pins the API-level
+guard and the degenerate collective's completion on a multi-device
+endpoint.
+
+### Fixed — surrogate ring AllGather step count is a single ring pass
+
+`_steps(N, 'ring', 'allgather')` returned the AllReduce's `2(N-1)` —
+ring AllGather executes one pass of `N-1` steps (`ns-3 RingAllGather`
+sets `m_totalSteps = numGpus - 1`); the second pass is the
+reduce-scatter half, which AllGather does not have. At 0.4-µs link
+latency the surrogate charged 5.6 µs instead of 2.8 µs of fixed
+per-step communication latency, independent of serialization (codex
+round 16, finding 7). Because the rs/ag `phase=` halving was likewise
+inherited from the AllReduce, the hierarchical AllGather stages
+(`phase='ag'`) were compensating back to a single pass — the guide pins
+(450.39 / 413.76 µs) are byte-identical after the fix; only direct
+`collective='allgather'` predictions were overcharged. The halving is
+now guarded to `collective == 'allreduce'`, so `phase='ag'` on an
+AllGather is the whole collective. `test_ring_allgather_steps_single_pass`
+pins `_steps(8,'ring','allgather') == 7`, the phase-equivalence, and the
+unchanged AllReduce halving; it fails on the pre-fix module. The
+USER_GUIDE step table gains the `allgather | ring | N-1` row.
+
+### Fixed — fullmesh reduce-scatter sizes contributions by destination chunk
+
+The FullMeshAllReduce reduce-scatter phase sized each contribution with
+the sender's chunk, but destination `dest` reduces its own chunk: every
+source must send its copy of chunk `dest`, so the per-destination RS
+load is `(N-1)*ChunkSizeOf(dest)`. For the 15-B `[4,4,4,3]` grid the
+correct per-rank load is `[12,12,12,9]`; the old code delivered
+`[11,11,11,12]` — whole-collective traffic still totaled 90 B, so the
+coverage test passed while per-rank load and timing were wrong (codex
+round 16, finding 6). The RS send site now sizes by `ChunkSizeOf(dest)`,
+the RS completion threshold is `(N-1)*ChunkSizeOf(dest)` (the AllGather
+threshold `dataSize - own chunk` is unchanged), and a
+`m_rsReceivedBytes` ledger persists across the phase switch.
+`FullMeshReduceScatterPerDestLoadTest` pins the per-destination load and
+fails on the pre-fix build.
+
+### Fixed — standalone fullmesh AllGather/ReduceScatter grids cover the full data size
+
+The standalone fullmesh AllGather and ReduceScatter injectors still used
+`dataSize / numGpus` for every transfer and their completion threshold,
+silently dropping `dataSize % numGpus` bytes — the remainder fix from
+round 15 only covered RingAllGather, RingReduceScatter, and
+FullMeshAllReduce. At 4 GPUs and 15 B each injector reported completion
+after 36 effective bytes instead of the required `(N-1)*D = 45` (codex
+round 16, finding 5). Both injectors now use the same remainder grid
+(rank r's chunk is `dataSize/numGpus` bytes plus one for the first
+`dataSize % numGpus` ranks, degenerate sub-GPU-count sizes degrade to
+one byte per rank), per-destination completion thresholds of
+`dataSize - own chunk`, and a `GetSentDataBytes` coverage probe. The
+`CollectiveInjectorCoverageTest` grid now pins both injectors at
+45 wire bytes and fails on the pre-fix build.
+
+### Fixed — fullmesh allreduce degenerate sub-GPU-count grid
+
+With `dataSize < numGpus` (4 GPUs, 3 B), the degenerate fallback set
+every chunk to the whole dataSize, so `ExpectedBytesPerDest =
+dataSize - chunk` was zero for every rank: the first RS delivery
+flipped the state to AllGather and the second completed the collective
+with zero AllGather bytes on the wire (completion at 65,214 ns; codex
+round 16, finding 4). The degenerate grid is now one byte on each of
+the first dataSize ranks and zero on the rest (still summing to exactly
+dataSize), thresholds are dataSize minus the rank's own chunk — never
+zero — and ranks with a zero chunk send nothing. The probe reported
+`chunk0=3, expected0=0, sentBytes=72` pre-fix; `[1,1,1,0]` grid with
+18 wire bytes post-fix. `FullMeshDegenerateGridTest` pins the grid, the
+positive thresholds, and the `2(N-1)*dataSize` wire coverage; it fails
+on the pre-fix build.
+
+### Fixed — injector events and receive callbacks are cancelled at dispose
+
+Every collective injector scheduled its startup phase (and the pipelined
+step continuations) with raw `this`, and installed a receive callback on
+each endpoint holding the same raw pointer, but no DoDispose cancelled
+any of it. Disposing an injector mid-startup left the startup event
+live: when the ~65-µs default startup expired it invoked
+`FullMeshAllReduce::TriggerReduceScatterPhase` on freed memory, which
+valgrind confirmed as invalid reads (codex round 16, finding 3). The
+same scheduling pattern existed in every derived injector, and the same
+stale-callback class as finding 2 existed for the injector receive
+callbacks.
+
+`CollectiveInjector` now owns the fix for all 16 injectors: a protected
+`m_pendingEvents` vector collects every `Simulator::Schedule` /
+`ScheduleNow` event id at the scheduling site, and the base `DoDispose`
+cancels every non-expired entry before the object is freed (mirroring
+`FabricEndpoint::m_deferredEgressEvents`). Each injector's DoDispose
+also detaches its receive callbacks from the endpoints (null
+`ReceiveCallback`) before dropping the endpoint references. The
+hierarchical injectors now chain to `CollectiveInjector::DoDispose`
+instead of `Object::DoDispose`. A new
+`InjectorStartupEventCancelledAtDisposeTest` disposes and releases a
+started FullMeshAllReduce at 1 µs and runs past the startup expiry:
+the pre-fix build reads freed memory under valgrind, the post-fix build
+is clean.
+
+### Fixed — endpoint and switch Dispose detach device promisc callbacks
+
+The promisc receive callbacks installed on NetDevices hold a raw `this`
+pointer of their owner. `FabricEndpoint::DoDispose` cleared `m_devices`
+and `NvSwitch::DoDispose` cleared `m_ports` without detaching those
+callbacks first, so a packet still in flight on the channel after the
+owner was disposed and freed invoked `ReceiveFromDevice` /
+`ReceiveFromPort` on freed memory. Both DoDispose implementations now
+null the callbacks via `MakeNullCallback` with the exact
+`PromiscReceiveCallback` signature before dropping the device/port
+references. Verified with valgrind: the pre-fix build reports invalid
+reads (and, on the switch, invalid writes) when a 64-B packet crosses a
+100-µs-delay link and the receiver is disposed mid-flight; the post-fix
+build is clean (codex round 16, finding 2). A new
+`DeviceCallbackDetachAtDisposeTest` covers both the endpoint-receiver
+and switch-receiver scenarios.
+
+### Fixed — endpoint Dispose cancels deferred source-reload retransmissions
+
+Both SACK retransmission dispatch sites — `ProcessRetryPacket` (the GBN
+path) and `DispatchRetransmissions` (the SACK/NACK path) — scheduled
+retransmissions with a nonzero `readyDelay` via lambdas capturing raw
+`this`, WITHOUT tracking the EventIds in `m_deferredEgressEvents`, so
+`DoDispose` could not cancel them. Repro (codex round 16, finding 1):
+SACK, one-entry retry buffer, 100-µs source-reload latency — store two
+packets, NACK the evicted first entry, then dispose and release the
+endpoint at 1 µs: the deferred `SendRetransmission` fired at the 100-µs
+reload deadline and read freed memory (valgrind-confirmed pre-fix invalid
+read in `SendRetransmission` via the `DispatchRetransmissions` lambda;
+post-fix valgrind-clean). Both sites now push their EventId into
+`m_deferredEgressEvents`, the same structure every other deferred-egress
+site uses. New regression
+`EgressDisposeCancelsSourceReloadRetransmissionsTest` (drives the exact
+geometry and asserts the reload path fired via the reload counter, so the
+test cannot pass vacuously). EXTENSIVE 86; integration PASS.
+
+### Fixed — documented NVLS parity value refreshed
+
+CONFIG_GUIDE.md's verified-cases table claimed `simTimeNs=27576` for the
+8-GPU / 1-MiB NVLS allreduce; the shipped config and the equivalent inline
+command both reproducibly return **28034 ns** (codex round 15, finding 8 —
+stale pin, no code change). Re-measured via
+`test/parity/test_config_vs_inline_parity.py`, which still passes
+config `==` inline for all six rows; only the nvls row's recorded value
+was updated.
+
+### Fixed — Ring AG/RS and FullMesh grids cover the full data size
+
+`RingAllGather`, `RingReduceScatter`, and `FullMeshAllReduce` sized every
+per-step/per-phase transfer with plain `dataSize / numGpus`, silently
+dropping `dataSize % numGpus` bytes — the same truncation `RingAllReduce`
+fixed in round 13 (commit 81108d5). Repro (codex round 15, finding 7):
+4-GPU / 15-B fullmesh allreduce reported complete after 72 effective wire
+bytes where 2(N−1)·D = 90 is required (only 12 of 15 tensor bytes
+represented); the ring AG/RS injectors dropped 3 of 15 bytes the same way.
+All three now carry a remainder grid — base size with the first
+`dataSize % numGpus` segments/chunks one byte larger — keyed on ring
+POSITION for the ring injectors (mirroring the round-15 finding-4 rule:
+`idx = (pos − step) mod N` for ReduceScatter's clockwise sends,
+`idx = (pos + step) mod N` for AllGather's counterclockwise sends; both
+preserve the forward invariant a rank forwards exactly the chunk it
+received, including on topology-embedded reordered rings). The receive
+ledgers compare against the SENDER's step size (`StepExpectedBytes`,
+scanning the send-target permutation like RingAllReduce), and fullmesh
+completion thresholds use `dataSize − ownChunk` per destination. New
+`CollectiveInjectorCoverageTest` (4 GPUs / 15 B: ring AG/RS 45 B,
+fullmesh 90 B exact-traffic assertions via new `GetSentDataBytes`
+probes). EXTENSIVE 85; integration PASS; surrogate 79; parity 14/14
+(parity scenarios use divisible sizes — no pins moved).
+
+### Fixed — surrogate coalescing gates on the 512-MiB COALESCE_THRESHOLD
+
+`TheoryDerivedSurrogate._spray_fragments` gated its large-transfer
+coalescing branch on the 500-MiB `OVERFLOW_THRESHOLD_COLLECTIVE` — the
+constant that governs whether a SINGLE-LINK fabric fragments at all —
+where the C++ spray loop uses the separate 512-MiB `COALESCE_THRESHOLD`
+(fabric-endpoint-send.cc). Between the two constants (500–512 MiB) the
+surrogate coalesced transfers the C++ still sprays at 128 KiB. Repro
+(codex round 15, finding 6): 2-GPU / 1008-MiB allgather (504-MiB per-rank
+upload) — the surrogate modeled 72 × 7-MiB upload fragments per rank where
+the C++ emits 4,032 × 128-KiB (~32× too few, ~56× too large), so at BER
+1e-8 / SACK / 3 retries `strict_reliability` returned infinity for a
+config ns-3 completes in 4,251.879 µs with zero permanent losses; post-fix
+the geometry matches (4,032 × 131,072 B) and the strict prediction is
+finite (28,077 µs — conservative, as the lower-bound profile is expected
+to be). The coalescing branch now compares against its own 512-MiB
+`coalesce_threshold`; the 500-MiB overflow gate keeps its single-link role
+unchanged. Boundary pins moved accordingly (511 MiB now sprays to 4,088
+fragments, 513 MiB still coalesces to 72; 499 MiB / 64 MiB unchanged, and
+the round-14 2-GiB → 144-fragment geometry is untouched since 1 GiB >
+512 MiB). New regression
+`test_spray_fragments_coalesce_gate_is_512mib`. Surrogate 79; integration
+PASS; parity 14/14.
+
+### Fixed — surrogate NVLS result losses are permanent when LLR is off
+
+`TheoryDerivedSurrogate.expected_permanent_losses` granted NVLS multicast
+RESULT packets the full switch-side repair budget
+(`nvls_switch_result_retry_limit + 1` = 65 attempts) unconditionally, while
+the C++ side only has that machinery when LLR is enabled:
+`NvSwitch::StoreMulticastResult` skips outright when `!m_llrEnabled`, so
+`HandleSwitchNack` has nothing to retransmit and a lost result is permanent
+on its FIRST attempt. Repro (codex round 15, finding 5): 8-GPU / 16-MiB
+allgather / BER 8e-4 / RS(544,514,15) / LLR off — the model counted 0.303
+expected unrepaired losses and `strict_reliability` returned a finite
+90.247 µs, while the ns-3 run (seed 2) stays incomplete after two
+uncorrectable result packets with zero upload drops; the one-attempt budget
+gives 2.728 expected losses. `expected_permanent_losses` now takes
+`llr_enabled` (default True — direct callers keep the LLR-on split budgets
+pinned by the round-14 tests) and collapses `result_attempts` to 1 when LLR
+is off; `predict` passes its own `llr_enabled` through, so the strict gate
+correctly rejects the LLR-off config. New regression
+`test_nvls_llr_off_results_have_one_attempt` (LLR-off 2.728 pin + strict
+infinity, the omitted-retry-limit path, and the LLR-on control staying
+completable). Surrogate 78; integration PASS; parity 14/14.
+
+### Fixed — ring chunk ownership keys on ring position, not numeric rank
+
+`RingAllReduce::SegmentSizeOf` computed the segment-ownership index from the
+GPU's NUMERIC RANK, while `GetSendTarget` already followed the
+topology-embedded ring neighbors installed by
+`GpuClusterTopologyHelper::InstallCollectiveEmbedding`. On a reordered ring
+(such as the supported switched-fabric order 0→1→3→2) the two disagreed:
+rank 2 sits at ring POSITION 3, so it must transmit the position-3 chunk, but
+the rank-keyed formula handed it the rank-2 chunk. Repro (codex round 15,
+finding 4): 4 GPUs / 259 B on ring order 0→1→3→2 — pre-fix, rank 2 sent
+65 B to rank 0 at step 0 while rank 0 forwarded 64 B at step 1, violating
+the forward invariant (a rank forwards at step s+1 exactly the chunk it
+received at step s). `Initialize` now derives a `m_ringPos` table by walking
+the reduce-scatter direction of the embedded ring from rank 0 (the same
+neighbor source `GetSendTarget` reads; identity fallback when no embedding
+is installed or the embedding is not a single cycle covering every rank),
+and `SegmentSizeOf` evaluates the existing idx formulas with the position in
+place of the rank — preserving both the forward invariant across the AG
+reversal and the 2(N−1)·D grid sum. `StepExpectedBytes` needed no change: it
+already scans `GetSendTarget` for the step's sender and reads that sender's
+`SegmentSizeOf`. Extended `RingAllReduceChunkRotationTest` with the
+reordered-ring geometry (real endpoints carrying `SetRingNeighbors`
+0→1→3→2; the previous bare-endpoint cases fall back to rank arithmetic,
+which is exactly why they missed this). EXTENSIVE 84 PASS; integration PASS;
+surrogate 77; parity 14/14 (all ring pins unchanged — canonical-order
+simulations are unaffected).
+
+### Fixed — ring transaction graph waits on input receipt, not own delivery
+
+`RingAllReduce::BuildTransactionGraph` chained each GPU's step s+1 send on
+DELIVERY OF THE GPU'S OWN step-s transfer (a gpu-major loop whose
+`dependency` was the rank's previous wait node), so every rank transmitted
+at wire speed regardless of input arrival — a ring forwards what it just
+received, so sends must be gated on input receipt, exactly the rule the
+wire path applies in `OnGpuStepReceiveComplete`. Repro (codex round 15,
+finding 3): 4-GPU / 256-B SIMPLE ring over an NvSwitch fabric with three
+1-µs links and one 100-µs link — pre-fix, rank 0's transmit cadence was its
+own slow-link delivery spacing (sends at 1.000 / 101.216 / 202.432 µs) and
+the transaction-path completion (608.296 µs) disagreed with the
+receive-driven wire path (410.296 µs); post-fix both paths are BIT-IDENTICAL
+(duration and every rank-0 transmit instant). The graph is now built
+step-major: each step's sends depend on `deliveredTo[gpu]` — the wait node
+of the transfer whose `GetSendTarget` IS that GPU (a ring step is a
+permutation) — with the per-step software overhead applied after input
+receipt, and a GPU's completion is its LAST step's input delivery. This also
+corrects the node-completion bookkeeping (`m_transactionGpuByNode` now
+records the RECEIVER, matching the wire path's LogStepComplete semantics).
+New regression `RingAllReduceTransactionInputDependencyTest` (runs both
+paths on the identical cluster, asserts equal durations and per-instant
+rank-0 transmit ordering; the cluster keeps the NvSwitch Ptr alive — its
+port promisc callbacks hold raw `this`). Parity fallout: the
+single-bg-w1 contention pin moved 468378 → 405462 ns — the old pin itself
+recorded the pre-fix bug; the wire path (`--useTransactionModel=0`) always
+gave 405462 and the fixed transaction path matches it (per-step traces
+identical). EXTENSIVE 84 PASS; integration PASS; surrogate 77; parity 14/14.
+
+### Fixed — NvSwitch disposal cancels deferred result multicasts
+
+The switch scheduled its deferred collective-result multicasts —
+`MulticastAllReducePartition` (pipelined path), `MulticastAllReduceResult`
+(legacy single multicast), `MulticastAllGatherResult`, and the FEC-coding
+egress hold in `SendMulticastResultOnPort` — as bound member calls on raw
+`this`, while `DoDispose()` cancelled only the arbitration event.
+Completing a 64-B aggregation with a 100-µs aggregation delay, then
+disposing and releasing the switch at 1 µs, let `MulticastAllReduceResult`
+fire into freed memory — valgrind-confirmed UAF at nvswitch.cc:1203 (the
+cleared `m_allReduceBuffer`), SIGSEGV outside valgrind (codex round 15,
+finding 2; git-stash round-trip reproduced the pre-fix invalid reads).
+The four Schedule sites now push their EventIds into a new
+`m_deferredResultEvents` vector that `DoDispose()` cancels before clearing
+any state. New regression `SwitchDisposeCancelsResultMulticastsTest`
+(drives the aggregation via the inject seam, disposes mid-delay, drops the
+last reference, runs past the deadline); the standalone valgrind harness
+is clean post-fix. EXTENSIVE 83 PASS.
+
+### Fixed — FEC receive continuation is cancelled by endpoint disposal
+
+`ReceiveFromDevice` deferred the rest of receive processing through the
+FEC decode latency with a bound member call on raw `this`
+(`Simulator::Schedule(decodeLatency,
+&FabricEndpoint::ContinueReceiveAfterFec, this, ...)`) without tracking
+the event. Disposing and releasing the endpoint before the decode
+completed let the continuation fire into freed memory — valgrind-confirmed
+invalid reads/writes on the traced-callback and stats members DoDispose
+had nulled (codex round 15, finding 1; repro: a 64-B packet under FEC
+with a 100-µs decode latency, Dispose at 300 ns, release at 310 ns →
+39 valgrind errors at fabric-endpoint.cc:1488/1490). The Schedule's
+EventId is now pushed into `m_deferredEgressEvents`, the same list whose
+DoDispose cancellation already covers the deferred sends and backlog
+callbacks. New regression `EgressDisposeCancelsFecReceiveTest`; the
+standalone valgrind harness is clean post-fix (0 errors). EXTENSIVE
+82 PASS.
+
+### Fixed — NVLS retry-buffer byte capacity converts at the spray fragment size
+
+`predict(retry_buffer_bytes=...)` / `predict_tail(...)` converted a
+byte-capped buffer into entries with `_packet_bytes_per_transfer` — the
+DATA bulk path's ~932-KiB fragment — for every algorithm. NVLS
+collectives retain the SPRAYED upload fragments (128 × 128 KiB = 16 MiB
+at 4 GPU / 64 MiB AllGather), and the C++ scratch sim converts
+`llrBufferSizeBytes / sprayChunkSize` the same way: a 16-MiB byte cap
+yields `llrBuf=128`, `retryBufferPeak=128`, and ZERO source reloads —
+identical to `--llrBufferSize=128` (an actual 18-entry buffer takes 2
+reloads). The 932-KiB divisor turned the same 16 MiB into 18 entries and
+added a false reload penalty: 484.2529 µs where the equivalent 128-entry
+capacity predicts 483.6896 (codex round 14, finding 6). New
+`_retry_buffer_fragment_bytes` returns the spray upload fragment size
+for NVLS collectives and the DATA-bulk fragment otherwise; both predict
+call sites use it. New regression
+`test_nvls_retry_buffer_byte_capacity_uses_spray_fragment_size` pins
+byte/entry equivalence on predict AND predict_tail for allgather and
+allreduce, plus the non-NVLS passthrough. Full surrogate suite 77 PASS.
+
+### Fixed — NVLS result reliability uses the switch's retry budget
+
+Both NVLS branches of `expected_permanent_losses` applied
+`retry_limit + 1` attempts to BOTH sides. But an upload the switch
+fails to receive is NACKed back to the sending endpoint and
+retransmitted from its LLR source store (endpoint retry budget), while a
+multicast RESULT is repaired by the switch itself from its own result
+store on the receiver's NACK (DestRank 0xFFFF →
+`NvSwitch::HandleSwitchNack`), bounded by `SHARP_RESULT_RETRY_LIMIT =
+64` retransmissions independent of the endpoint's limit (codex round 14,
+finding 5). At 8 GPU / 16 MiB allgather / BER 1e-9 / endpoint retry 0,
+the shared count predicted 1.2074 losses and strict-rejected a config
+whose ns-3 run (seed 3) completes at 79.3 µs including a switch result
+repair (`Switch retransmit multicast result seq 97 to rank 2` at debug
+level); the split budgets predict 0.1342. The result side now uses
+`nvls_switch_result_retry_limit + 1` (new constructor parameter,
+default 64 mirroring nvswitch.h), the upload side keeps
+`retry_limit + 1`. Moved pins: allgather 16 MiB/retry 0/BER 1e-9
+1.2074 → 0.134156; allreduce 2.1464 → 1.073179; spray-geometry pins
+0.062731 → 0.006970, 0.386322 → 0.042925, 0.111522 → 0.055761;
+partition-geometry expected now raises the result term to ^65;
+single-link pin 17.35 → 5.061 (upload term only). Full surrogate suite
+76 PASS.
+
+### Fixed — RingAllReduce AG chunk identity after the direction reversal
+
+`SegmentSizeOf` computed the segment a rank holds with
+`(gpu − step) mod N` in BOTH phases. That rotation is only correct while
+bytes flow clockwise in Reduce-Scatter; the AllGather phase reverses the
+send direction (counterclockwise, to ring prev), and the offset must
+ADVANCE +1 per step from the first AG step instead of continuing to
+decrement — otherwise a rank's receive/forward sizes disagree: at
+4 GPU / 259 B, rank 1 received a 64-B chunk at step 3 but forwarded
+65 B at step 4 (codex round 14, finding 4). Correct AG rotation:
+`idx = (gpu + step + 2) mod N` (algebraically `(g + s − 2(N−1)) mod N`;
+the simplified form is evaluated directly because the subtraction wraps
+in unsigned arithmetic — `s − 2(N−1)` is negative throughout AG and
+`2^32 mod N ≠ 0` for N = 3 or 5, which silently shifted the index at
+those ranks; the direct translation of the math only coincided with the
+truth at N ∈ {2, 4, 8}). New regression `RingAllReduceChunkRotationTest`
+asserts the chunk invariant — at every step s, a rank transmits at s+1
+exactly the chunk it received at s, `SegmentSizeOf(sendTarget(g, s),
+s+1) == SegmentSizeOf(g, s)` — over N ∈ {2, 3, 4, 5, 8} plus the codex
+259-B geometry and the 2(N−1)·D aggregate; it is exactly the test that
+caught the unsigned-wrap translation bug. Probe wrappers
+`ProbeSegmentSizeOf`/`ProbeSendTarget` expose the rotation to tests
+without simulating a collective. EXTENSIVE 81 PASS; the 90-B coverage
+pin and So-GBN/lossy/fullmesh parity pins unchanged.
+
+### Fixed — RingAllReduce wire receive ledger is keyed per sender step
+
+The wire path accumulated received bytes in a single per-destination
+counter, so bytes of DIFFERENT steps mixed whenever the pipelined senders
+ran ahead of the receiver or a retransmission delivered a late copy after
+the counter had advanced — the mixed counter crossed one step's threshold
+with another step's bytes and then starved a later step: 4 GPU / 16 MiB−1
+/ BER 1e-8 / SACK / 64 retries / timeout-retransmit stalled
+`status=incomplete` with zero permanent losses and an empty retry store,
+while the transaction path completed the same inputs (codex round 14,
+finding 3; git-stash round-trip reproduced the stall pre-fix). The ledger
+is now `m_gpuStepReceivedBytes[dest][senderStep]` (step decoded from the
+step-encoded flowId, its own threshold via the new `StepExpectedBytes` —
+the size of the segment the step's sender holds), steps complete in
+order via a while-loop, and malformed flowIds past the step range are
+ignored instead of corrupting ledgers. New regression
+`RingAllReduceLossyWireLedgerTest` (lossy 15-B wire ring with SACK +
+timeout retransmit completes); EXTENSIVE 80 PASS; lossy/GBN/fullmesh
+parity pins unchanged.
+
+### Fixed — collective spray models the large-transfer coalescing branch
+
+`_spray_fragments` fragmented every multi-lane transfer on the 128-KiB
+spray grid, but above the 512-MiB `COALESCE_THRESHOLD` the C++ caps the
+event count by coalescing into ~8-MiB path-balanced chunks
+(`numChunks = max(lanes, min(sizeBased, ceil(ceil(wire/8 MiB)/lanes)·lanes))`)
+— a 2-GPU / 2-GiB AllGather uploads 144 fragments of ~7.46 MiB, not
+8,192 × 128 KiB (codex round 14, finding 2). The un-coalesced count
+understated each fragment's failure probability by ~57×: 0.000582
+predicted permanent losses at BER 1e-8 / 3 retries accepted a strict
+completion ns-3 rejects with 13 permanent losses. The helper now applies
+the coalescing branch above the threshold (35.2 expected losses, strict
+rejected); NVLS expected-loss and retry-buffer sizing inherit it. A
+regression test pins the 144-fragment geometry, the strict rejection,
+and the threshold boundaries (500-MiB single-link gate vs the separate
+512-MiB coalescing gate).
+
+### Fixed — endpoint Dispose cancels the WFQ backlog-decrement callbacks
+
+The three `DecrementBacklog` schedules in `SendPacketOnDevice` (WFQ
+service-time branch, FEC-only branch, and the immediate-send tail) captured
+raw `this` but were not tracked in `m_deferredEgressEvents`, so
+`DoDispose` cancelled the deferred sends while their backlog callbacks
+survived — after the endpoint was freed, the callback dereferenced
+`m_contentionModel` on freed memory (codex round 14, finding 1; valgrind:
+Invalid read of size 8 at the `m_contentionModel->DecrementBacklog` line
+with FEC + a contention model and one paced packet). All three sites now
+push their EventId into `m_deferredEgressEvents`, so Dispose cancels them
+with the deferred sends. Regression test
+`EgressDisposeCancelsBacklogCallbacksTest` disposes and frees a paced
+FEC+WFQ endpoint and runs past the backlog callback time.
+
+### Fixed — NVLS retry-buffer sizing counts the collective spray fragments
+
+`required_retry_buffer_entries` sized the LLR fast-copy store with the
+DATA bulk path's fragment count (`max(lanes, ceil(upload/8 MiB))` = 18 at
+18 lanes), but NVLS uploads move via `SendCollectiveBulk`'s SPRAY: the
+endpoint retains one fast copy per sprayed fragment of its own upload
+(D for allreduce, D/N for allgather) — 128 fragments of 128 KiB at
+4 GPU / 64 MiB AllGather (codex round 13, finding 7). The undercount
+called a 32-entry buffer "sufficient" where ns-3 needs 2 source reloads
+(0 at 128). NVLS collectives now size the store (and
+`required_retry_buffer_bytes`) from `_spray_fragments(upload)`; other
+algorithms keep the DATA-bulk sizing. A regression test pins the 128
+entries / 16 MiB requirement and the reload penalty engaging at 32
+entries but not 128.
+
+### Fixed — collective spray models the single-link single-packet branch
+
+`_spray_fragments` always fragmented (`max(lanes, ceil(bytes/128 KiB))`),
+but the C++ spray loop only fragments when the fabric NEEDS it:
+`needFragmentColl = (spray links > 1) OR (wire > 500 MiB)`
+(fabric-endpoint-send.cc). A single-link (or single-QP) fabric below the
+threshold sends the whole transfer as ONE packet of the full size — a
+4-GPU / 16-MiB AllGather over one link uploads one 4-MiB packet per
+rank, not 32 × 128-KiB fragments (codex round 13, finding 6). The
+always-fragment geometry predicted 0.06285 permanent losses at BER
+1e-7 / 3 retries (finite strict completion) where a 4-MiB packet fails
+with p ≈ 0.965 per attempt and ns-3 reports the collective incomplete
+with 3 permanent losses. The helper now returns the single-packet
+geometry for `num_lanes <= 1` below the 500-MiB threshold (17.35
+expected losses, strict rejected); multi-lane geometries are unchanged.
+This also fixes the NVLS AllReduce/AllGather expected-loss and
+retry-buffer counts on single-link fabrics.
+
+### Fixed — NVLS AllReduce reliability uses the partitioned result geometry
+
+The NVLS branch of `expected_permanent_losses` mirrored the allgather
+formula for allreduce, counting the result side as `N·frag(D)` per
+destination = 8,192 result chunks at N=8/D=16 MiB. But the C++ AllReduce
+result multicast is PIPELINED over `nvlsNumPartitions` (default 8): every
+rank uploads the full D (frag(D) = 128 chunks of 128 KiB → 1,024 uploads)
+and the switch multicasts each dest P partitions of D/P each, re-fragmented
+at frag(D/P) = 18 chunks of 116,509 B → 144 per dest, 1,152 results
+(codex round 13, finding 5). The old count made BER 1e-10/0 retries give
+0.9663 expected losses, so `strict_reliability` returned infinity for a
+config whose ns-3 run completes with zero permanent losses; the corrected
+geometry gives 0.2147 and a finite 86.57 µs. The allreduce arm now counts
+`N·frag(D)` uploads at the upload fragment size plus
+`N·P·frag(D/P)` results at the partition fragment size (a separate
+`p_frag` per side — the 116,509 B result chunk is not the 128 KiB upload
+chunk), with the partition count exposed as `nvls_num_partitions`
+(default 8, matching gpu-cluster-sim's `--nvlsNumPartitions`). Allgather
+keeps its upload-mirroring geometry (its result really is a re-multicast
+of the D/N uploads). Tests pin the 1,024 + 1,152 counts, the
+0.2147-loss / finite-strict codex point, and the allgather value
+unchanged; CHANGES' round-12 entry ("8,192 results") corrected in place.
+
+### Fixed — NcclRing chunk identity follows each channel's ring order
+
+`ChunkSizeOf` indexed the chunk grid by the sender's NUMERIC rank
+(`(rank − step) mod N`), but rotated channels permute the ring: channel 1 of
+2 nodes × 2 GPUs orders 1→0→3→2→1, so the rank that forwards a chunk is not
+its numeric predecessor — individual chunks gained or lost bytes at ring
+boundaries while the global total stayed correct (codex round 13, finding 4:
+rank 3's 1-byte chunk lands on rank 2, which forwards 2 bytes next step).
+Chunk identity now keys on the channel's ring POSITION (`m_ringPos`, computed
+in `BuildRings` by walking `ringNext`): the rank at position p moves chunk
+`(p − s) mod N` at step s, so a chunk keeps its size as it travels the ring.
+The coverage test now asserts the chunk-invariant (a rank forwards at
+step s+1 exactly what it received at step s) across both channels — 10
+mismatches pre-fix, 0 post-fix.
+
+### Fixed — RingAllReduce segment grid covers the full data size
+
+`RingAllReduce` sized every per-step transfer and the receive-completion
+threshold with plain `dataSize / numGpus`, silently dropping
+`dataSize % numGpus` bytes: at 4 ranks / 15 B the ring reported complete
+after 72 effective bytes of traffic where 2(N−1)·D = 90 is required
+(codex round 13, finding 3). The segment grid is now rank-indexed with the
+first `dataSize % numGpus` segments one byte larger (`SegmentSizeOf`:
+rank g's step-s send moves segment (g−s) mod N); both execution paths use
+it (the transaction graph's per-edge `effectiveBytes` and the wire path's
+`SendBulkWireTransferSize`). The wire path's receive ledger also gained
+two corrections exposed while pinning this: the expected byte count keys
+on the SENDER's segment size decoded from the packet's step-encoded
+flowId (the sender's step counter drifts from the receiver's in the
+pipeline), and the receive callback's first argument is the receiving
+endpoint's rank — the sender comes from the header (the old code read the
+receiver's rank from the callback and the dest from the header, which
+happened to work only because the two agreed in the uniform-segment
+world). Regression test `RingAllReduceSegmentCoverageTest` pins 90 B of
+effective traffic and completion on both paths.
+
+### Fixed — endpoint Dispose cancels deferred egress callbacks
+
+The three deferred-egress sites in `SendPacketOnDevice` (WFQ total-delay,
+FEC-encode-latency, DCQCN/RTTCC shapingDelay) schedule lambdas that capture
+raw `this` and dereference `m_devices`; `DoDispose` cleared `m_devices`
+without cancelling them, so disposing and releasing the endpoint while a
+paced send was pending crashed with SIGSEGV when the callback landed
+(codex round 13, finding 2: three same-flow packets paced at a 13.4-µs
+slot, Dispose at 5 µs → reproducible SIGSEGV at the deferred send). Every
+deferred egress now records its `EventId` in `m_deferredEgressEvents`
+(pruned of fired entries at each egress), and `DoDispose` cancels all
+pending ones before clearing the members. Regression test
+`EgressDisposeCancelsDeferredSendsTest` re-runs the repro scenario and
+asserts the pre-disposal packet still delivers with no crash.
+
+### Fixed — retransmission retry countdown starts at its wire transmission
+
+The GBN and SACK retransmission paths armed the source entry's retry timer
+at `readyDelay + retryTimeout` when the repair was queued — but the egress
+pacer/WFQ/FEC gates hold retransmissions exactly as they hold fresh sends,
+so with a 64-B LL packet, 0.1-Gbps per-QP pacing (~13.4-µs slot), 1-µs
+timeout and one retry, the budget expired at ~2 µs while the repair did not
+reach the wire until 13.36 µs: 64 B permanently lost on a link that
+delivers the repair (codex round 13, finding 1). `HandleRetryRequest` and
+`HandleSackRequest` now drop the pending timer and clear `wireArmed`,
+leaving `ArmRetryTimeoutOnWire` (the R12#4 egress hook) to arm at the
+actual transmission; `SendPacketOnDevice`'s invalid-device early-out arms
+there as the fallback so a never-sent entry keeps its backstop.
+Regression test `LlrRetryArmsAtWireOnRetransmitTest` pins loss-free
+delivery of the paced repair. The 2-node lossy GBN parity pins are
+unchanged (their timeout is long relative to the pacing).
+
+### Docs — retransmission path is topology-capped (like the mean path)
+
+`WHITEBOX_SURROGATE.md` §12 and `USER_GUIDE.md` §8 claimed the `ber > 0`
+retransmission path "keeps the construction bandwidth", implying only the
+`ber = 0` mean path was topology-aware (codex round 12, finding 9). The
+implementation caps the serialization rate itself —
+`T_serial_step = per_step / min(ring_bw, bisection)` — and `_retry_overhead`
+consumes that capped value, so SACK/GBN retransmissions serialize at the
+bisection-capped rate exactly like the mean term (verified numerically:
+16 MiB / 8-GPU ring / BER 1e-7 / retry 3 / SACK goes 222.98 µs → 737.04 µs
+under a 50 GB/s bisection cap). Both documents now state this, with the
+measured numbers; the code was already correct and is unchanged.
+
+### Fixed — NcclRing chunk grid covers the full data size
+
+`NcclRingAllReduce` split the tensor into `channels × numGpus` chunks with
+plain integer division, silently dropping `dataSize % (C·N)` bytes: at
+2 nodes × 2 GPUs, 2 channels, `dataSize=15` the chunk size floored to 1,
+representing only 8 of 15 tensor bytes (48 B of ring traffic where
+2(N−1)·D = 90 B is required) — yet the ring completed and reported the
+collective done (codex round 12, finding 8). The chunk grid is now
+row-major over (channel, index) with the first `dataSize % (C·N)` chunks
+carrying one extra byte, so the grid sums to exactly `dataSize`; rank r's
+step-s send moves chunk `(r−s) mod N` of its channel
+(`ChunkSizeOf`), and the receive ledger advances per step against the
+predecessor's expected chunk size (`ExpectedRecvBytes`). The 16 MiB
+parity pin is unchanged (its grid divides exactly). Regression test
+`NcclRingChunkCoverageTest` pins 90 B of traffic and completion at the
+repro point.
+
+### Fixed — multicast result sends honor FEC wire expansion
+
+The NVLS/SHARP multicast result paths (AllReduce single and partitioned,
+AllGather, and the NACK-driven result repairs) sent result fragments with
+direct `port->Send` calls, bypassing FEC egress entirely: with
+RS(544,514,15) on the result port a 65,536-B fragment serialized as
+65,536 wire bytes where `GetEncodedSize` requires 70,040 — the result
+link's serialization was understated and the codec latency never applied
+(codex round 12, finding 7). The four sites now go through the new
+`NvSwitch::SendMulticastResultOnPort`, which mirrors the endpoint egress
+convention exactly: the body is padded to the encoded size (the FEC
+receiver strips parity via the header's payload size), tx accounting
+uses the encoded wire size, and the send is held for the
+encode+decode latency. Regression test `MulticastResultFecExpansionTest`
+pins two 65,536-B fragments serializing as 2×(70,040+37) wire bytes.
+
+### Fixed — NVLS surrogate reliability uses the collective spray geometry
+
+The NVLS branch of `expected_permanent_losses` called
+`_packets_per_transfer` with D/N — which divides by N internally, so the
+upload side was sized at D/N² — and inherited the DATA bulk path's
+packet failure probability (~932 KB fragments at D=128 MiB instead of
+the collective spray's 128 KB chunks, ~1370× the per-packet failure
+probability). 8 GPU / 128 MiB allgather / BER 5e-8 / retry 3 reported
+12.1577 expected losses and `strict_reliability` rejected a config
+whose ns-3 run completes with zero permanent losses (codex round 12,
+finding 6). The branch now fragments via the new `_spray_fragments`
+helper, mirroring `SendCollectiveBulk` exactly: each rank's upload of
+D/N (allgather) or D (allreduce) moves as
+`max(lanes, ceil(bytes/spray_chunk))` fragments, and each result chunk
+mirrors one upload chunk — giving 0.062731 at the repro point,
+matching the C++ geometry. Regression test pins the 128 MiB value and
+a finite strict gate.
+
+### Fixed — upload dedup survives the NVLS/SHARP result multicast
+
+The switch erased its upload dedup ledger (`m_seenUploadSeqs`) when a
+flow completed and multicasted its result, so replaying the same
+(flow, src, seq) uploads after the result re-registered as new
+contributions: the byte ledgers re-accumulated, the flow "completed" a
+second time, and the switch multicasted a second full result — 256 B of
+result traffic where 128 B is correct, with zero duplicates reported
+(codex round 12, finding 5). The ledger now survives the result (one
+uint32 per accepted upload, cleared in `DoDispose`); late replays stay
+rejected duplicates exactly like pre-result retransmissions.
+Regression test `SharpUploadDedupSurvivesResultTest` pins one result
+set and two counted duplicates.
+
+### Fixed — LLR retry timers start at first wire transmission, not enqueue
+
+`LlrManager::StorePacket` armed the retry timeout at enqueue, but the
+endpoint's egress path can hold a stored packet before any wire
+transmission — DCQCN per-QP shaping, WFQ contention service, and FEC
+encode latency all defer `dev->Send`. The timeout window therefore
+measured the pacing hold, not the network: with a retry timeout shorter
+than the pace slot (1 µs vs ~13 µs for 1000 B at a 0.1 Gbps per-QP
+ceiling) the retry budget exhausted while the first transmission was
+still queued, fabricating permanent loss on a loss-free link (codex
+round 12, finding 4). First stores no longer arm a timer;
+`FabricEndpoint::ArmRetryTimeoutOnWire`, called immediately before
+`dev->Send` in all four egress branches (so the FabricHeader is read
+before the device mutates the packet front), forwards to the new
+`LlrManager::ArmRetryTimeoutAtTransmission`, which arms only-extend —
+an earlier NACK-driven deadline is never pushed out. Re-stores after a
+timeout re-arm as before, and GBN/SACK retransmits still arm at
+`delay + retryTimeout`. The 2-node lossy GBN parity pins re-anchor by
++1106 ns with every event count identical (each of the 696 retransmit
+deadlines now starts one FEC hold later); regression test
+`LlrTimeoutStartsAtWireTest` pins loss-free delivery under a sub-slot
+retry timeout.
+
+### Fixed — NVLS expected losses count upload and result sides separately
+
+The whole-collective reliability estimate treated NVLS like the ring
+(`2N(N−1)` same-size sides), but the two directions differ: every rank
+uploads the full D (or D/N for allgather) once, while the switch
+re-multicasts every received chunk to each of the N destinations — at
+N=8/D=16 MiB allgather the C++ truth is 144 upload fragments and 1,152
+result fragments (1,296 total, 9× the upload side); allreduce carries
+1,024 uploads and 1,152 results (its result multicast is pipelined over
+8 partitions, see the round-13 entry below). The generic
+multiplier overreported allgather losses by ~4.5× (0.2683 vs the
+measured 1.2074 at BER 1e-9/0 retries; codex round 11, finding 6 —
+count and parameter corrections per round 12, finding 10).
+`expected_permanent_losses` now has an NVLS branch that counts
+each side with its own fragment count (`N·frag(D/N)` results per dest × N
+dests). Regression tests pin the allgather value and the allreduce/upload
+ratio.
+
+### Fixed — CONFIG_GUIDE advertises the registered per-step knob names
+
+The NCCL-ring section of `doc/CONFIG_GUIDE.md` listed the per-step software
+and compute knobs with `Ns`-suffixed names (`--perStepSwOverheadNs`,
+`--swOverheadPerByteNs`, `--computeBase*Ns`, `--startupDelayNs`) that the
+executable never registered — `gpu-cluster-sim` rejects them with "Invalid
+command-line argument" (codex round 11, finding 7). The registered names
+omit the suffix: `--perStepSwOverhead`, `--swOverheadPerByte`,
+`--computeBaseLL` / `--computeBaseLL128` / `--computeBaseSIMPLE`,
+`--startupDelay`. The guide now uses those; `--llThreshold` and
+`--ll128Threshold` were already correct as documented. Doc-only change:
+verified `--perStepSwOverhead=100` is accepted and the run completes.
+
+### Fixed — tree expected losses count edges, not ranks
+
+The whole-collective reliability estimate's allreduce multiplier applied
+`2N(N−1)` uniformly, but the tree is edge-based: it has N−1 edges and each
+edge carries the full D per direction (`_wire_bytes_per_transfer`'s tree
+branch already counts full-D fragments per edge), so the transfer count is
+`2(N−1)`. The old multiplier overcounted tree losses by a factor of N — at
+N=8/D=16 MiB/BER 6e-7/retry 3 it reported 0.80997 expected losses instead
+of 0.10125, and `strict_reliability` wrongly returned infinity for a
+completable config (codex round 11, finding 5). Ring/fullmesh keep
+`2N(N−1)` (every rank really does 2(N−1) chunk steps). Regression tests
+pin the corrected tree value (±2e-3), the now-finite strict prediction, and
+that ring losses are unchanged.
+
+### Fixed — multicast result sequence numbers are per-destination
+
+The three multicast-result sites stamped every packet from one global
+`m_multicastSeqNum` that advanced across destinations, but endpoint reorder
+buffers (the module default, `SetBypassReorderBuffer(false)`) key on
+(vc, flow, source) and expect each stream to start at seq 0. With two GPUs,
+64-byte uploads, no loss, the first destination received seqs 0–1 (delivered)
+while the second buffered seqs 2–3 forever awaiting a 0 that never came —
+codex reproduced 128 B / 0 B delivered (round 11, finding 4). The main
+executable's forced bypass masked this module-API failure.
+
+Each destination now has its own counter starting at 0 (`m_multicastSeqNums`,
+destRank-keyed); the old counter survives as a total-emitted statistic.
+Regression test `MulticastSeqPerDestTest` builds two reorder-enabled
+endpoints on real switch ports and asserts both receive the full 128-byte
+result.
+
+### Fixed — the switch-side result cache can no longer evict a fragment before its first delivery
+
+The multicast-result LLR store kept a full `Ptr<Packet>` copy per result
+fragment under a 512-entry per-dest window. Result generation queues every
+fragment synchronously, so a flow producing more than 512 fragments per
+destination — an 8-GPU 128-MiB allgather on the 18-lane fabric generates
+1,024 per dest — evicted the first half at generation time, before any of
+them could be lost and NACKed. Loss of an evicted fragment was unrepairable:
+the codex repro (SACK, retry limit 64, packet loss 0.001, `RngRun=1`) left
+the collective incomplete at the simulation limit while the loss-free run
+completed (codex round 11, finding 3).
+
+The store now retains the stamped header only — result bodies are dummy
+bytes whose size is all that matters for timing, so `HandleSwitchNack`
+rebuilds a body from the header's payload size instead of holding a copy —
+and the window rises to 8,192 entries per dest (~1.2 MB/dest bound, covering
+the eviction-repro geometry with headroom). The codex repro now completes
+(111 µs) with its 3 link-error drops repaired; at loss 0.01 the same run
+completes with 6 retransmissions. Regression test `SharpResultRetentionTest`
+reproduces the eviction geometry (8 ranks × 1024 fragments to one dest) and
+asserts both an early and a late NACK are serviceable.
+
+### Fixed — NVLS/SHARP retransmitted uploads no longer double-count toward completion
+
+The switch's aggregation paths (`ProcessAllReduce`/`ProcessAllGather`) counted
+every arriving upload packet toward the flow's received-bytes ledger, with no
+notion of "already seen". A retransmitted upload — its LLR ack lost on a lossy
+fabric — therefore counted twice: with 2 GPUs expected to contribute 64 B each,
+a 32 B fragment retransmitted with the same seq pushed rank 0's ledger to 64 B
+and the switch declared the flow complete off 96 unique bytes, multicasting a
+"complete" 128 B result assembled from partial data (codex round 11, finding 2).
+
+Both aggregation paths now run a dedup gate (`RegisterUploadSeq`, keyed on
+(flowId, srcRank, seqNum)) ahead of the ledgers: a duplicate re-ACKs (so the
+sender purges its retry entry) but advances nothing. The seen-seq ledger is
+retired with the flow's other state in the three multicast tails. Regression
+test `SharpUploadDedupTest` drives the aggregation path directly through a new
+`InjectAggregateUpload` seam: the duplicate must not complete a 96-byte flow,
+while the control run (the missing fragment arriving under a fresh seq) still
+multicasts its 3 result chunks.
+
+### Fixed — protocol framing is a wire flag, not a model-efficiency inference
+
+`ProcessDataPacket` routed packets to the protocol-aware extraction path by
+the handling model's wire efficiency (< 1.0 ⇒ "framed"). That inferred a wire
+property from a model property, and several send paths legitimately emit RAW
+packets under an efficiency<1.0 model: public `SendData`/`SendP2p`, collective
+uploads, switch multicast results, and `SendBulkWireTransferSize` chunks too
+small to hold the header (`wireChunk <= soHeaderSize`). Two codex-reproduced
+failures: `p2p-roce.cfg --dataSize=8` (wireSize 9 < 10 B SoHeader → receiver
+deserialized a header off 9 bytes → NS_ASSERT abort in `Buffer::Iterator`),
+and public `SendData` under the UB model (receiver stripped a 16-byte
+transaction header that was never stamped → 64 payload bytes delivered as 48).
+The switch multicast results were a third latent instance — an So builder at
+the receiver silently dropped them (SoHeader dataSize read off dummy bytes).
+
+`FabricHeader` now carries an explicit protocol-framed bit (bit 7 of the
+virtualLane byte — 39-byte wire layout unchanged; `SetVirtualLane` masks to
+the low 7 bits so it can never clobber the flag). Every send path that
+actually stamps a builder header sets it (`SendDataInternal`'s BuildChunks
+loop, the four `stampSoHeader` sites in `SendBulkWireTransferSize` /
+`PumpBulkTxWindow`), `SendRetransmission` propagates it, and the receiver
+dispatches on the flag instead of efficiency — send/receive gates provably
+match because the flag is set exactly where a header is stamped. Regression
+test `ProtocolFramedDispatchTest` covers the raw-RoCE, raw-UB, and framed-UB
+receive cases.
+
+### Changed — tree surrogate: back to the original physical form, refit at the TRUE 18-link fabric
+
+Two corrections landed together:
+
+1. **Fabric convention**: the tree calibration now runs at the TRUE H200
+   fabric — `--linksPerGpu=18` separate point-to-point GPU↔NVSwitch NVLink4
+   lanes @ 170 Gbps each, spray-routed (128 KiB chunks round-robin, aggregate
+   3060 Gbps trunk), credits unconstrained. The retired
+   `--linkDataRate=3060 --linksPerGpu=1` convention collapsed the 18 lanes
+   into ONE p2p pipe (no spray, no per-link queues) — same cell N=8/256 MiB:
+   2851.1 → 2699.4 µs. The `h200-ll128.profile` now carries
+   `linksPerGpu = 18` and both switched `.cfg` headers document the 18-link
+   recipe.
+2. **Model form**: the fill-form experiment (a1fa05d: an ADDITIVE capped
+   pipeline-fill term `min(F·steps, κ·D)` + per-N fitted α∞, five constants)
+   reached 3.96% MAPE but was rejected as pure curve-fitting. The tree keeps
+   the ORIGINAL two-parameter form
+
+       T = S(D) + steps·t_min_switch + α(N)·D / tree_bw
+       α(N) = 1 / 2 / 3   (N≤2 / N≤4 / N≥5, structural trunk load)
+
+   with BOTH constants refit on the fresh 36-point sweep
+   (N = {4,8,16,32} × 1–256 MiB, `configs/calibration/tree_sweep.csv`;
+   relative-error-weighted joint least squares): `t_min_switch = 4.10 µs`,
+   `tree_bw_per_level = 275400 B/µs` (η = 0.72 vs the 382500 B/µs trunk
+   physics; `eta_tree` 0.60 → 0.61 in `make_surrogate_from_wire`). MAPE
+   12.65% all-36 / 6.97% SIMPLE, per-N 10.6/11.0/14.0/15.1% — the accepted
+   cost of the physical form: the D-dependent pipeline-fill residual
+   (small-D ns-3 faster, large-D slightly slower) is absorbed into the
+   fitted pair and documented, not modeled.
+
+The consistency regression tree preset lands at 11.13% (ratio 0.80–1.11)
+against the 18-link ns-3 fabric; the nvls preset is recorded against the
+profile's 18-link cfg alone (the old duplicate single-link/trunk nvls
+presets converged once the profile changed — it sits 1.07–1.17× above
+ns-3, documented). Sweep credit convention: the inline 1-VC fabric model
+with CLI-default credits (unlimited), NOT the profile's PEX `vcCredits=64`
+(+24.8% at N=8/256 MiB under 64 on the 18-link fabric). Docs:
+`doc/CALIBRATION.md` tree section rewritten; 4 tree unit tests (structural
+α(N), per-step volume α(N)·D/steps, ≤16% ns-3 reproduction incl. N=32,
+N-monotone shape).
+
+### Fixed — `StartApplication`/`Initialize` clobbered exhausted credit windows
+
+`FabricEndpoint::Initialize()` and `StartApplication()` lazily re-initialize
+any VC whose available credit count is zero to the 64-credit default — they
+cannot distinguish "never configured" from "configured and already
+exhausted". Application-start events are scheduled by `Node::DoInitialize`
+at `Simulator::Run` time with higher event uids than t=0 sends scheduled
+earlier in `main`, so a bare t=0 send can consume the whole configured
+window before `StartApplication` resets it back to 64 — silently
+unsqueezing any experiment that drives sends without injector startup
+delays. `SetVcCredits(credits>0)` now records the VC in a new
+`m_configuredVcs` set, and both lazy-init sites skip configured VCs.
+Parity-neutral: the allreduce credit-BDP experiment (injector startup
+delays push first sends after `StartApplication`) is unaffected — su pin
+4769616 bit-identical and the full parity battery unchanged.
+
+### Added — credit-BDP pattern sweep (p2p / incast / fanout / alltoall)
+
+`examples/gpu-cluster/credit_bdp_sweep/run_credit_patterns.py` extends the
+credit-BDP experiment beyond allreduce to four traffic shapes on the same
+8-GPU Su fabric (per-flow volume 256 MiB; alltoall passes 8× so each pair
+carries 256 MiB): p2p (1 flow), incast (7→1), fanout (1→7), and alltoall
+(56 flows), each swept over 5 bandwidths × 5 latencies × 6 windows on both
+the fullmesh and the switched fabric (1200 runs). Findings (800 G, 200 µs):
+
+- **Switched** (every pair 2 hops):
+  p2p follows the per-flow BDP law; incast ≈ p2p (independent per-sender
+  windows, receiver ingress adds only ~2%); fanout and alltoall share ONE
+  per-endpoint window across their flows (a single VC), so the sender
+  serializes all 224 chunks through W — 7.08×/7.10× p2p at W=1, and
+  recovering p2p-level utilization needs ~W × flow-count credits, not W.
+  At W=1 alltoall ≡ fanout (217.1 vs 216.5 ms): the shared window
+  dominates; they diverge only at large W where alltoall's 56 concurrent
+  flows contend network-wide (T_∞ 35.5 vs 19.3 ms).
+- **Fullmesh** (every pair a DIRECT 1-hop link — the cleanest isolation:
+  the per-chunk credit RTT is uniformly ser + 2·lat, no hop-count or
+  switch-traversal confound): p2p == incast **exactly** (15284352 ns
+  bit-for-bit — 7 independent windows over 7 dedicated links, and the
+  receiver's ingress is 7 links wide so there is no receiver bottleneck);
+  fanout/alltoall = 7.08× p2p = 224 chunks × the uniform 483.886 µs RTT
+  (pure shared-window serialization). T_∞ is line-bound at 2.88 ms (7
+  parallel egress links), so the same window yields the lowest
+  utilization of the two fabrics — even at W=24 fanout/alltoall sit at
+  0.256/0.232 while p2p/incast reach 1.000 (completion still beats
+  switched, 11.3 vs 19.3 ms, because the 1-hop credit RTT makes each
+  credit worth more).
+
+### Fixed — single-node local-rank range (credit gate) in the 11 point-to-point topology builds
+
+The 11 single-node builds in `gpu-cluster-helper.cc` that call `SetRank`
+(fullyconnected, fattree, rail-optimized fattree, ring, fullmesh, torus,
+mesh2d, hypercube, 2dfullmesh, ndfullmesh, 2dfullmeshclos) never called
+`SetLocalRankRange`, so the `FabricEndpoint` constructor default
+(`base=0, count=1`) made `IsLocalRank` treat **only rank 0** as local in
+single-node runs. Credit consume is gated on `IsLocalRank(destRank)` and
+per-delivery credit return on `IsLocalRank(sourceRank)`, so exactly one
+rank pair exchanged credits; every other flow sent blind, and a squeezed
+`--vcCredits` window deadlocked at the sim limit instead of degrading
+gracefully (the comment at fabric-endpoint.cc:2491 stated the intent —
+"single-node keeps all sources local" — the code did the opposite). Fix:
+`SetLocalRankRange(0, numGpus)` after each `SetRank`, the `BuildMultiPlane`
+precedent (rail-fattree's leaf-local domain is non-contiguous in rank
+space, so the contiguous-range API cannot express it — all-local is the
+uniform choice). Parity-neutral by construction: So TX-window / strict-GBN
+/ RTTCC guards stay default-off, and at the default 1e8 credits the added
+per-packet CREDIT returns ride idle reverse links and never bind — su pin
+4769616 bit-identical, h200 calibration point 1353.58 µs, and all other
+parity gates unchanged.
+
+With the gate fixed, `examples/gpu-cluster/credit_bdp_sweep/` demonstrates
+the credit-BDP phenomenon on the Su fabric: an 8-GPU ring allreduce
+(256 MiB, 1 credit = one 8-MiB bulk chunk) swept over bandwidth 100–1600 G
+× one-way latency 0.5–200 µs × window 1–24 chunks. Utilization
+(T_unlimited / T_W) follows the BDP law W·chunk/(serialization + 2·lat):
+at 200 µs latency W=1 collapses to 0.21 as bandwidth rises (completion
+flat past 200 G — bandwidth cannot be spent), W=2 to 0.43, while W≥8 stays
+at 1.00; the knee doubles with W as predicted. The sawtooth panel shows
+the oscillation itself — burst-drain-refill cycles whose median idle gap
+is 400 µs = 2·lat, the credit-return RTT.
+
+### Added — lossy-RoCE (no-PFC) fabric regime + DCQCN-where-it-bites sweep
+
+`EthernetSwitch::VoqDropThreshold` now applies to RoCE packets too (TypeId
+default 0 = lossless on both fabrics; the scratch CLI default 8 stays
+plain-Ethernet-only): an **explicit** `--voqDropThreshold=N` (N>0) on a RoCE
+run opts the fabric into the lossy-RoCE/no-PFC regime — VOQ tail-drop with a
+NACK back to the source beside ECN marking (keep `--ecnThreshold < N` for
+mark-before-drop), LLR retransmission force-enabled, and the switch-side
+`SetInterNodeSwitchLlrEnabled` armed so the NACK actually fires. The opt-in
+is detected by scanning argv for the flag (the CLI default 8 must not leak
+into RoCE), and the unset path is byte-identical: all RoCE parity pins
+unchanged (su 4769616 / 2n 15307388 / 4n 13421212, ncclring 444189,
+collective-dcqcn 1776084 + ecn=192, config-vs-inline ETH 50879434/49452004).
+
+The 57-run sweep in that regime
+(`examples/gpu-cluster/collective_topology_dcqcn/run_lossy_roce_sweep.py`
++ `run_lossy_rand_sweep.py`, `plot_lossy_roce.py`) is where the DCQCN alpha
+knobs finally move outcomes: on a 2n×8g hierarchical allreduce (256 MiB,
+drop=8, ecn=4) drops cost +32 % completion time and DCQCN recovers 37 % of
+the excess (best corner GDecay=0.125: 46 %); one-at-a-time swings — GInit
+7.9 % (U-shaped), GDecay 8.4 %, AlphaFloor 6.4 %, while TFast/FastCycles
+are flat. The benefit is severity-gated (drop=16 costs 0.4 %, drop=32
+nothing) and absent under saturated goodput (randTraffic: delivered ±0.7 %
+with ~4.4k drops — a full bottleneck serves retransmissions at the same
+rate), so DCQCN tuning matters exactly for completion-deadline loads on a
+deep-drop fabric. `--dcqcn` also mounts the RoCE SoHeader payload builder
+(+10 B/packet), which shifts timing even with zero CNPs — part of any
+dcqcn=1 delta is framing, not rate control.
+
+### Added — DCQCN rate-machine parameter CLI + sensitivity sweep
+
+The 7 `DcqcnRateMachine` TypeId attributes are now CLI-exposed for
+parameter sweeps — `--dcqcnTFastNs/--dcqcnFastCycles/--dcqcnTAiNs/--dcqcnRai/--dcqcnGInit/--dcqcnGDecay/--dcqcnAlphaFloor`
+(0 = keep the TypeId default, so the default path stays byte-identical),
+and when `--dcqcn=1` the machine's `MaxRateBps` (the alpha shaping-delay
+rate anchor) is back-filled from `--interNodeBandwidth` (the TypeId
+default 50e9 B/s was only correct for 400G links; the backfill is inert
+until a CNP fires).
+
+The 92-run sensitivity sweep
+(`examples/gpu-cluster/collective_topology_dcqcn/run_dcqcn_param_sweep.py`
++ `run_dcqcn_rand_sweep.py`, 5×3×3 grid + dcqcn=0 baselines in two
+regimes) establishes that the alpha parameters are **outcome-neutral in
+the lossless model**: the collective regime (host ncclring 256 MiB) is
+nanosecond-identical across all 46 runs — ncclring's per-step one-shot
+flowIds mean the CNP round trip always returns after the flow finished
+sending, so Alpha rises on dead keys — and the sustained-flow regime
+(randTraffic on 4:1 leafspine, where Alpha can throttle later messages)
+moves delivered Gbps by only ±0.4 %: a soft per-chunk deferral (≤1×
+serialization) is absorbed by lossless deep-VOQ bottleneck queueing. Only
+the switch-side marking threshold responds (ECN marks −2 %/−11 % over
+threshold 1→32). The chain is a counters-observable, not a throughput
+lever; the hard pacers (`--rttcc`, `--perQpCeilingGbps`) are the ones that
+move outcomes.
+
+### Added — real-NCCL global pipelined ring allreduce (`--algorithm=ncclring`)
+
+`NcclRingAllReduce` (`src/gpu-cluster/model/nccl-ring-allreduce.{h,cc}`)
+models what NCCL's ring algorithm actually does at multi-node scale, as an
+opt-in alternative to the 4-phase barrier-separated `hierarchical`
+schedule: C parallel channels (default `--ringChannels=0` → gpusPerNode),
+each a single global ring over all N ranks, rail-rotated so channel c
+enters every node at local GPU c and exits at local GPU (c+g−1)%g — one
+NIC in, one NIC out per ring per node, all rails carrying inter-node
+crossings concurrently. Each channel moves S/C bytes in 2(N−1)
+same-direction chunk steps (chunk = S/(C·N); 256 MiB → 256 KiB, the NCCL
+SIMPLE regime), advanced per-(rank,channel) purely event-driven — no
+barriers, so intra- and inter-node hops pipeline and the completion time is
+the max-of-bottleneck rather than the hierarchical sum-of-phases.
+
+At 16 n × 8 g RoCE 400G 256 MiB, ncclring reaches 741 Gbps busbw on
+tor/leafspine vs hierarchical's 362 (2.05×), and 654 on fullmesh/rail —
+tor *beats* fullmesh because ring crossings are cross-rail
+((n,c−1)→(n+1,c)): a switch reaches any NIC in one hop while fullmesh must
+PXN-proxy through the rail peer, faithful to real NCCL's PXN behavior.
+Below ~16 MiB the 254-step latency dominates and hierarchical wins —
+exactly why real NCCL switches to tree at small sizes. `host` topology is
+the one shape whose single central switch sees enough incast to fire
+DCQCN under ncclring (≈32 k ECN marks at ≥16 MiB). Experiment
+`run_ncclring_sweep.py` + `plot_ncclring.py` (8 topologies × 5 sizes) in
+`examples/gpu-cluster/collective_topology_dcqcn/`; gate
+`test/parity/test_ncclring.py` pins 2 n × 8 g leafspine 16 MiB at
+444189 ns and ncclring < hierarchical. Default paths untouched: all
+existing parity pins byte-identical.
+
+### Added — So payload-builder seam + collective-vs-topology experiment (16 n × 8 g, DCQCN)
+
+`FabricEndpoint::SetSoPayloadBuilder` / `GetPayloadBuilderForRank(rank)`
+mirror the existing `SetInterNodeProtocolModel` Su/So split: when a
+dedicated inter-node payload builder is mounted, remote-rank bulk sends are
+framed by it (with the wire protocol id overridden to the So protocol
+model's own id) while local-rank (Su) traffic keeps the vendor builder's
+framing and timing. This closes the DCQCN gap on inline collectives: the
+NCCL builder never stamps a SoHeader, so the switch ECN-mark and receiver
+CNP-echo guards (both keyed on `RoceProtocol::SIMPLE` + SoHeader) left the
+whole ECN → CNP → DCQCN chain dormant on inline collective runs. With
+`--dcqcn=1` on a RoCE fabric, `scratch/gpu-cluster-sim.cc` now mounts a
+shared So `RocePayloadBuilder`; the 10-byte SoHeader sits within the
+wire-size budget so chunk count and egress serialization are unchanged, and
+the default (`--dcqcn=0`, seam unmounted) stays byte-identical (all parity
+pins intact).
+
+Experiment `examples/gpu-cluster/collective_topology_dcqcn/` (sweep +
+figure): hierarchical allreduce + alltoall completion time and NCCL bus
+bandwidth vs data size (1–256 MiB per GPU) for all eight
+`--interNodeTopology` values at 16 nodes × 8 GPUs (128 ranks), RoCE 400G,
+DCQCN on. Fullmesh dominates (dedicated per-pair links; allreduce ~463,
+alltoall ~694 Gbps busbw at 256 MiB); the switched shapes cluster at the
+single-NIC-per-GPU bound with live ECN/CNP counters; ring is worst at this
+scale (GPU-0 gateway funnel; alltoall ~21 Gbps); the gateway shapes show
+structurally-zero ECN. The lossless-fabric DCQCN finding extends to finite
+collectives: on/off completion time is bit-identical on an oversubscribed
+leafspine, with activity visible only in the ECN/CNP counters. New gate
+`test/parity/test_collective_dcqcn.py` pins dormant-off + chain-alive-on.
+
+The figure carries an analytic **So wire bound** reference (iso-hardware,
+one 400G NIC per GPU): allreduce is rail-parallel (`2(n-1)/(g·n)·S` per
+NIC, bound ≈3387 Gbps busbw — ~1 decade above every curve, showing
+allreduce at this scale is intra-node/startup-bound, verified by a 10×
+So-bandwidth run moving tor only 11.8→9.4 ms), while alltoall moves the
+`(N-g)/N` inter-node fraction (bound ≈423 Gbps — the switched shapes reach
+38–50% of it; fullmesh crosses above it because the builder gives one link
+per rail per node pair, i.e. 15×400G per GPU, extra hardware rather than an
+iso-cost ideal).
+
+### Added — uniform-random traffic mode (`--randTraffic`) + topology throughput-vs-injection experiment (DCQCN)
+
+New fixed-duration synthetic-load mode in `scratch/gpu-cluster-sim.cc`:
+every rank self-schedules fixed-interval `--randMsgBytes` messages to
+uniform-random ranks on other nodes at `--randInjectionRate` × the
+inter-node line rate; offered/delivered bytes are counted inside a
+`--randWarmupNs`/`--randMeasureNs` window (RngRun-seeded phases, default
+off = parity-safe). On the RoCE fabric the mode mounts `RocePayloadBuilder`
+and sends with protocol `RoceProtocol::SIMPLE`, so bulk packets carry a
+SoHeader and the ECN → CNP → DCQCN chain is live wherever an
+`EthernetSwitch` is in the So path (it stays structurally inert on the
+switchless fullmesh and the GPU-0-gateway shapes). New observability:
+`EthernetSwitch::GetEcnMarkedPackets` and per-endpoint CNP sent/received
+counters, reported as `ecnMarkedPackets`/`cnpPacketsSent`/
+`cnpPacketsReceived` in every RESULT block.
+
+Experiment `examples/gpu-cluster/random_traffic_dcqcn/` (sweep + figure):
+delivered throughput vs injection rate for all eight `--interNodeTopology`
+values at 8 nodes × 4 GPUs, RoCE 400G, `--dcqcn` on. Fullmesh is linear to
+line rate; the switched shapes (host/tor/rail/leafspine) bend at ~0.7 to
+the uniform-random destination-collision limit (~75%) with ECN/CNP rising
+sharply; the gateway shapes saturate early at the GPU-0 funnel (ring
+~2.2 Tbps, dragonfly ~3.8, torus2d ~4.5). New gate
+`test/parity/test_random_traffic.py` (fixed-duration completion,
+non-blocking delivery, and ECN/CNP/DCQCN activation under a 4:1
+oversubscribed leafspine); all existing parity pins re-verified unchanged.
+
+### Added — four scale-out topologies (rail / leafspine / torus2d / dragonfly) + gateway-forwarding flood fix
+
+`MultiNodeTopologyHelper` now supports eight `--interNodeTopology` values.
+New: `rail` (DGX-SuperPOD-style rail-optimized — one shared rail switch per
+local rank, cross-rank via the intra-node PXN proxy path), `leafspine`
+(2-tier Clos; `--interNodeSpines`, 0 = auto = gpusPerNode non-blocking; leaf
+spreads destination MACs across spines by `destLocalIdx % S` as deterministic
+rail-aligned ECMP), `torus2d` (GPU-0-gateway 2D torus; `--interNodeTorusWidth`,
+0 = auto; dimension-order shortest-wrap routing) and `dragonfly`
+(`--interNodeDragonflyGroupSize`, 0 = auto; palmtree global-link assignment,
+minimal l-g-l routing). Rail/leafspine switches are configured through a new
+`CreateInterNodeSwitch` helper (VOQ/arbitration/cut-through/LLR arming), so
+the lossy-ETH NACK/retransmit path works on them out of the box.
+
+Fixing the gateway shape exposed a latent bug in the pre-existing `ring`
+topology: the endpoint hop-by-hop forwarding path re-added the FabricHeader
+unchanged, so the DestMac still named the *first* hop's gateway. Switches
+route on the header's MACs, the stale MAC is unknown at the destination
+node's NVSwitch, and every forwarded packet flooded all ports — each
+non-target GPU then re-forwarded its flooded copy, storming exponentially at
+gpusPerNode ≥ 8 (a 64 KB 4-node run never terminated; at 4 GPUs/node it
+"worked" with a 477× receive amplification). The forwarder now rewrites the
+header DestMac to the current hop's next-hop MAC. New gate
+`test/parity/test_so_topologies.py` pins a completion + losslessness smoke
+for all eight topologies; all existing parity pins (So hierarchical
+4769616/15307388/13421212, config-vs-inline ETH, lossy recovery, C++
+EXTENSIVE, 67 surrogate tests) re-verified unchanged.
+
+### Changed — alignment demos moved to `examples/gpu-cluster/`
+
+`configs/calibration/` had accumulated 30 unindexed files mixing two roles.
+The external/HW-anchor alignment demonstrations (consistency regression,
+Demystifying-NCCL Fig. 6 sweep, SRNIC Fig. 11 loss sweep, ConnectX-7
+perftest lat/bw sweeps, anchor re-plot script, plus their reference CSVs,
+result JSONs and figures — 22 files) moved to a new `examples/gpu-cluster/`
+with a README table of every aligned scenario, its reference and the
+achieved alignment. The fit machinery that produces calibrated constants
+(`tree_ns3_sweep`, `fullmesh_ns3_sweep`, `roce_p2p_calib` + their outputs)
+stays in `configs/calibration/`. Scripts are `__file__`-relative so they
+run unchanged from the new location (`demystify_nccl_sweep.py`'s hardcoded
+paths were fixed in the move); cross-references in the `.cfg` headers,
+`doc/CALIBRATION.md`, `doc/PLAN.md`/`doc/TASKS.md`, `README.md` and
+`CONTRIBUTING.md` updated (historical entries below keep the old paths).
+The directory is build-inert (no `CMakeLists.txt`, so the stock examples
+scan skips it). No code changes — config-vs-inline parity re-verified
+bit-identical, 67 surrogate tests green.
+
+### Fixed — h200-nvls-allgather.cfg run recipe left the GPU↔NVSwitch trunk 18× under-provisioned
+
+The cfg's documented run command passed no `--linkDataRate`, so the switched
+builder fell back to the profile's `bandwidthGbps=170` — a PER-LANE value
+(375 GB/s aggregate ÷ 18 lanes; correct for ring/fullmesh, whose builders
+instantiate 18 physical lanes) — for the ONE link the switched topology
+gives each GPU. The NVSwitch's full-D multicast egress then serialized on a
+single 170 Gbps link (16 MB allgather: 918 µs observed ≈ the 790 µs
+single-link bound), the root cause of the ≈0.09–0.16× surrogate/ns-3 ratio
+in the consistency regression. Header now recommends and the run example
+passes `--linkDataRate=3060` (18×170 = the full trunk, the tree-calibration
+convention). Comments only — config-vs-inline parity re-verified
+bit-identical.
+
+### Changed — surrogate tree preset recalibrated to the post-volume-fix ns-3 tree; 4-preset consistency regression added
+
+The theory-surrogate tree constants were fitted against the pre-#37
+under-transferring TreeAllReduce and undershot the rewritten injector by up
+to ~10x at 256 MB. Recalibrated against a 27-point ns-3 sweep
+(`configs/calibration/tree_ns3_sweep.py`, N∈{4,8,16} × 9 sizes,
+`--linkDataRate=3060` = the full 18×170 Gbps GPU↔NVSwitch trunk): the old
+serial term `D(N−1)/N/(log₂N·tree_bw)` *decreases* in N while measured
+large-size cost grows (α = 2.505/3.894/3.993 trunk-loads at N=4/8/16), so
+the formula changed, not just constants — per-step volume is now
+`α(N)·D/steps` with the structural trunk-load `α(N)=1/2/3` (N≤2/N≤4/N≥5,
+busiest GPU↔switch trunk of the heap-shaped chunk-pipelined tree), applied
+in `_per_step` so predict/predict_tail/BER-packet paths all inherit it.
+Fitted `tree_bw_per_level=270653 B/µs` (η=0.7076 vs the 382500 B/µs trunk)
+and `t_min_switch=2.99 µs` (relative-error-weighted LS; MAPE 7.59% all /
+5.02% SIMPLE). `make_surrogate_from_wire` tree derivation is now
+`eta_tree·B_agg` with default `eta_tree=0.60` (270000, −0.24% vs fit).
+`h200-tree-allreduce.cfg` header now recommends `--linkDataRate=3060` and
+retires the pre-fix 80/100/50 Gbps guidance. Ring/nvls/fullmesh presets and
+all from-wire non-tree numbers are byte-identical; optical/connectx7 tree
+constants are untouched historical placeholders. New regression
+`configs/calibration/surrogate_ns3_consistency.py` records all four presets
+vs current ns-3 at N=8: ring MAPE 1.87%, tree 7.39%, fullmesh 0.12%; nvls
+is convention-dependent (0.09–0.16× vs the cfg's single-170G-link default,
+1.07–1.17× vs the full trunk — the historical "≈0.566× lower bound" note's
+conditions were unrecorded and match neither; documented in
+`doc/CALIBRATION.md`). 3 new unit tests (α values, ns-3 ground-truth
+reproduction within 12%, monotonicity in N); 67 pytest green; config-vs-
+inline parity unchanged.
+
+### Fixed — RingBroadcast/RingReduce moved less than D per edge; rewritten as chunk-pipelined full-volume chains
+
+The two rooted ring collectives beat the physical lower bound D/BW (NCCL
+busbw factor for broadcast/reduce is 1: every ring edge must carry the full
+D). Old RingBroadcast relayed a single D/N segment sequentially — each
+non-root GPU received only 1/N of the array (wrong semantics on top of the
+volume error); old RingReduce ran N−1 parallel steps of D/N per link
+((N−1)/N·D per edge — the *reduce-scatter* volume, but the root needs the
+whole result, and completion checked only the root's step counter). Both
+rewritten in the TreeAllReduce (#37) style: chunk-pipelined chains carrying
+full D per edge (`clamp(D/(32·(N−1)), 64 KiB, 8 MiB)` forwarding quanta,
+byte-counted order-insensitive progress, uint64 `SendBulkWireTransferSize`).
+Broadcast: root streams D around the ring, last-before-root does not
+forward, done when all N−1 non-roots hold D. Reduce: the chain head (root's
+ring predecessor) streams D toward the root; interiors forward the running
+partial sum gated on received bytes; done when the root holds D. Post-fix
+64 MB times sit just above the D/BW bound and are nearly N-independent
+(n=4 751.6 µs / n=8 757.6 µs vs old 569.8/655.7 = (N−1)/N·bound); small
+sizes get slightly *faster* (old paid full store-and-forward latency per
+hop — two errors partially cancelled). Neither collective is in any
+calibration or parity path; all pins unchanged, all gates green.
+
+### Fixed — 2D AlltoAll relay keyed first-hop accounting on the wrong rank (latent)
+
+`AlltoAllInjector::OnPacketReceived` keyed the 2D-mode (UB-Mesh
+`--topology=2dfullmesh`) first-hop relay counter on the receive callback's
+first argument — which is the *receiving* endpoint's own rank
+(`FabricEndpoint` passes `m_rank`), not the sender. Every same-row sender's
+bytes toward the same final destination pooled into one counter, and the
+threshold-crossing `erase()` would discard overshoot bytes. The bug is
+latent today: bulk-transfer deliveries arrive atomically (one callback per
+completed transfer with `effectiveDataSize` = the full chunk), so pooled
+crossings landed exactly on chunk boundaries and nothing was lost — verified
+byte-identical pre/post fix on 2×2/3×3/4×4 grids at 4–64 MB including
+forced fragmentation (`--sprayChunkSize=8192`). Any future fragmented
+delivery (e.g. partial spans under loss) would have deadlocked the relay.
+Now keyed on `header.GetSourceRank()` (same trap as the TreeAllReduce fix
+below). All parity pins and gates unchanged.
+
+### Fixed — TreeAllReduce carried only D/N per edge; rewritten as full-volume chunk-pipelined tree
+
+The Demystifying-NCCL anchor (below) exposed a structural bug: the old
+`TreeAllReduce` sent `m_chunkSize = dataSize/numGpus` per tree hop per step,
+so the total per-edge volume was D/N instead of D — the sim's effective
+per-edge bandwidth (193.7 GB/s) exceeded the 150 GB/s GH200 pair spec and the
+sim beat the physical bound D/BW = 28.6 ms (22.2 ms at 2^32). The old
+schedule also never sent GPU 3's reduce contribution at N=4
+(`targetLevel = depth−1−k` skipped level 2). The model is rewritten as a
+chunk-pipelined binary tree (heap arithmetic parent=(g−1)/2 kept): reduce
+flow sends the full D up every edge (interior GPUs forward
+`[sent, min-over-children-received)`), broadcast flow re-sends the full D
+down, forwarding quantized to `clamp(D/(32·depth), 64 KiB, 8 MiB)` uniform
+chunks (no per-hop re-fragmentation cascade), progress byte-counted per
+(flow, edge) so spray reorder and GBN duplicates cannot regress it; sw
+overhead knobs pace each hop (perStep at first chunk + perByte rate tax,
+defaults 0 = zero extra events). Public API unchanged. Demystify tree arm
+post-fix: MAPE LL 16.9→5.8%, LL128 15.2→8.1%, Simple 26.4→16.3%; 2^32 Simple
+28.84 ms = 1.007× physical bound (was impossibly under it); 2^32 protocol
+ratios within 1% of measured. Ring arm byte-identical; all parity pins
+(RoCE triple, ETH, strict-GBN, config-vs-inline incl. the tree case)
+unchanged. Note: `h200-tree-allreduce.cfg` per-protocol `linkDataRate`
+80/100/50 was fitted against the old under-transferring model and needs
+recalibration before its absolute numbers are reused.
+
+### New — Demystifying-NCCL Fig. 6 anchor: Su protocol constants validated on third-party GH200 hardware
+
+Third external measured anchor, first for the **Su (NVLink) protocol axis**:
+*Demystifying NCCL* (arXiv:2507.04786) Fig. 6 intra-node panels — LL / LL128 /
+Simple × Ring/Tree AllReduce on a 4× GH200 quad (CSCS Alps, NCCL 2.19.1,
+2^14–2^32 B) — digitized by pixel extraction
+(`configs/calibration/demystify_nccl_fig6_reference.csv`, provenance in
+header) and compared against the stock `NcclProtocolModel` with only the
+physical spec changed (ring: `--numLanes=18 --bandwidth=200` = 450 GB/s
+per-GPU multi-ring aggregate; tree: fullmesh `--numLanes=6` = one 150 GB/s
+pair per edge). Only 6 startup intercepts fitted (anchored at 2^14);
+2^16–2^32 is a pure transfer test: per-curve MAPE 15–26% (one-sided
+optimistic, worst in the 2^22–2^26 transition regime), and the
+bandwidth-independent protocol-shape ratios at 2^32 transfer to within 3% on
+the tree path (tree LL/Simple 1.95 vs 2.01 measured; LL128/Simple 1.04 vs
+1.07) — independent confirmation of the LL=0.5 / LL128=0.9375 wire model.
+Ring LL undershoots 21% (our LL efficiency is NCCL's theoretical bound; the
+paper reports LL at 25–50% of peak) — documented, not tuned. Sweep:
+`configs/calibration/demystify_nccl_sweep.py` (60 runs) + comparison figure;
+write-up in `doc/CALIBRATION.md` §"NCCL protocol shapes (scale-up)". No
+model-code changes — measurement-only round.
+
+### New — `--soGbnStrict` strict So go-back-N receive semantics (supersedes the GBN numbers below)
+
+The re-run below left the GBN arm optimistic at high loss (0.820 vs CX-6
+0.467 at 1%, arms inverting at 2%): the receive path kept the bypass-mode
+dedup, so out-of-order originals were accepted (and re-ACKed) and blanket
+retransmits arrived as cheap duplicates. New `--soGbnStrict` (default 0 =
+legacy, So-only — the gate requires a remote source rank, so the sprayed Su
+NVLink fabric where OOO is normal is never touched) switches `llrMode=gobackn`
+So receive to real IB responder behavior: in-order-only acceptance,
+out-of-order arrivals discarded with no ACK, exactly one NAK per gap (lost
+NAKs covered by the 500 µs retry-timer backstop), duplicates re-ACKed only,
+and the drop site no longer emits the oracle per-drop NACK (which also kills
+the R = window × plr blanket cascade that made large windows explode).
+Under strict semantics the TX window IS the rewind span; the GBN arm uses
+w=64, a calibrated back-fit against the CX-6 anchor within the physical
+bounds [wire BDP = 16, testbed tx_depth = 128] (CX-6 reverse-solves to a
+per-drop waste of 70–130 packets). SRNIC Fig. 11 sweep re-run (3-seed):
+strict GBN tracks CX-6 within ~3 points up to 0.5% loss (0.919/0.933 at
+0.1%, 0.725/0.744 at 0.5%), stays ~10 points optimistic at 1–2% (no
+RTO-scale stalls modeled: 0.580/0.467, 0.383/0.278), and restores the
+measured mode ordering at every loss rate (GBN below SACK — the legacy arms
+inverted at 2%). SACK arm unchanged (w=16, within ~5 points everywhere).
+Gates: build clean, C++ EXTENSIVE, surrogate 64, all 5 parity suites, new
+`test/parity/test_so_gbn_strict.py` (default-off legacy pin 3185174 ns +
+strict-on lossless baseline 2521509 ns + strict-on lossy pin 4276850 ns).
+
+### New — `--soTxWindow` ACK-clocked TX window; SRNIC Fig. 11 re-run (supersedes the entry below)
+
+Aligning against SRNIC Fig. 11 exposed three model bugs, all fixed and inert
+at defaults (parity-pinned byte-identical):
+
+1. **No TX-depth/BDP window**: `FabricEndpoint::SendBulkWireTransferSize`
+   dispatched every chunk synchronously at t≈0, making the effective GBN
+   window the whole remaining message. New `--soTxWindow=N` (default 0 =
+   legacy): bounds in-flight So bulk chunks per endpoint, clocked by the
+   per-packet LLR ACKs (requires `--llrEnabled`); the NIC send-queue /
+   perftest `tx_depth` analog. Window slots release on ACK or permanent
+   loss; duplicate ACKs from GBN blankets don't over-release.
+2. **Retry timers armed at dispatch, not TX**: with the synchronous dispatch,
+   LLR retry timers all started at t≈0, forcing whole-transfer-scale
+   timeouts (3/20 ms). With the window, `StorePacket` happens at
+   window-gated TX time, so RTT-scale timeouts (500 µs ≈ 100×RTT) are sound.
+3. **NACK-of-NACK**: the endpoint receive path emitted a NACK for *control*
+   packets dropped by `--packetLossRate` (loss sample ran before the
+   protocol-control check). Control packets now drop silently, matching the
+   switch path; lost control packets recover via the sender's retry timer.
+
+Re-run results (3-seed, `--soTxWindow=16` = wire BDP, 500 µs timeout, both
+arms): the SACK arm now tracks measured SRNIC within ~5 points at every loss
+rate (0.823 vs 0.773 at 1%, 0.569 vs 0.619 at 2%); the GBN arm has the
+correct low-loss shape (0.977 vs 0.933 at 0.1%) but is optimistic at high
+loss (0.820 vs 0.467 at 1%) because the receiver keeps out-of-order
+originals (no true-GBN discard) and there are no RTO-scale stalls — see
+`doc/CALIBRATION.md` for the honest gap analysis and the blanket-cascade
+subcriticality rule (R = window × plr < 1). The numbers and the
+"whole-message GBN window" caveats in the entry below are superseded.
+
+### New — SRNIC Fig. 11 loss-recovery comparison + `--llrTimeoutRetransmit` backstop
+
+External measured anchor for the LLR recovery modes: SRNIC (NSDI'23) Figure 11
+measures a ConnectX-6 (go-back-N) collapsing under FPGA-injected random loss
+while SRNIC's selective repeat degrades gently. The ns-3 counterpart sweeps
+`llrMode=gobackn` vs `llrMode=sack` (only that axis changes between arms) on
+the RoCE tor 100G fabric with `--packetLossRate` — the recovery-mode spread
+reproduces, and at 1% loss the GBN arm (0.510 normalized) sits within 5 points
+of the measured CX-6 collapse (0.467). Digitized reference with provenance in
+`configs/calibration/srnic_fig11_cx6_reference.csv`, sweep driver
+`configs/calibration/eth_gbn_loss_sweep.py`, arms
+`configs/protocol_configs/p2p-roce-lossy{,-sack}.cfg`, full write-up (incl. the
+whole-message-GBN-window structural caveats) in `doc/CALIBRATION.md`.
+
+The experiment exposed a production model gap: `LlrManager::OnRetryTimeout`
+only invoked a callback that unit tests registered — the retry timeout was a
+no-op in real runs, so a lost NACK deadlocked SACK mode forever (NACK emission
+at receiver drop time was the only recovery trigger, and `--packetLossRate`
+applies to control packets). New opt-in `--llrTimeoutRetransmit` (default 0 =
+legacy no-op, parity-pinned byte-identical) wires `FabricEndpoint` to the
+timeout: on fire it re-issues the retransmission through the mode's own path
+(SACK single-seq / GBN blanket), re-arming timers and honoring
+`--llrRetryLimit`.
+
+### New — RTTCC (RTT-probe-based congestion control) for the plain-Ethernet So fabric
+
+`--rttcc` (default off) adds a second congestion-control option beside DCQCN,
+targeted at the **lossy plain-Ethernet fabric where DCQCN cannot operate**
+(ETH has no ECN/CNP loop, and `EthernetProtocolModel` locks
+`WireEfficiency=1.0`, which the DCQCN So gate keys on). RTTCC senses
+congestion from delay instead (NVIDIA RTT-CC / Swift-style):
+
+* **Probe/response loop.** At the `SendPacketOnDevice` egress chokepoint the
+  sender emits at most one `RTT_PROBE` per `ProbeInterval` per flow alongside
+  the data; the receiver reflects it as an `RTT_RESPONSE` echoing only the
+  probe sequence (timestamps never go on the wire — the sender keeps a local
+  seq→sentNs map). Both new packet types are CONTROL packets: they bypass BER
+  sampling, VOQ tail-drop, ECN marking, LLR storage and both rate machines'
+  shaping, but are still ENQUEUED into switch VOQs — so the measured RTT
+  reflects real congestion queueing.
+* **Swift-style rate law** (`RttccRateMachine`, one per So endpoint):
+  `rtt<=TargetRtt` → rate += `AdditiveIncreaseGbps` (cap `LineRateGbps`);
+  `rtt>TargetRtt` → rate ×= `1 − Beta·(rtt−target)/rtt` (floor
+  `MinRateGbps`). The rate is enforced as a TRUE per-flow pacer (per-flow
+  next-send bookkeeping, same mechanism as the DCQCN per-QP ceiling) and
+  COMPOSES with DCQCN via `max(dcqcnDelay, rttccDelay)`.
+* **Per-endpoint mount** (unlike DCQCN's shared machine): the flow key
+  carries no source rank, so a shared machine would merge the pacer/probe
+  state of two incast senders targeting the same (dest, vc, flow).
+* **Parity.** Default off mounts nothing; the incast baseline
+  (simTimeNs 68664 / drops 87 / retx 285 / permLoss 0) and the RoCE triple
+  (su 4769616 / 2n 15307388 / 4n 13421212) stay byte-identical. Even when
+  mounted, an uncongested flow sits at the line rate and the pacer is a
+  0-delay no-op. On the long 4MB `p2p-eth-incast.cfg` run RTTCC reduces
+  drops 16388→16317, retransmits 25151→24911 and permanent losses 280→272.
+* CLI: `--rttcc`, `--rttccTargetRttNs` (default 10000), `--rttccProbeIntervalNs`
+  (default 5000); RESULT block reports `rttccProbesSent/RttSamples/
+  MinRttNs/MaxRttNs/MinRateGbps`. Gates: `RttccRateMachineTest` (C++) +
+  `test/parity/test_rttcc_ethernet.py` (default-off byte-identity + loop-alive).
+* Idealizations (see `doc/RISKS.md`): probes ride the control path so they are
+  never tail-dropped (every probe returns a sample); the receiver reflects
+  unconditionally (no receiver-side machine).
+
+### New — multi-operation temporal contention modeling (multi-node contention wiring + background P2P injection)
+
+ProtoBridge can now model **contention between a primary collective and a
+time-offset background P2P flow sharing the same fabric**, for both scale-up
+(single-node) and — newly — scale-out (multi-node) topologies. Two gaps closed:
+
+1. **Multi-node contention wiring.** `ContentionModel` (WFQ over three traffic
+   classes COLLECTIVE/MEMORY/P2P) was previously attached only on the
+   single-node (Su) path (`topoHelper.SetContentionModel`); multi-node (So)
+   endpoints never received one. The multi-node endpoint loop in
+   `scratch/gpu-cluster-sim.cc` now creates an **independent** `ContentionModel`
+   per endpoint (backlog local to that endpoint's injection side; bandwidth is
+   the intra-node NVLink rate `bandwidthGbps`, also for So-bound packets) —
+   this DIFFERS from the single-node `GpuClusterTopologyHelper`, whose
+   `AttachContentionModelToEndpoints` creates ONE clone and shares it across all
+   endpoints so the backlog aggregates node-wide (two layers, not a correctness
+   difference; the helper's header comment previously said "cloned for each
+   endpoint" and now states the sharing). WFQ penalty fires only at
+   `numActive>1`, so pure-collective So traffic stays single-class and
+   **byte-identical** (su 4769616 / 2n 15307388 / 4n 13421212 ns re-verified);
+   the model engages only when a second class is concurrently active on the
+   same endpoint.
+2. **Background P2P injection entry.** New `--bgP2p*` CLI injects a self-driven
+   `P2pTraffic` flow scheduled at `--bgP2pStartTimeNs` that shares the fabric
+   with the primary collective — exercising endpoint WFQ (multi-class) and So
+   switch VOQ arbitration. Unlimited (`maxPackets=0`); the sim stops via
+   `OnCollectiveComplete` when the collective finishes. `--bgP2pIntervalNs=0`
+   (back-to-back) means one packet serialization time at the intra-node
+   bandwidth (clamped to ≥1 ns — integer division floors <100 B at 800G to 0,
+   which would loop at a fixed sim-time and starve later events); a cross-node
+   flow is thereby over-driven by the intra/inter rate ratio (2× at 800G/400G)
+   and queues at the NIC — pass `--bgP2pIntervalNs` explicitly to pace at the
+   inter-node rate. `bgP2pBytesSent`/`bgP2pPacketsSent` count injection
+   (`SendP2p` calls), not delivery. Default off (parity-identical).
+
+**What slows the collective, honestly.** Two mechanisms, which the gate checks
+separately because each can regress on its own: (a) **link sharing** — the bg
+packets FIFO-serialize on the same NetDevice / So switch VOQ as the collective;
+(b) the **WFQ penalty** — an extra send-side delay when >1 class is active.
+Smoke (2-node RoCE host, 16 MiB hierarchical allreduce): baseline 1248928 ns →
+cross-node bg (rank 0→4) 1353663 ns (+8.4%, 129 × 1 MiB injected). That +8.4%
+is **entirely link sharing**: with all three weights set to 1.0 (which makes
+`ComputeServiceTime` return exactly 0 while the model stays mounted) the run
+is byte-identical at 1353663 — the WFQ term fires (26 packets penalized) but
+is off the critical path behind the over-driven 400G NIC queue. An intra-node
+bg (rank 0→1) on the same 2-node run does discriminate: 1311031 (default) vs
+1295971 (weights=1.0). Single-node Su: 319658 → 450982 ns (+41%), of which the
+WFQ penalty on the P2P class is a −3.7% correction (468378 with weights=1.0).
+WFQ reshuffles who waits; it is not monotone in latency. `--bgP2p*`:
+`bgP2pEnabled`/`bgP2pSrc`/`bgP2pDst`/`bgP2pSizeBytes`/`bgP2pIntervalNs`/
+`bgP2pStartTimeNs`. Gated by `test/parity/test_contention_interference.py`
+(4 cases): interference `simTimeNs > baseline` + `complete` + injected bytes
+for both regimes, a **WFQ discriminator** (default weights `!=` weights=1.0,
+intra-node bg in both regimes), and all seven `simTimeNs` values pinned like
+the RoCE parity triple. Design note: single-node shares one `ContentionModel`
+clone across endpoints (backlog node-wide); multi-node mounts an independent
+per-endpoint instance (backlog per endpoint) — different layers, magnitudes
+not expected to match.
+
+### Changed — scale-out (So) traffic bypasses credit flow control
+
+`SendBulkWireTransferSize` and `OnPacketDelivered` now gate credit on
+`IsLocalRank(destRank)`: scale-out (inter-node, So) packets neither consume nor
+return per-packet credits. Previously So endpoints carried a credit structure
+that never fired (the default `--vcCredits` depth ≫ any bulk chunk, so
+`HasCredits` was always true) — a vestigial shell. So flow control is, and now
+honestly is, the lossless/lossy fabric mechanism instead: ECN/DCQCN/per-QP
+ceiling (RoCE) and VOQ tail-drop + LLR retransmit (Ethernet). Scale-up (Su,
+NVLink) keeps full credit gating — unchanged. Single-node (`m_localRankCount
+==1`) keeps all ranks local → unchanged. Su baseline (4769616 ns) and So RoCE
+hierarchical parity (15307388 / 13421212 ns) re-verified byte-identical; the
+bypass is behavior-equivalent at the old credit depth. `--vcCredits` now
+documented as Su-only.
+
+### New — config-primary selection of the scale-out (So) fabric
+
+The config-primary path (`.cfg`/`.profile`) previously sourced only the
+scale-**up** (Su, intra-node) fabric axes; the scale-**out** fabric type (RoCE
+vs ETH) was CLI-only (`--interNodeFabricType`). The profile→CLI sourcing block
+now also sources the four inter-node axes — `interNodeFabricType`,
+`interNodeTopology`, `interNodeBandwidthGbps`, `interNodeLatencyNs` — from the
+`.cfg`'s `[stack]` section (or the `.profile`), so **one config adapts across
+protocols**: `interNodeFabricType = ETH` selects the lossy Ethernet So fabric,
+`RoCE` the lossless variant, with no `--interNode*` CLI flag. Keys absent fall
+back to the CLI default (backward-compatible — existing profiles unaffected).
+`numNodes`/`gpusPerNode`/`dataSize` stay on the CLI (scale axes, like `numGpus`).
+Demo `configs/protocol_configs/eth-hierarchical.cfg` (a hierarchical allreduce
+over ETH, fully config-driven); bit-identical to the inline CLI path — gated by
+the new `test/parity/test_config_vs_inline_eth.py` (2-/4-node, 256 MiB,
+`simTimeNs` exactly equal). Closes the config-primary So gap noted in
+`test_so_hierarchical_regression.py`.
+
+### New — plain (non-RoCE) lossy Ethernet scale-out fabric (ns-3 + surrogate)
+
+The scale-out (So) fabric was RoCEv2-only (lossless RDMA + DCQCN/PFC/ECN). It
+now gains a PLAIN (non-RoCE) lossy Ethernet counterpart — the lossy contrast to
+RoCE's losslessness, for a RoCE-vs-Ethernet loss-resilience comparison. Both
+layers, on branch `feature/plain-ethernet-fabric`.
+
+**ns-3 (C++):** a new `EthernetProtocolModel`
+(`src/gpu-cluster/model/ethernet-protocol-model.{h,cc}`, mirroring
+`roce-protocol-model`) — `WireEfficiency=1.0` (locked; plain L2 data carries no
+RoCE IP/UDP/IB headers), `GetProtocolId()=0` (NONE — the non-bulk send path
+stamps `SetProtocol` unconditionally), store-and-forward NIC driver
+(startup 1500 ns / per-step 800 ns / 9 KiB jumbo chunk). The `EthernetSwitch`
+(lossy) tail-drops at `VoqDropThreshold` and emits a NACK back to the source
+(`NvSwitch::EmitNackBack`, mirroring the BER-NACK path); the sender retransmits
+via the LLR/SACK path (`ProcessNackPacket` → `HandleRetryRequest`/
+`HandleSackRequest`), with `LlrManager::OnRetryTimeout` as the backstop and
+`--llrRetryLimit` bounding the loop (permanent-loss fallback under exhausted
+retries = faithful severe-congestion lossy-Ethernet degradation). To wire the
+NACK origin, `NvSwitch::OnPacketEnqueue` changed `void→bool` (+`inPort`) — base
+returns `true` (no-op) so the RoCE/ECN path is byte-identical — and
+`MultiNodeTopologyHelper` gained `SetInterNodeSwitchLlrEnabled` (default `false`
+= RoCE parity) so the So switch carries `m_llrEnabled=true` on the ETH path (else
+`EmitNackBack` early-returns and the drop is silent → stall). `scratch` lights
+the previously-dead `FabricType::ETHERNET` enum + forces LLR on **both** endpoint
+and switch for ETH; new `configs/protocol_configs/p2p-eth.cfg` (single P2P) +
+`p2p-eth-incast.cfg` (2-flow incast: `--voqDropThreshold=2 --llrRetryLimit=64`
+→ 87 drops → 285 retransmits → 0 permanent losses, completes 68.7 µs). 2 new C++
+tests (`EthernetProtocolModelTest`, `EthernetSwitchDropTest`); `--ber=0` keeps
+the lossy drop the only loss source. RoCE parity byte-identical
+(su 4769616 / 2-node 15307388 / 4-node 13421212 ns).
+
+**Surrogate:** `make_h200_ethernet_theory()` — the lossy counterpart to
+`make_h200_roce_theory()`: same 400GbE wire (`ring_bw=160000`), store-and-forward
+latency (`link_latency_us=3.0` / `t_min_switch_us=3.0` vs RoCE 1.0/1.5),
+`wire_efficiency=1.0` (mirrors the ns-3 model's locked 1.0). It is a spec-derived
+**lower bound anchored to ns-3** (no perftest ground truth, like RoCE); the lossy
+drop/NACK/retransmit behavior is ns-3-only (same split as RoCE/DCQCN).
+`make_h200_hierarchical_theory` gains a backward-compatible `so_factory` seam
+(default `make_h200_roce_theory`) to swap in the Ethernet So stage. 3 new pytests
+(61→64 green); parity test `test/parity/test_surrogate_vs_ns3_ethernet.py`
+(lower-bound anchor, ratio ~0.2 = identical to the RoCE hierarchical anchor).
+Doc: `doc/CALIBRATION.md` §"Plain Ethernet" + `USER_GUIDE.md` recipe N +
+`WHITEBOX_SURROGATE.md` So-profile mention. (`eta_ethernet` skipped — Ethernet
+differs from RoCE in switch *latency*, not wire *bandwidth*, so an eta would be a
+redundant alias; the preset captures the store-and-forward latency.)
+
+**Independent code review (3 read-only subagents, adversarial) — verdict
+SHIP-WITH-FIXES, no blockers; RoCE parity gate re-confirmed byte-identical.**
+Fixes applied: (1) `--voqDropThreshold=0` now genuinely means lossless/off
+(early-return-true guard; the prior `voqDepth >= 0` would tail-drop every
+packet — a total-stall foot-gun the doc called "off"); (2) the lossy-NACK
+invariant `voqDropThreshold < switchVoqDepth` is now enforced
+(`NS_ABORT_MSG_IF`) — the comment no longer claims the dead
+`Config::SetDefault(VoqDepth,1024)` governs (the helper's
+`SetVoqDepth(switchVoqDepth=10000)` supersedes it); (3) a stderr warning when
+`ETH` is combined with `fullmesh`/`ring` (no switch in the inter-node path →
+the lossy path is inert); (4) the RoCE parity numbers
+(4769616/15307388/13421212) are now **pinned by `test_so_hierarchical_regression.py`**
+(were a doc claim only); (5) new `test/parity/test_ethernet_lossy_recovery.py`
+automates the incast NACK→retransmit→complete loop AND the
+`--llrRetryLimit` permanent-loss fallback (were manual smoke only).
+
 ### New — full-mesh surrogate algorithm (ns-3-calibrated, the 4th shape)
 
 The latency surrogate gains a 4th algorithm shape — `fullmesh` — calibrated

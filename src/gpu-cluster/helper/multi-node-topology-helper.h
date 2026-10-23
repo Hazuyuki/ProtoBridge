@@ -91,12 +91,31 @@ class MultiNodeTopologyHelper
     void SetInterNodeDataRate(const std::string& rate);
     void SetInterNodeDelay(const std::string& delay);
     void SetInterNodeFabricType(FabricType type);
-    void SetInterNodeTopology(const std::string& topo); // "fullmesh", "ring", "host"
+    // "fullmesh", "ring", "host", "tor", "rail", "leafspine", "torus2d",
+    // "dragonfly"
+    void SetInterNodeTopology(const std::string& topo);
+    /// leafspine: number of spine switches (0 = auto: gpusPerNode, which is
+    /// non-blocking at equal link rates -- each leaf has gpusPerNode down
+    /// links and one up link per spine).
+    void SetInterNodeSpines(uint32_t spines);
+    /// torus2d: grid width W (height = numNodes / W). 0 = auto: the largest
+    /// divisor of numNodes that is <= sqrt(numNodes).
+    void SetInterNodeTorusWidth(uint32_t width);
+    /// dragonfly: nodes per group (0 = auto: the divisor of numNodes closest
+    /// to sqrt(numNodes)).
+    void SetInterNodeDragonflyGroupSize(uint32_t groupSize);
     // Switch TypeId for the inter-node (So) fabric's switched topologies (e.g.
     // "host"). Default "ns3::NvSwitch"; set to "ns3::EthernetSwitch" for a real
     // Ethernet RoCEv2 So fabric (EthernetSwitch derives from NvSwitch, so the
     // existing datapath wiring is reused unchanged).
     void SetInterNodeSwitchType(const std::string& typeId);
+    /// Enable LLR (link-level retry) on every inter-node (So) switch so the
+    /// lossy EthernetSwitch can emit NACKs back to senders on VOQ tail-drop
+    /// (EmitNackBack gates on the switch's m_llrEnabled). Default false keeps
+    /// the lossless RoCE path byte-identical (RoCE avoids drops via ECN, so it
+    /// never relies on switch-emitted NACKs); set true only for the plain
+    /// (lossy) Ethernet path.
+    void SetInterNodeSwitchLlrEnabled(bool enabled);
 
     // Build
     NodeContainer Build();
@@ -112,6 +131,17 @@ class MultiNodeTopologyHelper
     void BuildIntraNodeFullmesh(uint32_t nodeId, NodeInfo& info);
     void BuildIntraNodeSwitched(uint32_t nodeId, NodeInfo& info);
     void BuildInterNodeLinks();
+    /// Create + configure one inter-node switch (VOQ depth, arbitration,
+    /// cut-through, arbiter, LLR arming) of type m_interNodeSwitchType and
+    /// register its node in m_allSwitchNodes / m_allNodes. Returns the switch;
+    /// switchNode receives the hosting node.
+    Ptr<NvSwitch> CreateInterNodeSwitch(Ptr<Node>& switchNode);
+    /// Gateway-topology (torus2d / dragonfly) node-level next hop from
+    /// nodeId toward dstNode (both != each other; returns a direct neighbor
+    /// of nodeId).
+    uint32_t GatewayNextHop(uint32_t nodeId, uint32_t dstNode) const;
+    uint32_t TorusWidth() const;     ///< resolved torus2d width (auto if 0)
+    uint32_t DragonflyGroupSize() const; ///< resolved dragonfly group size (auto if 0)
 
     uint32_t m_numNodes;
     uint32_t m_gpusPerNode;
@@ -134,6 +164,10 @@ class MultiNodeTopologyHelper
     FabricType m_interNodeFabricType;
     std::string m_interNodeTopology;
     std::string m_interNodeSwitchType{"ns3::NvSwitch"}; ///< So switch TypeId (NvSwitch default; EthernetSwitch for RoCE)
+    bool m_interNodeSwitchLlrEnabled = false;            ///< LLR on So switches (default false = RoCE parity)
+    uint32_t m_interNodeSpines = 0;             ///< leafspine spine count (0 = auto)
+    uint32_t m_interNodeTorusWidth = 0;         ///< torus2d width (0 = auto)
+    uint32_t m_interNodeDragonflyGroupSize = 0; ///< dragonfly group size (0 = auto)
 
     std::vector<NodeInfo> m_nodeInfos;
     NodeContainer m_allGpuNodes;

@@ -22,7 +22,10 @@
 
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <queue>
+#include <deque>
+#include <set>
 #include <cstdint>
 #include <functional>
 
@@ -252,6 +255,19 @@ class NvSwitch : public FabricSwitch
      */
     void AddStaticRoute(Mac48Address addr, uint32_t port) override;
 
+    /**
+     * @brief Register a rank-to-port mapping for multicast result delivery.
+     *
+     * m_portRankMap only learns from GPUs that UPLOAD collective fragments, so
+     * a rank whose chunk is zero-sized under the frozen chunk grid (rank >=
+     * dataSize when dataSize < numGpus) never appears in it and the multicast
+     * result loop skips it — its receiver stalls forever at done=N-1 of N
+     * (codex round 19, finding 6). Helpers call this alongside AddStaticRoute
+     * to pre-register every rank's port(s); the multicast builders union this
+     * table with the learned map so zero-chunk ranks still get the result.
+     */
+    void AddRankPort(uint16_t rank, uint32_t port);
+
     std::string GetVendorName() const override;
 
     /**
@@ -332,24 +348,75 @@ class NvSwitch : public FabricSwitch
     uint32_t GetTtlDrops() const { return m_ttlDrops; }
     uint32_t GetVoqDrops() const { return m_voqDrops; }
     uint32_t GetRouteUnavailableDrops() const { return m_routeUnavailableDrops; }
+    uint32_t GetSharpDuplicateUploads() const { return m_sharpDuplicateUploads; }
+    /// Monotonic count of multicast result packets emitted (0 = no result yet).
+    uint32_t GetMulticastSeqNum() const { return m_multicastSeqNum; }
 
   protected:
     void DoDispose() override;
 
     /**
+     * @brief Test seam: feed an upload packet straight into the SHARP/NVLS
+     * aggregation path, bypassing ReceiveFromPort's routing/preamble.
+     *
+     * Mirrors the FabricEndpoint test subclasses' Inject* pattern. Used by
+     * the upload-dedup regression test to drive ProcessAllGather without a
+     * full fabric.
+     */
+    void InjectAggregateUpload(uint16_t flowId, uint16_t srcRank, uint32_t seqNum,
+                               uint32_t effectiveSize, bool allGather);
+
+    /**
+     * @brief Test seam: drive the multicast-result retransmit path directly
+     * with a receiver NACK (DestRank 0xFFFF), bypassing the p2p loopback.
+     *
+     * Returns HandleSwitchNack's verdict: true when a stored result matched
+     * and was retransmitted. Used by the result-cache eviction regression
+     * test.
+     */
+    bool InjectResultNack(uint16_t requestingRank, uint32_t seqNum);
+
+    /**
+     * @brief Test seam: number of result copies currently retained for a
+     * destination rank in the switch-side LLR store.
+     */
+    size_t GetSharpResultStoreSize(uint16_t destRank) const;
+
+    /**
      * @brief Congestion hook called when a packet is enqueued to a VOQ.
      *
-     * Default is a no-op (NvSwitch marks nothing, so Su parity is preserved
-     * on NVSwitch instances). A scale-out switch (EthernetSwitch) overrides
-     * this to mark the SoHeader ECN bit when the VOQ depth indicates
-     * congestion. At call time the packet still carries its FabricHeader
-     * (outermost) over the inner SoHeader, matching the in-flight state.
+     * Returns false to DROP the packet (the caller skips the push and counts
+     * a VOQ drop); returns true to admit it. Default returns true (no-op, so
+     * Su parity is preserved on NVSwitch instances). A scale-out switch
+     * overrides this: EthernetSwitch marks the SoHeader ECN bit on RoCE data
+     * packets (lossless), and tail-drops plain-Ethernet data packets past the
+     * VoqDropThreshold with a NACK to the source (lossy). At call time the
+     * packet still carries its FabricHeader (outermost) over any inner
+     * SoHeader, matching the in-flight state.
      * @param packet The packet being enqueued (mutable)
      * @param outPort Output port the packet is queued for
+     * @param inPort Input port the packet arrived on (return path for a NACK)
      * @param voqDepth Current VOQ depth (packets, excluding this one)
+     * @return true to admit (enqueue); false to drop (caller counts m_voqDrops)
      */
-    virtual void OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
-                                 size_t voqDepth);
+    virtual bool OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
+                                 uint32_t inPort, size_t voqDepth);
+
+    /**
+     * @brief Emit a NACK control packet back to the source of @p orig on @p returnPort.
+     *
+     * Used by the lossy Ethernet drop path: when a plain-Ethernet data packet
+     * is tail-dropped at the VoqDropThreshold, the switch tells the sender to
+     * retransmit via the existing LLR/SACK path. Mirrors the BER-NACK emission
+     * in ReceiveFromPort. No-op when LLR is disabled (the sender could not
+     * process the NACK anyway). Protected so EthernetSwitch (which cannot reach
+     * the private m_ports table) can call it.
+     * @param orig The dropped packet's FabricHeader (source becomes NACK dest)
+     * @param returnPort Port back toward the source (the packet's input port)
+     * @param destMac L2 destination for the NACK (the source's NIC MAC)
+     */
+    void EmitNackBack(const FabricHeader& orig, uint32_t returnPort,
+                      Mac48Address destMac);
 
   private:
     /**
@@ -374,6 +441,18 @@ class NvSwitch : public FabricSwitch
      * @brief Return true when the output port and its modeled link are usable.
      */
     bool IsPortOperational(uint32_t port) const;
+
+    /**
+     * @brief Dedup gate for NVLS/SHARP upload packets.
+     *
+     * Returns true the FIRST time (flowId, srcRank, seqNum) is seen; false on
+     * every retransmission of an already-counted upload. The aggregation
+     * ledgers (received bytes + chunk lists) must only advance on the first
+     * arrival — a retransmitted upload whose LLR ack was lost otherwise
+     * double-counts and the switch assembles a "complete" result from fewer
+     * unique bytes than the collective requires.
+     */
+    bool RegisterUploadSeq(uint16_t flowId, uint16_t srcRank, uint32_t seqNum);
 
     /**
      * @brief Enqueue packet to VOQ
@@ -454,6 +533,11 @@ class NvSwitch : public FabricSwitch
     uint32_t m_currentArbitrationPort;              ///< Current port for RR arbitration
     std::vector<Time> m_outputBusyUntil;            ///< Per-port egress busy time (serialization)
     Ptr<Arbiter> m_arbiter;                         ///< Crossbar arbitration strategy (default: RoundRobinArbiter)
+    /// Deferred collective-result multicasts (aggregation delay + FEC-coding
+    /// egress holds). Each callback targets raw `this` (bound member call or
+    /// lambda capture) and dereferences state DoDispose clears, so DoDispose
+    /// must cancel whatever is still pending (codex round 15, finding 2).
+    std::vector<EventId> m_deferredResultEvents;
 
     /**
      * @brief Process All-Gather packets (NVLS concatenation + multicast)
@@ -466,6 +550,62 @@ class NvSwitch : public FabricSwitch
      */
     void MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount);
 
+    /**
+     * @brief LLR ack an accepted SHARP/NVLS upload packet back to its sender.
+     *
+     * The GPU endpoints store ALLREDUCE/ALLGATHER uploads in their LLR
+     * managers (the receive-side store-filter exclusion for these types was
+     * removed — without storage a switch-side drop could never be
+     * retransmitted and the collective stalled forever). The switch is the
+     * receiving end of that link, so it must ACK what it consumed to purge
+     * the sender's retry entry; otherwise the entry lives until the retry
+     * limit turns it into a false permanent loss. The ack carries
+     * SourceRank = the upload's DestRank (the switch-addressed destination,
+     * the same key space the switch's BER NACK already uses), so the
+     * sender's RemovePacket((seq, dest, flow, vc)) lookup matches.
+     */
+    void SendSharpLlrAck(const FabricHeader& uploadHeader, uint32_t inPort);
+
+    /**
+     * @brief Keep a multicast result packet for switch-side LLR retransmit.
+     *
+     * Result packets carry SourceRank 0xFFFF (switch sentinel); the endpoint
+     * receiver's NACK for a lost one is addressed DestRank 0xFFFF and
+     * arrives on the losing GPU's port. HandleSwitchNack looks the packet
+     * up here and retransmits it on the stored port. Bounded FIFO per
+     * (destination, flow) — a new flow's results REPLACE the old flow's
+     * entries wholesale (stale: its collective completed), so the window
+     * only ever bounds one flow's fragments.
+     */
+    void StoreMulticastResult(uint16_t destRank, uint16_t flowId,
+                              uint32_t portIdx, uint32_t seqNum, Ptr<Packet> pkt);
+
+    /**
+     * @brief Egress helper for multicast result sends (FEC-aware).
+     *
+     * Pads the packet body to GetEncodedSize on FEC ports (the receiver
+     * strips parity via the header's payload size) and holds the send for
+     * the codec latency, matching the endpoint egress convention. Direct
+     * port->Send calls otherwise skip FEC wire expansion entirely.
+     */
+    void SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt);
+
+    /**
+     * @brief Retransmit a multicast result on a receiver NACK (DestRank 0xFFFF).
+     *
+     * @return true when a stored result matched and was retransmitted.
+     */
+    bool HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort);
+
+    /**
+     * @brief Build rank -> ports for a multicast result pass.
+     *
+     * Unions the upload-learned m_portRankMap with the helper-registered
+     * m_rankPortMap so ranks that never uploaded (zero-sized chunk under the
+     * frozen grid) still receive the result (codex round 19, finding 6).
+     */
+    std::unordered_map<uint16_t, std::vector<uint32_t>> BuildRankPorts() const;
+
     // In-Network Computing (SHARP)
     bool m_allReduceEnabled;                        ///< All-Reduce enabled flag
     uint32_t m_allReduceThreshold;                  ///< Number of GPUs for aggregation
@@ -474,7 +614,20 @@ class NvSwitch : public FabricSwitch
     uint32_t m_allReduceNumPartitions;              ///< Number of partitions for pipelined multicast (0=single)
     // FlowID -> count of completed partitions (for pipelined multicast)
     std::unordered_map<uint16_t, uint32_t> m_allReduceCompletedPartitions;
-    uint32_t m_multicastSeqNum = 0; ///< Monotonic seqnum for multicast result packets
+    /// Flows whose legacy single-multicast result already went out (codex
+    /// round 22, finding 1). The allComplete test re-runs on every upload —
+    /// including late padding fragments that land after the multicast
+    /// cleared the buffer — and without this marker a second result event
+    /// was scheduled onto a cleared buffer (empty begin() deref).
+    std::unordered_set<uint16_t> m_allReduceLegacyMulticastDone;
+    // Multicast result seqnums are PER (DESTINATION, FLOW): endpoint reorder
+    // buffers (the module default, SetBypassReorderBuffer(false)) key on
+    // (vc, flow, source) and expect each stream to start at 0 — a counter
+    // spanning destinations OR flows leaves every stream after the first
+    // buffering its seqs forever awaiting a 0 that never comes. Counters
+    // start at 0 for each (destination, flow) pair.
+    std::unordered_map<uint64_t, uint32_t> m_multicastSeqNums; ///< (destRank<<16|flowId) -> next seq
+    uint32_t m_multicastSeqNum = 0; ///< Total result packets emitted (stats/tests)
     // FlowID -> (sourceRank -> chunk sizes) — track per-GPU contribution sizes only.
     // Full Packet objects are NOT stored to avoid memory explosion (256MB × N GPUs
     // would hold GBs). Data content is dummy; only sizes matter for multicast.
@@ -484,6 +637,9 @@ class NvSwitch : public FabricSwitch
     // FlowID -> (sourceRank -> bytes received) — for chunk-level tracking
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, uint64_t>> m_allReduceReceivedBytes;
     std::unordered_map<uint32_t, uint16_t> m_portRankMap; ///< port -> GPU rank (learned from ALLREDUCE packets)
+    // rank -> port(s), pre-registered by helpers (see AddRankPort): covers
+    // zero-chunk ranks that never upload and thus never enter m_portRankMap.
+    std::unordered_map<uint16_t, std::vector<uint32_t>> m_rankPortMap;
 
     // NVLS AllGather
     bool m_allGatherEnabled;                        ///< All-Gather enabled flag
@@ -493,6 +649,47 @@ class NvSwitch : public FabricSwitch
     // FlowID -> (sourceRank -> bytes received) — track per-GPU chunk contributions
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, uint64_t>> m_allGatherReceivedBytes;
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, std::vector<uint32_t>>> m_allGatherBuffer;
+
+    // Switch-side LLR for multicast results: (destRank<<16|flowId) -> FIFO of
+    // (seq, portIdx, retransmitCount, header). Only the stamped header is
+    // kept — the packet BODY is dummy bytes (only sizes matter for timing),
+    // so a retransmit rebuilds a body of the header's payload size instead of
+    // holding a full copy per fragment. Entries live until evicted by the
+    // window bound; a NACK re-sends a rebuilt packet (bounded retries).
+    struct SharpResultEntry
+    {
+        uint32_t seqNum;        ///< FabricHeader sequence number of the result
+        uint32_t portIdx;       ///< Port the result was multicast on
+        uint32_t retransmits;   ///< NACK-driven retransmits issued so far
+        FabricHeader header;    ///< Header of the multicast result packet
+    };
+    std::unordered_map<uint64_t, std::deque<SharpResultEntry>> m_sharpResultStore;
+    // destRank -> most recent flow whose results were stored. Bookkeeping
+    // only (diagnostics); HandleSwitchNack must NOT use it to re-key a
+    // named-flow NACK onto another flow's window (codex round 24, finding 4).
+    std::unordered_map<uint16_t, uint16_t> m_lastResultFlow;
+    // Result-fragment retention. Result entries belong to a FLOW and the
+    // store is keyed per (dest, flow), so concurrent flows keep independent
+    // windows — a new flow's results do NOT erase a prior flow's in-flight
+    // repair state (completion of one collective does not imply delivery of
+    // another's results; codex round 24, finding 4). Each window is bounded
+    // by SHARP_RESULT_WINDOW on its own. The eviction harnesses pinned the
+    // true scale: 1,024 fragments/dest for an 8-GPU 128-MiB allgather,
+    // 16,384 for 2 GiB — and header-only entries are ~144 B, so 65,536
+    // entries per (dest, flow) bounds memory at ~9.4 MB per live flow while
+    // covering an 8-GPU 8-GiB allgather with headroom. The window is a
+    // safety valve for absurd geometries; the observed scales fit well
+    // inside it.
+    static constexpr size_t SHARP_RESULT_WINDOW = 65536; ///< Max stored results per (dest, flow)
+    static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
+
+    // Upload dedup: (flowId, srcRank) -> seen upload sequence numbers. A
+    // retransmitted NVLS/SHARP upload (its LLR ack lost) must not count as a
+    // new contribution — the aggregation ledgers (received bytes + chunk
+    // lists) would double-count it and return a "complete" result assembled
+    // from fewer unique bytes than the collective requires.
+    std::unordered_map<uint16_t, std::unordered_map<uint16_t, std::set<uint32_t>>> m_seenUploadSeqs;
+    uint32_t m_sharpDuplicateUploads = 0; ///< Duplicate uploads dropped by the dedup gate
 
     // Callbacks
     NetDevice::ReceiveCallback m_rxCallback;

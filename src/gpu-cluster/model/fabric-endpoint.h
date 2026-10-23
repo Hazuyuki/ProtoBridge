@@ -22,6 +22,7 @@
 #include "protocol-payload-builder.h"
 #include "flow-control-policy.h"
 #include "dcqcn-rate-machine.h"
+#include "rttcc-rate-machine.h"
 
 #include "ns3/application.h"
 #include "ns3/net-device.h"
@@ -32,6 +33,8 @@
 
 #include <vector>
 #include <queue>
+#include <deque>
+#include <tuple>
 #include <unordered_map>
 
 namespace ns3
@@ -200,7 +203,13 @@ class FabricEndpoint : public Application
      * receivers can correctly track progress against the data size.
      * FabricHeader.protocol is set to 0 (NONE) to bypass per-line processing.
      */
-    void SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uint32_t dataSize,
+    // dataSize is uint64_t: collective volumes legitimately exceed 4 GiB
+    // (a 3-GPU-per-node local ring aggregates (g-1) segments — 4 GiB at
+    // D=6 GiB), and the old uint32_t parameter truncated such volumes to
+    // zero bytes, stalling the phase with zero packets emitted (codex round
+    // 24, finding 5). The data pointer is advisory only (the 64-bit path
+    // sends dummy bytes); callers passing a buffer keep working unchanged.
+    void SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uint64_t dataSize,
                               uint8_t protocolId, uint16_t flowId, uint8_t vcId = 0);
     void SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                                   uint8_t protocolId, uint16_t flowId, uint8_t vcId = 0);
@@ -243,6 +252,14 @@ class FabricEndpoint : public Application
     void SetLlrRetryLimit(uint32_t limit);
     uint32_t GetLlrRetryLimit() const;
     Ptr<LlrManager> GetLlrManager() const;
+    // Opt-in sender-side retry-timeout backstop: registers the LlrManager
+    // timeout callback so an un-ACKed entry is RETRANSMITTED when its retry
+    // timer fires (SACK: that seq; GBN: from that seq onward). Without this
+    // the timeout is a no-op, and under random loss a lost NACK deadlocks
+    // SACK mode (the NACK is the only recovery trigger). Default-off for
+    // parity: under heavy congestion RETRY_ACKs arrive later than the retry
+    // timeout and the backstop would inject spurious duplicates.
+    void EnableLlrTimeoutRetransmit();
 
     // FEC model
     void SetFecModel(Ptr<FecModel> model);
@@ -267,6 +284,15 @@ class FabricEndpoint : public Application
     void SetNumVirtualChannels(uint8_t numVcs);
     void SetVcCredits(uint8_t vcId, uint32_t credits);
 
+    // CreditManager attribute seam: setting the attribute swaps the manager
+    // this endpoint consults. The old manager may already carry our
+    // credit-available binding from a prior Initialize/StartApplication, and
+    // leaving it bound lets a post-dispose ReturnCredits fire
+    // OnCreditAvailable into freed memory (codex round 19, finding 1). The
+    // setter detaches only the binding this endpoint installed.
+    void SetCreditManager(Ptr<CreditManager> manager);
+    Ptr<CreditManager> GetCreditManager() const;
+
     // Flow-control policy seam (send gate dispatches on this)
     void SetFlowControlPolicy(FlowControlPolicy policy);
     FlowControlPolicy GetFlowControlPolicy() const;
@@ -276,6 +302,13 @@ class FabricEndpoint : public Application
     // baseline (parity-safe).
     void SetDcqcnRateMachine(Ptr<DcqcnRateMachine> machine);
     Ptr<DcqcnRateMachine> GetDcqcnRateMachine() const;
+
+    // RTTCC rate machine (scale-out; RTT-probe-based, fabric-agnostic — works
+    // on lossy plain Ethernet where no ECN/CNP loop exists). Mount ONE
+    // machine per endpoint (the flow key carries no source rank). Null =>
+    // byte-identical to the unmounted baseline (parity-safe, --rttcc off).
+    void SetRttccRateMachine(Ptr<RttccRateMachine> machine);
+    Ptr<RttccRateMachine> GetRttccRateMachine() const;
     /**
      * @brief Send-gate dispatch. Returns true if the packet is admitted
      *        (credit consumed under CREDIT); false => caller backpressures.
@@ -289,6 +322,28 @@ class FabricEndpoint : public Application
     virtual bool FlowControlGate(uint8_t vcId, uint32_t seqNum, bool creditBypass);
     void SetLaunchDelay(uint64_t delayNs);
     void SetBulkChunkSize(uint32_t bytes);
+    /**
+     * @brief Bound the number of in-flight bulk chunks to a remote (So) rank,
+     *        modeling a NIC send-queue depth (perftest tx_depth). 0 (default)
+     *        keeps the legacy unbounded synchronous dispatch. The window is
+     *        ACK-clocked: a slot is released when the per-packet LLR ACK
+     *        purges the retry store (or on permanent loss). So-only; requires
+     *        LLR (without LLR ACKs no slot is ever released).
+     */
+    void SetSoTxWindow(uint32_t chunks);
+
+    /**
+     * @brief Strict go-back-N receive semantics for So (remote-rank) flows in
+     *        GOBACKN mode: the receiver only accepts the next expected
+     *        sequence number per flow, discards out-of-order arrivals
+     *        (no delivery, no ACK), and emits ONE NAK per gap (further OOO
+     *        arrivals for the same gap are dropped silently, like an IB
+     *        responder). Duplicates below the expected seq are re-ACKed only.
+     *        Default false = legacy bypass-mode dedup (keeps OOO originals).
+     *        Su (local-rank) traffic is never affected: on the 18-lane sprayed
+     *        NVLink fabric out-of-order arrival is normal, not loss.
+     */
+    void SetSoGbnStrict(bool enable);
 
     // Callbacks
     typedef Callback<void, uint16_t, Ptr<Packet>, FabricHeader> ReceiveCallback;
@@ -296,6 +351,15 @@ class FabricEndpoint : public Application
     typedef Callback<void, uint16_t, uint64_t, MemoryAccessType> MemorySemanticCallback;
 
     void SetReceiveCallback(ReceiveCallback cb);
+    /// Current receive callback (identity comparison lets an owner detach
+    /// exactly the callback IT installed — see ~ProtocolConfigRunner).
+    ReceiveCallback GetReceiveCallback() const;
+    /// Ownership-checked detach: clears the receive binding only when it is
+    /// the callback `owner` installed (codex round 20, findings 5 and 6 —
+    /// injector DoDispose / runner teardown must not null a later owner's
+    /// binding). Returns whether the binding was cleared. A null `owner`
+    /// never matches; unconditional clearing stays SetReceiveCallback(null).
+    bool DetachReceiveCallbackIfOwner(ReceiveCallback owner);
     void SetMemoryResponseCallback(ReceiveCallback cb);
     void SetMemoryRequestCallback(MemoryRequestCallback cb);
     void SetMemorySemanticCallback(MemorySemanticCallback cb);
@@ -319,6 +383,15 @@ class FabricEndpoint : public Application
     void SetProtocolPayloadBuilder(Ptr<ProtocolPayloadBuilder> builder);
     Ptr<ProtocolPayloadBuilder> GetProtocolPayloadBuilder() const;
 
+    // Inter-node (So) payload builder seam, mirroring SetInterNodeProtocolModel:
+    // when non-null the endpoint frames remote-rank bulk sends with it (and the
+    // So protocol model's own protocol id) while local-rank (Su) traffic keeps
+    // m_payloadBuilder. Null (default) -> m_payloadBuilder everywhere,
+    // byte-identical (parity-safe). Inline runs mount a RocePayloadBuilder here
+    // to light the RoCE SoHeader/ECN/CNP/DCQCN chain without touching Su framing.
+    void SetSoPayloadBuilder(Ptr<ProtocolPayloadBuilder> builder);
+    Ptr<ProtocolPayloadBuilder> GetPayloadBuilderForRank(uint16_t rank) const;
+
     // Link degradation
     void SetLinkDegradationModel(Ptr<LinkDegradationModel> model);
     Ptr<LinkDegradationModel> GetLinkDegradationModel() const;
@@ -330,6 +403,13 @@ class FabricEndpoint : public Application
     void GetReorderBufferStats(uint32_t& totalReorderEvents, uint32_t& maxOccupancy) const;
     uint32_t GetTxPackets() const { return m_txPackets; }
     uint32_t GetRxPackets() const { return m_rxPackets; }
+    /// Cumulative wire bytes transmitted (payload + framing). Coverage
+    /// probe for collective-injector byte-accounting tests.
+    uint64_t GetTxBytes() const { return m_txBytes; }
+    /// Cumulative wire bytes received (payload + framing).
+    uint64_t GetRxBytes() const { return m_rxBytes; }
+    uint64_t GetCnpPacketsSent() const { return m_cnpPacketsSent; }
+    uint64_t GetCnpPacketsReceived() const { return m_cnpPacketsReceived; }
 
     // Memory attributes (for MEMORY device type)
     void SetMemorySize(uint64_t size);
@@ -349,6 +429,60 @@ class FabricEndpoint : public Application
         return (static_cast<uint64_t>(destRank) << 24) | (static_cast<uint64_t>(vcId) << 16) | (static_cast<uint64_t>(flowId) & 0xFFFF);
     }
 
+    /**
+     * @brief Rate-machine flow key: (source, dest, vc, flow)
+     * @return Composite key: (sourceRank << 40) | (destRank << 24) | (vcId << 16) | flowId
+     *
+     * Distinct from MakeSeqKey: the DCQCN/RTTCC per-flow state (pacer,
+     * alpha, probe bookkeeping) is per SENDER per flow, not merely per
+     * flow. A key without the source rank merges two senders that happen
+     * to share (dest, vc, flow) coordinates onto one pacer — with a
+     * shared machine (the sim's single-NIC modeling) the second sender
+     * inherited the first's pacing debt and finished at 1434.8 µs where
+     * independent state finishes at 715.1 µs (codex round 23, finding 1).
+     * Bits 40-55 (source rank) are unused by MakeSeqKey and clear of bit
+     * 63's memory namespace.
+     */
+    static uint64_t MakeRateFlowKey(uint16_t sourceRank, uint16_t destRank,
+                                    uint8_t vcId, uint16_t flowId)
+    {
+        return (static_cast<uint64_t>(sourceRank & 0xFFFF) << 40)
+             | (static_cast<uint64_t>(destRank) << 24)
+             | (static_cast<uint64_t>(vcId) << 16)
+             | (static_cast<uint64_t>(flowId) & 0xFFFF);
+    }
+
+    /**
+     * @brief Sequence counter key for MEMORY_* packets (read/write/response/
+     * semantic requests)
+     *
+     * Memory packets ride their own counter namespace, disjoint from the
+     * DATA/collective counter space MakeSeqKey(dest, vc, flow) covers: the
+     * receiver's reorder/bypass per-flow sequence tracking only sees
+     * ProcessDataPacket traffic, so a memory seq drawn from the shared
+     * (dest, vc=0, flow=0) counter leaves a permanent gap in the DATA flow
+     * (DATA seq N+1 waits forever for the seq N a MEMORY_RESP consumed).
+     * Bit 63 is never set by MakeSeqKey (dest occupies bits 24-39), so the
+     * namespaces cannot collide.
+     */
+    static uint64_t MakeMemorySeqKey(uint16_t destRank)
+    {
+        return MakeSeqKey(destRank, 0, 0) | (1ULL << 63);
+    }
+
+    /// Wire flow id stamped on every MEMORY_* packet. Memory senders stamp
+    /// flow 0 on the wire, the same flow id DATA/collective traffic uses, so
+    /// every identity-bearing receiver structure keyed on (vc, flow, seq)
+    /// collides memory with DATA: the CREDIT dedup (m_creditsReturned)
+    /// discards DATA flow 0's CREDIT as a duplicate once a memory packet with
+    /// the same seq was re-credited (with one credit the next DATA send
+    /// blocks forever), and two LLR RetryKey entries with the same
+    /// (dest, flow=0, vc=0, seq) alias — the second store overwrites the
+    /// first's retransmit payload. MEMORY_FLOW_ID is outside the flow-id
+    /// space the collective drivers allocate (they number their flows from 1
+    /// upward, 16 bits wide; 0xFFFF is reserved for memory).
+    static constexpr uint16_t MEMORY_FLOW_ID = 0xFFFF;
+
   protected:
     void DoDispose() override;
     void StartApplication() override;
@@ -362,6 +496,25 @@ class FabricEndpoint : public Application
      */
     void SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                             const Address& dest);
+    /**
+     * @brief Forward a received packet whose DestRank is not this endpoint.
+     *
+     * Shared by ReceiveFromDevice and ContinueReceiveAfterFec. Returns true
+     * when the packet was consumed as transit traffic (already re-queued to
+     * the next hop's device). VIRTUAL so GatewayEndpoint can route through
+     * its hybrid routing table and apply the gateway delay instead of the
+     * base class's immediate same-fabric re-send (codex round 24, finding 6:
+     * the base path never consulted m_hybridRoutingTable, and a configured
+     * 100-µs GatewayDelay produced a ~1204-ns traversal).
+     */
+    virtual bool TryForwardReceivedPacket(Ptr<Packet> pkt, FabricHeader& header);
+    /**
+     * \brief Re-arm the LLR retry timer at first wire transmission. The
+     *        timer otherwise starts at StorePacket (enqueue) and can expire
+     *        while a pacer/contention/FEC hold still gates the send — a
+     *        loss-free link would then produce permanent losses.
+     */
+    void ArmRetryTimeoutOnWire(Ptr<Packet> packet);
     bool LinkUsesFec() const;
 
     /**
@@ -413,6 +566,17 @@ class FabricEndpoint : public Application
     void ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header);
 
     /**
+     * @brief In bypass mode, run strict-GBN acceptance / duplicate suppression
+     *        on a DATA packet and deliver it if it passes.
+     *
+     * Shared by ProcessDataPacket and ProcessProtocolDataPacket (the latter
+     * after payload extraction) so protocol-aware packets get the same
+     * duplicate/GBN guards as raw ones. Returns true if the packet was
+     * handled here (delivered, discarded as a duplicate, or NAKed).
+     */
+    bool DeliverBypassDataPacket(Ptr<Packet> packet, const FabricHeader& header);
+
+    /**
      * @brief Process a credit packet
      * @param packet The packet
      * @param header The fabric header
@@ -450,6 +614,19 @@ class FabricEndpoint : public Application
      * @param header The fabric header
      */
     void ProcessNackPacket(Ptr<Packet> packet, const FabricHeader& header);
+    /**
+     * @brief Handle a PERMANENT_LOSS notice from the sender.
+     *
+     * The retransmit budget for header.GetSequenceNumber() is exhausted; the
+     * sender already returned the credit in NotifyPermanentLoss. Strict GBN
+     * flows advance their expected counter past the lost seq (parking
+     * out-of-order notices); reorder-buffer flows mark a permanent gap and
+     * release everything parked below it. Shared by the FEC and non-FEC
+     * receive paths.
+     */
+    void ProcessPermanentLossNotice(const FabricHeader& header);
+    void OnLlrRetryTimeout(uint32_t seqNum, uint16_t destRank, uint16_t flowId, uint8_t vcId);
+    void DispatchRetransmissions(const std::vector<LlrManager::Retransmission>& retransmissions);
     void ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header);
     void SendRetransmission(LlrManager::Retransmission retransmission);
 
@@ -478,7 +655,8 @@ class FabricEndpoint : public Application
      * @param flowId Flow ID
      * @return Pointer to the reorder buffer
      */
-    Ptr<ReorderBuffer> GetOrCreateReorderBuffer(uint8_t vcId, uint16_t flowId);
+    Ptr<ReorderBuffer> GetOrCreateReorderBuffer(uint8_t vcId, uint16_t flowId,
+                                                uint16_t sourceRank = 0);
 
     private:
     bool ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packet,
@@ -498,6 +676,19 @@ class FabricEndpoint : public Application
     ///        machine (per-flow Alpha backoff) for the flow the CNP echoes.
     ///        No-op when no machine is mounted (dormant baseline).
     void ProcessCnpPacket(const FabricHeader& cnpHeader);
+
+    /// @brief Emit an RTTCC RTT probe on a flow (control packet: rides the
+    ///        same VOQ queues as data — the RTT sample sees congestion — but
+    ///        bypasses BER/tail-drop/LLR/shaping). Timestamps stay sender-
+    ///        local in the RttccRateMachine, keyed by probeSeq.
+    void SendRttProbePacket(uint16_t destRank, uint8_t vcId, uint16_t flowId,
+                            uint32_t probeSeq);
+    /// @brief Reflect an inbound RTT probe back to its source (hardware-style
+    ///        immediate echo; needs no rate machine on the receiver).
+    void SendRttResponsePacket(const FabricHeader& probeHeader);
+    /// @brief Receive-side handler for an RTT_RESPONSE: turns the echo into
+    ///        an RTT sample for the RTTCC machine. No-op when unmounted.
+    void ProcessRttResponsePacket(const FabricHeader& respHeader);
     void TrySendQueuedPackets();
 
     /**
@@ -549,18 +740,84 @@ class FabricEndpoint : public Application
 
     // Flow control
     Ptr<CreditManager> m_creditManager;             ///< Credit manager
+    std::set<uint8_t> m_configuredVcs;              ///< VCs whose credits were set explicitly (SetVcCredits, credits>0) — exempt from the lazy 64-credit default init
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
     Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
-    std::unordered_map<uint32_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(VC,flowId) reorder buffers, key=(vcId<<16)|flowId
+    Ptr<RttccRateMachine> m_rttccRate{nullptr}; ///< RTTCC rate machine (So-only; null=dormant)
+    std::unordered_map<uint64_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(sourceRank,VC,flowId) reorder buffers, key=(srcRank<<32)|(vcId<<16)|flowId
 
     // Send queue
     std::queue<SendQueueEntry> m_sendQueue;         ///< Pending send queue
     std::unordered_map<uint64_t, uint32_t> m_nextSeqNum; ///< Next sequence number per (destRank, vcId) key
+    /// Deferred-egress events scheduled by SendPacketOnDevice (pacer/FEC/WFQ
+    /// holds). Each captures raw `this` and touches m_devices, so DoDispose
+    /// must cancel every pending one before the endpoint goes away — a
+    /// survivor fires into cleared state (codex round 13, finding 2).
+    std::vector<EventId> m_deferredEgressEvents;
+
+    /// Pending contention-backlog decrements: one entry per in-flight
+    /// IncrementBacklog whose matching DecrementBacklog event is still
+    /// scheduled. DoDispose cancels the event; each entry whose event had NOT
+    /// yet fired must still decrement its (captured) model here, or a shared
+    /// ContentionModel keeps a phantom backlog forever and later traffic
+    /// draws an artificial contention penalty (codex round 21, finding 4).
+    /// Entries whose event already fired decremented on schedule and are
+    /// left alone (IsExpired test). Fired entries are pruned on each append
+    /// (TrackBacklogDecrement) so the ledger tracks only IN-FLIGHT
+    /// decrements and stays O(wire depth), not O(cumulative packets) —
+    /// unpruned it grew by one ~40-byte entry per transmitted packet
+    /// (codex round 22, finding 5).
+    std::vector<std::tuple<EventId, Ptr<ContentionModel>, TrafficClass>> m_pendingBacklogDecrements;
+
+    /// Register a scheduled backlog decrement and prune entries whose event
+    /// already fired (their DecrementBacklog landed on schedule — keeping
+    /// them only leaks memory, codex round 22, finding 5).
+    void TrackBacklogDecrement(const EventId& ev, const Ptr<ContentionModel>& model,
+                               TrafficClass tc);
 
     // Configuration
     uint8_t m_numVcs;                               ///< Number of virtual channels
     uint64_t m_launchDelayNs;                       ///< NCCL launch delay
     uint32_t m_bulkChunkSize;                       ///< Maximum packet size for bulk transfers
+
+    // So TX window (NIC send-queue depth, perftest tx_depth analog).
+    // 0 = legacy unbounded synchronous bulk dispatch (parity default).
+    struct BulkTxChunk
+    {
+        uint16_t destRank;
+        uint16_t flowId;
+        uint8_t vcId;
+        uint8_t protocolId;
+        uint32_t wireChunk;         ///< on-wire bytes for this chunk
+        uint32_t fragmentDataSize;  ///< effective data bytes for this chunk
+        uint32_t chunkIndex;        ///< index within the bulk transfer (SoHeader)
+        uint32_t deviceIndex;       ///< egress device chosen at enqueue (spray order)
+        bool stamp;                 ///< stamp SoHeader (RoCE Seam B)
+    };
+    uint32_t m_soTxWindow{0};                       ///< Max in-flight bulk chunks to remote ranks (0=off)
+    uint32_t m_bulkTxInflight{0};                   ///< Chunks dispatched but not yet ACK-purged
+    std::deque<BulkTxChunk> m_bulkTxQueue;          ///< Chunks awaiting a window slot
+    /// (destRank, seqNum) of window-dispatched bulk chunks, for exact slot
+    /// release: only a packet that OCCUPIED a slot (PumpBulkTxWindow
+    /// dispatch) may free one — small unfragmented remote sends and local
+    /// (Su) packets share the LLR store but never touch the window.
+    /// (destRank, vcId, flowId, seqNum) of window-dispatched bulk chunks, for
+    /// exact slot release: only a packet that OCCUPIED a slot (PumpBulkTxWindow
+    /// dispatch) may free one. The key must carry the full flow identity —
+    /// seq allocation is per (dest, vc, flow), so two flows to one dest run
+    /// independent seq counters and collide on bare (dest, seq): an ACK from
+    /// an unwindowed flow would release another flow's bulk slot.
+    std::set<std::tuple<uint16_t, uint8_t, uint16_t, uint32_t>> m_bulkTxWindowSeqs;
+    void PumpBulkTxWindow();                        ///< Dispatch queued chunks while window has room
+    void ReleaseBulkTxSlot();                       ///< Free one window slot and pump
+
+    // Strict So go-back-N receive semantics (opt-in, see SetSoGbnStrict)
+    bool m_soGbnStrict{false};                      ///< In-order-only So receive in GOBACKN mode
+    std::map<uint64_t, uint32_t> m_strictNextExpected; ///< Per-flow next expected seq (strict GBN)
+    std::map<uint64_t, uint32_t> m_strictNakPending;   ///< Per-flow seq a NAK was already sent for
+    std::map<uint64_t, std::set<uint32_t>> m_strictPermLost; ///< Permanently lost seqs ahead of expected
+    bool IsStrictGbnFlow(const FabricHeader& header) const; ///< Strict semantics apply to this packet?
+    void SendStrictGbnNak(const FabricHeader& dataHeader, uint32_t expectedSeq); ///< One NAK per gap
 
     // Link degradation
     Ptr<LinkDegradationModel> m_linkDegradationModel; ///< Link degradation model
@@ -571,12 +828,21 @@ class FabricEndpoint : public Application
 
     // Protocol payload builder (defaults to NcclProtocolPayloadBuilder)
     Ptr<ProtocolPayloadBuilder> m_payloadBuilder;     ///< Vendor-specific payload builder
+    Ptr<ProtocolPayloadBuilder> m_soPayloadBuilder{nullptr}; ///< Inter-node (So) builder; null -> use m_payloadBuilder
 
     // Reorder buffer control
     bool m_bypassReorderBuffer;                     ///< Bypass reorder buffer for direct links
     uint32_t m_bypassReorderEvents{0};              ///< Out-of-order arrivals counted in bypass mode
     std::map<uint64_t, uint32_t> m_bypassNextExpectedSeq; ///< Next expected seq per flow (bypass mode)
     std::set<std::pair<uint64_t, uint32_t>> m_bypassDelivered; ///< (flowKey, seqNum) already delivered
+    /// (flowKey, seqNum) MEMORY_* packets already EXECUTED (reads serviced,
+    /// writes applied, responses delivered). GO_BACK_N retransmission is a
+    /// blanket resend: a retransmitted memory packet arrives twice, and the
+    /// memory path has no reorder buffer to swallow the duplicate. A
+    /// duplicate is still ACKed and credit-returned, but never re-executed —
+    /// a retried write would revert newer data, a retried read would mint a
+    /// fresh response seq that defeats response dedup.
+    std::set<std::pair<uint64_t, uint32_t>> m_memoryDelivered;
 
     // Memory attributes
     uint64_t m_memorySize;                          ///< Memory size in bytes (for MEMORY type)
@@ -592,6 +858,14 @@ class FabricEndpoint : public Application
     bool m_isRetransmitting;                        ///< True during retransmission, prevents StorePacket reset
     std::unordered_map<uint64_t, uint32_t> m_gbnNextAckSeq;
     std::unordered_map<uint64_t, std::set<uint32_t>> m_gbnPendingAcks;
+    /// (ackKey, seqNum) credits already received from a peer. The receiver
+    /// re-credits a duplicate delivery in case the original CREDIT was lost
+    /// (CREDIT is BER-exempt but still subject to the loss-rate draw). When
+    /// the original CREDIT also arrives, the second one is phantom — the
+    /// send consumed exactly one credit and the first CREDIT already
+    /// returned it — so counting both grows the VC pool beyond its budget
+    /// and dispatches queued packets early.
+    std::set<std::pair<uint64_t, uint32_t>> m_creditsReturned;
 
     // FEC model
     Ptr<FecModel> m_fecModel;                       ///< Forward error correction model
@@ -618,6 +892,8 @@ class FabricEndpoint : public Application
     uint64_t m_rxBytes;
     uint32_t m_txPackets;
     uint32_t m_rxPackets;
+    uint64_t m_cnpPacketsSent;     ///< CNPs emitted (receiver saw ECN-marked RoCE data)
+    uint64_t m_cnpPacketsReceived; ///< CNPs received back at the flow source
 };
 
 // Backward compatibility typedef
