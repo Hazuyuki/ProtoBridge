@@ -6,6 +6,53 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 23: four defects in flow-key isolation and switch-side surrogate geometry
+
+1. **DCQCN/RTTCC flow keys carry the sender rank** (medium). The
+   rate-machine flow key was `MakeSeqKey(dest, vc, flow)` — no source
+   rank — so with the sim's single shared machine (single-NIC modeling)
+   two senders sharing flow coordinates merged onto ONE pacer: the
+   second sender inherited the first's pacing debt and finished at
+   1434.8 µs where independent state finishes at 715.1 µs (codex's
+   probe: 2 senders / 4 MiB each / 49-GB/s per-QP ceiling, identical
+   (dest, flow, vc)). A new `MakeRateFlowKey(source, dest, vc, flow)`
+   (source rank in bits 40-55, clear of MakeSeqKey and bit 63's memory
+   namespace) is now used at all four key sites: DCQCN shaping,
+   RTTCC shaping/probe, CNP receive, and RTT-response receive.
+   Single-flow behavior is byte-identical (parity suites unchanged).
+   Test: `DCQCN shared machine keeps per-sender flow state isolated`.
+2. **SHARP AllReduce result reliability uses the switch multicast
+   geometry** (medium). The surrogate's result arm modeled each
+   partition with the ENDPOINT single-link rule (one whole 2-MiB packet
+   at 1 lane) while `NvSwitch::MulticastAllReducePartition` always
+   sprays at ~128-KiB chunks: N=2 / D=4 MiB / 2 partitions / BER 2.1e-7 /
+   retry 10000 predicted 0.571 permanent losses and strict latency ∞
+   where ns-3 seeds 1-3 report zero. A new
+   `_switch_multicast_fragments` helper mirrors the C++ spray loop
+   (≥ ceil(wire/128 KiB) chunks, >512-MiB coalescing, trailing-lane-pad
+   skip); predicted losses drop to 3.3e-4 and strict latency is finite.
+   Test: `test_sharp_result_uses_switch_multicast_geometry`.
+3. **NVLS AllGather retry latency uses the rank grid** (low). The
+   `_retry_overhead` arm still fragmented a uniform D/N: at
+   D=9,437,185 / N=4 / 18 lanes it modeled 19 × 124,174-B fragments
+   where three ranks send 18 × 131,072-B — expected max attempts 8.60
+   vs 8.17 modeled, 326.94 vs 311.77 µs. The dominant stream is now
+   selected by its expected max attempt count over the real
+   `_rank_upload_chunks` grid. Test:
+   `test_nvls_allgather_retry_latency_rank_grid`.
+4. **Heavy-tail retransmission serialization honors the topology cap**
+   (low). `predict_tail`'s heavy-tail branch divided `delay_per_error`
+   by the raw `BW_link`, so a 50-GB/s bisection cap left the
+   p99-minus-mean increment unchanged at 560.39 µs (16 MiB / N=8 ring /
+   32 credits / BER 2e-7 / SACK) — the same contract the mean path
+   (round 22 #6) already follows. It now divides by
+   `min(BW_link, bisection)`; the capped increment rises to 1983.8 µs.
+   Test: `test_heavy_tail_topology_cap_scales_retransmission`.
+
+Suite state: EXTENSIVE 136 PASS / 0 FAIL (1 new C++ test), integration
+5 PASS, surrogate pytest 94 passed (3 new round-23 tests), 14/14 parity
+scripts, valgrind QUICK exit 0 with zero errors.
+
 ### Fixed — codex round 22: seven defects across legacy multicast, degenerate collectives, and surrogate consistency
 
 1. **Legacy SHARP multicast result fires once per flow** (high).

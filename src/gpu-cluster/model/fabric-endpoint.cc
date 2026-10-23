@@ -2575,16 +2575,20 @@ FabricEndpoint::ProcessCnpPacket(const FabricHeader& cnpHeader)
     m_cnpPacketsReceived++;
 
     // A CNP echoes the original flow back to its source. The CNP's source is
-    // the receiver, so at the source endpoint the flow key (destRank=receiver,
-    // vc, flowId) maps to MakeSeqKey(cnpHeader.GetSourceRank(), vc, flowId).
+    // the receiver, so at the source endpoint the flow coordinates are
+    // (source=this rank, dest=cnp source, vc, flowId). The rate key carries
+    // the SENDER rank too: two senders sharing (dest, vc, flow) coordinates
+    // must keep independent pacing/congestion state (codex round 23,
+    // finding 1) — the old dest-only key merged them onto one pacer.
     if (!m_dcqcnRate)
     {
         // Dormant baseline: no machine mounted (--dcqcn off). CNP is a no-op.
         return;
     }
-    uint64_t flowKey = MakeSeqKey(cnpHeader.GetSourceRank(),
-                                 cnpHeader.GetVirtualChannel(),
-                                 cnpHeader.GetFlowId());
+    uint64_t flowKey = MakeRateFlowKey(m_rank,
+                                       cnpHeader.GetSourceRank(),
+                                       cnpHeader.GetVirtualChannel(),
+                                       cnpHeader.GetFlowId());
     m_dcqcnRate->OnCnp(flowKey);
 }
 
@@ -2668,16 +2672,19 @@ FabricEndpoint::ProcessRttResponsePacket(const FabricHeader& respHeader)
 {
     NS_LOG_FUNCTION(this << respHeader.GetSourceRank());
 
-    // The response's source is the flow's receiver, so at the prober the flow
-    // key is MakeSeqKey(respHeader.GetSourceRank(), vc, flowId) — the same
-    // key the send path used (mirrors ProcessCnpPacket).
+    // The response's source is the flow's receiver, so at the prober the
+    // flow coordinates are (source=this rank, dest=response source, vc,
+    // flowId) — the same key the send path used (mirrors ProcessCnpPacket;
+    // sender-ranked for independent per-sender state, codex round 23,
+    // finding 1).
     if (!m_rttccRate)
     {
         return; // dormant baseline: no machine mounted (--rttcc off)
     }
-    uint64_t flowKey = MakeSeqKey(respHeader.GetSourceRank(),
-                                 respHeader.GetVirtualChannel(),
-                                 respHeader.GetFlowId());
+    uint64_t flowKey = MakeRateFlowKey(m_rank,
+                                       respHeader.GetSourceRank(),
+                                       respHeader.GetVirtualChannel(),
+                                       respHeader.GetFlowId());
     m_rttccRate->OnProbeResponse(flowKey, respHeader.GetSequenceNumber());
 }
 
@@ -2783,9 +2790,10 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             double eff = GetProtocolModelForDest(hdr.GetDestRank())->GetEfficiency(hdr.GetProtocol());
             if (eff < 1.0)
             {
-                uint64_t flowKey = MakeSeqKey(hdr.GetDestRank(),
-                                             hdr.GetVirtualChannel(),
-                                             hdr.GetFlowId());
+                uint64_t flowKey = MakeRateFlowKey(m_rank,
+                                                  hdr.GetDestRank(),
+                                                  hdr.GetVirtualChannel(),
+                                                  hdr.GetFlowId());
                 shapingDelay = m_dcqcnRate->ShapingDelay(packet->GetSize(), flowKey);
             }
         }
@@ -2806,9 +2814,10 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket() &&
             !IsLocalRank(hdr.GetDestRank()))
         {
-            uint64_t flowKey = MakeSeqKey(hdr.GetDestRank(),
-                                         hdr.GetVirtualChannel(),
-                                         hdr.GetFlowId());
+            uint64_t flowKey = MakeRateFlowKey(m_rank,
+                                              hdr.GetDestRank(),
+                                              hdr.GetVirtualChannel(),
+                                              hdr.GetFlowId());
             shapingDelay = std::max(shapingDelay,
                                     m_rttccRate->ShapingDelay(packet->GetSize(), flowKey));
             // At most one probe per ProbeInterval rides ahead of the data

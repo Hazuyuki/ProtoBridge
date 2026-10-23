@@ -424,6 +424,29 @@ class FabricEndpoint : public Application
     }
 
     /**
+     * @brief Rate-machine flow key: (source, dest, vc, flow)
+     * @return Composite key: (sourceRank << 40) | (destRank << 24) | (vcId << 16) | flowId
+     *
+     * Distinct from MakeSeqKey: the DCQCN/RTTCC per-flow state (pacer,
+     * alpha, probe bookkeeping) is per SENDER per flow, not merely per
+     * flow. A key without the source rank merges two senders that happen
+     * to share (dest, vc, flow) coordinates onto one pacer — with a
+     * shared machine (the sim's single-NIC modeling) the second sender
+     * inherited the first's pacing debt and finished at 1434.8 µs where
+     * independent state finishes at 715.1 µs (codex round 23, finding 1).
+     * Bits 40-55 (source rank) are unused by MakeSeqKey and clear of bit
+     * 63's memory namespace.
+     */
+    static uint64_t MakeRateFlowKey(uint16_t sourceRank, uint16_t destRank,
+                                    uint8_t vcId, uint16_t flowId)
+    {
+        return (static_cast<uint64_t>(sourceRank & 0xFFFF) << 40)
+             | (static_cast<uint64_t>(destRank) << 24)
+             | (static_cast<uint64_t>(vcId) << 16)
+             | (static_cast<uint64_t>(flowId) & 0xFFFF);
+    }
+
+    /**
      * @brief Sequence counter key for MEMORY_* packets (read/write/response/
      * semantic requests)
      *

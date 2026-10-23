@@ -1455,3 +1455,71 @@ def test_gbn_topology_cap_scales_retry_penalty():
                             topology=wb.make_topology(bisection_gbps=50),
                             **sack_kwargs)
     assert sack_cap > sack_no
+
+
+# ---- Codex round 23 regressions ----
+
+def test_sharp_result_uses_switch_multicast_geometry():
+    """The AllReduce result arm used the ENDPOINT single-link rule for the
+    switch's partition multicast: a single-link fabric's 4-MiB partition was
+    modeled as ONE 2-MiB packet (p ~ 1 per attempt) where the switch sprays
+    16 x 128-KiB chunks — 0.571 predicted permanent losses at BER 2.1e-7 /
+    retry 10000 / strict inf, where ns-3 seeds 1-3 report zero (codex round
+    23, finding 2)."""
+    nvls = wb.make_h200_nvls_theory(num_lanes=1)
+    nvls.nvls_num_partitions = 2
+    # Switch geometry: 16 x 131072 per 2-MiB partition, 2 partitions.
+    assert nvls._switch_multicast_fragments(2 * 1024 * 1024) == (16, 131072)
+    got = nvls.expected_permanent_losses(
+        4 * 1024 * 1024, 2, "nvls", 2.1e-7, 10000,
+        collective="allreduce", llr_enabled=True)
+    assert got < 1e-2, got
+    strict = nvls.predict(4 * 1024 * 1024, 2, "nvls", 128,
+                          collective="allreduce", ber=2.1e-7,
+                          llr_enabled=True, strict_reliability=True,
+                          retry_limit=10000)
+    assert math.isfinite(strict)
+
+
+def test_nvls_allgather_retry_latency_rank_grid():
+    """The AllGather retry-latency arm fragmented uniform D/N: at
+    D=9,437,185 / N=4 / 18 lanes it modeled 19 x 124,174-B fragments where
+    three ranks send 18 x 131,072-B — expected max attempts 8.60 vs 8.17,
+    326.94 vs 311.77 µs (codex round 23, finding 3). The dominant stream is
+    chosen by its expected max attempt count over the real grid."""
+    nvls = wb.make_h200_nvls_theory(num_lanes=18)
+    v = nvls.predict(9437185, 4, "nvls", 128, ber=1e-6, llr_enabled=True,
+                     retry_mode="sack", collective="allgather")
+    assert v == pytest.approx(326.9446, rel=1e-4)
+    # The many-rank uniform regime (D%N == 0) is unchanged in structure:
+    # every rank sprays the same (count, size).
+    base = 16 * 1024 * 1024
+    frags = nvls._spray_fragments(base // 4)
+    assert nvls._spray_fragments(base // 4) == frags
+
+
+def test_heavy_tail_topology_cap_scales_retransmission():
+    """The heavy-tail branch divided delay_per_error by the raw BW_link, so
+    a 50-GB/s cap left the p99-minus-mean increment unchanged at 560.39 µs
+    for 16 MiB / N=8 ring / 32 credits / BER 2e-7 / SACK (codex round 23,
+    finding 4). The increment must scale with the capped rate."""
+    ring = wb.make_h200_ring_theory()
+    kw = dict(ber=2e-7, llr_enabled=True, retry_mode="sack",
+              collective="allreduce", percentile=99)
+    mean_kw = dict(ber=2e-7, llr_enabled=True, retry_mode="sack",
+                   collective="allreduce")
+    t99_no = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                               topology=None, **kw)
+    t99_cap = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                                topology=wb.make_topology(
+                                    bisection_gbps=50), **kw)
+    m_no = ring.predict(16 * 1024 * 1024, 8, "ring", 32,
+                        topology=None, **mean_kw)
+    m_cap = ring.predict(16 * 1024 * 1024, 8, "ring", 32,
+                         topology=wb.make_topology(
+                             bisection_gbps=50), **mean_kw)
+    inc_no = t99_no - m_no
+    inc_cap = t99_cap - m_cap
+    assert inc_cap > inc_no
+    # No cap -> byte-identical legacy behavior.
+    assert inc_no == pytest.approx(560.3918, rel=1e-4)

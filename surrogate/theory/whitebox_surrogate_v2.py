@@ -490,6 +490,39 @@ class TheoryDerivedSurrogate:
             emitted += 1
         return max(1, emitted)
 
+    def _switch_multicast_fragments(self, data_bytes):
+        """(count, bytes) of one switch-side multicast partition delivery.
+
+        Mirrors NvSwitch::MulticastAllReducePartition's spray loop: the
+        switch ALWAYS fragments a result partition at ~128-KiB chunks
+        (numChunks = max(ports per GPU, ceil(wire/128 KiB)), then the
+        >512-MiB coalescing path), REGARDLESS of the endpoint upload side's
+        single-link whole-packet rule. Using the endpoint rule on the
+        result side modeled a 4-MiB partition as ONE 2-MiB packet (p ~ 1
+        per attempt) where the switch actually sends 16 x 128-KiB chunks —
+        0.571 predicted permanent losses at BER 2.1e-7 / retry 10000 /
+        strict inf, where ns-3 seeds 1-3 report zero (codex round 23,
+        finding 2). Fragment geometry follows the same ``offset >= wire
+        end`` skip as ``_spray_fragments``.
+        """
+        if data_bytes <= 0:
+            return 1, 1
+        spray_chunk = 128 * 1024
+        max_chunk = 8 * 1024 * 1024
+        coalesce_threshold = 512 * 1024 * 1024
+        min_chunks = max(1, self.num_lanes)  # ports per GPU
+        num_chunks = max(min_chunks,
+                         math.ceil(data_bytes / spray_chunk))
+        coalesced = math.ceil(data_bytes / max_chunk)
+        if data_bytes > coalesce_threshold and coalesced > min_chunks:
+            path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
+            num_chunks = max(min_chunks,
+                             min(num_chunks, path_balanced))
+        sent = sum(1 for i in range(num_chunks)
+                   if i * math.ceil(data_bytes / num_chunks) < data_bytes)
+        frag_bytes = math.ceil(data_bytes / num_chunks) if num_chunks else 1
+        return max(1, sent), max(1, frag_bytes)
+
     def _spray_fragments(self, data_bytes):
         """(count, bytes) of one SendCollectiveBulk sprayed transfer.
 
@@ -977,9 +1010,14 @@ class TheoryDerivedSurrogate:
             # AllReduce: full-D uploads + partitioned result multicast.
             upload_frags, upload_frag_bytes = self._spray_fragments(data_bytes)
             num_partitions = max(1, self.nvls_num_partitions)
-            result_frags, result_frag_bytes = self._spray_fragments(
+            # Result partitions are sprayed by the SWITCH at its own 128-KiB
+            # multicast geometry, not the endpoint upload rule (codex round
+            # 23, finding 2): a single-link fabric's uploads stay whole
+            # packets while each result partition still fragments at
+            # ceil(D/P/128KiB) x 128-KiB chunks.
+            result_frags, result_frag_bytes = self._switch_multicast_fragments(
                 data_bytes / num_partitions)
-            # Each dest receives every partition: P * frag(D/P) chunks.
+            # Each dest receives every partition: P x frag(D/P) chunks.
             result_frags_per_dest = num_partitions * result_frags
             p_upload_frag = self._packet_failure_probability(
                 ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
@@ -1093,9 +1131,36 @@ class TheoryDerivedSurrogate:
         # so the max-of-geometrics over the upload fragment count is the
         # right "slowest fragment" driver for the step-extension term.
         if algo == 'nvls' and collective in ('allreduce', 'allgather'):
-            upload_bytes = (D if collective == 'allreduce'
-                            else D / max(1, N))
-            packets, packet_bytes = self._spray_fragments(upload_bytes)
+            if collective == 'allreduce':
+                packets, packet_bytes = self._spray_fragments(D)
+            else:
+                # AllGather: the per-dest result stream mirrors the
+                # per-rank upload grid (D/N + (r < D%N) each), so the
+                # slowest-fragment driver must use the REAL streams — the
+                # uniform D/N modeled 19 x 124,174-B fragments at
+                # D=9,437,185/N=4 where three ranks actually send
+                # 18 x 131,072-B (expected max attempts 8.60 vs 8.17
+                # modeled, 326.94 vs 311.77 µs; codex round 23, finding 3).
+                # The dominant stream maximizes the expected max attempt
+                # count E[max] over its (count, size) — at D=9,437,185 the
+                # 18 x 131,072-B streams dominate the 19 x 124,174-B one
+                # (8.60 vs 8.17 expected attempts: the larger fragment's
+                # failure probability outweighs the extra fragment).
+                best_attempts = 0.0
+                packets, packet_bytes = 1, 1
+                for chunk in self._rank_upload_chunks(D, N):
+                    if chunk <= 0:
+                        continue
+                    frags, frag_bytes = self._spray_fragments(chunk)
+                    p_frag = self._packet_failure_probability(
+                        ber, fec_enabled, fec_n, fec_k, fec_t, frag_bytes)
+                    attempts = self._expected_max_attempts(p_frag,
+                                                           float(frags))
+                    if attempts > best_attempts:
+                        best_attempts = attempts
+                        packets, packet_bytes = frags, frag_bytes
+                if best_attempts == 0.0:
+                    packets, packet_bytes = self._spray_fragments(D / max(1, N))
             packets = float(packets)
         else:
             packets = self._packets_per_transfer(D, N, algo, collective)
@@ -1384,7 +1449,16 @@ class TheoryDerivedSurrogate:
         else:
             bdp = self._bdp(num_gpus, algo, collective)
             window = min(credits, bdp) if bdp != float('inf') else credits
-            delay_per_error = window * self.chunk_size / self.BW_link
+            # Retransmissions serialize at the TOPOLOGY-CAPPED rate (codex
+            # round 23, finding 4): the heavy-tail branch's delay_per_error
+            # divided by the raw BW_link, so a 50-GB/s bisection cap left
+            # the p99-minus-mean increment unchanged at 560.39 µs — the
+            # same capped-retransmission contract the mean path (round 22,
+            # finding 6) and _step_variance already follow.
+            bsec = (topology.bisection_bw_bytes_per_us
+                    if topology is not None else float('inf'))
+            delay_per_error = window * self.chunk_size / min(self.BW_link,
+                                                             bsec)
             # Exponential tail approximating the geometric retry cascade: the
             # expected extra delay is (P/(1-P)) * delay_per_error (retries per
             # success), so the exponential rate is its reciprocal:

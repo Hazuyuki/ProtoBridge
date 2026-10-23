@@ -10089,6 +10089,77 @@ class RailOptimizedFatTreeCoreTierTest : public TestCase
 };
 
 
+
+// (codex round 23, finding 1) The DCQCN/RTTCC flow key carried no source
+// rank, so two senders sharing (dest, vc, flow) coordinates merged onto one
+// pacer when the machine is shared (the sim's single-NIC modeling): the
+// second sender inherited the first's pacing debt and finished at 1434.8 µs
+// where independent state finishes at 715.1 µs. The rate key now includes
+// the sender rank.
+class DcqcnFlowKeySenderIsolationTest : public TestCase
+{
+  public:
+    DcqcnFlowKeySenderIsolationTest()
+        : TestCase("DCQCN shared machine keeps per-sender flow state isolated") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        GpuClusterTopologyHelper helper(3, 1);
+        helper.SetLinkDataRate("400Gbps");
+        helper.SetLinkDelay("100ns");
+        helper.SetLinksPerGpu(1);
+        helper.BuildFullyConnected();
+        auto apps = helper.GetEndpoints();
+        std::vector<Ptr<FabricEndpoint>> eps;
+        std::vector<uint64_t> lastArrival(3, 0);
+        Ptr<DcqcnRateMachine> shared = CreateObject<DcqcnRateMachine>();
+        shared->SetAttribute("PerQpCeilingGbps", DoubleValue(49));
+        for (uint32_t i = 0; i < apps.GetN(); ++i)
+        {
+            Ptr<FabricEndpoint> ep = DynamicCast<FabricEndpoint>(apps.Get(i));
+            ep->SetLocalRankRange(i, 1);
+            ep->SetInterNodeProtocolModel(CreateObject<RoceProtocolModel>());
+            ep->SetBypassReorderBuffer(true);
+            ep->SetBulkChunkSize(65536);
+            ep->Initialize();
+            ep->SetReceiveCallback(
+                [&lastArrival](uint16_t, Ptr<Packet>, FabricHeader h) {
+                    if (h.GetPacketType() == FabricPacketType::DATA)
+                    {
+                        lastArrival[h.GetSourceRank()] =
+                            Simulator::Now().GetNanoSeconds();
+                    }
+                });
+            // ONE shared machine across both senders — the sim's convention.
+            ep->SetDcqcnRateMachine(shared);
+            eps.push_back(ep);
+        }
+
+        // Two senders, identical (dest=0, flow=7, vc=0) coordinates.
+        const uint64_t d = 4 * 1024 * 1024;
+        eps[1]->SendBulkWireTransferSize(0, d, 1, 7, 0);
+        eps[2]->SendBulkWireTransferSize(0, d, 1, 7, 0);
+        Simulator::Stop(MilliSeconds(5));
+        Simulator::Run();
+
+        // The two streams are paced INDEPENDENTLY: the second sender's
+        // completion must not inherit the first's pacing debt (pre-fix
+        // 1,434,799 ns vs 715,096 ns independent; a 2x merge artifact).
+        const uint64_t t1 = lastArrival[1];
+        const uint64_t t2 = lastArrival[2];
+        NS_TEST_ASSERT_MSG_EQ(t1 > 0 && t2 > 0, true,
+            "both senders' streams must arrive");
+        uint64_t diff = (t1 > t2) ? t1 - t2 : t2 - t1;
+        NS_TEST_ASSERT_MSG_LT(diff, 100000u,
+            "two same-coordinates senders must finish within 100 µs of each "
+            "other on independent pacers (pre-fix: 721 µs apart on a shared "
+            "pacer)");
+        Simulator::Destroy();
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Codex round 22 regressions.
 // ---------------------------------------------------------------------------
@@ -10922,6 +10993,9 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new NcclRingZeroDataTest, TestCase::Duration::QUICK);
     AddTestCase(new ContentionBacklogLedgerPruningTest, TestCase::Duration::QUICK);
     AddTestCase(new NvlsPartitionZeroSemanticsTest, TestCase::Duration::QUICK);
+
+    // Codex round 23 regressions.
+    AddTestCase(new DcqcnFlowKeySenderIsolationTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);
