@@ -1523,3 +1523,74 @@ def test_heavy_tail_topology_cap_scales_retransmission():
     assert inc_cap > inc_no
     # No cap -> byte-identical legacy behavior.
     assert inc_no == pytest.approx(560.3918, rel=1e-4)
+
+
+def test_nvls_legacy_allreduce_uses_upload_geometry():
+    """Legacy single-multicast mode (nvls_num_partitions 0 or 1) ran the
+    AllReduce result arm through the switch's 128-KiB partition spray:
+    N=2 / D=4 MiB / one lane / BER 2.1e-7 / LLR / retry 10000 predicted
+    0.000330 expected losses and a finite strict latency, while
+    NvSwitch::MulticastAllReduceResult replays the UPLOAD chunk sizes --
+    one whole 4-MiB packet per dest whose 65 switch-side result retries
+    still leave ~1.890 permanent losses (codex round 24, finding 1)."""
+    for parts in (0, 1):
+        nvls = wb.make_h200_nvls_theory(num_lanes=1)
+        nvls.nvls_num_partitions = parts
+        got = nvls.expected_permanent_losses(
+            4 * 1024 * 1024, 2, "nvls", 2.1e-7, 10000,
+            collective="allreduce", llr_enabled=True)
+        assert got == pytest.approx(1.890259, rel=1e-4), (parts, got)
+        strict = nvls.predict(4 * 1024 * 1024, 2, "nvls", 128,
+                              collective="allreduce", ber=2.1e-7,
+                              llr_enabled=True, strict_reliability=True,
+                              retry_limit=10000)
+        assert math.isinf(strict), (parts, strict)
+    # Pipelined mode (>= 2 partitions) keeps the switch spray geometry
+    # (codex round 23, finding 2): same config stays at ~0 losses.
+    nvls = wb.make_h200_nvls_theory(num_lanes=1)
+    nvls.nvls_num_partitions = 2
+    got = nvls.expected_permanent_losses(
+        4 * 1024 * 1024, 2, "nvls", 2.1e-7, 10000,
+        collective="allreduce", llr_enabled=True)
+    assert got < 1e-2, got
+
+
+def test_tail_variance_topology_cap_scales_retransmission():
+    """_step_variance divided both retransmission delay terms by the raw
+    BW_link, so a 50-GB/s bisection cap left the low-BER p99-minus-mean
+    increment unchanged at 1.736 µs for 16 MiB / N=8 ring / 32 credits /
+    BER 1e-8 / SACK; evaluating the same equations at the capped rate gives
+    5.371 µs (codex round 24, finding 8). The increment must scale with
+    the capped rate, and topology=None must stay byte-identical."""
+    ring = wb.make_h200_ring_theory()
+    kw = dict(ber=1e-8, llr_enabled=True, retry_mode="sack",
+              collective="allreduce", percentile=99)
+    mean_kw = dict(ber=1e-8, llr_enabled=True, retry_mode="sack",
+                   collective="allreduce")
+    cap = wb.make_topology(bisection_gbps=50)
+
+    m_cap = ring.predict(16 * 1024 * 1024, 8, "ring", 32, topology=cap,
+                         **mean_kw)
+    t99_cap = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                                topology=cap, **kw)
+    inc_cap = t99_cap - m_cap
+    assert inc_cap == pytest.approx(5.370596, rel=1e-4), inc_cap
+
+    # Codex's cross-check: the same surrogate built AT the capped per-link
+    # rate must reproduce the capped increment (the mean stays identical
+    # because its schedule bandwidth already honors the cap).
+    retx_bw = 50000.0  # 50 GB/s in bytes/µs (bisection_gbps unit)
+    ring_c = wb.make_h200_ring_theory(packet_bw_bytes_per_us=retx_bw)
+    m_c = ring_c.predict(16 * 1024 * 1024, 8, "ring", 32, topology=cap,
+                         **mean_kw)
+    t99_c = ring_c.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                                topology=cap, **kw)
+    assert m_c == pytest.approx(m_cap, rel=1e-9)
+    assert (t99_c - m_c) == pytest.approx(inc_cap, rel=1e-4)
+
+    # No cap -> byte-identical legacy behavior.
+    m_no = ring.predict(16 * 1024 * 1024, 8, "ring", 32, topology=None,
+                        **mean_kw)
+    t99_no = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                               topology=None, **kw)
+    assert (t99_no - m_no) == pytest.approx(1.528577, rel=1e-4)

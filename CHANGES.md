@@ -6,6 +6,87 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 24: eight defects across forwarded-traffic shaping, repair-state isolation, and surrogate tail geometry
+
+1. **Legacy AllReduce results use the upload spray geometry** (medium).
+   The surrogate's AllReduce result arm ran every configuration through
+   the switch's 128-KiB partition spray, but legacy single-multicast
+   mode (`nvls_num_partitions` 0 or 1) replays the UPLOADS' chunk sizes
+   — one whole-D packet per dest on a single lane. N=2 / D=4 MiB /
+   BER 2.1e-7 / LLR / retry 10000 predicted 0.000330 permanent losses
+   and finite strict latency where the correct legacy expectation is
+   1.890 losses (one whole-packet retry stream per dest). The arm now
+   branches: legacy mode reuses the upload fragment geometry,
+   pipelined mode keeps `_switch_multicast_fragments` (round 23 #2).
+   Test: `test_nvls_legacy_allreduce_uses_upload_geometry`.
+2. **Forwarded packets skip the forwarder's rate machines** (medium).
+   DCQCN/RTTCC shaping gated only on packet type, so a transit packet
+   was re-paced on the FORWARDING endpoint's `m_rank` key: on routes
+   0→1→2 and 1→2 (shared dest/vc/flow coordinates, 49-GB/s per-QP
+   ceiling) source 0's stream merged onto source 1's pacer and finished
+   at 1434.2 µs where independent pacing finishes at 714.4 µs. Both
+   shaping gates now add `hdr.GetSourceRank() == m_rank` — the per-QP
+   pacer is a sender-NIC property; the CNP / RTT-response receive paths
+   already keyed on flow origin. Test: `DCQCN forwarded packets skip
+   the forwarder's pacer`.
+3. **Random-traffic goodput excludes permanent-loss notices** (medium).
+   The sim's receive callback counted `PERMANENT_LOSS` terminal notices
+   (synthetic empty packet + original metadata) as delivered payload:
+   with drop threshold 1 / SACK / retry limit 0 / zero warmup, seed 1
+   reported 1363.149 Gbps delivered where actual payload goodput is
+   298.844 Gbps (203 of 260 counted messages were loss notices). The
+   callback now early-returns on the PERMANENT_LOSS packet type.
+   Parity gate `test_random_traffic.py` gained Check 3: delivered bytes
+   must be a multiple of the message size and strictly below the
+   pre-fix value.
+4. **SHARP result store keeps flows' repair state isolated** (medium).
+   `StoreMulticastResult` erased the destination's whole store on every
+   new result flow, and `HandleSwitchNack` fell back to "the last flow
+   seen" when a named-flow lookup missed: a NACK for flow 1/seq 0
+   arriving after flow 2 started was answered with flow 2's sequence 0
+   — flow 1's missing result stayed unrecoverable. The store is now
+   per-(dest, flow) with coexisting bounded windows (~9.4 MB per live
+   flow), and a NACK only ever repairs its own flow's window.
+   Test: `SHARP result store keeps flows' repair state isolated`.
+5. **`SendBulkWireTransfer` carries 64-bit volumes** (medium). The
+   wrapper's dataSize parameter was `uint32_t`, so hierarchical
+   AllReduce's `uint64_t ringVolume` truncated: 3 GPUs/node, D=6 GiB,
+   local ring mode passed 4 GiB & 0xFFFFFFFF = 0 and phase 1 emitted
+   zero packets. The parameter is now `uint64_t` (the wrapper never
+   reads the data pointer; it forwards to SendBulkWireTransferSize).
+   Test: `SendBulkWireTransfer carries 64-bit volumes`.
+6. **GatewayEndpoint forwards cross-fabric traffic through the hybrid
+   table with the gateway delay** (medium). The base receive path never
+   consulted `m_hybridRoutingTable`: 0→gateway 1→2 delivered locally
+   at rank 1 (rank 2 received nothing), and forcing a base routing
+   entry still bypassed `GatewayDelay` (100 µs configured, 0.204 µs
+   traversal). A new virtual `TryForwardReceivedPacket` lets
+   `GatewayEndpoint` route via `LookupRoute` + `ScheduleForwarding`
+   (delay applied), falling back to the base same-fabric forward when
+   the hybrid table has no route. Test: `GatewayEndpoint forwards
+   cross-fabric routes with gateway delay`.
+7. **`ecnThreshold=0` disables ECN marking** (low).
+   `MarkEcnIfCongested` gated only on `voqDepth < m_ecnThreshold`, and
+   `0 < 0` is false — a quiescent 64-byte P2P run with dcqcn=1 /
+   ecnThreshold=0 produced one ECN mark and one CNP despite the CLI's
+   documented "0=off". The zero-disable guard now matches the
+   voqDropThreshold one above it. Test: `EcnThreshold=0 disables ECN
+   marking`.
+8. **Tail-variance retransmission serialization honors the topology
+   cap** (low). `_step_variance` divided both retransmission delay
+   terms by the raw `BW_link`, so a 50-GB/s bisection cap left the
+   low-BER p99-minus-mean increment unchanged at 1.736 µs (16 MiB /
+   N=8 ring / 32 credits / BER 1e-8 / SACK) where the capped rate
+   gives 5.371 µs — the same contract the mean path (round 22 #6) and
+   the heavy-tail branch (round 23 #4) already follow. The capped rate
+   is `min(BW_link, bisection)`; `topology=None` stays byte-identical.
+   Test: `test_tail_variance_topology_cap_scales_retransmission`.
+
+Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
+5 PASS, surrogate pytest 96 passed (2 new round-24 tests), 14/14 parity
+scripts (test_random_traffic.py extended with a goodput-excludes-losses
+check), valgrind QUICK exit 0 with zero errors.
+
 ### Fixed — codex round 23: four defects in flow-key isolation and switch-side surrogate geometry
 
 1. **DCQCN/RTTCC flow keys carry the sender rank** (medium). The

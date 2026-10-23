@@ -113,7 +113,13 @@ EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
 bool
 EthernetSwitch::MarkEcnIfCongested(Ptr<Packet> packet, size_t voqDepth) const
 {
-    if (!packet || voqDepth < m_ecnThreshold)
+    // 0 = off (disable ECN marking): the CLI's documented contract
+    // (gpu-cluster-sim "0=off; Phase-B reaction pending"). Without this
+    // guard `voqDepth < 0` is never true, so even a quiescent VOQ (depth
+    // 0) would satisfy `0 < 0 == false` and mark every RoCE data packet
+    // -- one ECN mark + CNP on an otherwise idle link (codex round 24,
+    // finding 7).
+    if (!packet || m_ecnThreshold == 0 || voqDepth < m_ecnThreshold)
     {
         return false;
     }

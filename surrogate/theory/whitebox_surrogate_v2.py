@@ -1010,15 +1010,30 @@ class TheoryDerivedSurrogate:
             # AllReduce: full-D uploads + partitioned result multicast.
             upload_frags, upload_frag_bytes = self._spray_fragments(data_bytes)
             num_partitions = max(1, self.nvls_num_partitions)
-            # Result partitions are sprayed by the SWITCH at its own 128-KiB
-            # multicast geometry, not the endpoint upload rule (codex round
-            # 23, finding 2): a single-link fabric's uploads stay whole
-            # packets while each result partition still fragments at
-            # ceil(D/P/128KiB) x 128-KiB chunks.
-            result_frags, result_frag_bytes = self._switch_multicast_fragments(
-                data_bytes / num_partitions)
-            # Each dest receives every partition: P x frag(D/P) chunks.
-            result_frags_per_dest = num_partitions * result_frags
+            if self.nvls_num_partitions <= 1:
+                # LEGACY single-multicast mode: NvSwitch falls back to
+                # MulticastAllReduceResult, which replays the UPLOADS' chunk
+                # sizes (``chunkSizes`` copied from the first GPU's stored
+                # upload records) -- NOT the switch's own 128-KiB spray. On
+                # a single-link fabric the result is one WHOLE 4-MiB packet
+                # per dest, p ~ 1 per attempt, so 65 switch-side result
+                # retries still leave ~1.89 expected permanent losses at
+                # N=2 / D=4 MiB / BER 2.1e-7 -- where the partition-spray
+                # geometry below (16 x 128-KiB chunks) predicted 0.000330
+                # and strict latency stayed finite for a run ns-3 leaves
+                # incomplete (codex round 24, finding 1).
+                result_frags_per_dest = upload_frags
+                result_frag_bytes = upload_frag_bytes
+            else:
+                # Result partitions are sprayed by the SWITCH at its own
+                # 128-KiB multicast geometry, not the endpoint upload rule
+                # (codex round 23, finding 2): a single-link fabric's
+                # uploads stay whole packets while each result partition
+                # still fragments at ceil(D/P/128KiB) x 128-KiB chunks.
+                result_frags, result_frag_bytes = self._switch_multicast_fragments(
+                    data_bytes / num_partitions)
+                # Each dest receives every partition: P x frag(D/P) chunks.
+                result_frags_per_dest = num_partitions * result_frags
             p_upload_frag = self._packet_failure_probability(
                 ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
             p_result_frag = self._packet_failure_probability(
@@ -1308,7 +1323,7 @@ class TheoryDerivedSurrogate:
     def _step_variance(self, T_step, D, N, algo, cr, ber, competing_bw, llr_enabled,
                        fec_enabled=False, fec_n=None, fec_k=None, fec_t=None,
                        retry_mode='gobackn', retry_buffer_entries=None,
-                       optical_fraction=1.0, collective=None):
+                       optical_fraction=1.0, collective=None, topology=None):
         """Per-step delay variance from retransmission + queuing.
 
         Uses post-FEC BER when FEC is enabled (variance from corrected errors
@@ -1329,6 +1344,16 @@ class TheoryDerivedSurrogate:
         where effective_delay accounts for credit slack: when cr > BDP,
         spare credits absorb part of the retransmission, reducing the
         effective delay that propagates.
+
+        Retransmissions serialize at the TOPOLOGY-CAPPED rate
+        min(BW_link, bisection) (codex round 24, finding 8): both delay
+        terms below divided by the raw BW_link, so a 50-GB/s bisection cap
+        left the low-BER p99-minus-mean increment unchanged at 1.736 µs
+        (16 MiB / N=8 ring / 32 credits / BER 1e-8 / SACK) where the
+        capped rate gives 5.371 µs -- the same capped-retransmission
+        contract the mean path (round 22, finding 6) and the heavy-tail
+        branch (round 23, finding 4) already follow. ``topology=None`` is
+        byte-identical to the legacy behavior.
         """
         collective = self._validate_collective(collective)
         effective_ber = (self._post_fec_ber(ber, fec_n, fec_k, fec_t)
@@ -1352,7 +1377,11 @@ class TheoryDerivedSurrogate:
             P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk
             retry_chunks = (1.0 if retry_mode.lower() == 'sack'
                             else (window + 1.0) / 2.0)
-            delay_per_error = retry_chunks * self.chunk_size / self.BW_link
+            # Topology-capped retransmission rate (see docstring).
+            bsec = (topology.bisection_bw_bytes_per_us
+                    if topology is not None else float('inf'))
+            bw_retx = min(self.BW_link, bsec)
+            delay_per_error = retry_chunks * self.chunk_size / bw_retx
 
             # Pipeline absorption: compute effective delay after credit slack
             # and the propagation fraction.
@@ -1361,7 +1390,7 @@ class TheoryDerivedSurrogate:
                 excess_chunks = max(0.0, window - spare_credits)
             else:
                 excess_chunks = window
-            effective_delay = excess_chunks * self.chunk_size / self.BW_link
+            effective_delay = excess_chunks * self.chunk_size / bw_retx
 
             if T_step > 0 and effective_delay > 0:
                 f_prop = T_step / (T_step + effective_delay)
@@ -1419,7 +1448,8 @@ class TheoryDerivedSurrogate:
                                         credits, ber, competing_bw, llr_enabled,
                                         fec_enabled, fec_n, fec_k, fec_t,
                                         retry_mode, retry_buffer_entries,
-                                        optical_fraction, collective)
+                                        optical_fraction, collective,
+                                        topology)
 
         if var_step <= 0:
             return mean

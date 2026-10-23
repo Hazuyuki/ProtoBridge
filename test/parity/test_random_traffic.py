@@ -102,6 +102,45 @@ def main():
         f"PASS leafspine 4:1: delivered {delivered:.1f} / offered "
         f"{offered:.1f} Gbps, ecnMarked={ecn} cnpTx={cnp_tx} cnpRx={cnp_rx}"
     )
+
+    # --- Check 3: permanent-loss notices are NOT delivered goodput ---------
+    # (codex round 24, finding 3) RandTrafficReceive counted PERMANENT_LOSS
+    # callback bytes as delivered: with drop threshold 1 and retry limit 0
+    # the loss notices (synthetic empty packets carrying the lost chunk's
+    # metadata) outnumbered real deliveries and randDeliveredGbps reported
+    # 1363.149 where the true payload goodput is 298.844 Gbps. Deliveries
+    # must now satisfy: deliveredBytes == 64KiB-multiples, and delivered
+    # strictly below the pre-fix inflated value.
+    r = run(COMMON + [
+        "--interNodeTopology=leafspine",
+        "--interNodeSpines=1",
+        "--randWarmupNs=0",
+        "--randMeasureNs=100000",
+        "--voqDropThreshold=1",
+        "--llrRetryLimit=0",
+        "--llrMode=sack",
+    ])
+    assert r.get("status") == "complete", f"lossy status={r.get('status')}"
+    delivered_b = int(r["randDeliveredBytes"])
+    losses = int(r["permanentLosses"])
+    offered_b = int(r["randOfferedBytes"])
+    assert losses > 0, "lossy run must actually lose packets (else check is vacuous)"
+    assert delivered_b % 65536 == 0, (
+        f"delivered bytes {delivered_b} not a 64-KiB message multiple — "
+        "loss-notice bytes are being counted as goodput"
+    )
+    # Pre-fix value on this exact config: 17,039,360 bytes (1363.149 Gbps).
+    # The fixed count is 3,735,552 (298.844 Gbps); assert the phantom
+    # 13,303,808 loss-notice bytes are gone.
+    assert delivered_b < 17_000_000, (
+        f"delivered {delivered_b} B >= pre-fix inflated count — loss notices "
+        "counted as goodput (pre-fix 17039360 B / true 3735552 B)"
+    )
+    assert delivered_b < offered_b, "delivered must be below offered on a lossy fabric"
+    print(
+        f"PASS lossy: delivered {delivered_b} B of {offered_b} B offered "
+        f"({losses} permanent losses excluded from goodput)"
+    )
     print("OK: random-traffic mode + DCQCN chain alive")
 
 

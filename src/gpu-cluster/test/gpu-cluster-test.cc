@@ -76,6 +76,7 @@
 #include "ns3/error-model.h"
 #include "ns3/string.h"
 
+#include <array>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -8619,6 +8620,127 @@ class SharpResultRetentionTest : public TestCase
     }
 };
 
+// (codex round 24, finding 4) StoreMulticastResult erased the previous
+// flow's window when a new flow's first result landed — even while the old
+// flow's results were still in flight. A subsequent NACK for flow 1/seq 0
+// fell back to the dest's LAST stored flow (flow 2) via m_lastResultFlow and
+// retransmitted flow 2's seq 0 under a flow-1 request, while flow 1's
+// genuinely lost result stayed unrecoverable. The store is per (dest, flow),
+// so concurrent flows keep independent windows; a named-flow NACK repairs
+// only its own flow.
+class SharpResultFlowIsolationTest : public TestCase
+{
+  public:
+    SharpResultFlowIsolationTest()
+        : TestCase("SHARP result store keeps flows' repair state isolated") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("400Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(10)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        // Per-flow result counters on the dest-side device.
+        unsigned flow1Packets = 0, flow2Packets = 0;
+        devs.Get(1)->SetPromiscReceiveCallback(
+            [&flow1Packets, &flow2Packets](Ptr<NetDevice>, Ptr<const Packet> p,
+                                           uint16_t, const Address&, const Address&,
+                                           NetDevice::PacketType) {
+                FabricHeader h;
+                p->PeekHeader(h);
+                if (h.GetPacketType() == FabricPacketType::ALLREDUCE)
+                {
+                    if (h.GetFlowId() == 1)
+                        flow1Packets++;
+                    if (h.GetFlowId() == 2)
+                        flow2Packets++;
+                }
+                return true;
+            });
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        nodes.Get(0)->AddDevice(sw);
+        sw->AddPort(devs.Get(0));
+        sw->AddRankPort(0, 0);
+        sw->SetLlrEnabled(true);
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        sw->SetAllReduceDataSize(64);
+        sw->SetAllReduceNumPartitions(1);
+        sw->SetAllReduceAggregationDelay(0);
+
+        // Flow 1 completes and multicasts its result; flow 2 completes and
+        // multicasts DURING flow 1's delivery window (10-µs link — flow 1's
+        // result is still on the wire when flow 2's store writes begin).
+        sw->InjectAggregateUpload(1, 0, 0, 64, false);
+        Simulator::Schedule(NanoSeconds(100), [sw] {
+            sw->InjectAggregateUpload(2, 0, 0, 64, false);
+        });
+        // NACK for FLOW 1 / seq 0 at 1 µs: pre-fix this retransmitted flow
+        // 2's seq 0 (fallback through m_lastResultFlow once flow 2's store
+        // replaced flow 1's), leaving flow 1's loss unrecoverable.
+        Simulator::Schedule(MicroSeconds(1), [devs] {
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::NACK);
+            h.SetSourceRank(0);
+            h.SetDestRank(0xFFFF);
+            h.SetFlowId(1);
+            h.SetSequenceNumber(0);
+            Ptr<Packet> pkt = Create<Packet>();
+            pkt->AddHeader(h);
+            devs.Get(1)->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
+        });
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+
+        // Flow 1's result + its own repair = 2; flow 2's single result = 1.
+        // Pre-fix: flow1=1 (no repair) / flow2=2 (the wrong-flow repair).
+        NS_TEST_ASSERT_MSG_EQ(flow1Packets, 2u,
+            "flow 1's NACK must repair FLOW 1's own result (pre-fix: its "
+            "repair state was erased and the NACK retransmitted flow 2's "
+            "fragment instead)");
+        NS_TEST_ASSERT_MSG_EQ(flow2Packets, 1u,
+            "flow 2 must not grow a packet from flow 1's NACK (pre-fix: the "
+            "wrong-flow repair retransmitted flow 2's seq 0)");
+        // Store-level check: BOTH flows' windows survive concurrently.
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpResultStoreSize(0), 2u,
+            "both flows' repair windows must coexist in the store");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 24, finding 5) SendBulkWireTransfer's dataSize parameter was
+// uint32_t while every collective driver computes uint64_t volumes: a
+// 3-GPU-per-node local ring ships (g-1) segments — a 4-GiB aggregate at
+// D=6 GiB — which truncated to ZERO bytes and stalled phase 1 with no
+// packets emitted. The parameter is now uint64_t (the wrapper forwards to
+// SendBulkWireTransferSize and never reads the data pointer).
+class BulkWireTransferWideSizeTest : public TestCase
+{
+  public:
+    BulkWireTransferWideSizeTest()
+        : TestCase("SendBulkWireTransfer carries 64-bit volumes") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetLocalRankRange(0, 1);
+        // Exactly 2^32: the value that truncated to zero pre-fix.
+        const uint64_t volume = uint64_t{1} << 32;
+        ep->SendBulkWireTransfer(1, nullptr, volume, 3, 1, 0);
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 512u,
+            "a 4-GiB bulk volume must emit its full fragment stream (512 "
+            "chunks at the 8-MiB bulk chunk size); pre-fix the uint32_t "
+            "parameter truncated it to zero packets");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
 // Multicast result sequence numbering must be per-destination: endpoint
 // reorder buffers (the module default, SetBypassReorderBuffer(false)) key on
 // (vc, flow, source) and expect each stream to start at seq 0. Codex repro
@@ -9079,6 +9201,91 @@ class TrafficPatternTest : public TestCase
   private:
     void OnComplete() { m_completeFired = true; }
     bool m_completeFired;
+};
+
+// (codex round 24, finding 6) The gateway's cross-fabric forwarding handler
+// was never connected to ingress: the base receive path consults only
+// m_routingTable, so a cross-fabric route (SetCrossFabricRoute) never fired —
+// the transit packet was delivered LOCALLY at the gateway and the remote rank
+// received nothing. Even with a base routing entry, the base forwarding
+// branch re-sent immediately and ignored GatewayDelay (configured 100 µs
+// produced a ~1204-ns traversal). GatewayEndpoint now overrides the
+// forwarding decision: hybrid-table routes go through ScheduleForwarding,
+// which applies the delay.
+class GatewayForwardingDelayTest : public TestCase
+{
+  public:
+    GatewayForwardingDelayTest()
+        : TestCase("GatewayEndpoint forwards cross-fabric routes with gateway delay") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer n;
+        n.Create(3);
+        PointToPointHelper p;
+        p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto ab = p.Install(n.Get(0), n.Get(1));
+        auto bc = p.Install(n.Get(1), n.Get(2));
+
+        auto a = CreateObject<FabricEndpoint>();
+        auto c = CreateObject<FabricEndpoint>();
+        auto b = CreateObject<GatewayEndpoint>();
+        n.Get(0)->AddApplication(a);
+        n.Get(1)->AddApplication(b);
+        n.Get(2)->AddApplication(c);
+        a->SetRank(0);
+        b->SetRank(1);
+        c->SetRank(2);
+        a->SetLocalRankRange(0, 1);
+        b->SetLocalRankRange(1, 1);
+        c->SetLocalRankRange(2, 1);
+        a->AddNetDevice(ab.Get(0));
+        b->AddFabricDevice(FabricType::NVLINK, ab.Get(1));
+        b->AddFabricDevice(FabricType::ETHERNET, bc.Get(0));
+        c->AddNetDevice(bc.Get(1));
+        a->SetRoutingEntry(2, 0);
+        a->SetNeighborMac(2, Mac48Address::ConvertFrom(ab.Get(1)->GetAddress()));
+        b->SetHybridRoutingTable(CreateObject<HybridRoutingTable>());
+        b->SetCrossFabricRoute(2, FabricType::ETHERNET, 1);
+        b->SetGatewayDelay(MicroSeconds(100));
+        b->SetNeighborMac(2, Mac48Address::ConvertFrom(bc.Get(1)->GetAddress()));
+        // NO base routing entry: the hybrid table alone must carry the route
+        // (pre-fix the packet was delivered locally at the gateway).
+        a->SetStartTime(Seconds(0));
+        b->SetStartTime(Seconds(0));
+        c->SetStartTime(Seconds(0));
+
+        uint64_t sinkBytes = 0, gatewayBytes = 0, sinkAt = 0;
+        b->SetReceiveCallback(
+            [&gatewayBytes](uint16_t, Ptr<Packet>, FabricHeader h) {
+                gatewayBytes += h.GetEffectiveDataSize();
+            });
+        c->SetReceiveCallback(
+            [&sinkBytes, &sinkAt](uint16_t, Ptr<Packet>, FabricHeader h) {
+                sinkBytes += h.GetEffectiveDataSize();
+                sinkAt = Simulator::Now().GetNanoSeconds();
+            });
+
+        Simulator::Schedule(MicroSeconds(1), [a] {
+            a->SendBulkWireTransferSize(2, 64, 3, 1, 0);
+        });
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(gatewayBytes, 0u,
+            "transit packet must not be delivered locally at the gateway "
+            "(pre-fix: 64 B consumed locally, remote rank starved)");
+        NS_TEST_ASSERT_MSG_EQ(sinkBytes, 64u,
+            "the cross-fabric route must deliver to the remote rank "
+            "(pre-fix: 0 B — the hybrid table was never consulted)");
+        // 1 µs send + 100 µs gateway delay + ~200 ns wire: the traversal
+        // must reflect GatewayDelay, not the pre-fix ~1204 ns bypass.
+        NS_TEST_ASSERT_MSG_GT(sinkAt, 100000u,
+            "gateway delay must be applied to cross-fabric forwarding "
+            "(pre-fix: 1204 ns with a configured 100,000 ns delay)");
+        Simulator::Destroy();
+    }
 };
 
 class GatewayEndpointTest : public TestCase
@@ -10090,12 +10297,148 @@ class RailOptimizedFatTreeCoreTierTest : public TestCase
 
 
 
+// (codex round 24, finding 7) The CLI documents --ecnThreshold "0=off", but
+// MarkEcnIfCongested gated only on `voqDepth < m_ecnThreshold`: with a
+// threshold of 0 that comparison is `0 < 0 == false`, so a quiescent link
+// (VOQ depth 0) still marked every RoCE DATA packet -- a 64-byte P2P run
+// with dcqcn=1/ecnThreshold=0 produced one ECN mark and one CNP. Threshold
+// 0 must disable marking, like the voqDropThreshold guard above it.
+class EcnThresholdZeroDisablesTest : public TestCase
+{
+  public:
+    EcnThresholdZeroDisablesTest() : TestCase("EcnThreshold=0 disables ECN marking") {}
+    void DoRun() override
+    {
+        Ptr<EthernetSwitch> sw = CreateObject<EthernetSwitch>();
+        sw->SetAttribute("EcnThreshold", UintegerValue(0));
+
+        // RoCE DATA packet arriving into a quiescent VOQ (depth 0): the
+        // pre-fix bug marked exactly this (0 < 0 is false).
+        Ptr<Packet> pkt = Create<Packet>(64);
+        SoHeader soh;
+        soh.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        soh.SetEcn(false);
+        soh.SetDataSize(64);
+        pkt->AddHeader(soh);
+        FabricHeader fh;
+        fh.SetPacketType(FabricPacketType::DATA);
+        fh.SetFabricType(FabricType::ROCE);
+        fh.SetProtocol(static_cast<uint8_t>(RoceProtocol::SIMPLE));
+        pkt->AddHeader(fh);
+
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(pkt, 0), false,
+                              "ecnThreshold=0 must disable marking even at VOQ depth 0");
+        // Even a genuinely deep queue stays unmarked: "0=off", not "0=mark-all".
+        NS_TEST_ASSERT_MSG_EQ(sw->MarkEcnIfCongested(pkt, 100), false,
+                              "ecnThreshold=0 must disable marking at any VOQ depth");
+        // The packet itself must be untouched (no spurious SoHeader rewrite).
+        FabricHeader outFh;
+        pkt->PeekHeader(outFh);
+        Ptr<Packet> copy = pkt->Copy();
+        copy->RemoveHeader(outFh);
+        SoHeader outSo;
+        copy->PeekHeader(outSo);
+        NS_TEST_ASSERT_MSG_EQ(outSo.GetEcn(), false, "SoHeader ECN bit must stay clear");
+    }
+};
+
 // (codex round 23, finding 1) The DCQCN/RTTCC flow key carried no source
 // rank, so two senders sharing (dest, vc, flow) coordinates merged onto one
 // pacer when the machine is shared (the sim's single-NIC modeling): the
 // second sender inherited the first's pacing debt and finished at 1434.8 µs
 // where independent state finishes at 715.1 µs. The rate key now includes
 // the sender rank.
+// (codex round 24, finding 2) Forwarded packets were shaped on the FORWARDING
+// endpoint's m_rank at both rate machines: on routes 0->1->2 and 1->2 (shared
+// dest=2/vc=0/flow=7 coordinates, 49-Gbps per-QP ceiling on one shared
+// machine), endpoint 1's key merged source 0's transit stream onto source 1's
+// pacer — source 0 finished at 1434 us where the independent-pacer time is
+// 714 us. The per-QP pacer is a SENDER-NIC property: forwarded packets carry
+// the original sender's rank and are now skipped at both machines (the CNP /
+// RTT-response receive paths already key on the flow's origin).
+class DcqcnForwardedPacketOriginTest : public TestCase
+{
+  public:
+    DcqcnForwardedPacketOriginTest()
+        : TestCase("DCQCN forwarded packets skip the forwarder's pacer") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p;
+        p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto ab = p.Install(nodes.Get(0), nodes.Get(1));
+        auto bc = p.Install(nodes.Get(1), nodes.Get(2));
+
+        std::array<Ptr<FabricEndpoint>, 3> ep;
+        Ptr<DcqcnRateMachine> rate = CreateObject<DcqcnRateMachine>();
+        rate->SetAttribute("PerQpCeilingGbps", DoubleValue(49));
+        std::array<uint64_t, 2> rx{}, done{};
+        for (unsigned i = 0; i < 3; ++i)
+        {
+            ep[i] = CreateObject<FabricEndpoint>();
+            nodes.Get(i)->AddApplication(ep[i]);
+            ep[i]->SetRank(i);
+            ep[i]->SetNodeId(i);
+            ep[i]->SetLocalRankRange(i, 1);
+            ep[i]->SetInterNodeProtocolModel(CreateObject<RoceProtocolModel>());
+            ep[i]->SetBulkChunkSize(65536);
+            ep[i]->SetBypassReorderBuffer(true);
+            ep[i]->Initialize();
+            ep[i]->SetReceiveCallback(
+                [&rx, &done](uint16_t, Ptr<Packet>, FabricHeader h) {
+                    if (h.GetPacketType() != FabricPacketType::DATA)
+                        return;
+                    unsigned s = h.GetSourceRank();
+                    if (s >= 2)
+                        return;
+                    rx[s] += h.GetEffectiveDataSize();
+                    if (rx[s] >= (4u << 20))
+                        done[s] = Simulator::Now().GetNanoSeconds();
+                });
+            // ONE shared machine across endpoint 0 (origin) and endpoint 1
+            // (origin + forwarder) — the sim's single-NIC convention.
+            ep[i]->SetDcqcnRateMachine(rate);
+        }
+        ep[0]->AddNetDevice(ab.Get(0));
+        ep[1]->AddNetDevice(ab.Get(1));
+        ep[1]->AddNetDevice(bc.Get(0));
+        ep[2]->AddNetDevice(bc.Get(1));
+        ep[0]->SetRoutingEntry(2, 0);
+        ep[0]->SetNeighborMac(2, Mac48Address::ConvertFrom(ab.Get(1)->GetAddress()));
+        ep[1]->SetRoutingEntry(2, 1);
+        ep[1]->SetNeighborMac(2, Mac48Address::ConvertFrom(bc.Get(1)->GetAddress()));
+
+        Simulator::Schedule(MicroSeconds(1), [ep] {
+            ep[0]->SendBulkWireTransferSize(2, 4u << 20, 1, 7, 0);
+            ep[1]->SendBulkWireTransferSize(2, 4u << 20, 1, 7, 0);
+        });
+        Simulator::Stop(MilliSeconds(5));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(rx[0], 4u << 20, "forwarded stream fully delivered");
+        NS_TEST_ASSERT_MSG_EQ(rx[1], 4u << 20, "direct stream fully delivered");
+        NS_TEST_ASSERT_MSG_EQ(done[0] > 0 && done[1] > 0, true, "both streams complete");
+        // The forwarded stream must finish at the independent-pacer time
+        // (~714 us), NOT the merged ~1434 us. Assert against a threshold
+        // well below the merge artifact but above the true pace.
+        NS_TEST_ASSERT_MSG_LT(done[0], 1000000u,
+            "forwarded stream must not inherit the forwarder's pacing debt "
+            "(pre-fix: 1,434,200 ns; independent-pacer time ~714,398 ns)");
+        // And the two same-coordinates senders stay isolated (round 23's
+        // guarantee holds on the shared machine): within ~100 us of each other.
+        uint64_t diff = (done[0] > done[1]) ? done[0] - done[1] : done[1] - done[0];
+        NS_TEST_ASSERT_MSG_LT(diff, 100000u,
+            "forwarded and direct senders with identical coordinates must be "
+            "paced independently at the forwarder");
+        Simulator::Destroy();
+    }
+};
+
 class DcqcnFlowKeySenderIsolationTest : public TestCase
 {
   public:
@@ -10997,6 +11340,12 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     // Codex round 23 regressions.
     AddTestCase(new DcqcnFlowKeySenderIsolationTest, TestCase::Duration::QUICK);
 
+    // Codex round 24 regressions.
+    AddTestCase(new EcnThresholdZeroDisablesTest, TestCase::Duration::QUICK);
+    AddTestCase(new DcqcnForwardedPacketOriginTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpResultFlowIsolationTest, TestCase::Duration::QUICK);
+    AddTestCase(new BulkWireTransferWideSizeTest, TestCase::Duration::QUICK);
+
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new NvSwitchVoqContentionTest, TestCase::Duration::EXTENSIVE);
@@ -11009,6 +11358,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new ContentionModelTest, TestCase::Duration::QUICK);
     AddTestCase(new TrafficPatternTest, TestCase::Duration::QUICK);
     AddTestCase(new GatewayEndpointTest, TestCase::Duration::QUICK);
+    AddTestCase(new GatewayForwardingDelayTest, TestCase::Duration::QUICK);
 }
 
 static GpuClusterTestSuite g_gpuClusterTestSuite;

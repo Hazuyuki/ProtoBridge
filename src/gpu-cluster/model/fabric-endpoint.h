@@ -203,7 +203,13 @@ class FabricEndpoint : public Application
      * receivers can correctly track progress against the data size.
      * FabricHeader.protocol is set to 0 (NONE) to bypass per-line processing.
      */
-    void SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uint32_t dataSize,
+    // dataSize is uint64_t: collective volumes legitimately exceed 4 GiB
+    // (a 3-GPU-per-node local ring aggregates (g-1) segments — 4 GiB at
+    // D=6 GiB), and the old uint32_t parameter truncated such volumes to
+    // zero bytes, stalling the phase with zero packets emitted (codex round
+    // 24, finding 5). The data pointer is advisory only (the 64-bit path
+    // sends dummy bytes); callers passing a buffer keep working unchanged.
+    void SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uint64_t dataSize,
                               uint8_t protocolId, uint16_t flowId, uint8_t vcId = 0);
     void SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                                   uint8_t protocolId, uint16_t flowId, uint8_t vcId = 0);
@@ -490,6 +496,18 @@ class FabricEndpoint : public Application
      */
     void SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                             const Address& dest);
+    /**
+     * @brief Forward a received packet whose DestRank is not this endpoint.
+     *
+     * Shared by ReceiveFromDevice and ContinueReceiveAfterFec. Returns true
+     * when the packet was consumed as transit traffic (already re-queued to
+     * the next hop's device). VIRTUAL so GatewayEndpoint can route through
+     * its hybrid routing table and apply the gateway delay instead of the
+     * base class's immediate same-fabric re-send (codex round 24, finding 6:
+     * the base path never consulted m_hybridRoutingTable, and a configured
+     * 100-µs GatewayDelay produced a ~1204-ns traversal).
+     */
+    virtual bool TryForwardReceivedPacket(Ptr<Packet> pkt, FabricHeader& header);
     /**
      * \brief Re-arm the LLR retry timer at first wire transmission. The
      *        timer otherwise starts at StorePacket (enqueue) and can expire

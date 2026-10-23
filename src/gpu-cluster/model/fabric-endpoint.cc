@@ -1496,23 +1496,8 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
     uint16_t destRank = header.GetDestRank();
 
     // Check if this packet is destined for us or needs forwarding
-    if (destRank != m_rank && !m_routingTable.empty())
+    if (TryForwardReceivedPacket(pkt, header))
     {
-        // Forward the packet to its destination
-        NS_LOG_DEBUG("Forwarding packet from " << header.GetSourceRank()
-                     << " to " << destRank << " at node " << m_rank);
-
-        uint32_t deviceIndex = ResolveDeviceIndex(destRank);
-        Mac48Address destMac = ResolveDestMac(destRank);
-        // Re-target the header's DestMac for THIS hop: switches route on the
-        // FabricHeader's MACs (nvswitch.cc), so a stale first-hop DestMac is
-        // unknown at the destination node's switch and floods every port --
-        // each non-target GPU then re-forwards the flooded copy, storming at
-        // high radix (gateway topologies: ring/torus2d/dragonfly).
-        header.SetDestMac(destMac);
-        pkt->AddHeader(header);
-        SendPacketOnDevice(pkt, deviceIndex, destMac);
-
         return true;
     }
 
@@ -1627,6 +1612,32 @@ FabricEndpoint::ProcessPermanentLossNotice(const FabricHeader& header)
     }
 }
 
+bool
+FabricEndpoint::TryForwardReceivedPacket(Ptr<Packet> pkt, FabricHeader& header)
+{
+    const uint16_t destRank = header.GetDestRank();
+    if (destRank == m_rank || m_routingTable.empty())
+    {
+        return false;
+    }
+
+    // Forward the packet to its destination
+    NS_LOG_DEBUG("Forwarding packet from " << header.GetSourceRank()
+                 << " to " << destRank << " at node " << m_rank);
+
+    uint32_t deviceIndex = ResolveDeviceIndex(destRank);
+    Mac48Address destMac = ResolveDestMac(destRank);
+    // Re-target the header's DestMac for THIS hop: switches route on the
+    // FabricHeader's MACs (nvswitch.cc), so a stale first-hop DestMac is
+    // unknown at the destination node's switch and floods every port --
+    // each non-target GPU then re-forwards the flooded copy, storming at
+    // high radix (gateway topologies: ring/torus2d/dragonfly).
+    header.SetDestMac(destMac);
+    pkt->AddHeader(header);
+    SendPacketOnDevice(pkt, deviceIndex, destMac);
+    return true;
+}
+
 void
 FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
 {
@@ -1635,16 +1646,8 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
     m_rxPackets++;
     m_rxBytes += pkt->GetSize();
 
-    uint16_t destRank = header.GetDestRank();
-
-    if (destRank != m_rank && !m_routingTable.empty())
+    if (TryForwardReceivedPacket(pkt, header))
     {
-        uint32_t deviceIndex = ResolveDeviceIndex(destRank);
-        Mac48Address destMac = ResolveDestMac(destRank);
-        // Re-target DestMac for this hop (see Receive's forwarding branch).
-        header.SetDestMac(destMac);
-        pkt->AddHeader(header);
-        SendPacketOnDevice(pkt, deviceIndex, destMac);
         return;
     }
 
@@ -2780,12 +2783,21 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     // chokepoint. So-only (efficiency < 1.0) data/collective traffic; control,
     // memory, retry, and scale-up traffic are untouched. At alpha=0 (no CNP)
     // ShapingDelay is zero, so the baseline is byte-identical (parity-safe).
+    // ORIGIN-guarded (codex round 24, finding 2): the per-QP pacer/ceiling is
+    // a property of the SENDING NIC. A FORWARDING endpoint re-sends packets
+    // whose SourceRank is the original sender's; keying those on its own
+    // m_rank merges transit traffic onto the forwarder's pacer — on routes
+    // 0->1->2 and 1->2 (shared dest/vc/flow, 49-Gbps ceiling) source 0
+    // finished at 1434 us where the true independent time is 714 us.
+    // ProcessCnpPacket keys on the flow's ORIGIN, so forwarded packets (which
+    // can never receive a CNP for the forwarder's key) are skipped entirely.
     Time shapingDelay = Time(0);
     if (m_dcqcnRate)
     {
         FabricHeader hdr;
         packet->PeekHeader(hdr);
-        if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket())
+        if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket()
+            && hdr.GetSourceRank() == m_rank)
         {
             double eff = GetProtocolModelForDest(hdr.GetDestRank())->GetEfficiency(hdr.GetProtocol());
             if (eff < 1.0)
@@ -2807,12 +2819,16 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     // DCQCN via max (both are earliest-egress constraints on the same chunk).
     // At the line rate (the initial state, before any over-target RTT sample)
     // ShapingDelay is zero, so the baseline is byte-identical (parity-safe).
+    // Same ORIGIN guard as DCQCN above (codex round 24, finding 2): forwarded
+    // packets carry the original sender's rank, and ProcessRttResponsePacket
+    // samples only self-originated probes — a transit packet must not touch
+    // (or be paced by) the forwarder's per-flow state.
     if (m_rttccRate)
     {
         FabricHeader hdr;
         packet->PeekHeader(hdr);
         if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket() &&
-            !IsLocalRank(hdr.GetDestRank()))
+            !IsLocalRank(hdr.GetDestRank()) && hdr.GetSourceRank() == m_rank)
         {
             uint64_t flowKey = MakeRateFlowKey(m_rank,
                                               hdr.GetDestRank(),
@@ -3155,9 +3171,10 @@ FabricEndpoint::SendDataWithProtocol(uint16_t destRank, const uint8_t* data, uin
 }
 
 void
-FabricEndpoint::SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uint32_t dataSize,
+FabricEndpoint::SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uint64_t dataSize,
                                       uint8_t protocolId, uint16_t flowId, uint8_t vcId)
 {
+    // (data is advisory — the 64-bit path sends dummy bytes by design.)
     (void)data;
     SendBulkWireTransferSize(destRank, dataSize, protocolId, flowId, vcId);
 }

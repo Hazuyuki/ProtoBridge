@@ -185,6 +185,16 @@ RandTrafficReceive(uint16_t /*rank*/, Ptr<Packet> packet, FabricHeader header)
     {
         return;
     }
+    // A PERMANENT_LOSS callback is a terminal-loss NOTICE (a synthetic empty
+    // packet carrying the lost chunk's metadata), not a delivery: counting
+    // its effectiveDataSize as delivered goodput reported 1363.149 Gbps on a
+    // 2-node / 4-GPU / leafspine / drop-threshold-1 / retry-0 run whose true
+    // payload goodput is 298.844 Gbps — 203 of 260 counted "messages" were
+    // loss notices (codex round 24, finding 3).
+    if (header.GetPacketType() == FabricPacketType::PERMANENT_LOSS)
+    {
+        return;
+    }
     uint32_t bytes = header.GetEffectiveDataSize();
     if (bytes == 0 && packet)
     {

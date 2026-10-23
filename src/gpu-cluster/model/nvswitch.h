@@ -664,17 +664,22 @@ class NvSwitch : public FabricSwitch
         FabricHeader header;    ///< Header of the multicast result packet
     };
     std::unordered_map<uint64_t, std::deque<SharpResultEntry>> m_sharpResultStore;
-    std::unordered_map<uint16_t, uint16_t> m_lastResultFlow; ///< destRank -> flow of stored entries
-    // Result-fragment retention. Result entries belong to a FLOW: when a dest
-    // sees a new flow's results, the old flow's entries are stale (its
-    // collective already completed and its seq stream is per-(dest,flow)) and
-    // are dropped wholesale, so the window only ever bounds ONE flow's
-    // fragments. The eviction harnesses pinned the true scale: 1,024
-    // fragments/dest for an 8-GPU 128-MiB allgather, 16,384 for 2 GiB — and
-    // header-only entries are ~144 B, so 65,536 entries per (dest, flow)
-    // bounds memory at ~9.4 MB while covering an 8-GPU 8-GiB allgather with
-    // headroom. The window is a safety valve for absurd geometries; the
-    // observed scales fit well inside it.
+    // destRank -> most recent flow whose results were stored. Bookkeeping
+    // only (diagnostics); HandleSwitchNack must NOT use it to re-key a
+    // named-flow NACK onto another flow's window (codex round 24, finding 4).
+    std::unordered_map<uint16_t, uint16_t> m_lastResultFlow;
+    // Result-fragment retention. Result entries belong to a FLOW and the
+    // store is keyed per (dest, flow), so concurrent flows keep independent
+    // windows — a new flow's results do NOT erase a prior flow's in-flight
+    // repair state (completion of one collective does not imply delivery of
+    // another's results; codex round 24, finding 4). Each window is bounded
+    // by SHARP_RESULT_WINDOW on its own. The eviction harnesses pinned the
+    // true scale: 1,024 fragments/dest for an 8-GPU 128-MiB allgather,
+    // 16,384 for 2 GiB — and header-only entries are ~144 B, so 65,536
+    // entries per (dest, flow) bounds memory at ~9.4 MB per live flow while
+    // covering an 8-GPU 8-GiB allgather with headroom. The window is a
+    // safety valve for absurd geometries; the observed scales fit well
+    // inside it.
     static constexpr size_t SHARP_RESULT_WINDOW = 65536; ///< Max stored results per (dest, flow)
     static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
 

@@ -520,9 +520,8 @@ NvSwitch::InjectResultNack(uint16_t requestingRank, uint32_t seqNum)
 size_t
 NvSwitch::GetSharpResultStoreSize(uint16_t destRank) const
 {
-    // Sum every flow's window for the dest (in practice at most one flow's
-    // entries are live — a new flow replaces the old one's, see
-    // StoreMulticastResult).
+    // Sum every flow's window for the dest (concurrent flows keep
+    // independent windows — see StoreMulticastResult's retention note).
     size_t total = 0;
     for (const auto& kv : m_sharpResultStore)
     {
@@ -1915,25 +1914,22 @@ NvSwitch::StoreMulticastResult(uint16_t destRank, uint16_t flowId,
     {
         return;
     }
-    // Entries belong to a FLOW. A new flow's first result replaces the old
-    // flow's entries wholesale: they are stale (that collective already
-    // completed) and result seqs are per-(dest, flow), so a fixed per-dest
-    // window would otherwise evict THIS flow's early fragments mid-generation
-    // once two flows' fragments interleaved (codex round 12: an 8-GPU 2-GiB
-    // allgather — 16,384 fragments/dest — lost its first half to the 8,192
-    // window before any of them could be NACKed).
+    // Entries belong to a FLOW and the store is keyed per (dest, flow), so
+    // concurrent flows keep INDEPENDENT windows — each bounded by
+    // SHARP_RESULT_WINDOW on its own. The old wholesale erase of the
+    // previous flow's window assumed "a new flow's results imply the old
+    // flow completed", but completion is not DELIVERY: flow 2 could
+    // aggregate and multicast while flow 1's results are still in flight,
+    // and the erase destroyed flow 1's repair state — a later NACK for
+    // flow 1/seq 0 then fell back to flow 2's window and retransmitted the
+    // WRONG flow's fragment while flow 1's loss stayed unrecoverable
+    // (codex round 24, finding 4). Eviction of an old flow's window now
+    // happens only through its own bound (the safety valve) or DoDispose;
+    // seq streams are per-(dest, flow), so cross-flow key collisions are
+    // impossible.
     uint64_t key = (static_cast<uint64_t>(destRank) << 16) | flowId;
     auto& window = m_sharpResultStore[key];
-    if (window.empty())
-    {
-        auto flowIt = m_lastResultFlow.find(destRank);
-        if (flowIt != m_lastResultFlow.end() && flowIt->second != flowId)
-        {
-            m_sharpResultStore.erase(
-                (static_cast<uint64_t>(destRank) << 16) | flowIt->second);
-        }
-        m_lastResultFlow[destRank] = flowId;
-    }
+    m_lastResultFlow[destRank] = flowId;
     window.push_back({seqNum, portIdx, 0, header});
     while (window.size() > SHARP_RESULT_WINDOW)
     {
@@ -1948,20 +1944,14 @@ NvSwitch::HandleSwitchNack(const FabricHeader& nackHeader, uint32_t inPort)
     uint16_t requestingRank = nackHeader.GetSourceRank();
     uint32_t seqNum = nackHeader.GetSequenceNumber();
 
-    // The store is keyed per (dest, flow) — the NACK names the flow it lost
-    // a fragment of; fall back to the dest's last stored flow when the NACK
-    // carries none (the test seam).
+    // The store is keyed per (dest, flow) and the NACK NAMES the flow it
+    // lost a fragment of: repair must serve THAT flow's window only. The
+    // old fallback to the dest's last stored flow silently re-keyed a
+    // flow-1 NACK onto flow 2's window after flow 1's entries were dropped
+    // — retransmitting the wrong flow's fragment while the requested one
+    // stayed unrecoverable (codex round 24, finding 4). A named-flow miss
+    // (stale/evicted/bogus flow id) is a genuine repair failure: false.
     uint16_t flowId = nackHeader.GetFlowId();
-    if (m_sharpResultStore.find((static_cast<uint64_t>(requestingRank) << 16) | flowId) ==
-        m_sharpResultStore.end())
-    {
-        auto flowIt = m_lastResultFlow.find(requestingRank);
-        if (flowIt == m_lastResultFlow.end())
-        {
-            return false;
-        }
-        flowId = flowIt->second;
-    }
     auto destIt = m_sharpResultStore.find(
         (static_cast<uint64_t>(requestingRank) << 16) | flowId);
     if (destIt == m_sharpResultStore.end())
