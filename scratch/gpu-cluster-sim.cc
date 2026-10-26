@@ -1034,7 +1034,20 @@ main(int argc, char* argv[])
     {
         protoModel = pbundle.protocol;
         payloadBuilder = pbundle.payloadBuilder;
-        if (pbundle.fec) { fecModel = pbundle.fec; }
+        if (pbundle.fec)
+        {
+            fecModel = pbundle.fec;
+            // The profile key set has no fecEnabled (RESERVED only covers
+            // fecN/fecK/fecT/fecEncodeLatencyNs/fecDecodeLatencyNs) and
+            // FecModel defaults m_enabled=true, so an unconditional swap
+            // silently re-enabled FEC after the CLI's --fecEnabled=0 had
+            // disabled the model built at line ~945 — config mode then ran
+            // with the encode/decode latency and BER-protection behavior
+            // the user had explicitly turned off, indistinguishable in the
+            // counters from --fecEnabled=1 (codex round 29, finding 4).
+            // The explicit CLI flag wins over the model default.
+            fecModel->SetEnabled(fecEnabled);
+        }
         llrEnabled = pbundle.llrEnabled;
         if (forceProtocol != 0)
         {

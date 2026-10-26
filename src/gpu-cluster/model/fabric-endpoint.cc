@@ -1509,6 +1509,11 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
             // decode completes (codex round 15, finding 1 — valgrind-confirmed
             // invalid reads/writes in ContinueReceiveAfterFec's traced-callback
             // and stats members, which DoDispose nulls).
+            // Pruned before each append so the ledger does not retain dead
+            // EventIds (and their captured packets) forever — the same
+            // append-site convention as SendDeferredEgressInternal and the
+            // switch result-event ledger (codex round 29, finding 2).
+            PruneDeferredEgressEvents();
             m_deferredEgressEvents.push_back(
                 Simulator::Schedule(decodeLatency,
                                     &FabricEndpoint::ContinueReceiveAfterFec,
@@ -2768,7 +2773,19 @@ FabricEndpoint::ProcessPfcPausePacket(const FabricHeader& pauseHeader)
     const uint16_t pausedDest = pauseHeader.GetSourceRank();
     NS_LOG_DEBUG("PFC PAUSE toward dest " << pausedDest
                   << " at VOQ depth " << pauseHeader.GetSequenceNumber());
-    m_pfcPausedDests.insert(pausedDest);
+    // Ownership is per originating switch, not per dest: a multi-hop path
+    // can have SEVERAL switches holding a pause for the same destination
+    // (each paused its own (inPort,outPort) hop). The PAUSE's SourceMac is
+    // the emitting switch's MAC (the original data header's DestMac at
+    // that hop), and the RESUME replays the PAUSE's MACs exactly — so
+    // (dest, SourceMac) identifies which switch's hold an incoming RESUME
+    // lifts. A dest-only key let one switch's RESUME clear another's
+    // outstanding hold: the endpoint resumed sending across a switch that
+    // was still paused (codex round 29, finding 1). Limitation: the header
+    // carries no port, so two pauses from the same switch MAC (multi-link
+    // ingress to one switch) share one entry — the first RESUME lifts it;
+    // the switch re-pauses if its VOQ refills.
+    m_pfcPausedDests[pausedDest].insert(pauseHeader.GetSourceMac());
 }
 
 void
@@ -2776,19 +2793,30 @@ FabricEndpoint::ProcessPfcResumePacket(const FabricHeader& resumeHeader)
 {
     const uint16_t resumedDest = resumeHeader.GetSourceRank();
     NS_LOG_DEBUG("PFC RESUME toward dest " << resumedDest);
-    if (m_pfcPausedDests.erase(resumedDest) > 0)
+    auto it = m_pfcPausedDests.find(resumedDest);
+    if (it == m_pfcPausedDests.end())
     {
-        // Sends toward this dest were being gated; drain what queued up.
-        TrySendQueuedPackets();
-        // PFC-held bulk chunks keep their TX-window slots while parked, so
-        // a pause can stall the window with inflight == m_soTxWindow and
-        // m_bulkTxQueue nonempty. The drain above re-sends the parked
-        // chunks, but the window needs a pump too: without it the next
-        // windowed chunk waited for an ACK that could not release a slot
-        // the window thought it still owed (round 27, finding 3's resume
-        // half).
-        PumpBulkTxWindow();
+        return;
     }
+    // Lift only this switch's hold (the RESUME replays the PAUSE's MACs,
+    // so SourceMac names the switch whose pause it resumes). The dest
+    // stays paused while any other switch still holds a pause for it.
+    it->second.erase(resumeHeader.GetSourceMac());
+    if (!it->second.empty())
+    {
+        return;
+    }
+    m_pfcPausedDests.erase(it);
+    // Sends toward this dest were being gated; drain what queued up.
+    TrySendQueuedPackets();
+    // PFC-held bulk chunks keep their TX-window slots while parked, so
+    // a pause can stall the window with inflight == m_soTxWindow and
+    // m_bulkTxQueue nonempty. The drain above re-sends the parked
+    // chunks, but the window needs a pump too: without it the next
+    // windowed chunk waited for an ACK that could not release a slot
+    // the window thought it still owed (round 27, finding 3's resume
+    // half).
+    PumpBulkTxWindow();
 }
 
 bool
@@ -3619,15 +3647,18 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             header.SetEffectiveDataSize(fragmentDataSize);
             header.SetTtl(64);
 
-            // Credit-based flow control: check and consume credits before sending.
-            // Scale-out (So) traffic bypasses credit: inter-node fabric uses
-            // ECN/DCQCN (RoCE) or VOQ tail-drop + LLR retransmit (Ethernet) for
-            // flow control, not per-packet credits. The Su/So split mirrors
-            // GetProtocolModelForDest's IsLocalRank() predicate. So packets
-            // never queue on credit (they'd deadlock since no credit is ever
-            // returned for So -- see OnPacketDelivered). Su (local rank)
-            // keeps full credit gating, unchanged.
-            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
+            // Admission through the virtual FlowControlGate (the documented
+            // send-gate seam). Scale-out (So) traffic bypasses credit:
+            // inter-node fabric uses ECN/DCQCN (RoCE) or VOQ tail-drop + LLR
+            // retransmit (Ethernet) for flow control, not per-packet credits.
+            // The Su/So split mirrors GetProtocolModelForDest's IsLocalRank()
+            // predicate. So packets never queue on credit (they'd deadlock
+            // since no credit is ever returned for So -- see
+            // OnPacketDelivered). Su (local rank) keeps full credit gating,
+            // unchanged. The gate performs the HasCredits/ConsumeCredit pair
+            // for the CREDIT policy, so a subclass override is no longer
+            // bypassed on this path (codex round 29, finding 3).
+            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
             {
                 NS_LOG_DEBUG("No credits for BULK chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -3700,10 +3731,6 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                 TrySendQueuedPackets();
                 break;
             }
-            if (m_creditManager && IsLocalRank(destRank))
-            {
-                m_creditManager->ConsumeCredit(vcId, seqNum);
-            }
 
             chunkPacket->AddHeader(header);
 
@@ -3768,10 +3795,10 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         header.SetEffectiveDataSize(static_cast<uint32_t>(dataSize));
         header.SetTtl(64);
 
-        // Credit-based flow control: check and consume credits before sending.
-        // So (inter-node) traffic bypasses credit (see multi-chunk branch
-        // above for the rationale); Su (local rank) keeps full gating.
-        if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
+        // Admission through the virtual FlowControlGate (see multi-chunk
+        // branch above; Su/So split and gate rationale, codex round 29
+        // finding 3).
+        if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
         {
             NS_LOG_DEBUG("No credits for BULK single packet on VC " << static_cast<int>(vcId));
             SendQueueEntry entry;
@@ -3782,10 +3809,6 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             m_sendQueue.push(entry);
             TrySendQueuedPackets();
             return;
-        }
-        if (m_creditManager && IsLocalRank(destRank))
-        {
-            m_creditManager->ConsumeCredit(vcId, seqNum);
         }
 
         packet->AddHeader(header);

@@ -105,14 +105,17 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
             header.SetSourceMac(m_address);
             header.SetDestMac(ResolveDestMac(destRank));
 
-            // Check and consume credit before sending (credit-based flow
-            // control) — Su (local-dest) traffic only. So (remote-dest) DATA
-            // bypasses credits, mirroring SendBulkWireTransferSize /
+            // Admission through the virtual FlowControlGate (the documented
+            // send-gate seam) — Su (local-dest) traffic only. So (remote-dest)
+            // DATA bypasses credits, mirroring SendBulkWireTransferSize /
             // SendP2p: the receiver returns credits only for local sources
             // (OnPacketDelivered's IsLocalRank guard), so a credit-consuming
             // remote send would drain the VC pool with no return path and
-            // stall after vcCredits sends.
-            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
+            // stall after vcCredits sends. The gate performs the
+            // HasCredits/ConsumeCredit pair for the CREDIT policy, so a
+            // subclass override is no longer bypassed on this path (codex
+            // round 29, finding 3).
+            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
             {
                 NS_LOG_DEBUG("No credits for DATA chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -161,10 +164,6 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 }
                 TrySendQueuedPackets();
                 break;
-            }
-            if (m_creditManager && IsLocalRank(destRank))
-            {
-                m_creditManager->ConsumeCredit(vcId, seqNum);
             }
 
             chunkPacket->AddHeader(header);
@@ -390,10 +389,14 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             header.SetDestMac(ResolveDestMac(destRank));
             header.SetEffectiveDataSize(thisEffectiveSize);
 
-            // Check and consume credit before sending (credit-based flow control)
-            // NVLS/SHARP packets bypass credits — switch SHARP engine has own buffer
+            // Admission through the virtual FlowControlGate (the documented
+            // send-gate seam). creditBypass stays as-is: NVLS/SHARP packets
+            // bypass credits — the switch SHARP engine has its own buffer.
+            // The gate performs the HasCredits/ConsumeCredit pair for the
+            // CREDIT policy, so a subclass override is no longer bypassed on
+            // this path (codex round 29, finding 3).
             uint8_t vcId = 0;
-            if (!creditBypass && m_creditManager && !m_creditManager->HasCredits(vcId))
+            if (!FlowControlGate(vcId, seqNum, creditBypass))
             {
                 NS_LOG_DEBUG("No credits for collective chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -457,10 +460,6 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                 // Try to send any queued packets that might have credits
                 TrySendQueuedPackets();
                 break;
-            }
-            if (!creditBypass && m_creditManager)
-            {
-                m_creditManager->ConsumeCredit(vcId, seqNum);
             }
 
             chunkPacket->AddHeader(header);
@@ -677,27 +676,26 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control: check and consume credits before sending.
-    // Su (local-dest) traffic only — the receiver returns credits solely for
-    // local sources (OnPacketDelivered's IsLocalRank guard), so a remote
-    // memory write would drain the VC pool with no return path.
+    // Admission through the virtual FlowControlGate (the documented
+    // send-gate seam). Su (local-dest) traffic only — the receiver returns
+    // credits solely for local sources (OnPacketDelivered's IsLocalRank
+    // guard), so a remote memory write would drain the VC pool with no
+    // return path. The gate performs the HasCredits/ConsumeCredit pair for
+    // the CREDIT policy, so a subclass override is no longer bypassed on
+    // this path (codex round 29, finding 3).
     uint8_t vcId = 0;
-    if (m_creditManager && IsLocalRank(destRank))
+    if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
     {
-        if (!m_creditManager->HasCredits(vcId))
-        {
-            NS_LOG_DEBUG("No credits for MEMORY_WRITE on VC " << static_cast<int>(vcId)
-                         << ", queuing packet");
-            SendQueueEntry entry;
-            entry.packet = packet;
-            entry.header = header;
-            entry.vcId = vcId;
-            entry.seqNum = seqNum;
-            m_sendQueue.push(entry);
-            TrySendQueuedPackets();
-            return;
-        }
-        m_creditManager->ConsumeCredit(vcId, seqNum);
+        NS_LOG_DEBUG("No credits for MEMORY_WRITE on VC " << static_cast<int>(vcId)
+                     << ", queuing packet");
+        SendQueueEntry entry;
+        entry.packet = packet;
+        entry.header = header;
+        entry.vcId = vcId;
+        entry.seqNum = seqNum;
+        m_sendQueue.push(entry);
+        TrySendQueuedPackets();
+        return;
     }
 
     packet->AddHeader(header);
@@ -743,25 +741,21 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control for MEMORY_RESP — Su (local-dest) traffic
-    // only (see SendMemoryWrite for the So bypass rationale).
+    // Admission through the virtual FlowControlGate (see SendMemoryWrite;
+    // Su/So split and gate rationale, codex round 29 finding 3).
     uint8_t vcId = 0;
-    if (m_creditManager && IsLocalRank(destRank))
+    if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
     {
-        if (!m_creditManager->HasCredits(vcId))
-        {
-            NS_LOG_DEBUG("No credits for MEMORY_RESP on VC " << static_cast<int>(vcId)
-                         << ", queuing packet");
-            SendQueueEntry entry;
-            entry.packet = packet;
-            entry.header = header;
-            entry.vcId = vcId;
-            entry.seqNum = seqNum;
-            m_sendQueue.push(entry);
-            TrySendQueuedPackets();
-            return;
-        }
-        m_creditManager->ConsumeCredit(vcId, seqNum);
+        NS_LOG_DEBUG("No credits for MEMORY_RESP on VC " << static_cast<int>(vcId)
+                     << ", queuing packet");
+        SendQueueEntry entry;
+        entry.packet = packet;
+        entry.header = header;
+        entry.vcId = vcId;
+        entry.seqNum = seqNum;
+        m_sendQueue.push(entry);
+        TrySendQueuedPackets();
+        return;
     }
 
     packet->AddHeader(header);
@@ -840,37 +834,33 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control for memory semantic packets — Su (local-dest)
-    // traffic only (see SendMemoryWrite for the So bypass rationale).
+    // Admission through the virtual FlowControlGate (see SendMemoryWrite;
+    // Su/So split and gate rationale, codex round 29 finding 3).
     uint8_t vcId = 0;
-    if (m_creditManager && IsLocalRank(destRank))
+    if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
     {
-        if (!m_creditManager->HasCredits(vcId))
-        {
-            NS_LOG_DEBUG("No credits for MEMORY_SEMANTIC on VC " << static_cast<int>(vcId)
-                         << ", queuing packet");
-            SendQueueEntry entry;
-            entry.packet = packet;
-            entry.header = header;
-            entry.vcId = vcId;
-            entry.seqNum = seqNum;
-            m_sendQueue.push(entry);
-            TrySendQueuedPackets();
-            // Still schedule completion — the packet will be sent when credits arrive
-            // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
-            // bound member call targets raw `this` and fires into freed
-            // memory when the endpoint is disposed and released before the
-            // completion latency elapses (codex round 17, finding 2 — with a
-            // 100-us sync latency and dispose+release at 1 us, valgrind
-            // confirmed invalid reads in NotifyMemorySemanticComplete's
-            // callback member access at the 100-us firing).
-            m_deferredEgressEvents.push_back(
-                Simulator::Schedule(NanoSeconds(latencyNs),
-                                    &FabricEndpoint::NotifyMemorySemanticComplete,
-                                    this, destRank, address, accessType));
-            return;
-        }
-        m_creditManager->ConsumeCredit(vcId, seqNum);
+        NS_LOG_DEBUG("No credits for MEMORY_SEMANTIC on VC " << static_cast<int>(vcId)
+                     << ", queuing packet");
+        SendQueueEntry entry;
+        entry.packet = packet;
+        entry.header = header;
+        entry.vcId = vcId;
+        entry.seqNum = seqNum;
+        m_sendQueue.push(entry);
+        TrySendQueuedPackets();
+        // Still schedule completion — the packet will be sent when credits arrive
+        // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
+        // bound member call targets raw `this` and fires into freed
+        // memory when the endpoint is disposed and released before the
+        // completion latency elapses (codex round 17, finding 2 — with a
+        // 100-us sync latency and dispose+release at 1 us, valgrind
+        // confirmed invalid reads in NotifyMemorySemanticComplete's
+        // callback member access at the 100-us firing).
+        m_deferredEgressEvents.push_back(
+            Simulator::Schedule(NanoSeconds(latencyNs),
+                                &FabricEndpoint::NotifyMemorySemanticComplete,
+                                this, destRank, address, accessType));
+        return;
     }
 
     packet->AddHeader(header);
@@ -994,11 +984,14 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             // receiver's ProcessDataPacket dispatch reads.
             header.SetProtocolFramed(true);
 
-            // Credit-based flow control: check and consume credits before
-            // sending — Su (local-dest) traffic only (see SendData for the
-            // So bypass rationale; the receiver's return is IsLocalRank-
-            // guarded, so a remote consume would never come back).
-            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
+            // Admission through the virtual FlowControlGate (the documented
+            // send-gate seam) — Su (local-dest) traffic only (see SendData
+            // for the So bypass rationale; the receiver's return is
+            // IsLocalRank-guarded, so a remote consume would never come
+            // back). The gate performs the HasCredits/ConsumeCredit pair
+            // for the CREDIT policy, so a subclass override is no longer
+            // bypassed on this path (codex round 29, finding 3).
+            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
             {
                 NS_LOG_DEBUG("No credits for DATA_INTERNAL chunk on VC " << static_cast<int>(vcId)
                              << ", queuing packet");
@@ -1012,10 +1005,6 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                 // Skip device selection for queued packets — TrySendQueuedPackets handles it
                 chunkIndex++;
                 continue;
-            }
-            if (m_creditManager && IsLocalRank(destRank))
-            {
-                m_creditManager->ConsumeCredit(vcId, seqNum);
             }
 
             pkt->AddHeader(header);

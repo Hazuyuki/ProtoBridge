@@ -10114,6 +10114,235 @@ class TransferStencilRangeValidationTest : public TestCase
     }
 };
 
+// (codex round 29, finding 1) Pause ownership was a dest-only set, so with
+// two switches holding a pause for the same destination, the FIRST switch's
+// RESUME cleared the shared entry and the endpoint transmitted through the
+// still-paused second switch. The pause state is now keyed by (dest,
+// originating-switch MAC — the PAUSE's SourceMac, which the RESUME replays),
+// so one switch's RESUME lifts only its own hold.
+class PfcTwoSwitchPauseOwnershipTest : public TestCase
+{
+  public:
+    PfcTwoSwitchPauseOwnershipTest()
+        : TestCase("PFC pause ownership is per originating switch") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        Ptr<PfcEndpointHarness> ep = CreateObject<PfcEndpointHarness>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1);
+        ep->AddNetDevice(link.Get(0));
+        ep->SetRoutingEntry(1, 0);
+        ep->SetBypassReorderBuffer(true);
+        ep->Initialize();
+
+        // Switch A (MAC ..0A) and switch B (MAC ..0B) both pause dest 1.
+        FabricHeader pauseA;
+        pauseA.SetPacketType(FabricPacketType::PFC_PAUSE);
+        pauseA.SetFabricType(FabricType::ETHERNET);
+        pauseA.SetSourceRank(1);
+        pauseA.SetDestRank(0);
+        pauseA.SetSourceMac(Mac48Address("00:00:00:00:00:0A"));
+        pauseA.SetDestMac(Mac48Address("00:00:00:00:00:01"));
+        ep->ProcessPfcPausePacket(pauseA);
+        FabricHeader pauseB = pauseA;
+        pauseB.SetSourceMac(Mac48Address("00:00:00:00:00:0B"));
+        ep->ProcessPfcPausePacket(pauseB);
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1), true,
+            "dest 1 is paused while both switches hold");
+
+        // Switch A drains and RESUMEs; switch B is still congested. The
+        // RESUME replays A's PAUSE MACs, so only A's hold lifts.
+        FabricHeader resumeA = pauseA;
+        resumeA.SetPacketType(FabricPacketType::PFC_RESUME);
+        ep->ProcessPfcResumePacket(resumeA);
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1), true,
+            "B's outstanding pause must survive A's RESUME "
+            "(pre-fix: the dest-only key let A's RESUME clear B's hold)");
+
+        // DATA toward dest 1 must still park under B's hold.
+        const uint64_t txBefore = ep->GetTxPackets();
+        std::vector<uint8_t> buf(64, 0);
+        ep->SendData(1, buf.data(), 64, 0);
+        Simulator::Stop(MicroSeconds(10));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), txBefore,
+            "no DATA may cross while B still holds a pause "
+            "(pre-fix: the send crossed the still-paused switch)");
+
+        // B's RESUME lifts the last hold and the dest resumes.
+        FabricHeader resumeB = pauseB;
+        resumeB.SetPacketType(FabricPacketType::PFC_RESUME);
+        ep->ProcessPfcResumePacket(resumeB);
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1), false,
+            "the last switch's RESUME clears the pause");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 29, finding 2) The FEC receive-deferral append site never
+// pruned m_deferredEgressEvents, and a receive-only endpoint (remote DATA,
+// LLR off) never enters SendPacketOnDevice's entry-side prune — 1,000
+// completed deliveries left 1,000 expired EventIds, each pinning its
+// captured packet. The append site now prunes like every other.
+class FecReceiveLedgerPruningTest : public TestCase
+{
+  public:
+    FecReceiveLedgerPruningTest()
+        : TestCase("FEC receive deferral prunes the egress-event ledger") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        Ptr<FabricEndpoint> a = CreateObject<FabricEndpoint>();
+        nodes.Get(0)->AddApplication(a);
+        a->SetRank(0);
+        a->SetLocalRankRange(0, 1);
+        a->AddNetDevice(link.Get(0));
+        a->SetRoutingEntry(1, 0);
+        a->SetBypassReorderBuffer(true);
+
+        Ptr<PfcEndpointHarness> b = CreateObject<PfcEndpointHarness>();
+        nodes.Get(1)->AddApplication(b);
+        b->SetRank(1);
+        b->SetLocalRankRange(1, 1);
+        b->AddNetDevice(link.Get(1));
+        b->SetRoutingEntry(0, 0);
+        b->SetBypassReorderBuffer(true);
+
+        // FEC on both sides: a encodes, b decodes with latency -> every
+        // received DATA defers through the FEC append site.
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        fec->SetFecParams(544, 514, 15);
+        fec->SetEncodeLatency(NanoSeconds(50));
+        fec->SetDecodeLatency(NanoSeconds(80));
+        a->SetFecModel(fec);
+        b->SetFecModel(fec);
+
+        a->Initialize();
+        b->Initialize();
+
+        uint32_t delivered = 0;
+        b->SetReceiveCallback([&delivered](uint16_t, Ptr<Packet>, FabricHeader) {
+            delivered++;
+        });
+
+        std::vector<uint8_t> buf(64, 0);
+        for (int i = 0; i < 200; ++i)
+        {
+            a->SendData(1, buf.data(), 64, 0);
+            Simulator::Stop(MicroSeconds(2));
+            Simulator::Run();
+        }
+        NS_TEST_ASSERT_MSG_EQ(delivered, 200u,
+            "every deferred receive must complete delivery");
+        const size_t total = b->GetDeferredEgressEventCountForTest();
+        const size_t live = b->GetLiveDeferredEgressEventCountForTest();
+        // Pre-fix: 200 expired entries pinning 200 packets. Post-fix the
+        // next append prunes the fired ones, so the ledger is near-empty.
+        NS_TEST_ASSERT_MSG_LT(total, 10u,
+            "completed FEC receive deferrals must not accumulate in the "
+            "ledger (pre-fix: one expired entry per delivery, 200 after 200 "
+            "deliveries)");
+        NS_TEST_ASSERT_MSG_EQ(live, 0u,
+            "no receive deferral is still pending after the deliveries");
+        a->Dispose();
+        b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 29, finding 3) The bulk/collective/memory send paths checked
+// and consumed credits inline instead of dispatching through the virtual
+// FlowControlGate, so a subclass overriding the gate to deny admission was
+// bypassed: a denied bulk transfer transmitted anyway. Every send path now
+// routes admission through FlowControlGate (the same fix the round-25 queue
+// drain received).
+class BulkSendRespectsFlowControlGateTest : public TestCase
+{
+  public:
+    BulkSendRespectsFlowControlGateTest()
+        : TestCase("Bulk and memory sends consult the overridden FlowControlGate") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        Ptr<DenyingGateEndpoint> ep = CreateObject<DenyingGateEndpoint>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 2); // dest 1 is LOCAL: credit-gated path
+        ep->AddNetDevice(link.Get(0));
+        ep->SetRoutingEntry(1, 0);
+        ep->SetBypassReorderBuffer(true);
+        ep->SetLlrEnabled(false);
+        ep->Initialize();
+
+        // 1-KiB single-chunk bulk transfer to LOCAL rank 1 (the inline-check
+        // path at the single-chunk branch). The gate must be consulted and
+        // its denial must hold.
+        ep->SendBulkWireTransferSize(1, 1024, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(ep->gateCalls, 0u,
+            "the overridden gate must be consulted on the bulk send path "
+            "(pre-fix: the inline HasCredits check bypassed it)");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
+            "a bulk packet the overridden gate denies must never transmit");
+
+        // The multi-chunk branch (4 chunks at 256 B with a 1-KiB bulk cap)
+        // routes through the gate too.
+        ep->SetBulkChunkSize(256);
+        ep->gateCalls = 0;
+        ep->SendBulkWireTransferSize(1, 1024, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(ep->gateCalls, 0u,
+            "the overridden gate must be consulted on the multi-chunk bulk path");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
+            "a multi-chunk bulk transfer the gate denies must never transmit");
+
+        // The memory-write path routes through the gate as well.
+        uint8_t mem[16] = {0};
+        ep->gateCalls = 0;
+        ep->SendMemoryWrite(1, 0x1000, mem, sizeof(mem));
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(ep->gateCalls, 0u,
+            "the overridden gate must be consulted on the memory-write path");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
+            "a memory write the gate denies must never transmit");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
 // (codex round 26, finding 1) MulticastAllReducePartition's chunk loop never
 // decremented bytesRemaining and never stopped at the wire end: with
 // effective=wire=8 B, 8 partitions and 18 lanes (numChunks floored to 18),
@@ -13008,6 +13237,14 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new NvSwitchResultLedgerPruningTest, TestCase::Duration::QUICK);
     AddTestCase(new ApplyBundleLlrModeTest, TestCase::Duration::QUICK);
     AddTestCase(new TransferStencilRangeValidationTest, TestCase::Duration::QUICK);
+
+    // Codex round 29 regressions (per-switch PFC pause ownership + FEC
+    // receive-deferral ledger pruning + bulk-path FlowControlGate routing;
+    // the config-mode --fecEnabled override is gated by
+    // test/parity/test_config_fec_enabled.py).
+    AddTestCase(new PfcTwoSwitchPauseOwnershipTest, TestCase::Duration::QUICK);
+    AddTestCase(new FecReceiveLedgerPruningTest, TestCase::Duration::QUICK);
+    AddTestCase(new BulkSendRespectsFlowControlGateTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

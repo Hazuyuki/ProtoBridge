@@ -29,6 +29,7 @@
 #include "ns3/mac48-address.h"
 #include "ns3/traced-callback.h"
 #include "ns3/timer.h"
+#include <map>
 #include <set>
 
 #include <vector>
@@ -825,9 +826,13 @@ class FabricEndpoint : public Application
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
     Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
     Ptr<RttccRateMachine> m_rttccRate{nullptr}; ///< RTTCC rate machine (So-only; null=dormant)
-    /// Destination ranks a switch PFC pause has silenced (So-only). Cleared
-    /// by PFC_RESUME; DoDispose empties it with the rest of the send state.
-    std::set<uint16_t> m_pfcPausedDests;
+    /// Destination ranks a switch PFC pause has silenced (So-only), with the
+    /// set of originating switch MACs still holding each pause (the PAUSE's
+    /// SourceMac; the RESUME replays it — keying per switch keeps one
+    /// switch's RESUME from lifting another's outstanding hold). A dest is
+    /// paused iff it has an entry with a nonempty MAC set. Cleared by
+    /// PFC_RESUME; DoDispose empties it with the rest of the send state.
+    std::map<uint16_t, std::set<Mac48Address>> m_pfcPausedDests;
     std::unordered_map<uint64_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(sourceRank,VC,flowId) reorder buffers, key=(srcRank<<32)|(vcId<<16)|flowId
 
     // Send queue

@@ -87,7 +87,68 @@ Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
 scripts (test_random_traffic.py extended with a goodput-excludes-losses
 check), valgrind QUICK exit 0 with zero errors.
 
-### Fixed — codex round 28: five defects — a deferred LLR repair losing its PFC exemption, two EventId ledgers growing without bound, ApplyBundle ignoring llrMode, and silent stencil rank/VC narrowing
+### Fixed — codex round 29: four defects — per-switch PFC pause ownership, the FEC receive-deferral ledger, bulk paths bypassing the FlowControlGate, and config mode clobbering --fecEnabled
+
+1. **One switch's PFC RESUME cleared another switch's outstanding pause**
+   (medium). The endpoint's pause state was a dest-only set
+   (`m_pfcPausedDests`), but switches pause per-(inPort,outPort) hop: on a
+   multi-hop path several switches can hold a pause for the same
+   destination, and the first switch's RESUME erased the shared entry —
+   the endpoint then transmitted across a switch that was still paused
+   (two-hop repro: A's RESUME cleared B's hold and a DATA crossed the
+   still-paused switch B). The pause state is now keyed by (dest,
+   originating-switch MAC): the PAUSE's SourceMac is the emitting
+   switch's MAC and the RESUME replays the PAUSE's MACs exactly, so each
+   RESUME lifts only its own switch's hold and the dest stays paused
+   while any switch still holds. Limitation: the header carries no port,
+   so two pauses from the same switch MAC share one entry (the first
+   RESUME lifts it; the switch re-pauses if its VOQ refills). Test:
+   `PFC pause ownership is per originating switch`.
+2. **The FEC receive-deferral append site never pruned the egress-event
+   ledger** (medium). The `ContinueReceiveAfterFec` schedule appended to
+   `m_deferredEgressEvents` without pruning (round 28 fixed only the
+   re-defer loop's appends), and a receive-only endpoint (remote DATA,
+   LLR off) never enters `SendPacketOnDevice`'s entry-side prune — 1,000
+   completed deliveries retained 1,000 expired EventIds, each pinning
+   its captured packet. The append site now calls
+   `PruneDeferredEgressEvents` like every other (the same convention as
+   round 28's fixes). Test: `FEC receive deferral prunes the
+   egress-event ledger`.
+3. **The bulk/collective/memory send paths bypassed the virtual
+   FlowControlGate** (medium). `FlowControlGate` is the documented
+   plug-in admission seam, but only the small-send path and the queue
+   drain dispatched through it: the bulk multi-chunk and single-chunk
+   paths (`SendBulkWireTransferSize`), the collective path
+   (`SendCollective`), the framed builder path (`SendDataInternal`), and
+   the memory paths (`SendMemoryWrite`/`SendMemoryResponse`/
+   `SendMemorySemantic`) inlined `HasCredits` + `ConsumeCredit` — a
+   subclass overriding the gate to deny admission was bypassed and the
+   denied bulk transfer transmitted anyway. All eight site-groups now
+   route admission through `FlowControlGate(vcId, seqNum,
+   !IsLocalRank(dest))` (the same fix the round-25 queue-drain received;
+   the So bypass arm and the NVLS/SHARP `creditBypass` are preserved).
+   Test: `Bulk and memory sends consult the overridden FlowControlGate`.
+4. **Config mode silently re-enabled FEC after `--fecEnabled=0`**
+   (medium). The `[stack]` profile's FEC model (always enabled —
+   `FecModel` defaults `m_enabled=true` and the profile key set has no
+   `fecEnabled`) unconditionally replaced the CLI-constructed model that
+   had honored the flag: with `--protocolConfig=p2p-single.cfg
+   --fecEnabled=0`, the run reported `fecNoError=18`, identical to
+   `--fecEnabled=1`, and paid the encode/decode latency the user had
+   explicitly disabled. The CLI flag is now applied to the bundle's
+   model after the swap, so the explicit CLI value always wins over the
+   model default. Parity gate: `test/parity/test_config_fec_enabled.py`
+   (config mode `--fecEnabled=0` must show zero FEC activity, differ in
+   sim time from `--fecEnabled=1`, and the enabled run must still
+   count decodes).
+
+Suite state: gpu-cluster EXTENSIVE 168 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 99 passed, 15/15 parity scripts
+(including the new config-FEC gate), valgrind on the three round-29
+probes (two-switch pause, FEC receive ledger, gate-deny bulk) 0 errors /
+no leaks.
+
+
 
 1. **A DEFERRED LLR repair lost its PFC exemption** (medium).
    `SendRetransmission` raises `m_isRetransmitting` only around the
