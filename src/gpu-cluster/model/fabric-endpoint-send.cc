@@ -172,7 +172,12 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
             // Select device using round-robin with global offset
             uint32_t deviceIdx = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(chunkPacket, deviceIdx, destMac);
+            if (!SendPacketOnDevice(chunkPacket, deviceIdx, destMac))
+            {
+                // PFC-held: parked on the send queue by the chokepoint; do
+                // not count a transmission (the resume drains it).
+                break;
+            }
 
             m_txTrace(chunkPacket->GetSize(), seqNum);
             m_txPackets++;
@@ -459,7 +464,12 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
 
             uint32_t deviceIdx = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(chunkPacket, deviceIdx, destMac);
+            if (!SendPacketOnDevice(chunkPacket, deviceIdx, destMac))
+            {
+                // PFC-held: parked on the send queue by the chokepoint; do
+                // not count a transmission (the resume drains it).
+                break;
+            }
 
             m_txTrace(chunkPacket->GetSize(), seqNum);
             m_txPackets++;
@@ -498,13 +508,16 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             packet->AddHeader(header);
             uint32_t deviceIdx = m_devices.empty() ? 0 : (m_globalSprayOffset % m_devices.size());
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(packet, deviceIdx, destMac);
-            if (!m_devices.empty())
+            const bool pfcHeld = !SendPacketOnDevice(packet, deviceIdx, destMac);
+            if (!pfcHeld && !m_devices.empty())
             {
                 m_globalSprayOffset = (m_globalSprayOffset + 1) % m_devices.size();
             }
-            m_txPackets++;
-            m_txBytes += packetSize;
+            if (!pfcHeld)
+            {
+                m_txPackets++;
+                m_txBytes += packetSize;
+            }
         }
         else
         {
@@ -1017,7 +1030,12 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             }
 
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(pkt, deviceIdx, destMac);
+            if (!SendPacketOnDevice(pkt, deviceIdx, destMac))
+            {
+                // PFC-held: parked on the send queue by the chokepoint; do
+                // not count a transmission (the resume drains it).
+                break;
+            }
 
             m_txTrace(pkt->GetSize(), seqNum);
             m_txPackets++;

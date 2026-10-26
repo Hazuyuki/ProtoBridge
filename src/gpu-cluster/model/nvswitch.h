@@ -355,6 +355,16 @@ class NvSwitch : public FabricSwitch
   protected:
     void DoDispose() override;
 
+    /// Per-VOQ packet capacity (packets). Read accessor for congestion
+    /// subclasses (EthernetSwitch's dynamic PFC threshold scales against it).
+    uint32_t GetVoqDepth() const { return m_voqDepth; }
+
+    /// Current occupancy (packets) of a VOQ; 0 for an unknown port.
+    size_t GetVoqSize(uint32_t outPort) const
+    {
+        return outPort < m_voqs.size() ? m_voqs[outPort].size() : 0;
+    }
+
     /**
      * @brief Test seam: feed an upload packet straight into the SHARP/NVLS
      * aggregation path, bypassing ReceiveFromPort's routing/preamble.

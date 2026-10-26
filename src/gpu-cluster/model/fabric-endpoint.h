@@ -496,8 +496,12 @@ class FabricEndpoint : public Application
      * @param packet The packet to send
      * @param deviceIndex Index of the device to use
      * @param dest Destination MAC address
+     * @return false when a PFC pause toward the packet's destination held it
+     *         on the send queue (the caller must NOT count the transmission
+     *         or consume a window/credit slot for it — the drain pass after
+     *         the RESUME re-invokes this and completes it); true otherwise.
      */
-    void SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
+    bool SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                             const Address& dest);
     /**
      * @brief Forward a received packet whose DestRank is not this endpoint.
@@ -692,7 +696,26 @@ class FabricEndpoint : public Application
     /// @brief Receive-side handler for an RTT_RESPONSE: turns the echo into
     ///        an RTT sample for the RTTCC machine. No-op when unmounted.
     void ProcessRttResponsePacket(const FabricHeader& respHeader);
+
     void TrySendQueuedPackets();
+
+  protected:
+    /// @brief Receive-side handler for an inbound PFC_PAUSE (802.1Qbb analog,
+    ///        So-only): suspends new sends toward the paused destination rank
+    ///        (the switch's congested egress). In-flight retransmit timers
+    ///        keep running — PFC is a no-drop backstop, so the LLR deadline
+    ///        is the safety net, never the primary recovery.
+    void ProcessPfcPausePacket(const FabricHeader& pauseHeader);
+
+    /// @brief Receive-side handler for an inbound PFC_RESUME: lifts the pause
+    ///        on the destination rank and drains what queued up meanwhile.
+    void ProcessPfcResumePacket(const FabricHeader& resumeHeader);
+
+    /// @brief True while a PFC pause from the switch silences sends toward
+    ///        destRank. Consulted by the send paths and the queue drain.
+    bool IsPfcPausedForDest(uint16_t destRank) const;
+
+  private:
 
     /**
      * @brief Internal method to send data with NCCL protocol
@@ -747,6 +770,9 @@ class FabricEndpoint : public Application
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
     Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
     Ptr<RttccRateMachine> m_rttccRate{nullptr}; ///< RTTCC rate machine (So-only; null=dormant)
+    /// Destination ranks a switch PFC pause has silenced (So-only). Cleared
+    /// by PFC_RESUME; DoDispose empties it with the rest of the send state.
+    std::set<uint16_t> m_pfcPausedDests;
     std::unordered_map<uint64_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(sourceRank,VC,flowId) reorder buffers, key=(srcRank<<32)|(vcId<<16)|flowId
 
     // Send queue

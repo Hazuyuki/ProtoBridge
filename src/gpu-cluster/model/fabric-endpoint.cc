@@ -240,6 +240,10 @@ FabricEndpoint::DoDispose()
         }
     }
     m_deferredEgressEvents.clear();
+    // PFC pause latch goes with the rest of the send state: no resume will
+    // arrive for a disposed endpoint, and a stale latch would hold the send
+    // queue forever if the object were ever re-initialized.
+    m_pfcPausedDests.clear();
     // Detach the promisc callbacks BEFORE dropping the device references:
     // they hold raw `this`, so a packet arriving on the channel after this
     // endpoint is gone would invoke ReceiveFromDevice on freed memory
@@ -1097,7 +1101,17 @@ FabricEndpoint::PumpBulkTxWindow()
         // paths (small unfragmented remote sends, local Su packets), which
         // must not free a bulk window slot they never consumed.
         m_bulkTxWindowSeqs.emplace(desc.destRank, desc.vcId, desc.flowId, seqNum);
-        SendPacketOnDevice(chunkPacket, desc.deviceIndex, ResolveDestMac(desc.destRank));
+        if (!SendPacketOnDevice(chunkPacket, desc.deviceIndex,
+                                ResolveDestMac(desc.destRank)))
+        {
+            // PFC-held: the packet parked on the send queue instead of the
+            // wire. Undo the window membership + inflight slot (the drain
+            // pass after the RESUME re-sends it via the queue, not the
+            // window) and do NOT count a transmission.
+            m_bulkTxWindowSeqs.erase({desc.destRank, desc.vcId, desc.flowId, seqNum});
+            m_bulkTxInflight--;
+            break; // the head chunk is held: later chunks would park too
+        }
 
         m_txTrace(chunkPacket->GetSize(), seqNum);
         m_txPackets++;
@@ -1551,6 +1565,18 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
         // RTTCC echo: turn it into an RTT sample for the rate machine.
         ProcessRttResponsePacket(header);
     }
+    else if (header.GetPacketType() == FabricPacketType::PFC_PAUSE)
+    {
+        // PFC PAUSE from the switch: suspend sends toward the paused dest.
+        // Intercepted before the generic control branch (a pause is not a
+        // credit), mirroring the CNP/RTT interception order.
+        ProcessPfcPausePacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::PFC_RESUME)
+    {
+        // PFC RESUME from the switch: lift the pause + drain the queue.
+        ProcessPfcResumePacket(header);
+    }
     else if (header.IsControlPacket())
     {
         ProcessCreditPacket(pkt, header);
@@ -1697,6 +1723,18 @@ FabricEndpoint::ContinueReceiveAfterFec(Ptr<Packet> pkt, FabricHeader header)
     {
         // RTTCC echo: turn it into an RTT sample for the rate machine.
         ProcessRttResponsePacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::PFC_PAUSE)
+    {
+        // PFC PAUSE from the switch: suspend sends toward the paused dest.
+        // Intercepted before the generic control branch (a pause is not a
+        // credit), mirroring the CNP/RTT interception order.
+        ProcessPfcPausePacket(header);
+    }
+    else if (header.GetPacketType() == FabricPacketType::PFC_RESUME)
+    {
+        // PFC RESUME from the switch: lift the pause + drain the queue.
+        ProcessPfcResumePacket(header);
     }
     else if (header.IsControlPacket())
     {
@@ -2714,8 +2752,41 @@ FabricEndpoint::GetRttccRateMachine() const
 }
 
 void
-FabricEndpoint::TrySendQueuedPackets()
+FabricEndpoint::ProcessPfcPausePacket(const FabricHeader& pauseHeader)
 {
+    // PFC PAUSE from the switch: the egress toward pauseHeader.GetSourceRank()
+    // (the switch mirrored the original header, so SourceRank = the paused
+    // flow's DESTINATION) is congested. Latch the pause; every send path and
+    // the queue drain check IsPfcPausedForDest before transmitting. The pause
+    // does NOT touch LLR timers or stored retry state: PFC is a no-drop
+    // backstop, so a retransmit deadline firing mid-pause still retransmits
+    // (the retry machinery is the safety net, never the primary recovery).
+    const uint16_t pausedDest = pauseHeader.GetSourceRank();
+    NS_LOG_DEBUG("PFC PAUSE toward dest " << pausedDest
+                  << " at VOQ depth " << pauseHeader.GetSequenceNumber());
+    m_pfcPausedDests.insert(pausedDest);
+}
+
+void
+FabricEndpoint::ProcessPfcResumePacket(const FabricHeader& resumeHeader)
+{
+    const uint16_t resumedDest = resumeHeader.GetSourceRank();
+    NS_LOG_DEBUG("PFC RESUME toward dest " << resumedDest);
+    if (m_pfcPausedDests.erase(resumedDest) > 0)
+    {
+        // Sends toward this dest were being gated; drain what queued up.
+        TrySendQueuedPackets();
+    }
+}
+
+bool
+FabricEndpoint::IsPfcPausedForDest(uint16_t destRank) const
+{
+    return m_pfcPausedDests.find(destRank) != m_pfcPausedDests.end();
+}
+
+void
+FabricEndpoint::TrySendQueuedPackets(){
     NS_LOG_FUNCTION(this);
 
     while (!m_sendQueue.empty())
@@ -2742,6 +2813,23 @@ FabricEndpoint::TrySendQueuedPackets()
             break;
         }
 
+        // PFC-held entries park behind the pause: the queue is FIFO and a
+        // paused dest blocks only its own tail (a paused dest's entries stop
+        // the drain at the first held packet — the head-of-line effect a
+        // real paused NIC queue has, which is exactly what PFC head-of-line
+        // blocking IS). Control/retry entries pass: SendPacketOnDevice
+        // re-checks and exempts them.
+        {
+            const FabricHeader& hdr = entry.header;
+            if (!hdr.IsControlPacket() && !hdr.IsRetryPacket()
+                && m_pfcPausedDests.count(hdr.GetDestRank()) > 0)
+            {
+                NS_LOG_DEBUG("PFC pause parks queued packet for dest "
+                             << hdr.GetDestRank());
+                break;
+            }
+        }
+
         Ptr<Packet> pkt = entry.packet->Copy();
         pkt->AddHeader(entry.header);
 
@@ -2756,7 +2844,12 @@ FabricEndpoint::TrySendQueuedPackets()
                                    ? entry.deviceIndex
                                    : ResolveDeviceIndex(entry.header.GetDestRank());
         Mac48Address destMac = ResolveDestMac(entry.header.GetDestRank());
-        SendPacketOnDevice(pkt, deviceIndex, destMac);
+        if (!SendPacketOnDevice(pkt, deviceIndex, destMac))
+        {
+            // PFC re-parked it (the authoritative check lives in the
+            // chokepoint): stop draining, leave the entry queued.
+            break;
+        }
 
         m_txTrace(pkt->GetSize(), entry.seqNum);
         m_txPackets++;
@@ -2766,11 +2859,42 @@ FabricEndpoint::TrySendQueuedPackets()
     }
 }
 
-void
+bool
 FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                                     const Address& dest)
 {
     NS_LOG_FUNCTION(this << packet << deviceIndex);
+
+    // PFC throttle (802.1Qbb analog, So-only): while the switch holds a pause
+    // against this destination, NEW DATA-CLASS transmissions toward it are
+    // held back on the send queue (the exact effect a qbb-net-device's
+    // m_paused[] has on its transmission scheduler). Exempt traffic —
+    // control (ACK/NACK/CREDIT/CNP/RTT/PFC), retry, and permanent-loss
+    // notices — flows unimpeded: pausing feedback would deadlock the
+    // reliability loop, and LLR retransmits are the safety net that keeps
+    // running under PFC (the pause is a no-drop backstop, not the recovery).
+    // Local (Su) destinations are never paused: a pause mirrors a So fabric
+    // header, so its SourceRank is always an inter-node rank.
+    if (!m_pfcPausedDests.empty())
+    {
+        FabricHeader throttleHdr;
+        packet->PeekHeader(throttleHdr);
+        if (!throttleHdr.IsControlPacket() && !throttleHdr.IsRetryPacket()
+            && !IsLocalRank(throttleHdr.GetDestRank())
+            && m_pfcPausedDests.count(throttleHdr.GetDestRank()) > 0)
+        {
+            SendQueueEntry entry;
+            entry.packet = packet->Copy();
+            entry.header = throttleHdr;
+            entry.vcId = throttleHdr.GetVirtualChannel();
+            entry.seqNum = throttleHdr.GetSequenceNumber();
+            entry.deviceIndex = deviceIndex;
+            m_sendQueue.push(entry);
+            NS_LOG_DEBUG("PFC pause holds packet for dest "
+                         << throttleHdr.GetDestRank() << " on the send queue");
+            return false;
+        }
+    }
 
     if (deviceIndex >= m_devices.size())
     {
@@ -2780,7 +2904,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // no timeout backstop (the retransmission paths cancel the pending
         // timer until wire transmission). Arm it here as the fallback.
         ArmRetryTimeoutOnWire(packet);
-        return;
+        return true;
     }
 
     // Prune fired deferred-egress events so the tracking vector stays
@@ -2954,7 +3078,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 });
                 m_deferredEgressEvents.push_back(decrEv);
                 TrackBacklogDecrement(decrEv, model, tc);
-                return;
+                return true;
             }
         }
     }
@@ -2989,7 +3113,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 m_deferredEgressEvents.push_back(decrEv);
                 TrackBacklogDecrement(decrEv, model, tc);
             }
-            return;
+            return true;
         }
     }
 
@@ -3027,6 +3151,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         m_deferredEgressEvents.push_back(decrEv);
         TrackBacklogDecrement(decrEv, model, tc);
     }
+    return true;
 }
 
 void
@@ -3502,7 +3627,12 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
 
             uint32_t deviceIdx = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(chunkPacket, deviceIdx, destMac);
+            if (!SendPacketOnDevice(chunkPacket, deviceIdx, destMac))
+            {
+                // PFC-held: parked on the send queue by the chokepoint;
+                // do not count a transmission (the resume drains it).
+                break;
+            }
 
             m_txTrace(chunkPacket->GetSize(), seqNum);
             m_txPackets++;
@@ -3580,7 +3710,12 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             deviceIdx = ResolveDeviceIndex(destRank);
         }
         Mac48Address destMac = ResolveDestMac(destRank);
-        SendPacketOnDevice(packet, deviceIdx, destMac);
+        if (!SendPacketOnDevice(packet, deviceIdx, destMac))
+        {
+            // PFC-held: parked on the send queue by the chokepoint; do not
+            // count a transmission (the resume drains it).
+            return;
+        }
 
         m_txTrace(packet->GetSize(), seqNum);
         m_txPackets++;

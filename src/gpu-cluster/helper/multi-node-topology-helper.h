@@ -116,6 +116,21 @@ class MultiNodeTopologyHelper
     /// never relies on switch-emitted NACKs); set true only for the plain
     /// (lossy) Ethernet path.
     void SetInterNodeSwitchLlrEnabled(bool enabled);
+    /// PFC (802.1Qbb-style) on every inter-node (So) switch. mode 0 = off
+    /// (default, byte-identical legacy), 1 = static pause threshold, 2 =
+    /// dynamic (HPCC SwitchMmu-style headroom-scaled). Threshold/offset ride
+    /// the EthernetSwitch attributes (Config::SetDefault before Build, or the
+    /// setters below for per-helper overrides).
+    void SetInterNodeSwitchPfcMode(uint32_t mode);
+    void SetInterNodeSwitchPfcPauseThreshold(uint32_t threshold);
+    void SetInterNodeSwitchPfcResumeOffset(uint32_t offset);
+
+  private:
+    /// Apply the PFC attributes to an So switch (no-op for mode 0 and for
+    /// non-EthernetSwitch subtypes via SetAttributeFailSafe).
+    void ApplyPfcAttributes(Ptr<NvSwitch> sw) const;
+
+  public:
 
     // Build
     NodeContainer Build();
@@ -152,6 +167,10 @@ class MultiNodeTopologyHelper
     uint32_t m_switchVoqDepth;
     uint32_t m_switchArbIntervalNs;
     uint64_t m_switchCutThroughDelayNs;
+    /// PFC attributes applied to every inter-node (So) switch (mode 0 = off).
+    uint32_t m_switchPfcMode;
+    uint32_t m_switchPfcPauseThreshold;
+    uint32_t m_switchPfcResumeOffset;
     Ptr<Arbiter> m_arbiter;
 
     std::string m_intraNodeDataRate;

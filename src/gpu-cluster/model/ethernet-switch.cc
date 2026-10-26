@@ -10,7 +10,10 @@
 #include "so-header.h"
 #include "ns3/log.h"
 #include "ns3/packet.h"
+#include "ns3/simulator.h"
 #include "ns3/uinteger.h"
+
+#include <algorithm>
 
 namespace ns3
 {
@@ -42,13 +45,46 @@ EthernetSwitch::GetTypeId()
                           "regime with LLR retransmit.",
                           UintegerValue(0),
                           MakeUintegerAccessor(&EthernetSwitch::m_voqDropThreshold),
+                          MakeUintegerChecker<uint32_t>(0))
+            .AddAttribute("PfcMode",
+                          "PFC (802.1Qbb-style) priority flow control: "
+                          "0 = off (default; byte-identical legacy "
+                          "behavior), 1 = static threshold (pause when a "
+                          "VOQ crosses PfcPauseThreshold), 2 = dynamic "
+                          "(HPCC SwitchMmu-style: the threshold follows "
+                          "the remaining VOQ headroom, so a nearly-full "
+                          "switch pauses earlier). With PFC on, keep "
+                          "PfcPauseThreshold < VoqDropThreshold so the "
+                          "pause fires before the tail-drop.",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&EthernetSwitch::m_pfcMode),
+                          MakeUintegerChecker<uint32_t>(0, 2))
+            .AddAttribute("PfcPauseThreshold",
+                          "PFC: VOQ depth (packets) at which the switch "
+                          "PAUSEs the ingress feeding the congested "
+                          "egress (mode 1; the baseline for mode 2). "
+                          "Inert when PfcMode=0.",
+                          UintegerValue(64),
+                          MakeUintegerAccessor(&EthernetSwitch::m_pfcPauseThreshold),
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("PfcResumeOffset",
+                          "PFC resume hysteresis (packets): the pause "
+                          "lifts once the VOQ drains to "
+                          "PfcPauseThreshold - PfcResumeOffset. Guards "
+                          "against pause/resume thrash around the "
+                          "threshold. Inert when PfcMode=0.",
+                          UintegerValue(8),
+                          MakeUintegerAccessor(&EthernetSwitch::m_pfcResumeOffset),
                           MakeUintegerChecker<uint32_t>(0));
     return tid;
 }
 
 EthernetSwitch::EthernetSwitch()
     : m_ecnThreshold(8),
-      m_voqDropThreshold(0)
+      m_voqDropThreshold(0),
+      m_pfcMode(0),
+      m_pfcPauseThreshold(64),
+      m_pfcResumeOffset(8)
 {
 }
 
@@ -59,16 +95,187 @@ EthernetSwitch::GetVendorName() const
 }
 
 bool
+EthernetSwitch::IsPfcPaused(uint32_t inPort, uint32_t outPort) const
+{
+    auto it = m_pfcPaused.find({inPort, outPort});
+    return it != m_pfcPaused.end() && it->second;
+}
+
+void
+EthernetSwitch::DoDispose()
+{
+    // Cancel every pending resume-hysteresis watcher: each targets raw `this`
+    // and dereferences m_voqs/m_ports, which the base DoDispose clears below —
+    // a survivor firing after disposal is the same UAF class the deferred-result
+    // ledger fixed (codex round 15, finding 2).
+    for (const EventId& ev : m_pfcResumeEvents)
+    {
+        if (!ev.IsExpired())
+        {
+            Simulator::Cancel(ev);
+        }
+    }
+    m_pfcResumeEvents.clear();
+    m_pfcPaused.clear();
+    m_lastPfcPauseHeader.clear();
+    NvSwitch::DoDispose();
+}
+
+// PFC trigger, evaluated per arriving packet. The threshold in mode 1 is the
+// static PfcPauseThreshold; in mode 2 it is dynamic — the HPCC SwitchMmu
+// contract (GetPfcThreshold: (buffer - used) >> shift) compressed to our
+// single-priority VOQ model: threshold = PfcPauseThreshold scaled down by the
+// remaining headroom fraction, so a nearly-full switch pauses earlier. The
+// pause is latched per (inPort -> outPort) hop and idempotent: re-crossing
+// while paused emits nothing (matching qbb-net-device's paused[] check in
+// CheckShouldPause).
+uint32_t
+EthernetSwitch::EffectivePfcPauseThreshold(uint32_t outPort) const
+{
+    if (m_pfcMode == 2)
+    {
+        const uint32_t depth = GetVoqDepth();
+        if (depth > 0)
+        {
+            // Headroom-aware scaling: threshold * (1 - occupancy). At zero
+            // backlog this is exactly the static threshold (mode-2 == mode-1
+            // baseline); as the VOQ fills, the effective pause point drops
+            // toward zero — the same "pause earlier when the buffer is
+            // scarce" direction as HPCC's (buffer_size - shared_used) >> shift.
+            double occupancy = static_cast<double>(GetVoqSize(outPort))
+                               / static_cast<double>(depth);
+            double scaled = static_cast<double>(m_pfcPauseThreshold) * (1.0 - occupancy);
+            return std::max<uint32_t>(1u, static_cast<uint32_t>(scaled));
+        }
+    }
+    return m_pfcPauseThreshold;
+}
+
+void
+EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
+                                  uint32_t inPort, size_t voqDepth)
+{
+    if (m_pfcMode == 0 || inPort >= GetNPorts() || outPort >= GetNPorts())
+    {
+        return;
+    }
+    // Only DATA-class So traffic pauses its source: control/retry/feedback
+    // packets bypass (the same bypass class as ECN and the lossy drop —
+    // pausing the feedback loop itself would deadlock it).
+    if (fh.IsControlPacket() || fh.IsRetryPacket())
+    {
+        return;
+    }
+    if (IsPfcPaused(inPort, outPort))
+    {
+        return; // already paused toward this hop: idempotent
+    }
+    if (voqDepth < EffectivePfcPauseThreshold(outPort))
+    {
+        return;
+    }
+
+    // PAUSE toward the source behind this ingress. The FabricHeader carries
+    // the (dest=source, source=dest) mirror of the original — the same
+    // reversal EmitNackBack uses. The sequence-number field carries the
+    // paused VOQ's depth (the PauseHeader qlen analog; zero quanta here
+    // means "paused until an explicit RESUME", not the 802.1Qbb timer
+    // expiry).
+    FabricHeader pause;
+    pause.SetPacketType(FabricPacketType::PFC_PAUSE);
+    pause.SetFabricType(fh.GetFabricType());
+    pause.SetSourceRank(fh.GetDestRank());
+    pause.SetDestRank(fh.GetSourceRank());
+    pause.SetSequenceNumber(static_cast<uint32_t>(voqDepth));
+    pause.SetFlowId(fh.GetFlowId());
+    pause.SetVirtualChannel(fh.GetVirtualChannel());
+    pause.SetSourceMac(fh.GetDestMac());
+    pause.SetDestMac(fh.GetSourceMac());
+
+    Ptr<Packet> pausePkt = Create<Packet>(0);
+    pausePkt->AddHeader(pause);
+    GetPort(inPort)->Send(pausePkt, fh.GetSourceMac(), 0x0800);
+
+    m_pfcPaused[{inPort, outPort}] = true;
+    // Retain the mirrored header so the eventual RESUME (CheckPfcResume)
+    // reverses exactly this pause: same ranks/MACs/fabric type.
+    m_lastPfcPauseHeader[{inPort, outPort}] = pause;
+    m_pfcPausesSent++;
+
+    // Resume hysteresis watcher: poll the drained VOQ; lift the pause once
+    // it falls to threshold - offset (HPCC's resume_offset guard against
+    // thrash). Runs while paused; the ledger entry is retired at resume
+    // (DoDispose cancels whatever is still pending).
+    EventId watcher = Simulator::Schedule(NanoSeconds(500),
+                                          &EthernetSwitch::CheckPfcResume,
+                                          this, inPort, outPort);
+    m_pfcResumeEvents.push_back(watcher);
+}
+
+void
+EthernetSwitch::CheckPfcResume(uint32_t inPort, uint32_t outPort)
+{
+    if (!IsPfcPaused(inPort, outPort) || inPort >= GetNPorts())
+    {
+        return;
+    }
+    uint32_t threshold = EffectivePfcPauseThreshold(outPort);
+    uint32_t resumeLevel = (threshold > m_pfcResumeOffset)
+                               ? threshold - m_pfcResumeOffset
+                               : 0;
+    if (GetVoqSize(outPort) > resumeLevel)
+    {
+        // Still congested: keep watching.
+        EventId watcher = Simulator::Schedule(NanoSeconds(500),
+                                              &EthernetSwitch::CheckPfcResume,
+                                              this, inPort, outPort);
+        m_pfcResumeEvents.push_back(watcher);
+        return;
+    }
+    // Drained past the hysteresis level: RESUME the paused source.
+    m_pfcPaused[{inPort, outPort}] = false;
+
+    // The RESUME re-targets whichever source the PAUSE silenced. The PAUSE
+    // mirrored the ORIGINAL data header's ranks/MACs; replay that reversal
+    // via m_lastPfcPauseHeader so the RESUME reaches the same endpoint.
+    auto it = m_lastPfcPauseHeader.find({inPort, outPort});
+    if (it != m_lastPfcPauseHeader.end())
+    {
+        FabricHeader resume;
+        resume.SetPacketType(FabricPacketType::PFC_RESUME);
+        resume.SetFabricType(it->second.GetFabricType());
+        resume.SetSourceRank(it->second.GetSourceRank());
+        resume.SetDestRank(it->second.GetDestRank());
+        resume.SetSequenceNumber(0);
+        resume.SetFlowId(it->second.GetFlowId());
+        resume.SetVirtualChannel(it->second.GetVirtualChannel());
+        resume.SetSourceMac(it->second.GetSourceMac());
+        resume.SetDestMac(it->second.GetDestMac());
+
+        Ptr<Packet> resumePkt = Create<Packet>(0);
+        resumePkt->AddHeader(resume);
+        GetPort(inPort)->Send(resumePkt, it->second.GetDestMac(), 0x0800);
+        m_lastPfcPauseHeader.erase(it);
+    }
+    m_pfcResumesSent++;
+}
+
+bool
 EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
                                 uint32_t inPort, size_t voqDepth)
 {
-    (void)outPort;
     if (!packet)
     {
         return true;
     }
     FabricHeader fh;
     packet->PeekHeader(fh);
+
+    // PFC (opt-in, default off): past the pause threshold, PAUSE the ingress
+    // feeding this egress instead of dropping — the no-drop backstop RoCE
+    // layers UNDER ECN (pause must fire after mark: EcnThreshold <
+    // PfcPauseThreshold < VoqDropThreshold is the intended ordering).
+    MaybeSendPfcPause(fh, outPort, inPort, voqDepth);
 
     // Lossy drop: a DATA packet (plain-Ethernet, or RoCE when
     // --voqDropThreshold > 0 opts into the lossy-RoCE/no-PFC regime) that

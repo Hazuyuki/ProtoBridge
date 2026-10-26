@@ -14,6 +14,7 @@
 #include "ns3/log.h"
 #include "ns3/mac48-address.h"
 #include "ns3/drop-tail-queue.h"
+#include "ns3/uinteger.h"
 
 #include <cmath>
 
@@ -32,6 +33,9 @@ MultiNodeTopologyHelper::MultiNodeTopologyHelper()
       m_switchVoqDepth(10000),
       m_switchArbIntervalNs(100),
       m_switchCutThroughDelayNs(200),
+      m_switchPfcMode(0),
+      m_switchPfcPauseThreshold(64),
+      m_switchPfcResumeOffset(8),
       m_arbiter(nullptr),
       m_intraNodeDataRate("3600Gbps"),
       m_intraNodeDelay("400ns"),
@@ -67,6 +71,9 @@ void MultiNodeTopologyHelper::SetInterNodeFabricType(FabricType type) { m_interN
 void MultiNodeTopologyHelper::SetInterNodeTopology(const std::string& topo) { m_interNodeTopology = topo; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchType(const std::string& typeId) { m_interNodeSwitchType = typeId; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchLlrEnabled(bool enabled) { m_interNodeSwitchLlrEnabled = enabled; }
+void MultiNodeTopologyHelper::SetInterNodeSwitchPfcMode(uint32_t mode) { m_switchPfcMode = mode; }
+void MultiNodeTopologyHelper::SetInterNodeSwitchPfcPauseThreshold(uint32_t threshold) { m_switchPfcPauseThreshold = threshold; }
+void MultiNodeTopologyHelper::SetInterNodeSwitchPfcResumeOffset(uint32_t offset) { m_switchPfcResumeOffset = offset; }
 void MultiNodeTopologyHelper::SetInterNodeSpines(uint32_t spines) { m_interNodeSpines = spines; }
 void MultiNodeTopologyHelper::SetInterNodeTorusWidth(uint32_t width) { m_interNodeTorusWidth = width; }
 void MultiNodeTopologyHelper::SetInterNodeDragonflyGroupSize(uint32_t groupSize) { m_interNodeDragonflyGroupSize = groupSize; }
@@ -89,9 +96,26 @@ MultiNodeTopologyHelper::CreateInterNodeSwitch(Ptr<Node>& switchNode)
         sw->SetArbiter(m_arbiter);
     }
     sw->SetLlrEnabled(m_interNodeSwitchLlrEnabled);
+    ApplyPfcAttributes(sw);
     m_allSwitchNodes.Add(switchNode);
     m_allNodes.Add(switchNode);
     return sw;
+}
+
+void
+MultiNodeTopologyHelper::ApplyPfcAttributes(Ptr<NvSwitch> sw) const
+{
+    // PFC is an EthernetSwitch feature; a plain NvSwitch (or any other
+    // subtype) has no such attributes — SetAttributeFailSafe keeps the
+    // dynamic-cast-free call a no-op there.
+    if (m_switchPfcMode != 0)
+    {
+        sw->SetAttributeFailSafe("PfcMode", UintegerValue(m_switchPfcMode));
+        sw->SetAttributeFailSafe("PfcPauseThreshold",
+                                 UintegerValue(m_switchPfcPauseThreshold));
+        sw->SetAttributeFailSafe("PfcResumeOffset",
+                                 UintegerValue(m_switchPfcResumeOffset));
+    }
 }
 
 uint32_t
@@ -577,6 +601,7 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
                 hostSwitch->SetArbiter(m_arbiter);
             }
             hostSwitch->SetLlrEnabled(m_interNodeSwitchLlrEnabled);
+            ApplyPfcAttributes(hostSwitch);
             interNodeSwitchNodes[nodeId] = switchNode;
             interNodeSwitches[nodeId] = hostSwitch;
             m_allSwitchNodes.Add(switchNode);
@@ -668,6 +693,7 @@ MultiNodeTopologyHelper::BuildInterNodeLinks()
             leafSwitch->SetArbiter(m_arbiter);
         }
         leafSwitch->SetLlrEnabled(m_interNodeSwitchLlrEnabled);
+        ApplyPfcAttributes(leafSwitch);
         interNodeSwitchNodes[0] = switchNode;
         interNodeSwitches[0] = leafSwitch;
         m_allSwitchNodes.Add(switchNode);

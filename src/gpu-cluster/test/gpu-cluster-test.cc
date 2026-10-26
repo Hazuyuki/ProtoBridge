@@ -9106,6 +9106,236 @@ class SharpResultFlowRetirementTest : public TestCase
     }
 };
 
+// ---------------------------------------------------------------------------
+// PFC (IEEE 802.1Qbb-style) priority flow control — the opt-in third arm of
+// the So congestion contract (ECN mark / PFC pause / VOQ tail-drop).
+// ---------------------------------------------------------------------------
+
+// A switch harness exposing the protected enqueue datapath so tests can
+// drive full VOQ admission (OnPacketEnqueue + push) without a fabric.
+class EthernetSwitchPfcHarness : public EthernetSwitch
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::EthernetSwitchPfcHarness")
+                                .SetParent<EthernetSwitch>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<EthernetSwitchPfcHarness>();
+        return tid;
+    }
+    EthernetSwitchPfcHarness() = default;
+    using EthernetSwitch::OnPacketEnqueue; // public on the base already; keep parity
+    /// Drive the full admission path exactly as EnqueueToVoq would (the
+    /// pre-push congestion hook + the VOQ push), minus port bookkeeping.
+    bool Admit(Ptr<Packet> p, uint32_t outPort, uint32_t inPort)
+    {
+        if (!EthernetSwitch::OnPacketEnqueue(p, outPort, inPort, VoqSize(outPort)))
+        {
+            return false;
+        }
+        return true;
+    }
+    size_t VoqSize(uint32_t outPort) const { return GetVoqSize(outPort); }
+};
+
+NS_OBJECT_ENSURE_REGISTERED(EthernetSwitchPfcHarness);
+
+// PFC trigger semantics: mode 0 stays dark; mode 1 pauses past the static
+// threshold, latches idempotently, and exempts control traffic; mode 2's
+// dynamic threshold follows the static baseline at zero occupancy.
+class EthernetSwitchPfcTriggerTest : public TestCase
+{
+  public:
+    EthernetSwitchPfcTriggerTest()
+        : TestCase("EthernetSwitch PFC pause trigger (static, dynamic, off)") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // Each sub-case gets a real switch with one port wired to a dead p2p
+        // peer: the trigger needs a port to (pretend to) egress the PAUSE
+        // frame onto. The frame itself lands on the channel and goes nowhere
+        // (the far node has no receiver for it) — the test pins the LATCH +
+        // COUNTER state.
+        auto makeSwitch = []() {
+            NodeContainer nodes;
+            nodes.Create(2);
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes.Get(0), nodes.Get(1));
+            Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+            nodes.Get(0)->AddDevice(sw);
+            sw->AddPort(devs.Get(0));
+            return sw;
+        };
+
+        auto makeEthData = []() {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0);
+            fh.SetSourceRank(1);
+            fh.SetDestRank(0);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            pkt->AddHeader(fh);
+            return pkt;
+        };
+
+        // (1) Mode 0 (default off): no pause at any depth, byte-identical.
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            for (size_t d = 0; d <= 200; d += 50)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, d), true,
+                                      "mode 0 admits at any depth");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 0u,
+                                  "mode 0 must never pause");
+            NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 0), false,
+                                  "mode 0 must not latch a pause");
+            sw->Dispose();
+        }
+
+        // (2) Mode 1, static threshold 64: below = no pause, at/above = pause
+        // ONCE (idempotent latch — re-crossing emits nothing, matching
+        // qbb-net-device's paused[] check).
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            sw->SetAttribute("PfcMode", UintegerValue(1));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(64));
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 63), true,
+                                  "below threshold admits and does not pause");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 0u, "63 < 64: no pause");
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 64), true,
+                                  "at threshold admits (pause, not drop)");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 1u, "64 >= 64: pause fired");
+            NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 0), true, "pause latched on the hop");
+            // Re-crossing while paused: idempotent (no second frame).
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 80), true,
+                                  "admits while paused (the drop path is separate)");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 1u,
+                                  "re-crossing while paused must not re-pause");
+            // Control traffic never triggers a pause (feedback must flow).
+            Ptr<Packet> ctrl = Create<Packet>(16);
+            FabricHeader cfh;
+            cfh.SetPacketType(FabricPacketType::CREDIT);
+            cfh.SetFabricType(FabricType::ETHERNET);
+            ctrl->AddHeader(cfh);
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(ctrl, 0, 0, 500), true,
+                                  "control packet bypasses the PFC trigger");
+            sw->Dispose();
+        }
+
+        // (3) Mode 2, dynamic: at zero occupancy the headroom-scaled threshold
+        // equals the static baseline (the scaling floor/ceiling identity); a
+        // deep arrival pauses exactly as mode 1 would. The occupancy-scaled
+        // (pause-EARLIER) regime is exercised e2e where real backlog accrues.
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            sw->SetAttribute("PfcMode", UintegerValue(2));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(64));
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 40), true,
+                                  "mode 2 at depth 40, empty VOQ: no pause yet");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 0u, "dynamic baseline ~static");
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 64), true,
+                                  "mode 2 at depth 64: pause fires");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 1u, "dynamic pause fired");
+            sw->Dispose();
+        }
+        Simulator::Destroy();
+    }
+};
+
+// Expose the protected PFC handlers for direct drive.
+class PfcEndpointHarness : public FabricEndpoint
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::PfcEndpointHarness")
+                                .SetParent<FabricEndpoint>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<PfcEndpointHarness>();
+        return tid;
+    }
+    PfcEndpointHarness() = default;
+    using FabricEndpoint::ProcessPfcPausePacket;
+    using FabricEndpoint::ProcessPfcResumePacket;
+    using FabricEndpoint::IsPfcPausedForDest;
+};
+
+NS_OBJECT_ENSURE_REGISTERED(PfcEndpointHarness);
+
+// The endpoint's PFC contract: PAUSE latches the dest and parks DATA sends
+// (and queued entries) toward it; control sends flow unimpeded; RESUME lifts
+// the latch and drains the parked queue.
+class PfcEndpointHoldTest : public TestCase
+{
+  public:
+    PfcEndpointHoldTest()
+        : TestCase("PFC PAUSE holds endpoint DATA sends; RESUME drains") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        Ptr<PfcEndpointHarness> ep = CreateObject<PfcEndpointHarness>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1);
+        ep->AddNetDevice(link.Get(0));
+        ep->SetRoutingEntry(1, 0);
+        ep->SetNeighborMac(1, Mac48Address::ConvertFrom(link.Get(1)->GetAddress()));
+        ep->SetBypassReorderBuffer(true);
+        ep->Initialize();
+
+        uint64_t txBefore = ep->GetTxPackets();
+        // Pause dest 1, then send a DATA packet toward it: it must park.
+        FabricHeader pauseHdr;
+        pauseHdr.SetPacketType(FabricPacketType::PFC_PAUSE);
+        pauseHdr.SetFabricType(FabricType::ETHERNET);
+        pauseHdr.SetSourceRank(1);
+        pauseHdr.SetDestRank(0);
+        pauseHdr.SetSequenceNumber(64);
+        ep->ProcessPfcPausePacket(pauseHdr);
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1), true,
+                              "pause latches the destination");
+
+        ep->SendBulkWireTransferSize(1, 4096, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        uint64_t heldTx = ep->GetTxPackets();
+        NS_TEST_ASSERT_MSG_EQ(heldTx > txBefore, false,
+                              "DATA toward a paused dest must not transmit "
+                              "(pre-fix would send immediately)");
+
+        // RESUME: the latch lifts and the parked chunks drain.
+        FabricHeader resumeHdr = pauseHdr;
+        resumeHdr.SetPacketType(FabricPacketType::PFC_RESUME);
+        ep->ProcessPfcResumePacket(resumeHdr);
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1), false,
+                              "resume lifts the pause");
+        Simulator::Stop(MicroSeconds(200));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(ep->GetTxPackets(), txBefore,
+                              "resume must drain the parked sends");
+
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+
 // Multicast result sequence numbering must be per-destination: endpoint
 // reorder buffers (the module default, SetBypassReorderBuffer(false)) key on
 // (vc, flow, source) and expect each stream to start at seq 0. Codex repro
@@ -11719,6 +11949,10 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new QueuedSendRespectsFlowControlGateTest, TestCase::Duration::QUICK);
     AddTestCase(new LlrRetryLimitReachesManagerTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultFlowRetirementTest, TestCase::Duration::QUICK);
+
+    // PFC (802.1Qbb-style) opt-in congestion arm.
+    AddTestCase(new EthernetSwitchPfcTriggerTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcEndpointHoldTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

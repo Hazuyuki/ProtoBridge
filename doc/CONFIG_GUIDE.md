@@ -95,8 +95,29 @@ credit-return path (`OnPacketDelivered`). So flow control is the lossless/lossy
 fabric mechanism instead: ECN + DCQCN + per-QP ceiling
 (`--ecnThreshold`/`--dcqcn`/`--perQpCeilingGbps`) for RoCE, VOQ tail-drop +
 LLR retransmit (`--voqDropThreshold`/`--llrMode`/`--llrRetryLimit`) for plain
-Ethernet — matching real hardware (RDMA uses ECN/PFC, not per-packet credits;
+Ethernet, and opt-in PFC (`--switchPfcMode`) as the no-drop backstop under
+them — matching real hardware (RDMA uses ECN/PFC, not per-packet credits;
 NVLink is credit-based). Tuning `vcCredits` therefore only affects Su latency.
+
+**PFC (IEEE 802.1Qbb-style) is an opt-in third arm:** `--switchPfcMode=0`
+(default, off — byte-identical legacy), `1` = static pause threshold, `2` =
+dynamic (HPCC SwitchMmu-style: the threshold scales with the remaining VOQ
+headroom, so a nearly-full switch pauses earlier). Past
+`--pfcPauseThreshold` (default 64) the So switch PAUSEs the ingress feeding
+the congested egress instead of dropping; the RESUME fires once the VOQ
+drains to `pfcPauseThreshold - pfcResumeOffset` (default offset 8 — the
+hysteresis HPCC's `resume_offset` provides against pause/resume thrash).
+On the endpoint side the pause parks DATA-class sends toward the paused
+destination on the send queue (control/retry/feedback traffic flows
+unimpeded — pausing it would deadlock the reliability loop) and the resume
+drains them. Keep the intended ordering when all three arms are armed:
+`ecnThreshold < pfcPauseThreshold < voqDropThreshold` (mark first, pause as
+the no-drop backstop, drop never); the sim aborts a configuration where the
+pause threshold meets/exceeds an armed drop threshold. PFC needs a switch
+in the inter-node path (`host`/`tor`/`rail`/`leafspine`) — on
+fullmesh/ring/torus2d/dragonfly it is inert (the sim warns). Like DCQCN,
+PFC is ns-3-only congestion behavior: the surrogate stays the uncongested
+mean and is untouched.
 
 **Lossy RoCE (no-PFC) is an explicit opt-in:** pass `--voqDropThreshold=N`
 (N>0) on a RoCE run to arm VOQ tail-drop + NACK→LLR retransmit beside ECN
