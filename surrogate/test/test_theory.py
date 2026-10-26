@@ -1594,3 +1594,34 @@ def test_tail_variance_topology_cap_scales_retransmission():
     t99_no = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
                                topology=None, **kw)
     assert (t99_no - m_no) == pytest.approx(1.528577, rel=1e-4)
+
+
+def test_queuing_variance_topology_cap():
+    """The queuing arm of _step_variance computed both utilization and
+    service rate from the raw BW_link, so a 50-GB/s bisection cap left a
+    16-MiB / N=8 ring / 32 credits / BER=0 with 25 GB/s of competing
+    traffic at p99-minus-mean 2.821 µs where evaluating the M/M/1
+    equations at the capped rate gives 32.270 µs (codex round 25,
+    finding 7) — the same capped-rate contract the retransmission arm
+    (round 24, finding 8), the mean path (round 22, finding 6) and the
+    heavy-tail branch (round 23, finding 4) already follow. topology=None
+    stays byte-identical."""
+    ring = wb.make_h200_ring_theory()
+    kw = dict(ber=0, competing_bw=25, collective="allreduce", percentile=99)
+    mean_kw = dict(ber=0, competing_bw=25, collective="allreduce")
+    cap = wb.make_topology(bisection_gbps=50)
+
+    m_cap = ring.predict(16 * 1024 * 1024, 8, "ring", 32, topology=cap,
+                         **mean_kw)
+    t99_cap = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                                topology=cap, **kw)
+    assert (t99_cap - m_cap) == pytest.approx(32.270, rel=1e-3), \
+        t99_cap - m_cap
+
+    # No cap -> byte-identical legacy behavior (the raw-rate evaluation).
+    m_no = ring.predict(16 * 1024 * 1024, 8, "ring", 32, topology=None,
+                        **mean_kw)
+    t99_no = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                               topology=None, **kw)
+    assert (t99_no - m_no) == pytest.approx(2.821, rel=1e-2), \
+        t99_no - m_no

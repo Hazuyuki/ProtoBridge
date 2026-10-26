@@ -581,6 +581,18 @@ class NvSwitch : public FabricSwitch
                               uint32_t portIdx, uint32_t seqNum, Ptr<Packet> pkt);
 
     /**
+     * @brief Erase the flow's result-repair windows at multicast completion.
+     *
+     * Called when a flow's result multicast finishes (legacy single path and
+     * the partition path's last partition): keeps the store bounded by LIVE
+     * repair obligations instead of historical flows (codex round 25,
+     * finding 8). A later NACK naming the retired flow is a genuine
+     * named-flow miss (HandleSwitchNack returns false) — never a re-key onto
+     * another flow's window.
+     */
+    void RetireSharpResultFlow(uint16_t flowId);
+
+    /**
      * @brief Egress helper for multicast result sends (FEC-aware).
      *
      * Pads the packet body to GetEncodedSize on FEC ports (the receiver
@@ -681,6 +693,10 @@ class NvSwitch : public FabricSwitch
     // safety valve for absurd geometries; the observed scales fit well
     // inside it.
     static constexpr size_t SHARP_RESULT_WINDOW = 65536; ///< Max stored results per (dest, flow)
+    /// Completed flows whose repair windows stay retained per destination
+    /// (bounded history; older generations are retired at each completion —
+    /// codex round 25, finding 8).
+    static constexpr size_t SHARP_RESULT_GENERATIONS = 2;
     static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
 
     // Upload dedup: (flowId, srcRank) -> seen upload sequence numbers. A

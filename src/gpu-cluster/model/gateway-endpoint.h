@@ -14,6 +14,7 @@
 
 #include "ns3/net-device.h"
 #include "ns3/timer.h"
+#include "ns3/event-id.h"
 
 #include <unordered_map>
 #include <map>
@@ -155,6 +156,13 @@ class GatewayEndpoint : public FabricEndpoint
 
     /// Flag to prevent infinite forwarding loops
     uint8_t m_maxHops;
+
+    /// Pending gateway-delay forwarding events. Each schedules raw `this`
+    /// (ForwardToFabric dereferences m_fabricDeviceMap, cleared in DoDispose),
+    /// so disposal must cancel them or a queued forwarding fires on freed
+    /// memory (codex round 25, finding 4 — valgrind-confirmed UAF with
+    /// GatewayDelay=100 µs and disposal at 1 µs).
+    std::vector<EventId> m_forwardingEvents;
 };
 
 } // namespace ns3

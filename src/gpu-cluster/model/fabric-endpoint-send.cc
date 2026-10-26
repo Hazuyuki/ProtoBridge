@@ -229,8 +229,14 @@ IsCreditBypassType(FabricPacketType type)
 
 void
 FabricEndpoint::SendCollective(FabricPacketType type, uint16_t destRank,
-                                const uint8_t* data, uint32_t size)
+                                const uint8_t* data, uint64_t size)
 {
+    // (void)data — the body is dummy bytes (only sizes matter for timing);
+    // the parameter is uint64 so collective drivers computing uint64_t
+    // volumes (NVLS AllGather's chunk grid) don't truncate: a 4-GiB chunk
+    // through a uint32_t parameter became zero and SendCollectiveBulk
+    // aborted the upload (codex round 25, finding 3 — same widening
+    // SendBulkWireTransfer received in round 24, finding 5).
     (void)data;
     SendCollectiveBulk(type, destRank, size);
 }
@@ -342,8 +348,19 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             // sent chunk absorb whatever the skipped fragments would have
             // carried and the shares sum to exactly effectiveSize.
             uint64_t wireSpanEnd = std::min(offset + chunkSize, wireSize);
-            uint64_t effectiveBegin = effectiveSize * offset / std::max<uint64_t>(wireSize, 1);
-            uint64_t effectiveEnd = effectiveSize * wireSpanEnd / std::max<uint64_t>(wireSize, 1);
+            // 128-bit intermediates: effectiveSize * offset overflows uint64
+            // before the division at multi-GB scales (a 6-GiB upload over 18
+            // lanes advertised 9.3e9 effective bytes for 6.4e9 payload — the
+            // wrapped products inflated the effective ledger and could trip
+            // aggregation before the payload arrived; codex round 25,
+            // finding 2). __int128 is the codebase's established wide type
+            // (core/model/int64x64-128.h).
+            uint64_t effectiveBegin = static_cast<uint64_t>(
+                static_cast<__int128_t>(effectiveSize) * offset /
+                std::max<uint64_t>(wireSize, 1));
+            uint64_t effectiveEnd = static_cast<uint64_t>(
+                static_cast<__int128_t>(effectiveSize) * wireSpanEnd /
+                std::max<uint64_t>(wireSize, 1));
             uint32_t thisEffectiveSize =
                 static_cast<uint32_t>(effectiveEnd - effectiveBegin);
 
@@ -393,12 +410,15 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                     uint32_t remChunkSize = static_cast<uint32_t>(
                         std::min(chunkSize, wireSize - remOffset));
                     // Same wire-anchored proportional split as the main loop
-                    // (skipped trailing fragments must not eat a share).
+                    // (skipped trailing fragments must not eat a share) and
+                    // the same 128-bit intermediates (round 25, finding 2).
                     uint64_t remWireSpanEnd = std::min(remOffset + chunkSize, wireSize);
-                    uint64_t remEffectiveBegin =
-                        effectiveSize * remOffset / std::max<uint64_t>(wireSize, 1);
-                    uint64_t remEffectiveEnd =
-                        effectiveSize * remWireSpanEnd / std::max<uint64_t>(wireSize, 1);
+                    uint64_t remEffectiveBegin = static_cast<uint64_t>(
+                        static_cast<__int128_t>(effectiveSize) * remOffset /
+                        std::max<uint64_t>(wireSize, 1));
+                    uint64_t remEffectiveEnd = static_cast<uint64_t>(
+                        static_cast<__int128_t>(effectiveSize) * remWireSpanEnd /
+                        std::max<uint64_t>(wireSize, 1));
                     uint32_t remEffectiveSize =
                         static_cast<uint32_t>(remEffectiveEnd - remEffectiveBegin);
                     uint64_t remSeqKey = MakeSeqKey(destRank, 0, 0);

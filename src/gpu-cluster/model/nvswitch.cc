@@ -166,6 +166,8 @@ NvSwitch::DoDispose()
     m_allGatherBuffer.clear();
     m_allGatherReceivedBytes.clear();
     m_seenUploadSeqs.clear();
+    m_sharpResultStore.clear();
+    m_lastResultFlow.clear();
     Simulator::Cancel(m_arbitrationEvent);
     NetDevice::DoDispose();
 }
@@ -1371,6 +1373,53 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
     // finding 5). It is one uint32 per accepted upload, cleared in
     // DoDispose with the other per-flow state.
     m_allReduceReceivedBytes.erase(flowId);
+    RetireSharpResultFlow(flowId);
+}
+
+void
+NvSwitch::RetireSharpResultFlow(uint16_t flowId)
+{
+    // Flow retirement (codex round 25, finding 8): the store grew with every
+    // HISTORICAL flow — a completed flow's window stayed in the map forever
+    // (only DoDispose cleared it), so 100 completed flows kept 100 windows
+    // per destination alive until disposal. Per destination we now keep the
+    // SHARP_RESULT_GENERATIONS most recent flows' windows (the completing
+    // flow's own window stays: its fragments may still be on the wire and a
+    // NACK racing the tail of delivery must find them — retiring the flow's
+    // OWN window at its own completion broke exactly that, and retiring at
+    // the NEXT flow's completion killed the older flow's in-flight repairs
+    // too). Anything older than the retained generations is gone: a NACK
+    // that late names a flow whose collective layer completed a full
+    // generation ago — a stale replay, and the named-flow miss (false)
+    // HandleSwitchNack already returns for unknown flows. DoDispose clears
+    // the whole store.
+    std::unordered_map<uint16_t, std::vector<uint16_t>> recentFlows;
+    for (const auto& kv : m_sharpResultStore)
+    {
+        const uint16_t destRank = static_cast<uint16_t>(kv.first >> 16);
+        const uint16_t windowFlow = static_cast<uint16_t>(kv.first & 0xFFFF);
+        auto& flows = recentFlows[destRank];
+        flows.push_back(windowFlow);
+        std::sort(flows.begin(), flows.end(), std::greater<uint16_t>());
+        if (flows.size() > SHARP_RESULT_GENERATIONS)
+        {
+            flows.pop_back();
+        }
+    }
+    for (auto it = m_sharpResultStore.begin(); it != m_sharpResultStore.end();)
+    {
+        const uint16_t destRank = static_cast<uint16_t>(it->first >> 16);
+        const uint16_t windowFlow = static_cast<uint16_t>(it->first & 0xFFFF);
+        const auto& keep = recentFlows[destRank];
+        if (std::find(keep.begin(), keep.end(), windowFlow) == keep.end())
+        {
+            it = m_sharpResultStore.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
 }
 
 void
@@ -1413,17 +1462,31 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
         uint64_t chunkSize = (wirePartitionSize + numChunks - 1) / numChunks;
 
         uint64_t bytesRemaining = wirePartitionSize;
+        uint64_t offset = 0;
         for (uint64_t chunkIdx = 0; chunkIdx < numChunks; chunkIdx++)
         {
             uint32_t thisChunkSize = static_cast<uint32_t>(
                 std::min(static_cast<uint64_t>(chunkSize), bytesRemaining));
-            bytesRemaining -= thisChunkSize;
+            // Effective bytes PROPORTIONAL TO THE WIRE BYTES ACTUALLY SENT
+            // (same rule as SendCollectiveBulk's wire-anchored split). The
+            // old chunkIdx*effective/numChunks split reserved a share for
+            // every chunk index INCLUDING the trailing zero-payload chunks
+            // (numChunks is floored up to the lane count, so with D=8 B /
+            // 8 partitions / 2 lanes every partition emitted (payload=1,
+            // effective=0) then (payload=0, effective=1) — a zero-payload
+            // fragment carried the effective bytes while the payload-bearing
+            // one carried none). Anchoring the boundaries to the wire offset
+            // keeps every effective byte on a fragment that also carries
+            // payload, and the shares still sum to exactly
+            // effectivePartitionSize (codex round 25, finding 1).
+            uint64_t wireSpanEnd = std::min(offset + chunkSize, wirePartitionSize);
             uint64_t effectiveBegin =
-                chunkIdx * effectivePartitionSize / numChunks;
-            uint64_t effectiveEnd =
-                (chunkIdx + 1) * effectivePartitionSize / numChunks;
+                effectivePartitionSize * offset / std::max<uint64_t>(wirePartitionSize, 1);
+            uint64_t effectiveEnd = effectivePartitionSize * wireSpanEnd /
+                std::max<uint64_t>(wirePartitionSize, 1);
             uint32_t thisEffectiveSize =
                 static_cast<uint32_t>(effectiveEnd - effectiveBegin);
+            offset += thisChunkSize;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
 
@@ -1458,6 +1521,7 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
         m_allReduceBuffer.erase(flowId);
         m_allReduceReceivedBytes.erase(flowId);
         m_allReduceCompletedPartitions.erase(flowId);
+        RetireSharpResultFlow(flowId);
     }
 
     NS_LOG_INFO("SHARP AllReduce: multicast partition " << partitionIdx
@@ -1802,8 +1866,10 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
     // Flow complete: retire the byte ledger. m_seenUploadSeqs deliberately
     // survives the result multicast (see the AllReduce path's note): a late
     // replay of an accepted (flow, src, seq) must stay a rejected duplicate,
-    // not re-accumulate the ledger into a second result.
+    // not re-accumulate the ledger into a second result. The result store's
+    // windows retire with the flow (RetireSharpResultFlow's note).
     m_allGatherReceivedBytes.erase(flowId);
+    RetireSharpResultFlow(flowId);
 }
 
 void

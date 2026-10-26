@@ -12,6 +12,8 @@
 #include "ns3/uinteger.h"
 #include "ns3/pointer.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
@@ -56,6 +58,17 @@ void
 GatewayEndpoint::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    // Cancel every pending gateway-delay forwarding BEFORE the members it
+    // touches are cleared: each targets raw `this` (see ScheduleForwarding's
+    // retention note; codex round 25, finding 4).
+    for (const EventId& ev : m_forwardingEvents)
+    {
+        if (!ev.IsExpired())
+        {
+            Simulator::Cancel(ev);
+        }
+    }
+    m_forwardingEvents.clear();
     m_hybridRoutingTable = nullptr;
     m_fabricDeviceMap.clear();
     FabricEndpoint::DoDispose();
@@ -284,10 +297,21 @@ GatewayEndpoint::ScheduleForwarding(Ptr<Packet> packet, FabricHeader header,
 {
     NS_LOG_FUNCTION(this);
 
-    // Schedule the forwarding after gateway delay
-    Simulator::Schedule(m_gatewayDelay,
-                        &GatewayEndpoint::ForwardToFabric,
-                        this, packet, header, outFabric, outDeviceIndex);
+    // Retain the event so DoDispose can cancel it: ForwardToFabric targets
+    // raw `this` and dereferences members cleared there (m_fabricDeviceMap,
+    // the base's m_devices). A queued forwarding surviving disposal fired on
+    // freed memory (codex round 25, finding 4 — GatewayDelay=100 µs, dispose
+    // and release at 1 µs, valgrind-confirmed UAF at the 100-µs fire).
+    // Prune fired entries first so the vector stays bounded (each forwarding
+    // schedules exactly one; only still-pending entries are cancelled).
+    m_forwardingEvents.erase(
+        std::remove_if(m_forwardingEvents.begin(), m_forwardingEvents.end(),
+                       [](const EventId& ev) { return ev.IsExpired(); }),
+        m_forwardingEvents.end());
+    m_forwardingEvents.push_back(
+        Simulator::Schedule(m_gatewayDelay,
+                            &GatewayEndpoint::ForwardToFabric,
+                            this, packet, header, outFabric, outDeviceIndex));
 }
 
 } // namespace ns3

@@ -214,8 +214,11 @@ class FabricEndpoint : public Application
     void SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                                   uint8_t protocolId, uint16_t flowId, uint8_t vcId = 0);
 
+    /** size is uint64: collective volumes reach multi-GiB and the 64-bit
+     *  path sends dummy bytes, so a narrowed parameter truncates 4-GiB
+     *  chunks to zero (codex round 25, finding 3). */
     void SendCollective(FabricPacketType type, uint16_t destRank,
-                        const uint8_t* data, uint32_t size);
+                        const uint8_t* data, uint64_t size);
     void SendCollectiveBulk(FabricPacketType type, uint16_t destRank, uint64_t size);
     void SendCollectiveBulk(FabricPacketType type,
                             uint16_t destRank,

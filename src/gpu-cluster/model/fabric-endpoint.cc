@@ -111,7 +111,8 @@ FabricEndpoint::GetTypeId()
         .AddAttribute("LlrRetryLimit",
                       "Maximum retry count for LLR",
                       UintegerValue(3),
-                      MakeUintegerAccessor(&FabricEndpoint::m_llrRetryLimit),
+                      MakeUintegerAccessor(&FabricEndpoint::GetLlrRetryLimit,
+                                           &FabricEndpoint::SetLlrRetryLimit),
                       MakeUintegerChecker<uint32_t>())
         .AddAttribute("FlowControlPolicy",
                       "Send-gate flow-control policy: credit (per-VC, implemented), "
@@ -1124,6 +1125,15 @@ void
 FabricEndpoint::SetLlrRetryLimit(uint32_t limit)
 {
     m_llrRetryLimit = limit;
+    // The ACTIVE manager enforces the limit (its retryCount > m_retryLimit
+    // checks); leaving it at its own default meant the endpoint reported the
+    // configured budget while retransmissions kept flowing — a NACK after
+    // SetLlrRetryLimit(0) still produced a retransmit (codex round 25,
+    // finding 6). Propagate so the two agree from the first retry decision.
+    if (m_llrManager)
+    {
+        m_llrManager->SetRetryLimit(limit);
+    }
 }
 
 uint32_t
@@ -2712,21 +2722,23 @@ FabricEndpoint::TrySendQueuedPackets()
     {
         SendQueueEntry& entry = m_sendQueue.front();
 
-        // Credit gate — Su (local-dest) entries only. So (remote-dest) entries
-        // bypass credits entirely: the receiver never returns credits for a
-        // remote source (OnPacketDelivered's IsLocalRank guard), so consuming
-        // one here would strand it. Entries reach this queue from send paths
-        // whose own gates were bypassed under the same predicate, so the split
-        // here mirrors the send side exactly.
-        const bool destIsLocal = IsLocalRank(entry.header.GetDestRank());
-        if (destIsLocal && !m_creditManager->HasCredits(entry.vcId))
+        // Send-gate — the same FlowControlGate the send paths consult
+        // (codex round 25, finding 5). The drain used to re-implement the
+        // CREDIT policy inline (HasCredits + ConsumeCredit), so a subclass
+        // overriding FlowControlGate to deny transmission was bypassed: a
+        // denied MEMORY_READ was queued and then transmitted anyway on the
+        // drain pass. Dispatching through the virtual gate keeps the queue's
+        // admission rule identical to the send-side rule (and subclasses
+        // overriding the gate see queued entries too). So (remote-dest)
+        // entries keep bypassing credits under the gate's creditBypass arm —
+        // the receiver never returns credits for a remote source
+        // (OnPacketDelivered's IsLocalRank guard), so consuming one here
+        // would strand it.
+        if (!FlowControlGate(entry.vcId, entry.seqNum,
+                             !IsLocalRank(entry.header.GetDestRank())))
         {
-            NS_LOG_DEBUG("No credits for VC " << static_cast<int>(entry.vcId));
-            break;
-        }
-
-        if (destIsLocal && !m_creditManager->ConsumeCredit(entry.vcId, entry.seqNum))
-        {
+            NS_LOG_DEBUG("FlowControlGate denied queued packet on VC "
+                         << static_cast<int>(entry.vcId));
             break;
         }
 

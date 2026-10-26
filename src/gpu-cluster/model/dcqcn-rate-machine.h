@@ -38,9 +38,13 @@ namespace ns3
  * ShapingDelay() is zero, so mounting the machine is byte-identical to the
  * unmounted baseline (parity-safe).
  *
- * The flow key is FabricEndpoint::MakeSeqKey(destRank, vcId, flowId): the key
- * the sender uses on the send path matches the key the CNP carries back, so
- * OnCnp and ShapingDelay address the same per-flow state.
+ * The flow key is FabricEndpoint::MakeRateFlowKey(sourceRank, destRank, vcId,
+ * flowId): the key the sender uses on the send path matches the key the CNP
+ * carries back, so OnCnp and ShapingDelay address the same per-flow state.
+ * The key CARRIES the sender rank (codex round 23, finding 1) — the earlier
+ * MakeSeqKey(dest, vc, flow) form documented here merged two senders
+ * targeting the same coordinates onto one pacer, and following this stale
+ * doc updated a key no send path ever reads.
  *
  * PerQpCeilingGbps (> 0 = on) caps the *sustained* throughput of a single
  * flow (one flowKey == one QP) at the given rate. This is a HARDWARE per-QP

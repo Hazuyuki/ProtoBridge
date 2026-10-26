@@ -1401,11 +1401,21 @@ class TheoryDerivedSurrogate:
 
             var += K_step * P_chunk * (1 - P_chunk) * delay_per_error ** 2 * f_prop
 
-        # Queuing variance (M/M/1 Kingman)
+        # Queuing variance (M/M/1 Kingman) — evaluated at the topology-capped
+        # service rate (codex round 25, finding 7): both rho and mu came from
+        # the raw BW_link, so a 50-GB/s bisection cap left a 16-MiB/N=8 ring
+        # with 25 GB/s of competing traffic at p99-minus-mean 2.821 µs where
+        # the capped-rate evaluation gives 32.270 µs — the same capped
+        # contract the retransmission arm (round 24, finding 8), the mean
+        # path (round 22, finding 6) and the heavy-tail branch (round 23,
+        # finding 4) already follow. topology=None stays byte-identical.
         if competing_bw > 0:
-            bw_raw_GB = self.BW_link * 1e6 / 1e9
+            bw_cap = (topology.bisection_bw_bytes_per_us
+                      if topology is not None else float('inf'))
+            bw_eff = min(self.BW_link, bw_cap)
+            bw_raw_GB = bw_eff * 1e6 / 1e9
             rho = min(0.99, competing_bw / max(bw_raw_GB, 1))
-            mu = self.BW_link / self.chunk_size
+            mu = bw_eff / self.chunk_size
             var += rho / ((1 - rho) ** 2 * mu ** 2)
 
         return var

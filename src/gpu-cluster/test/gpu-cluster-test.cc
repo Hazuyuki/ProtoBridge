@@ -8741,6 +8741,371 @@ class BulkWireTransferWideSizeTest : public TestCase
     }
 };
 
+// (codex round 25, finding 1) MulticastAllReducePartition's effective-byte
+// split was chunkIdx*effective/numChunks — reserving a share for every chunk
+// index including the trailing zero-payload chunks (numChunks is floored up
+// to the lane count). With D=8 B / 8 partitions / 2 lanes every partition
+// emitted (payload=1, effective=0) then (payload=0, effective=1): a
+// zero-payload fragment carried the effective bytes. The split is now
+// anchored to the wire offset (same rule as SendCollectiveBulk).
+class PartitionEffectiveOnPayloadFragmentsTest : public TestCase
+{
+  public:
+    PartitionEffectiveOnPayloadFragmentsTest()
+        : TestCase("Partition multicast puts effective bytes on payload fragments") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("400Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(10)));
+        // Two lanes to rank 0.
+        auto d1 = p2p.Install(nodes.Get(0), nodes.Get(1));
+        auto d2 = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        unsigned zeroPayloadEffective = 0;
+        uint64_t effSum = 0;
+        uint64_t wireSum = 0;
+        auto sniffer = [&](Ptr<NetDevice>, Ptr<const Packet> p, uint16_t,
+                           const Address&, const Address&, NetDevice::PacketType) {
+            FabricHeader h;
+            Ptr<Packet> c = p->Copy();
+            c->RemoveHeader(h);
+            effSum += h.GetEffectiveDataSize();
+            wireSum += h.GetPayloadSize();
+            if (h.GetPayloadSize() == 0 && h.GetEffectiveDataSize() > 0)
+            {
+                zeroPayloadEffective++;
+            }
+            return true;
+        };
+        d1.Get(0)->SetPromiscReceiveCallback(sniffer);
+        d2.Get(0)->SetPromiscReceiveCallback(sniffer);
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        nodes.Get(1)->AddDevice(sw);
+        sw->AddPort(d1.Get(1));
+        sw->AddPort(d2.Get(1));
+        sw->AddRankPort(0, 0);
+        sw->AddRankPort(0, 1);
+        sw->SetLlrEnabled(true);
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        sw->SetAllReduceDataSize(8);
+        sw->SetAllReduceNumPartitions(8);
+        sw->SetAllReduceAggregationDelay(0);
+
+        sw->InjectAggregateUpload(1, 0, 0, 8, false);
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+
+        // Pre-fix: 8 fragments were zero-payload-but-effective-bearing.
+        NS_TEST_ASSERT_MSG_EQ(zeroPayloadEffective, 0u,
+            "no fragment may carry effective bytes without payload bytes "
+            "(pre-fix: 8 zero-payload fragments carried the 8 effective bytes)");
+        // The effective total is still exactly D (the split sums correctly).
+        NS_TEST_ASSERT_MSG_EQ(effSum, 8u,
+            "effective bytes across all partitions must sum to the data size");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 25, finding 2) SendCollectiveBulk's proportional effective
+// split multiplied effectiveSize * offset in uint64 before dividing: a
+// 6-GiB-effective / ~8-GiB-wire upload over 18 lanes wrapped the products
+// and advertised 9,305,762,474 effective bytes for 6,442,450,944 payload
+// bytes. The intermediates are now __int128 (the codebase's established wide
+// type). Receiver-side check: the effective ledger must sum to exactly the
+// requested effective size.
+class CollectiveEffectiveOverflowTest : public TestCase
+{
+  public:
+    CollectiveEffectiveOverflowTest()
+        : TestCase("Collective effective-byte split does not overflow at 6 GiB") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("400Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        p2p.SetQueue("ns3::DropTailQueue<Packet>",
+                     "MaxSize", StringValue("1000000p"));
+        NetDeviceContainer txDevs;
+        NetDeviceContainer rxDevs;
+        for (int i = 0; i < 18; i++)
+        {
+            auto d = p2p.Install(nodes.Get(0), nodes.Get(1));
+            txDevs.Add(d.Get(0));
+            rxDevs.Add(d.Get(1));
+        }
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        nodes.Get(0)->AddApplication(tx);
+        nodes.Get(1)->AddApplication(rx);
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        for (int i = 0; i < 18; i++)
+        {
+            tx->AddNetDevice(txDevs.Get(i));
+            rx->AddNetDevice(rxDevs.Get(i));
+        }
+        uint64_t rxEff = 0;
+        rx->SetReceiveCallback(
+            [&rxEff](uint16_t, Ptr<Packet>, FabricHeader h) {
+                rxEff += h.GetEffectiveDataSize();
+            });
+
+        const uint64_t GiB = uint64_t{1} << 30;
+        const uint64_t eff = 6ull * GiB;              // 6,442,450,944
+        const uint64_t wire = eff + 1610612736ull;    // 1.5 GiB of wire padding
+        tx->SendCollectiveBulk(FabricPacketType::ALLREDUCE, 1, eff, wire);
+        Simulator::Stop(Seconds(30));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(rxEff, eff,
+            "the receiver's effective-byte ledger must sum to exactly the "
+            "requested effective size (pre-fix: the wrapped 128-bit-less "
+            "products advertised 9,305,762,474 effective bytes)");
+        tx->Dispose();
+        rx->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 25, finding 3) SendCollective's size parameter was uint32_t
+// while NVLS AllGather computes uint64_t chunks: at N=2/D=8 GiB each 4-GiB
+// chunk truncated to zero and SendCollectiveBulk aborted the upload. The
+// parameter is now uint64_t (same widening SendBulkWireTransfer received in
+// round 24, finding 5).
+class SendCollectiveWideSizeTest : public TestCase
+{
+  public:
+    SendCollectiveWideSizeTest()
+        : TestCase("SendCollective carries 64-bit volumes") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetLocalRankRange(0, 1);
+        // Exactly 2^32: the value that truncated to zero pre-fix (and
+        // aborted via SendCollectiveBulk's zero-size NS_ABORT).
+        const uint64_t volume = uint64_t{1} << 32;
+        ep->SendCollective(FabricPacketType::ALLGATHER, 1, nullptr, volume);
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 512u,
+            "a 4-GiB collective volume must emit its full fragment stream "
+            "(512 chunks at the 8-MiB coalesced chunk size); pre-fix the "
+            "uint32_t parameter truncated it to zero and aborted");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 25, finding 4) GatewayEndpoint::ScheduleForwarding scheduled
+// ForwardToFabric on raw `this` without retaining the EventId: queueing a
+// 100-us gateway-delay forwarding, then disposing the gateway at 2 us, left
+// the event armed and it fired on freed/cleared state (valgrind-confirmed
+// UAF). DoDispose now cancels every pending forwarding event.
+class GatewayDisposeCancelsForwardingTest : public TestCase
+{
+  public:
+    GatewayDisposeCancelsForwardingTest()
+        : TestCase("Gateway Dispose cancels pending gateway-delay forwardings") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer n;
+        n.Create(3);
+        PointToPointHelper p;
+        p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto ab = p.Install(n.Get(0), n.Get(1));
+        auto bc = p.Install(n.Get(1), n.Get(2));
+
+        auto a = CreateObject<FabricEndpoint>();
+        auto b = CreateObject<GatewayEndpoint>();
+        auto c = CreateObject<FabricEndpoint>();
+        n.Get(0)->AddApplication(a);
+        n.Get(1)->AddApplication(b);
+        n.Get(2)->AddApplication(c);
+        a->SetRank(0);
+        b->SetRank(1);
+        c->SetRank(2);
+        a->SetLocalRankRange(0, 1);
+        b->SetLocalRankRange(1, 1);
+        c->SetLocalRankRange(2, 1);
+        a->AddNetDevice(ab.Get(0));
+        b->AddFabricDevice(FabricType::NVLINK, ab.Get(1));
+        b->AddFabricDevice(FabricType::ETHERNET, bc.Get(0));
+        c->AddNetDevice(bc.Get(1));
+        a->SetRoutingEntry(2, 0);
+        b->SetHybridRoutingTable(CreateObject<HybridRoutingTable>());
+        b->SetCrossFabricRoute(2, FabricType::ETHERNET, 1);
+        b->SetGatewayDelay(MicroSeconds(100));
+        a->SetStartTime(Seconds(0));
+        b->SetStartTime(Seconds(0));
+        c->SetStartTime(Seconds(0));
+
+        // Queue the 100-us forwarding at 1 us; dispose at 2 us; run to 300 us
+        // so the pre-fix armed event would fire at ~101 us on disposed state.
+        Simulator::Schedule(MicroSeconds(1), [a] {
+            a->SendBulkWireTransferSize(2, 64, 3, 1, 0);
+        });
+        Simulator::Schedule(MicroSeconds(2), [b] {
+            b->Dispose();
+        });
+        Simulator::Stop(MicroSeconds(300));
+        Simulator::Run();
+        // Survival IS the assertion (pre-fix: UAF/segfault or valgrind
+        // invalid read in ForwardToFabric at the 101-us fire).
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 25, finding 5) TrySendQueuedPackets re-implemented the CREDIT
+// policy inline (HasCredits + ConsumeCredit) instead of consulting the
+// virtual FlowControlGate, so a subclass overriding the gate to deny
+// transmission was bypassed: a denied MEMORY_READ was queued and then
+// transmitted anyway on the drain pass. The queue drain now dispatches
+// through FlowControlGate like every send path.
+namespace {
+class DenyingGateEndpoint : public FabricEndpoint
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::DenyingGateEndpoint")
+                                .SetParent<FabricEndpoint>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<DenyingGateEndpoint>();
+        return tid;
+    }
+    unsigned gateCalls = 0;
+
+  protected:
+    bool FlowControlGate(uint8_t, uint32_t, bool) override
+    {
+        gateCalls++;
+        return false; // deny every admission
+    }
+};
+NS_OBJECT_ENSURE_REGISTERED(DenyingGateEndpoint);
+} // namespace
+
+class QueuedSendRespectsFlowControlGateTest : public TestCase
+{
+  public:
+    QueuedSendRespectsFlowControlGateTest()
+        : TestCase("Queued sends consult the overridden FlowControlGate") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Ptr<DenyingGateEndpoint> ep = CreateObject<DenyingGateEndpoint>();
+        ep->SetLocalRankRange(0, 1);
+        // Default VC pool has 64 credits, so the pre-fix inline credit check
+        // passed and the queued packet was transmitted despite the denial.
+        ep->SendMemoryRead(1, 0x1000, 12);
+        NS_TEST_ASSERT_MSG_GT(ep->gateCalls, 0u,
+            "the overridden gate must be consulted on the queued path");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
+            "a packet the overridden gate denies must never transmit "
+            "(pre-fix: one denial recorded AND one packet transmitted)");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 25, finding 6) SetLlrRetryLimit updated only the endpoint's
+// member while the ACTIVE LlrManager kept its own default (3): after
+// SetLlrRetryLimit(0) the endpoint reported zero while a NACK still produced
+// a retransmission. The setter (and the LlrRetryLimit attribute, now routed
+// through it) propagates to the manager.
+class LlrRetryLimitReachesManagerTest : public TestCase
+{
+  public:
+    LlrRetryLimitReachesManagerTest()
+        : TestCase("SetLlrRetryLimit configures the active LLR manager") {}
+    void DoRun() override
+    {
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetLlrRetryLimit(0);
+        NS_TEST_ASSERT_MSG_EQ(ep->GetLlrManager()->GetRetryLimit(), 0u,
+            "SetLlrRetryLimit(0) must reach the active manager "
+            "(pre-fix: manager stayed at its default 3)");
+        // The attribute path must propagate too (it used to write the member
+        // directly, bypassing the manager).
+        Ptr<FabricEndpoint> ep2 = CreateObject<FabricEndpoint>();
+        ep2->SetAttribute("LlrRetryLimit", UintegerValue(7));
+        NS_TEST_ASSERT_MSG_EQ(ep2->GetLlrManager()->GetRetryLimit(), 7u,
+            "the LlrRetryLimit attribute must reach the active manager "
+            "(pre-fix: the attribute wrote only the endpoint member)");
+        ep->Dispose();
+        ep2->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 25, finding 8) SHARP result-repair windows were never retired
+// at flow completion and DoDispose never cleared the store: 100 completed
+// flows kept 100 windows per destination alive until disposal. Flows now
+// retire their windows when their result multicast finishes, and DoDispose
+// clears the store with the other per-flow state.
+class SharpResultFlowRetirementTest : public TestCase
+{
+  public:
+    SharpResultFlowRetirementTest()
+        : TestCase("SHARP result store retires completed flows") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("400Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(10)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        nodes.Get(0)->AddDevice(sw);
+        sw->AddPort(devs.Get(0));
+        sw->AddRankPort(0, 0);
+        sw->SetLlrEnabled(true);
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        sw->SetAllReduceDataSize(64);
+        sw->SetAllReduceNumPartitions(1);
+        sw->SetAllReduceAggregationDelay(0);
+
+        // Five sequential flows, each fully completing its multicast: only
+        // the most recent SHARP_RESULT_GENERATIONS (2) windows may remain —
+        // pre-fix all five lingered (and 100 flows kept 100 windows until
+        // disposal).
+        for (int f = 1; f <= 5; f++)
+        {
+            sw->InjectAggregateUpload(f, 0, 0, 64, false);
+        }
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpResultStoreSize(0), 2u,
+            "completed flows must retire their repair windows down to the "
+            "bounded recent generations (pre-fix: every flow's window "
+            "lingered — 5 here, 100 in codex's probe, until disposal)");
+        // And DoDispose clears whatever remains.
+        sw->Dispose();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpResultStoreSize(0), 0u,
+            "DoDispose must clear the SHARP result store with the other "
+            "per-flow state (pre-fix: entries survived disposal)");
+        Simulator::Destroy();
+    }
+};
+
 // Multicast result sequence numbering must be per-destination: endpoint
 // reorder buffers (the module default, SetBypassReorderBuffer(false)) key on
 // (vc, flow, source) and expect each stream to start at seq 0. Codex repro
@@ -11345,6 +11710,15 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new DcqcnForwardedPacketOriginTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpResultFlowIsolationTest, TestCase::Duration::QUICK);
     AddTestCase(new BulkWireTransferWideSizeTest, TestCase::Duration::QUICK);
+
+    // Codex round 25 regressions.
+    AddTestCase(new PartitionEffectiveOnPayloadFragmentsTest, TestCase::Duration::QUICK);
+    AddTestCase(new CollectiveEffectiveOverflowTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new SendCollectiveWideSizeTest, TestCase::Duration::QUICK);
+    AddTestCase(new GatewayDisposeCancelsForwardingTest, TestCase::Duration::QUICK);
+    AddTestCase(new QueuedSendRespectsFlowControlGateTest, TestCase::Duration::QUICK);
+    AddTestCase(new LlrRetryLimitReachesManagerTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpResultFlowRetirementTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);
