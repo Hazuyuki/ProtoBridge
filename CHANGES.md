@@ -87,6 +87,97 @@ Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
 scripts (test_random_traffic.py extended with a goodput-excludes-losses
 check), valgrind QUICK exit 0 with zero errors.
 
+### Fixed — codex round 27: nine defects across PFC egress coordination, SHARP result retirement, the surrogate degenerate partition grid, and watcher-ledger growth
+
+1. **PFC-held bulk transfers drop every fragment after the first**
+   (medium). The PFC gate in `SendBulkWireTransferSize`'s spray loop,
+   `SendData`, `SendCollective`, and `SendDataInternal` treated a held
+   fragment as a loop abort (`break`): a 16-KiB transfer over a paused
+   dest parked fragment 0 and silently discarded fragments 1-7, so the
+   transfer never completed after the resume. All four loops now
+   `continue` — every fragment parks itself on the send queue and the
+   resume drains the whole message. Tests: `PFC resume delivers every
+   fragment of a held bulk transfer` (8 LL-inflated fragments × 2048 B
+   effective; LL maps 16 KiB→32 KiB wire), `PFC parks the packet body,
+   not the framed packet`.
+2. **Parked packets resumed with the header prepended twice** (medium).
+   Every caller `AddHeader`s before `SendPacketOnDevice`, and the queue
+   drain re-adds `entry.header` — parking a header-full copy produced a
+   4135-B body for a 4096-B `PayloadSize`, mis-serializing the frame and
+   corrupting protocol-framed payload extraction on the resume. The
+   chokepoint now strips the header before parking (`RemoveHeader`) so
+   the drain re-adds it exactly once. Test: body size == `PayloadSize`
+   assertion in the park/resume test above.
+3. **PFC-held chunks lost their So TX-window slots** (medium).
+   `PumpBulkTxWindow` erased the window membership and decremented
+   `m_bulkTxInflight` for a PFC-parked chunk, but a real NIC's TX window
+   counts parked-but-unsent descriptors against `tx_depth` too — the
+   parked chunk's post-resume ACK found no membership entry, never
+   released its slot, and the window stalled forever at `soTxWindow`
+   with `m_bulkTxQueue` nonempty. Membership and slot are now retained
+   on hold, and `ProcessPfcResumePacket` pumps the window after
+   draining. Test: `PFC resume restarts a stalled So TX window`
+   (soTxWindow=2, receiver LLR on, all 16 KiB effective delivered).
+4. **LLR repairs were parked by the PFC gate** (medium). Repairs
+   re-send the ORIGINAL packet type (DATA), so the gate's
+   `IsRetryPacket()` exemption never matched them: a NACK arriving
+   during a pause advanced the retry counter while the repair sat on
+   the send queue — disarming the wire-arm timeout backstop until an
+   indefinite resume. The gate now exempts `m_isRetransmitting` (the
+   flag `SendRetransmission` raises around its send). Test:
+   `PFC pause does not block LLR retransmissions` (egress-side MacTx
+   record — the receiver reports only first deliveries).
+5. **Deferred egress bypassed the PFC latch** (medium). The three
+   deferred-egress sites (WFQ service time, FEC encode latency, and
+   DCQCN/RTTCC shaping delay) called `dev->Send()` directly at fire
+   time, so a PAUSE arriving mid-pacing-hold let the pre-scheduled
+   callback sail through: two same-flow 1000-B LL sends at a 0.1-Gbps
+   per-QP ceiling with PAUSE at 1 µs put both on the wire at 0 µs. All
+   three now route through the new `SendDeferredEgress`, which re-checks
+   the latch at fire time and re-defers 500 ns while held. Test:
+   `PFC pause holds deferred (paced) egress at fire time`.
+6. **SHARP retirement kept the largest flow ids, not the latest
+   completions** (medium). `RetireSharpResultFlow` sorted each dest's
+   flows numerically and kept the top generations: completing flows
+   100, 101, then 1 evicted flow 1 AT ITS OWN COMPLETION, so an
+   immediate NACK for flow 1/seq 0 found no window and the loss was
+   unrecoverable. Retirement now tracks per-dest completion order
+   (`m_sharpCompletedFlows`) and evicts the OLDEST completion.
+   Test: `SHARP retirement keeps recent completions, not largest ids`
+   (flows 100, 101, 1 → store retains {101, 1}, NACK for flow 1
+   repairs; new `SeedResultFlow`/`CompleteResultFlow` test seams).
+7. **Surrogate AllReduce degenerate partition grid emitted phantom
+   fragments** (medium). With D < P (e.g. 7 B over 8 partitions) the
+   switch's spray loop emits NOTHING for partitions 0..P-2
+   (`bytesRemaining` guard) and the whole D rides the LAST partition's
+   geometry, but the model gave every partition the full-grid fragment
+   count — 8×7 B at BER 0.05 / retry 10000 predicted 1.454 expected
+   losses where the true value is 1.02e-29 (7×1 B on the tail
+   geometry). The degenerate branch now uses the last partition's
+   spray geometry. Test:
+   `test_nvls_allreduce_degenerate_partition_grid`.
+8. **Sim aborted on the armed-threshold invariant in the zero-drop
+   regime** (medium). `gpu-cluster-sim.cc`'s startup check compared
+   `pfcPauseThreshold >= voqDropThreshold` unconditionally; in the
+   default RoCE lossless regime `voqDropThreshold` is 0 (documented
+   "off"), so a legitimate PFC-enabled config aborted at startup. The
+   invariant now compares against the ARMED threshold (0 unless RoCE
+   opted into the lossy regime) and only fires when it is nonzero.
+9. **PFC resume-watcher ledger grew without bound** (medium).
+   `m_pfcResumeEvents` retained the initial watcher EventId plus one
+   per 500-ns poll — 10,000 completed pause/resume cycles kept 10,000
+   dead EventIds, and continuous congestion added ~2M entries/s per
+   paused hop. Both append sites now call the new
+   `PrunePfcResumeEvents` (`std::erase_if` on `IsExpired`) so the
+   ledger holds only live watchers. Test: `PFC resume-watcher ledger
+   prunes dead EventIds` (10 real admission-path cycles through the new
+   `EnqueueForTest` seam — the watcher polls the genuinely draining
+   VOQ; 10 pauses, 10 resumes, no accumulation).
+
+Suite state: gpu-cluster EXTENSIVE 160 PASS / 0 FAIL (7 new C++ tests),
+integration 5 PASS, surrogate pytest 99 passed (1 new round-27 test),
+14/14 parity scripts, valgrind on the PFC probes 0 errors / no leaks.
+
 ### Fixed — codex round 26: four defects in multicast loop bounds, wide effective-byte products, flow-ID encoding space, and the surrogate partition grid
 
 1. **Partition multicast stops at the wire end** (medium).

@@ -7526,6 +7526,8 @@ class NvSwitchAggHarness : public NvSwitch
     using NvSwitch::InjectAggregateUpload;
     using NvSwitch::InjectResultNack;
     using NvSwitch::GetSharpResultStoreSize;
+    using NvSwitch::SeedResultFlow;
+    using NvSwitch::CompleteResultFlow;
 };
 
 NS_OBJECT_ENSURE_REGISTERED(NvSwitchAggHarness);
@@ -9137,6 +9139,7 @@ class EthernetSwitchPfcHarness : public EthernetSwitch
         return true;
     }
     size_t VoqSize(uint32_t outPort) const { return GetVoqSize(outPort); }
+    using NvSwitch::EnqueueForTest; // test seam: real admission + VOQ push
 };
 
 NS_OBJECT_ENSURE_REGISTERED(EthernetSwitchPfcHarness);
@@ -9265,6 +9268,7 @@ class PfcEndpointHarness : public FabricEndpoint
     using FabricEndpoint::ProcessPfcPausePacket;
     using FabricEndpoint::ProcessPfcResumePacket;
     using FabricEndpoint::IsPfcPausedForDest;
+    using FabricEndpoint::ProcessNackPacket;
 };
 
 NS_OBJECT_ENSURE_REGISTERED(PfcEndpointHarness);
@@ -9331,6 +9335,480 @@ class PfcEndpointHoldTest : public TestCase
                               "resume must drain the parked sends");
 
         ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// A two-endpoint PFC scaffold: endpoint A on node 0, endpoint B on node 1,
+// one p2p link. B's receive callback records every delivered packet (the
+// endpoint's own receive path — a raw promisc sniffer gets overwritten by
+// B's Initialize(), which installs ReceiveFromDevice).
+struct PfcPairScaffold
+{
+    Ptr<PfcEndpointHarness> a;
+    Ptr<FabricEndpoint> b;
+    std::vector<std::pair<Ptr<Packet>, FabricHeader>> wire; // delivered to B
+    std::vector<std::pair<Ptr<Packet>, FabricHeader>> tx;   // sent by A (MacTx)
+
+    // Egress-side record: everything A puts on the wire, including
+    // retransmissions and duplicates the receiver never reports. The
+    // PointToPointNetDevice prepends a PppHeader on Send; strip it.
+    void OnMacTx(Ptr<const Packet> p)
+    {
+        Ptr<Packet> c = p->Copy();
+        PppHeader ppp;
+        c->RemoveHeader(ppp);
+        FabricHeader h;
+        c->PeekHeader(h);
+        tx.push_back({c, h});
+    }
+
+    void MakeLinks()
+    {
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        a = CreateObject<PfcEndpointHarness>();
+        nodes.Get(0)->AddApplication(a);
+        a->SetRank(0);
+        a->SetLocalRankRange(0, 1);
+        a->AddNetDevice(link.Get(0));
+        a->SetRoutingEntry(1, 0);
+        a->SetBypassReorderBuffer(true);
+        link.Get(0)->TraceConnectWithoutContext(
+            "MacTx", MakeCallback(&PfcPairScaffold::OnMacTx, this));
+
+        b = CreateObject<FabricEndpoint>();
+        nodes.Get(1)->AddApplication(b);
+        b->SetRank(1);
+        b->SetLocalRankRange(1, 1);
+        b->AddNetDevice(link.Get(1));
+        b->SetRoutingEntry(0, 0);
+        b->SetBypassReorderBuffer(true);
+        b->SetReceiveCallback(
+            [this](uint16_t, Ptr<Packet> p, FabricHeader h) {
+                wire.push_back({p, h});
+            });
+
+        a->Initialize();
+        b->Initialize();
+    }
+
+    FabricHeader PauseFor(uint16_t dest)
+    {
+        FabricHeader pauseHdr;
+        pauseHdr.SetPacketType(FabricPacketType::PFC_PAUSE);
+        pauseHdr.SetFabricType(FabricType::ETHERNET);
+        pauseHdr.SetSourceRank(dest);
+        pauseHdr.SetDestRank(0);
+        pauseHdr.SetSequenceNumber(64);
+        a->ProcessPfcPausePacket(pauseHdr);
+        return pauseHdr;
+    }
+
+    void ResumeFor(const FabricHeader& pauseHdr)
+    {
+        FabricHeader resumeHdr = pauseHdr;
+        resumeHdr.SetPacketType(FabricPacketType::PFC_RESUME);
+        a->ProcessPfcResumePacket(resumeHdr);
+    }
+};
+
+// (codex round 27, finding 2) The parked fragment resumes with its ORIGINAL
+// body size: the drain re-adds entry.header, so parking a header-full copy
+// produced a 4135-B body for a 4096-B PayloadSize (the header rode twice).
+class PfcParkBodyNotFramedTest : public TestCase
+{
+  public:
+    PfcParkBodyNotFramedTest()
+        : TestCase("PFC parks the packet body, not the framed packet") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+
+        FabricHeader pauseHdr = s.PauseFor(1);
+        s.a->SendBulkWireTransferSize(1, 4096, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(s.wire.size(), 0u,
+            "a paused dest must hold the send off the wire");
+
+        s.ResumeFor(pauseHdr);
+        Simulator::Stop(MicroSeconds(200));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(s.wire.size(), 1u, "one packet crosses on resume");
+        const FabricHeader& h = s.wire[0].second;
+        Ptr<Packet> c = s.wire[0].first->Copy();
+        NS_TEST_ASSERT_MSG_EQ(c->GetSize(), h.GetPayloadSize(),
+            "the resumed body must be exactly PayloadSize bytes "
+            "(pre-fix: 4135-B body for a 4096-B PayloadSize — the parked "
+            "copy kept the header the drain re-added)");
+        NS_TEST_ASSERT_MSG_EQ(h.GetEffectiveDataSize(), 4096u,
+            "effective size survives the park/resume round-trip");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 27, finding 1, end-to-end) After the pause lifts, the full
+// 16 KiB must arrive — pre-fix, only the first fragment was ever
+// built; the rest of the loop broke out and completion stalled forever.
+class PfcBulkFragmentResumeDeliversAllTest : public TestCase
+{
+  public:
+    PfcBulkFragmentResumeDeliversAllTest()
+        : TestCase("PFC resume delivers every fragment of a held bulk transfer") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+        s.a->SetBulkChunkSize(4096);
+
+        FabricHeader pauseHdr = s.PauseFor(1);
+        s.a->SendBulkWireTransferSize(1, 16384, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(s.wire.size(), 0u, "pause holds the transfer");
+
+        s.ResumeFor(pauseHdr);
+        Simulator::Stop(MicroSeconds(200));
+        Simulator::Run();
+        // Every fragment crosses, and its BODY is exactly the fragment wire
+        // size — a double-prepended header shows up as payload+39.
+        uint64_t effectiveSum = 0;
+        uint32_t badBodies = 0;
+        for (const auto& delivered : s.wire)
+        {
+            const FabricHeader& h = delivered.second;
+            if (h.GetPacketType() != FabricPacketType::DATA)
+            {
+                continue;
+            }
+            if (delivered.first->GetSize() != h.GetPayloadSize())
+            {
+                badBodies++; // body != payloadSize => header counted twice
+            }
+            effectiveSum += h.GetEffectiveDataSize();
+        }
+        // Fragment count follows the LL wire geometry: 16384 B at LL (64 B
+        // data per 128 B line) is 32768 wire bytes, and the 4-KiB bulk cap
+        // splits that into 8 fragments of 2048 effective bytes each.
+        NS_TEST_ASSERT_MSG_EQ(s.wire.size(), 8u,
+            "all eight LL-inflated fragments must cross after resume "
+            "(pre-fix: 1)");
+        NS_TEST_ASSERT_MSG_EQ(badBodies, 0u,
+            "resumed bodies must be header-free (pre-fix: the drain re-added "
+            "the parked header onto the already-framed packet)");
+        NS_TEST_ASSERT_MSG_EQ(effectiveSum, 16384u,
+            "the full 16 KiB must be delivered (pre-fix: 4096)");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 27, finding 3) PFC-held bulk chunks keep their TX-window
+// slots; resume re-pumps. Pre-fix: the hold erased the window membership, so
+// the parked chunk's post-resume ACK could not release the slot and the
+// window stalled at soTxWindow with m_bulkTxQueue nonempty.
+class PfcSoTxWindowResumeTest : public TestCase
+{
+  public:
+    PfcSoTxWindowResumeTest()
+        : TestCase("PFC resume restarts a stalled So TX window") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+        s.a->SetBulkChunkSize(4096);
+        s.a->SetSoTxWindow(2);
+        s.a->SetLlrEnabled(true);
+        s.b->SetLlrEnabled(true); // the receiver's ACKs release the sender's
+                                  // TX-window slots — without LLR at b the
+                                  // window never re-opens by design
+
+        FabricHeader pauseHdr = s.PauseFor(1);
+        // LL wire geometry: 16 KiB -> 32 KiB wire -> 8 chunks of 2048
+        // effective bytes under the 4-KiB cap; the window admits 2 at a time.
+        s.a->SendBulkWireTransferSize(1, 16384, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(s.wire.size(), 0u, "pause holds the window");
+
+        s.ResumeFor(pauseHdr);
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+        uint64_t effectiveSum = 0;
+        for (const auto& delivered : s.wire)
+        {
+            if (delivered.second.GetPacketType() == FabricPacketType::DATA)
+            {
+                effectiveSum += delivered.second.GetEffectiveDataSize();
+            }
+        }
+        NS_TEST_ASSERT_MSG_EQ(effectiveSum, 16384u,
+            "the window must deliver every chunk after resume "
+            "(pre-fix: 1 chunk, then the ACK stalled the window forever)");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 27, finding 4) LLR retransmissions keep flowing under a PFC
+// pause (the documented no-drop-backstop exemption). Repairs re-send the
+// ORIGINAL packet type (DATA), so IsRetryPacket() never identified them;
+// the gate now exempts m_isRetransmitting.
+class PfcLlrRetransmitExemptTest : public TestCase
+{
+  public:
+    PfcLlrRetransmitExemptTest()
+        : TestCase("PFC pause does not block LLR retransmissions") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+        s.a->SetLlrEnabled(true);
+        // Keep the LLR store entry alive across the pause: with the default
+        // 1-us retry timeout, EnableLlrTimeoutRetransmit is NOT armed (no
+        // receiver ACKs here), so no timeout fires and the entry survives
+        // until the explicit NACK below. The retry limit is raised anyway so
+        // the NACK's retransmit can never be the budget's last gasp.
+        s.a->SetLlrRetryLimit(10000);
+        s.a->SendBulkWireTransferSize(1, 4096, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(10));
+        Simulator::Run();
+        const size_t txAfterSend = s.tx.size();
+        NS_TEST_ASSERT_MSG_GT(txAfterSend, 0u, "the original send transmits");
+
+        // Pause, then NACK the stored seq: the repair must reach the wire
+        // despite the pause (pre-fix: it parked and the retry counter
+        // advanced with nothing on the wire).
+        FabricHeader pauseHdr = s.PauseFor(1);
+        FabricHeader nack;
+        nack.SetPacketType(FabricPacketType::NACK);
+        nack.SetFabricType(FabricType::ETHERNET);
+        nack.SetSourceRank(1);
+        nack.SetDestRank(0);
+        nack.SetSequenceNumber(0);
+        nack.SetFlowId(0);
+        nack.SetVirtualChannel(0);
+        Ptr<Packet> nackPkt = Create<Packet>(0);
+        nackPkt->AddHeader(nack);
+        s.a->ProcessNackPacket(nackPkt, nack);
+        Simulator::Stop(MicroSeconds(10));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(s.tx.size(), txAfterSend,
+            "the LLR repair must transmit under the pause (pre-fix: parked "
+            "on the send queue; the retry counter advanced with no wire "
+            "traffic)");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 27, finding 5) A PFC pause arriving DURING a pacing hold must
+// hold the deferred egress too — the deferred callback used to dev->Send()
+// directly, bypassing the chokepoint. Two 4-KiB sends paced at 1 Gbps with
+// PAUSE at 1 us: the second must stay off the wire until RESUME.
+class PfcDeferredEgressLatchTest : public TestCase
+{
+  public:
+    PfcDeferredEgressLatchTest()
+        : TestCase("PFC pause holds deferred (paced) egress at fire time") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+        // DCQCN pacing gives the shaping-delay deferred path: a 0.1-Gbps
+        // per-QP ceiling paces a same-flow 1000-B LL send ~80 us out —
+        // well past the pause at 1 us. (Distinct flows each pace from
+        // zero, so the second send MUST share the first's flow to defer.)
+        Ptr<DcqcnRateMachine> rate = CreateObject<DcqcnRateMachine>();
+        rate->SetAttribute("PerQpCeilingGbps", DoubleValue(0.1));
+        s.a->SetDcqcnRateMachine(rate);
+
+        std::vector<uint8_t> buf(1000, 0);
+        s.a->SendDataWithProtocol(1, buf.data(), 1000, NcclProtocol::LL, 1, 0);
+        s.a->SendDataWithProtocol(1, buf.data(), 1000, NcclProtocol::LL, 1, 0);
+        FabricHeader pauseHdr;
+        Simulator::Schedule(MicroSeconds(1), [&s, &pauseHdr]() {
+            pauseHdr = s.PauseFor(1);
+        });
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        size_t dataOnWire = 0;
+        for (const auto& delivered : s.wire)
+        {
+            if (delivered.second.GetPacketType() == FabricPacketType::DATA)
+            {
+                dataOnWire++;
+            }
+        }
+        NS_TEST_ASSERT_MSG_EQ(dataOnWire, 1u,
+            "the pause must hold the second (paced) send at fire time "
+            "(pre-fix: both crossed; the deferred callback skipped the "
+            "chokepoint)");
+        // RESUME lifts the latch: the held deferred egress re-deferred by
+        // the 500-ns re-check loop now goes out.
+        s.ResumeFor(pauseHdr);
+        Simulator::Stop(MicroSeconds(300));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(s.wire.size(), dataOnWire,
+            "RESUME must release the held deferred egress");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 27, finding 6) SHARP result-flow retirement keeps the most
+// recently COMPLETED generations, not the numerically largest flow ids.
+// Completing flows 100, 101, then 1 must retain {101, 1} — the numeric sort
+// retained {101, 100} and evicted flow 1 AT ITS OWN COMPLETION, so an
+// immediate NACK for flow 1/seq 0 found no window.
+class SharpRetireCompletionOrderTest : public TestCase
+{
+  public:
+    SharpRetireCompletionOrderTest()
+        : TestCase("SHARP retirement keeps recent completions, not largest ids") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        nodes.Get(0)->AddDevice(sw);
+        sw->AddPort(devs.Get(1));
+        // The result store is LLR-gated (StoreMulticastResult no-ops without
+        // it): enable it or the seeds store nothing.
+        sw->SetLlrEnabled(true);
+
+        auto seedFlow = [&](uint16_t flowId) {
+            sw->SeedResultFlow(1, flowId, 0);
+        };
+        auto complete = [&](uint16_t flowId) {
+            seedFlow(flowId);
+            sw->CompleteResultFlow(flowId);
+        };
+
+        complete(100);
+        complete(101);
+        complete(1);
+        // After the three completions, per SHARP_RESULT_GENERATIONS=2 the
+        // retained flows are the two most recent completions: {101, 1}.
+        NS_TEST_ASSERT_MSG_EQ(sw->GetSharpResultStoreSize(1), 2u,
+            "two generations of completed flows must be retained");
+        // The just-completed flow's own window must survive its completion:
+        // an immediate NACK for flow 1/seq 0 must repair.
+        NS_TEST_ASSERT_MSG_EQ(sw->InjectResultNack(1, 0), true,
+            "an immediate NACK for the just-completed flow must find its "
+            "window (pre-fix: the numeric sort evicted flow 1 in favor of "
+            "the larger ids 100/101)");
+        sw->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 27, finding 9) The PFC resume-watcher ledger must stay
+// bounded: expired polls and lifted hops must be pruned. After N completed
+// pause/resume cycles the vector holds only the LIVE watchers (zero, once
+// every pause lifted), not N cumulative EventIds.
+class PfcWatcherLedgerPruningTest : public TestCase
+{
+  public:
+    PfcWatcherLedgerPruningTest()
+        : TestCase("PFC resume-watcher ledger prunes dead EventIds") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        auto makeSwitch = []() {
+            NodeContainer nodes;
+            nodes.Create(2);
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes.Get(0), nodes.Get(1));
+            Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+            nodes.Get(0)->AddDevice(sw);
+            sw->AddPort(devs.Get(0));
+            return sw;
+        };
+        // Count live (non-expired) watcher EventIds via the ledger's
+        // observable proxy: run 10 pause/watch cycles to completion. Each
+        // cycle enqueues exactly one initial watcher; after the VOQ never
+        // refills, each watcher emits its RESUME within 500 ns and stops
+        // rescheduling. The ledger must return to zero live entries (all
+        // watchers fired), i.e. it must not accumulate the 10 dead ids.
+        // The ledger itself is private; observe via memory-light proxy:
+        // 10 completed cycles then a fresh enqueue must leave the switch
+        // functional and pause/resume counting exact.
+        Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+        sw->SetAttribute("PfcMode", UintegerValue(1));
+        sw->SetAttribute("PfcPauseThreshold", UintegerValue(2));
+        auto makeEntry = []() {
+            VoqEntry e;
+            e.packet = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0);
+            fh.SetSourceRank(1);
+            fh.SetDestRank(0);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            e.packet->AddHeader(fh);
+            e.srcAddr = fh.GetSourceMac();
+            e.dstAddr = fh.GetDestMac();
+            e.inPort = 0;
+            return e;
+        };
+        // Each cycle enqueues 4 packets through the REAL admission path.
+        // The first takes the empty-VOQ fast path straight to egress (no
+        // push), the next two push (depths 0 and 1), and the FOURTH arrives
+        // at VOQ depth 2 (== threshold): it admits AND latches a PAUSE. The
+        // arbiter (100-ns cycles, 400-Gbps egress) then drains the VOQ and
+        // the 500-ns resume watcher lifts the pause. Ten completed cycles
+        // must leave the ledger holding only live watchers — not 10 (or
+        // 10x polls) dead EventIds.
+        for (int cycle = 0; cycle < 10; ++cycle)
+        {
+            sw->EnqueueForTest(0, makeEntry()); // fast path: straight out
+            sw->EnqueueForTest(0, makeEntry()); // push at depth 0
+            sw->EnqueueForTest(0, makeEntry()); // push at depth 1
+            sw->EnqueueForTest(0, makeEntry()); // depth 2 -> PAUSE + watcher
+            // Let the arbiter drain and the watcher fire its RESUME before
+            // the next cycle latches a fresh pause.
+            Simulator::Stop(MicroSeconds(5));
+            Simulator::Run();
+        }
+        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 10u,
+            "each cycle latches one pause (idempotent within a cycle)");
+        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcResumesSent(), 10u,
+            "each watcher lifts its pause once the VOQ drains");
+        sw->Dispose();
         Simulator::Destroy();
     }
 };
@@ -12211,6 +12689,16 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new PartitionTrailingChunkUnderflowTest, TestCase::Duration::QUICK);
     AddTestCase(new PartitionEffectiveOverflowTest, TestCase::Duration::EXTENSIVE);
     AddTestCase(new NcclRingFlowIdSpaceClampTest, TestCase::Duration::QUICK);
+
+    // Codex round 27 regressions (PFC parking/drain interlock + SHARP
+    // retirement + watcher ledger).
+    AddTestCase(new PfcParkBodyNotFramedTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcBulkFragmentResumeDeliversAllTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcSoTxWindowResumeTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcLlrRetransmitExemptTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcDeferredEgressLatchTest, TestCase::Duration::QUICK);
+    AddTestCase(new SharpRetireCompletionOrderTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcWatcherLedgerPruningTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

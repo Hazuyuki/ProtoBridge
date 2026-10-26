@@ -525,6 +525,18 @@ class FabricEndpoint : public Application
     bool LinkUsesFec() const;
 
     /**
+     * \brief Egress a deferred (paced/FEC/WFQ-held) packet at fire time,
+     *        re-checking the PFC latch that may have latched AFTER the send
+     *        was deferred. A pause arriving mid-hold must still hold the
+     *        packet (re-defer by 500 ns) instead of letting the deferred
+     *        callback's dev->Send() bypass the chokepoint entirely (codex
+     *        round 27, finding 5). Exempt classes (control/retry/retransmit,
+     *        local dests) go straight to the device.
+     */
+    void SendDeferredEgress(Ptr<Packet> packet, uint32_t deviceIndex,
+                            const Address& dest);
+
+    /**
      * @brief Get the next device index for spraying
      * @return Device index
      */

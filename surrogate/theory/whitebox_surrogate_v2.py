@@ -1050,11 +1050,21 @@ class TheoryDerivedSurrogate:
                     tail_frags, tail_frag_bytes = self._switch_multicast_fragments(
                         last_partition)
                 else:
-                    # Degenerate grid (D < P): the switch still emits one
-                    # (sub-chunk) partition body each; keep at least one
-                    # fragment per partition.
-                    body_frags, body_frag_bytes = 1, max(1, last_partition)
-                    tail_frags, tail_frag_bytes = body_frags, body_frag_bytes
+                    # Degenerate grid (D < P): partitionSize == 0, so the
+                    # switch's spray loop emits NOTHING for the first P-1
+                    # partitions (MulticastAllReducePartition's
+                    # bytesRemaining > 0 guard never admits a chunk) and the
+                    # WHOLE D rides the last partition's spray geometry.
+                    # For effective=wire=7 B / P=8 / 18 lanes that is SEVEN
+                    # 1-B results per dest, not eight 7-B ones: the old
+                    # fallback modeled a full-size fragment per partition
+                    # (1.45 expected permanent losses at N=8 / BER 0.05 /
+                    # LLR / retry 10000 vs the true ~1.02e-29, wrongly
+                    # inf under strict reliability — codex round 27,
+                    # finding 7).
+                    body_frags, body_frag_bytes = 0, 1
+                    tail_frags, tail_frag_bytes = self._switch_multicast_fragments(
+                        last_partition)
                 # Each dest receives every partition: (P-1) x frag(D//P)
                 # chunks plus the remainder tail's fragments. The two grid
                 # positions have DIFFERENT fragment sizes (18 x 131,072-B body

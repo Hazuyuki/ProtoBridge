@@ -1139,12 +1139,24 @@ main(int argc, char* argv[])
             // the race and PFC is dead weight: pfcPauseThreshold <
             // voqDropThreshold whenever both are armed (the same
             // invariant shape as voqDropThreshold < switchVoqDepth).
-            if (voqDropThreshold != 0 && pfcPauseThreshold >= voqDropThreshold)
+            // The ARMED threshold, not the raw CLI value:
+            // --voqDropThreshold defaults to 8 (the plain-ETH legacy
+            // default), but RoCE stays lossless (threshold 0) unless the
+            // flag was passed EXPLICITLY — testing the raw default rejected
+            // `--switchPfcMode=1` alone on a lossless two-node RoCE/ToR
+            // run (64 >= 8 abort; codex round 27, finding 8). Plain ETH
+            // always arms the drop; for RoCE `lossyRoce` is exactly the
+            // explicit-flag arm.
+            const uint32_t armedDropThreshold =
+                (interNodeFabricType == FabricType::ROCE && !lossyRoce)
+                    ? 0
+                    : voqDropThreshold;
+            if (armedDropThreshold != 0 && pfcPauseThreshold >= armedDropThreshold)
             {
                 NS_ABORT_MSG_IF(
                     true,
                     "pfcPauseThreshold (" << pfcPauseThreshold
-                    << ") must be < voqDropThreshold (" << voqDropThreshold
+                    << ") must be < voqDropThreshold (" << armedDropThreshold
                     << ") when --switchPfcMode>0 and the lossy drop is armed, "
                     << "else the tail-drop fires before the pause and PFC "
                     << "never engages.");

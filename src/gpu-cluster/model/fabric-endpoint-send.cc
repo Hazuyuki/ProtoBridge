@@ -175,8 +175,11 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
             if (!SendPacketOnDevice(chunkPacket, deviceIdx, destMac))
             {
                 // PFC-held: parked on the send queue by the chokepoint; do
-                // not count a transmission (the resume drains it).
-                break;
+                // not count a transmission (the resume drains it). KEEP
+                // BUILDING the remaining fragments — each parks itself the
+                // same way — instead of dropping them (codex round 27,
+                // finding 1; same shape as SendBulkWireTransferSize's loop).
+                continue;
             }
 
             m_txTrace(chunkPacket->GetSize(), seqNum);
@@ -467,8 +470,11 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             if (!SendPacketOnDevice(chunkPacket, deviceIdx, destMac))
             {
                 // PFC-held: parked on the send queue by the chokepoint; do
-                // not count a transmission (the resume drains it).
-                break;
+                // not count a transmission (the resume drains it). KEEP
+                // BUILDING the remaining fragments — each parks itself the
+                // same way — instead of dropping them (codex round 27,
+                // finding 1; same shape as SendBulkWireTransferSize's loop).
+                continue;
             }
 
             m_txTrace(chunkPacket->GetSize(), seqNum);
@@ -1033,8 +1039,14 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             if (!SendPacketOnDevice(pkt, deviceIdx, destMac))
             {
                 // PFC-held: parked on the send queue by the chokepoint; do
-                // not count a transmission (the resume drains it).
-                break;
+                // not count a transmission (the resume drains it). KEEP
+                // BUILDING the remaining sub-packets — each parks itself
+                // the same way — instead of dropping them (codex round 27,
+                // finding 1; same shape as SendBulkWireTransferSize's loop).
+                // The device-spray counter still advances so the parked
+                // sub-packets keep their per-lane assignment.
+                chunkIndex++;
+                continue;
             }
 
             m_txTrace(pkt->GetSize(), seqNum);

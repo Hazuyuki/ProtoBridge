@@ -101,6 +101,11 @@ class EthernetSwitch : public NvSwitch
     /// RESUME once the VOQ drains to threshold - offset).
     void CheckPfcResume(uint32_t inPort, uint32_t outPort);
 
+    /// Drop fired watcher EventIds from m_pfcResumeEvents so the ledger
+    /// tracks only LIVE polls (called at each append; codex round 27,
+    /// finding 9).
+    void PrunePfcResumeEvents();
+
     /// Mode-2 (dynamic) pause threshold; mode 1 returns the static value.
     uint32_t EffectivePfcPauseThreshold(uint32_t outPort) const;
 

@@ -393,6 +393,26 @@ class NvSwitch : public FabricSwitch
     size_t GetSharpResultStoreSize(uint16_t destRank) const;
 
     /**
+     * @brief Test seam: seed a stored result window for a flow, then retire
+     *        it, exactly as MulticastAllReduceResult/Partition's completion
+     *        path would (seed + RetireSharpResultFlow in one step, or split
+     *        across calls). Used by the completion-order retirement
+     *        regression test (codex round 27, finding 6).
+     */
+    void SeedResultFlow(uint16_t destRank, uint16_t flowId, uint32_t seqNum);
+    void CompleteResultFlow(uint16_t flowId);
+
+    /**
+     * @brief Test seam: enqueue a packet through the REAL admission path
+     *        (congestion hook + VOQ push + arbitration arming), bypassing the
+     *        promiscuous receive routing. Used by the PFC watcher-ledger
+     *        regression test, which needs a genuinely filling/draining VOQ
+     *        (the resume watcher polls GetVoqSize) rather than synthetic
+     *        OnPacketEnqueue depth arguments.
+     */
+    void EnqueueForTest(uint32_t outPort, const VoqEntry& entry);
+
+    /**
      * @brief Congestion hook called when a packet is enqueued to a VOQ.
      *
      * Returns false to DROP the packet (the caller skips the push and counts
@@ -708,6 +728,14 @@ class NvSwitch : public FabricSwitch
     /// codex round 25, finding 8).
     static constexpr size_t SHARP_RESULT_GENERATIONS = 2;
     static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
+    /// destRank -> completion-ordered flow ids (most recent last). The
+    /// retention policy keeps the SHARP_RESULT_GENERATIONS most recently
+    /// COMPLETED flows' windows; the numeric-sort it replaces kept the
+    /// numerically largest ids and could evict the just-completed flow's
+    /// own repair window (flows 100, 101, then 1: flow 1 was evicted at
+    /// its own completion and its immediate NACK missed — codex round 27,
+    /// finding 6).
+    std::unordered_map<uint16_t, std::deque<uint16_t>> m_sharpCompletedFlows;
 
     // Upload dedup: (flowId, srcRank) -> seen upload sequence numbers. A
     // retransmitted NVLS/SHARP upload (its LLR ack lost) must not count as a

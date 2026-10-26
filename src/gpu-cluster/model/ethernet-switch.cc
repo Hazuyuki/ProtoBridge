@@ -102,6 +102,17 @@ EthernetSwitch::IsPfcPaused(uint32_t inPort, uint32_t outPort) const
 }
 
 void
+EthernetSwitch::PrunePfcResumeEvents()
+{
+    // Drop fired watchers (IsExpired) — the current poll rescheduled itself
+    // before the ledger was pruned, so the vector's live tail is all that
+    // needs to survive. Keeps the ledger O(live watchers) instead of
+    // O(cumulative polls) (codex round 27, finding 9).
+    std::erase_if(m_pfcResumeEvents,
+                  [](const EventId& ev) { return ev.IsExpired(); });
+}
+
+void
 EthernetSwitch::DoDispose()
 {
     // Cancel every pending resume-hysteresis watcher: each targets raw `this`
@@ -205,10 +216,15 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
     // Resume hysteresis watcher: poll the drained VOQ; lift the pause once
     // it falls to threshold - offset (HPCC's resume_offset guard against
     // thrash). Runs while paused; the ledger entry is retired at resume
-    // (DoDispose cancels whatever is still pending).
+    // (DoDispose cancels whatever is still pending). Prune the fired/expired
+    // entries at each append — without pruning the ledger grew monotonically
+    // (initial watcher + one EventId per 500-ns poll; 10,000 pause/resume
+    // cycles retained 10,000 dead EventIds, and continuous congestion added
+    // ~2M entries/s per paused hop — codex round 27, finding 9).
     EventId watcher = Simulator::Schedule(NanoSeconds(500),
                                           &EthernetSwitch::CheckPfcResume,
                                           this, inPort, outPort);
+    PrunePfcResumeEvents();
     m_pfcResumeEvents.push_back(watcher);
 }
 
@@ -225,10 +241,12 @@ EthernetSwitch::CheckPfcResume(uint32_t inPort, uint32_t outPort)
                                : 0;
     if (GetVoqSize(outPort) > resumeLevel)
     {
-        // Still congested: keep watching.
+        // Still congested: keep watching (pruned at each append — see
+        // MaybeSendPfcPause).
         EventId watcher = Simulator::Schedule(NanoSeconds(500),
                                               &EthernetSwitch::CheckPfcResume,
                                               this, inPort, outPort);
+        PrunePfcResumeEvents();
         m_pfcResumeEvents.push_back(watcher);
         return;
     }

@@ -1671,3 +1671,36 @@ def test_nvls_allreduce_partition_grid_is_integer():
         optical_fraction=1.0, optical_hops=1, collective="allreduce")
     assert losses_aligned == pytest.approx(0.107369, rel=1e-3), \
         losses_aligned
+
+
+def test_nvls_allreduce_degenerate_partition_grid():
+    """Degenerate partition grid (D < P): partitionSize = D // P == 0, so
+    NvSwitch's MulticastAllReducePartition emits NOTHING for the first P-1
+    partitions (the bytesRemaining > 0 guard never admits a chunk) and the
+    WHOLE D rides the LAST partition's spray geometry. For effective=wire=7
+    B, 8 partitions, 18 lanes the switch emits SEVEN 1-B results per
+    destination. The pre-fix fallback modeled a full-size fragment per
+    partition (eight 7-B fragments), predicting 1.454 expected permanent
+    losses at N=8 / BER 0.05 / LLR / retry 10,000 — where the true geometry
+    gives ~1.02e-29 — and wrongly returned infinity under strict reliability
+    (codex round 27, finding 7)."""
+    nvls = wb.make_h200_nvls_theory()
+    nvls.num_lanes = 18
+    D, N, ber = 7, 8, 0.05
+    # Geometry: the tail (last partition = the whole 7 B) sprays at the
+    # 18-lane geometry: 7 sent fragments of 1 B each; body partitions emit 0.
+    tail_frags, tail_bytes = nvls._switch_multicast_fragments(D)
+    assert tail_frags == 7 and tail_bytes == 1
+    losses = nvls.expected_permanent_losses(
+        D, N, "nvls", ber, 10000,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce",
+        llr_enabled=True)
+    p_tail = 1 - (1 - ber) ** (tail_bytes * 8)
+    expected = N * (7 * tail_frags * p_tail ** 10001)
+    assert losses == pytest.approx(expected), losses
+    assert abs(losses - 1.02e-29) < 1e-30, losses
+    # Strict reliability must stay finite (pre-fix: 1.454 -> inf).
+    t = nvls.predict(D, N, "nvls", 128, ber=ber, retry_limit=10000,
+                     strict_reliability=True, collective="allreduce",
+                     llr_enabled=True)
+    assert math.isfinite(t)

@@ -1104,12 +1104,16 @@ FabricEndpoint::PumpBulkTxWindow()
         if (!SendPacketOnDevice(chunkPacket, desc.deviceIndex,
                                 ResolveDestMac(desc.destRank)))
         {
-            // PFC-held: the packet parked on the send queue instead of the
-            // wire. Undo the window membership + inflight slot (the drain
-            // pass after the RESUME re-sends it via the queue, not the
-            // window) and do NOT count a transmission.
-            m_bulkTxWindowSeqs.erase({desc.destRank, desc.vcId, desc.flowId, seqNum});
-            m_bulkTxInflight--;
+            // PFC-held: the chunk parked on the send queue instead of the
+            // wire, but it KEEPS its window slot and membership — a real
+            // NIC's TX window counts parked-but-unsent descriptors against
+            // tx_depth too. Erasing the membership (the old fix) stranded
+            // the slot: the parked chunk's post-resume ACK found no window
+            // entry, never called ReleaseBulkTxSlot, and the rest of
+            // m_bulkTxQueue stalled behind a window that thought it was
+            // full (soTxWindow=2 with 4 chunks delivered 1 and stopped,
+            // codex round 27, finding 3). The ACK after the resume drains
+            // the parked chunk releases the slot and re-pumps.
             break; // the head chunk is held: later chunks would park too
         }
 
@@ -2776,6 +2780,14 @@ FabricEndpoint::ProcessPfcResumePacket(const FabricHeader& resumeHeader)
     {
         // Sends toward this dest were being gated; drain what queued up.
         TrySendQueuedPackets();
+        // PFC-held bulk chunks keep their TX-window slots while parked, so
+        // a pause can stall the window with inflight == m_soTxWindow and
+        // m_bulkTxQueue nonempty. The drain above re-sends the parked
+        // chunks, but the window needs a pump too: without it the next
+        // windowed chunk waited for an ACK that could not release a slot
+        // the window thought it still owed (round 27, finding 3's resume
+        // half).
+        PumpBulkTxWindow();
     }
 }
 
@@ -2873,6 +2885,12 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     // notices — flows unimpeded: pausing feedback would deadlock the
     // reliability loop, and LLR retransmits are the safety net that keeps
     // running under PFC (the pause is a no-drop backstop, not the recovery).
+    // IsRetryPacket() names only RETRY_REQUEST/RETRY_ACK CONTROL types: an
+    // actual repair re-sends the ORIGINAL packet type (DATA/P2P/...), so the
+    // exemption is m_isRetransmitting — the flag SendRetransmission raises
+    // around this call — not the header's type field (codex round 27,
+    // finding 4: a NACK during a pause advanced the retry counter but the
+    // repair parked, disarming the timeout backstop until resume).
     // Local (Su) destinations are never paused: a pause mirrors a So fabric
     // header, so its SourceRank is always an inter-node rank.
     if (!m_pfcPausedDests.empty())
@@ -2880,11 +2898,19 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         FabricHeader throttleHdr;
         packet->PeekHeader(throttleHdr);
         if (!throttleHdr.IsControlPacket() && !throttleHdr.IsRetryPacket()
+            && !m_isRetransmitting
             && !IsLocalRank(throttleHdr.GetDestRank())
             && m_pfcPausedDests.count(throttleHdr.GetDestRank()) > 0)
         {
             SendQueueEntry entry;
+            // Park the BODY, not the framed packet: every caller AddHeaders
+            // before this call and the drain re-adds entry.header, so a
+            // header-full copy resumed as header+header+body — a 4096-B
+            // transfer drained as a 4135-B body, mis-serializing and
+            // corrupting protocol-framed payload extraction (codex round 27,
+            // finding 2).
             entry.packet = packet->Copy();
+            entry.packet->RemoveHeader(throttleHdr);
             entry.header = throttleHdr;
             entry.vcId = throttleHdr.GetVirtualChannel();
             entry.seqNum = throttleHdr.GetSequenceNumber();
@@ -3053,10 +3079,8 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                              << " serviceTime=" << serviceTime.GetNanoSeconds() << "ns"
                              << " encodeLatency=" << encodeLatency.GetNanoSeconds() << "ns");
                 m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, tc]() {
-                        Ptr<NetDevice> dev = m_devices[deviceIndex];
-                        ArmRetryTimeoutOnWire(packet);
-                        dev->Send(packet, dest, 0x0800);
+                    Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest]() {
+                        SendDeferredEgress(packet, deviceIndex, dest);
                     }));
                 // Decrement backlog after packet finishes transmission
                 // (serialization). Tracked like the deferred send itself:
@@ -3092,9 +3116,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         {
             m_deferredEgressEvents.push_back(
                 Simulator::Schedule(delay, [this, packet, deviceIndex, dest]() {
-                    Ptr<NetDevice> device = m_devices[deviceIndex];
-                    ArmRetryTimeoutOnWire(packet);
-                    device->Send(packet, dest, 0x0800);
+                    SendDeferredEgress(packet, deviceIndex, dest);
                 }));
             // Decrement backlog after serialization. Tracked for DoDispose
             // like the deferred send above (raw-`this` capture; codex round
@@ -3124,9 +3146,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     {
         m_deferredEgressEvents.push_back(
             Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest]() {
-                Ptr<NetDevice> dev = m_devices[deviceIndex];
-                ArmRetryTimeoutOnWire(packet);
-                dev->Send(packet, dest, 0x0800);
+                SendDeferredEgress(packet, deviceIndex, dest);
             }));
     }
     else
@@ -3171,6 +3191,37 @@ FabricEndpoint::TrackBacklogDecrement(const EventId& ev,
                       return std::get<0>(entry).IsExpired();
                   });
     m_pendingBacklogDecrements.push_back({ev, model, tc});
+}
+
+void
+FabricEndpoint::SendDeferredEgress(Ptr<Packet> packet, uint32_t deviceIndex,
+                                   const Address& dest)
+{
+    // The pause latch may have latched AFTER the send was deferred: a PFC
+    // PAUSE arriving mid-pacing-hold must hold the deferred packet too, not
+    // let the pre-scheduled dev->Send() bypass the chokepoint (codex round
+    // 27, finding 5: two 4-KiB sends paced at 1 Gbps, PAUSE at 1 us — the
+    // second still hit the wire at ~35 us without a RESUME). Same exemption
+    // set as SendPacketOnDevice's gate, so an exempt deferred send (control,
+    // repair, local dest) never re-defers.
+    if (!m_pfcPausedDests.empty())
+    {
+        FabricHeader hdr;
+        packet->PeekHeader(hdr);
+        if (!hdr.IsControlPacket() && !hdr.IsRetryPacket() && !m_isRetransmitting
+            && !IsLocalRank(hdr.GetDestRank())
+            && m_pfcPausedDests.count(hdr.GetDestRank()) > 0)
+        {
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(NanoSeconds(500), [this, packet, deviceIndex, dest]() {
+                    SendDeferredEgress(packet, deviceIndex, dest);
+                }));
+            return;
+        }
+    }
+    Ptr<NetDevice> dev = m_devices[deviceIndex];
+    ArmRetryTimeoutOnWire(packet);
+    dev->Send(packet, dest, 0x0800);
 }
 
 void
@@ -3629,9 +3680,17 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             Mac48Address destMac = ResolveDestMac(destRank);
             if (!SendPacketOnDevice(chunkPacket, deviceIdx, destMac))
             {
-                // PFC-held: parked on the send queue by the chokepoint;
-                // do not count a transmission (the resume drains it).
-                break;
+                // PFC-held: parked on the send queue by the chokepoint; do
+                // not count a transmission (the resume drains it). KEEP
+                // BUILDING the remaining fragments — each parks itself the
+                // same way — instead of dropping them: a held break threw
+                // away fragments i+1..n-1 entirely, so a paused dest's
+                // 16-KiB transfer over a 4-KiB bulk cap resumed with only
+                // the first 4 KiB and the completion stalled forever (codex
+                // round 27, finding 1). Per-iteration parking mirrors the
+                // credit-blocked path above (which queues every remaining
+                // chunk rather than abandoning them).
+                continue;
             }
 
             m_txTrace(chunkPacket->GetSize(), seqNum);
@@ -3713,7 +3772,8 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         if (!SendPacketOnDevice(packet, deviceIdx, destMac))
         {
             // PFC-held: parked on the send queue by the chokepoint; do not
-            // count a transmission (the resume drains it).
+            // count a transmission (the resume drains it). Single-packet
+            // path — nothing else to build, plain return.
             return;
         }
 

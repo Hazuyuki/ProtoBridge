@@ -168,6 +168,7 @@ NvSwitch::DoDispose()
     m_seenUploadSeqs.clear();
     m_sharpResultStore.clear();
     m_lastResultFlow.clear();
+    m_sharpCompletedFlows.clear();
     Simulator::Cancel(m_arbitrationEvent);
     NetDevice::DoDispose();
 }
@@ -517,6 +518,41 @@ NvSwitch::InjectResultNack(uint16_t requestingRank, uint32_t seqNum)
     nh.SetDestRank(0xFFFF);
     nh.SetSequenceNumber(seqNum);
     return HandleSwitchNack(nh, 0);
+}
+
+void
+NvSwitch::SeedResultFlow(uint16_t destRank, uint16_t flowId, uint32_t seqNum)
+{
+    FabricHeader h;
+    h.SetPacketType(FabricPacketType::ALLREDUCE);
+    h.SetFlowId(flowId);
+    h.SetSourceRank(0xFFFF); // switch sentinel (StoreMulticastResult's shape)
+    h.SetDestRank(destRank);
+    h.SetSequenceNumber(seqNum);
+    h.SetPayloadSize(8);
+    h.SetEffectiveDataSize(8);
+    Ptr<Packet> pkt = Create<Packet>(8);
+    pkt->AddHeader(h);
+    StoreMulticastResult(destRank, flowId, 0, seqNum, pkt);
+}
+
+void
+NvSwitch::CompleteResultFlow(uint16_t flowId)
+{
+    RetireSharpResultFlow(flowId);
+}
+
+void
+NvSwitch::EnqueueForTest(uint32_t outPort, const VoqEntry& entry)
+{
+    // Bypassing ReceiveFromPort skips its arbitration arming (line ~833);
+    // arm it here or the pushed packets sit in the VOQ forever and the
+    // resume watcher never sees the queue drain.
+    EnqueueToVoq(outPort, entry);
+    if (!m_arbitrationEvent.IsPending())
+    {
+        ScheduleArbitration();
+    }
 }
 
 size_t
@@ -1382,44 +1418,48 @@ NvSwitch::RetireSharpResultFlow(uint16_t flowId)
     // Flow retirement (codex round 25, finding 8): the store grew with every
     // HISTORICAL flow — a completed flow's window stayed in the map forever
     // (only DoDispose cleared it), so 100 completed flows kept 100 windows
-    // per destination alive until disposal. Per destination we now keep the
-    // SHARP_RESULT_GENERATIONS most recent flows' windows (the completing
-    // flow's own window stays: its fragments may still be on the wire and a
-    // NACK racing the tail of delivery must find them — retiring the flow's
-    // OWN window at its own completion broke exactly that, and retiring at
-    // the NEXT flow's completion killed the older flow's in-flight repairs
-    // too). Anything older than the retained generations is gone: a NACK
-    // that late names a flow whose collective layer completed a full
-    // generation ago — a stale replay, and the named-flow miss (false)
-    // HandleSwitchNack already returns for unknown flows. DoDispose clears
-    // the whole store.
-    std::unordered_map<uint16_t, std::vector<uint16_t>> recentFlows;
-    for (const auto& kv : m_sharpResultStore)
+    // per destination alive until disposal. Per destination we keep the
+    // SHARP_RESULT_GENERATIONS most recently COMPLETED flows' windows (the
+    // completing flow's own window stays: its fragments may still be on the
+    // wire and a NACK racing the tail of delivery must find them — retiring
+    // the flow's OWN window at its own completion broke exactly that, and
+    // retiring at the NEXT flow's completion killed the older flow's
+    // in-flight repairs too). Anything older than the retained generations
+    // is gone: a NACK that late names a flow whose collective layer
+    // completed a full generation ago — a stale replay, and the named-flow
+    // miss (false) HandleSwitchNack already returns for unknown flows.
+    // DoDispose clears the whole store.
+    //
+    // "Most recently completed" is COMPLETION ORDER, not flow-id order
+    // (codex round 27, finding 6): the numeric-descending sort this replaces
+    // kept the numerically largest ids, so completing flows 100, 101, then 1
+    // evicted flow 1 AT ITS OWN COMPLETION — an immediate NACK for flow 1
+    // seq 0 then missed the just-retired window. m_sharpCompletedFlows
+    // tracks the actual completion sequence per destination, and ONLY
+    // completed flows compete for retention: a still-in-flight flow (a
+    // window with no completion yet) is never evicted here (round 24,
+    // finding 4's concurrency guarantee), only by its own window bound or
+    // DoDispose.
+    for (auto& kv : m_sharpResultStore)
     {
+        if (static_cast<uint16_t>(kv.first & 0xFFFF) != flowId)
+        {
+            continue;
+        }
         const uint16_t destRank = static_cast<uint16_t>(kv.first >> 16);
-        const uint16_t windowFlow = static_cast<uint16_t>(kv.first & 0xFFFF);
-        auto& flows = recentFlows[destRank];
-        flows.push_back(windowFlow);
-        std::sort(flows.begin(), flows.end(), std::greater<uint16_t>());
-        if (flows.size() > SHARP_RESULT_GENERATIONS)
+        auto& order = m_sharpCompletedFlows[destRank];
+        order.erase(std::remove(order.begin(), order.end(), flowId), order.end());
+        order.push_back(flowId);
+        while (order.size() > SHARP_RESULT_GENERATIONS)
         {
-            flows.pop_back();
+            const uint16_t evicted = order.front();
+            order.pop_front();
+            m_sharpResultStore.erase((static_cast<uint64_t>(destRank) << 16) | evicted);
         }
     }
-    for (auto it = m_sharpResultStore.begin(); it != m_sharpResultStore.end();)
-    {
-        const uint16_t destRank = static_cast<uint16_t>(it->first >> 16);
-        const uint16_t windowFlow = static_cast<uint16_t>(it->first & 0xFFFF);
-        const auto& keep = recentFlows[destRank];
-        if (std::find(keep.begin(), keep.end(), windowFlow) == keep.end())
-        {
-            it = m_sharpResultStore.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
-    }
+    // Flows NOT in a destination's completion log are still in flight (their
+    // windows exist but their multicast has not completed) — keep them
+    // (round 24, finding 4: concurrent flows keep independent windows).
 }
 
 void
