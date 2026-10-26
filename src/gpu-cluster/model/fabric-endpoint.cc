@@ -3078,9 +3078,12 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                              << " numActive=" << numActive
                              << " serviceTime=" << serviceTime.GetNanoSeconds() << "ns"
                              << " encodeLatency=" << encodeLatency.GetNanoSeconds() << "ns");
+                // Capture the retransmit flag: m_isRetransmitting is reset
+                // before a deferred egress fires (codex round 28, finding 1).
+                const bool retransmit = m_isRetransmitting;
                 m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest]() {
-                        SendDeferredEgress(packet, deviceIndex, dest);
+                    Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, retransmit]() {
+                        SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
                     }));
                 // Decrement backlog after packet finishes transmission
                 // (serialization). Tracked like the deferred send itself:
@@ -3114,9 +3117,11 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         Time delay = encodeLatency + shapingDelay;
         if (delay > Seconds(0))
         {
+            // Capture the retransmit flag (codex round 28, finding 1).
+            const bool retransmit = m_isRetransmitting;
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(delay, [this, packet, deviceIndex, dest]() {
-                    SendDeferredEgress(packet, deviceIndex, dest);
+                Simulator::Schedule(delay, [this, packet, deviceIndex, dest, retransmit]() {
+                    SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
                 }));
             // Decrement backlog after serialization. Tracked for DoDispose
             // like the deferred send above (raw-`this` capture; codex round
@@ -3144,9 +3149,11 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     // (parity-identical to the unmounted baseline).
     if (shapingDelay > Time(0))
     {
+        // Capture the retransmit flag (codex round 28, finding 1).
+        const bool retransmit = m_isRetransmitting;
         m_deferredEgressEvents.push_back(
-            Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest]() {
-                SendDeferredEgress(packet, deviceIndex, dest);
+            Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest, retransmit]() {
+                SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
             }));
     }
     else
@@ -3197,24 +3204,41 @@ void
 FabricEndpoint::SendDeferredEgress(Ptr<Packet> packet, uint32_t deviceIndex,
                                    const Address& dest)
 {
+    SendDeferredEgressInternal(packet, deviceIndex, dest, false);
+}
+
+void
+FabricEndpoint::SendDeferredEgressInternal(Ptr<Packet> packet, uint32_t deviceIndex,
+                                           const Address& dest, bool isRetransmit)
+{
     // The pause latch may have latched AFTER the send was deferred: a PFC
     // PAUSE arriving mid-pacing-hold must hold the deferred packet too, not
     // let the pre-scheduled dev->Send() bypass the chokepoint (codex round
     // 27, finding 5: two 4-KiB sends paced at 1 Gbps, PAUSE at 1 us — the
     // second still hit the wire at ~35 us without a RESUME). Same exemption
     // set as SendPacketOnDevice's gate, so an exempt deferred send (control,
-    // repair, local dest) never re-defers.
+    // repair, local dest) never re-defers. The retransmit exemption rides
+    // through the deferral as a captured flag: m_isRetransmitting is already
+    // reset by the time a deferred egress fires (SendRetransmission raises
+    // it only around the synchronous call), so reading the member at fire
+    // time lost the exemption and parked LLR repairs for the whole pause
+    // (codex round 28, finding 1).
     if (!m_pfcPausedDests.empty())
     {
         FabricHeader hdr;
         packet->PeekHeader(hdr);
-        if (!hdr.IsControlPacket() && !hdr.IsRetryPacket() && !m_isRetransmitting
+        if (!hdr.IsControlPacket() && !hdr.IsRetryPacket() && !isRetransmit
             && !IsLocalRank(hdr.GetDestRank())
             && m_pfcPausedDests.count(hdr.GetDestRank()) > 0)
         {
+            // Prune fired EventIds at every append: this loop appends every
+            // 500 ns while held and never re-enters SendPacketOnDevice's
+            // entry-side prune, so the ledger grew ~2M entries/s per held
+            // callback (codex round 28, finding 2).
+            PruneDeferredEgressEvents();
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(NanoSeconds(500), [this, packet, deviceIndex, dest]() {
-                    SendDeferredEgress(packet, deviceIndex, dest);
+                Simulator::Schedule(NanoSeconds(500), [this, packet, deviceIndex, dest, isRetransmit]() {
+                    SendDeferredEgressInternal(packet, deviceIndex, dest, isRetransmit);
                 }));
             return;
         }
@@ -3222,6 +3246,13 @@ FabricEndpoint::SendDeferredEgress(Ptr<Packet> packet, uint32_t deviceIndex,
     Ptr<NetDevice> dev = m_devices[deviceIndex];
     ArmRetryTimeoutOnWire(packet);
     dev->Send(packet, dest, 0x0800);
+}
+
+void
+FabricEndpoint::PruneDeferredEgressEvents()
+{
+    std::erase_if(m_deferredEgressEvents,
+                  [](const EventId& ev) { return ev.IsExpired(); });
 }
 
 void

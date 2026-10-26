@@ -537,6 +537,15 @@ class FabricEndpoint : public Application
                             const Address& dest);
 
     /**
+     * @brief Fire-time core of SendDeferredEgress with the retransmit
+     *        exemption carried through the deferral as a captured flag
+     *        (m_isRetransmitting is already reset when a deferred egress
+     *        fires — codex round 28, finding 1).
+     */
+    void SendDeferredEgressInternal(Ptr<Packet> packet, uint32_t deviceIndex,
+                                    const Address& dest, bool isRetransmit);
+
+    /**
      * @brief Get the next device index for spraying
      * @return Device index
      */
@@ -711,7 +720,41 @@ class FabricEndpoint : public Application
 
     void TrySendQueuedPackets();
 
+    /// @brief Drop fired (IsExpired) deferred-egress EventIds from the
+    ///        ledger. Called at every append site — including the PFC
+    ///        re-defer loop in SendDeferredEgress, which appends a new
+    ///        EventId every 500 ns while a callback is held and never
+    ///        re-enters SendPacketOnDevice's entry-side prune (codex round
+    ///        28, finding 2: one held paced callback retained ~600k expired
+    ///        entries after a 10-ms pause, ~2M entries/s per held callback).
+    void PruneDeferredEgressEvents();
+
   protected:
+    /// @brief Test seam: total deferred-egress ledger size (live + expired).
+    ///        The ledger itself is private; tests observe its growth through
+    ///        this accessor (codex round 28, finding 2 — the PFC re-defer
+    ///        loop appended without pruning, so one held paced callback
+    ///        retained ~19,976 expired EventIds after a 10-ms pause).
+    size_t GetDeferredEgressEventCountForTest() const
+    {
+        return m_deferredEgressEvents.size();
+    }
+
+    /// @brief Test seam: deferred-egress ledger entries that are still live
+    ///        (not IsExpired). Pruning keeps total == live in steady state.
+    size_t GetLiveDeferredEgressEventCountForTest() const
+    {
+        size_t live = 0;
+        for (const EventId& ev : m_deferredEgressEvents)
+        {
+            if (!ev.IsExpired())
+            {
+                live++;
+            }
+        }
+        return live;
+    }
+
     /// @brief Receive-side handler for an inbound PFC_PAUSE (802.1Qbb analog,
     ///        So-only): suspends new sends toward the paused destination rank
     ///        (the switch's congested egress). In-flight retransmit timers

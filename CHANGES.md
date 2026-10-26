@@ -87,6 +87,61 @@ Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
 scripts (test_random_traffic.py extended with a goodput-excludes-losses
 check), valgrind QUICK exit 0 with zero errors.
 
+### Fixed — codex round 28: five defects — a deferred LLR repair losing its PFC exemption, two EventId ledgers growing without bound, ApplyBundle ignoring llrMode, and silent stencil rank/VC narrowing
+
+1. **A DEFERRED LLR repair lost its PFC exemption** (medium).
+   `SendRetransmission` raises `m_isRetransmitting` only around the
+   synchronous `SendPacketOnDevice` call; with FEC encode latency (or
+   WFQ/shaping delay) every egress is deferred, and the fire-time gate in
+   `SendDeferredEgress` read the already-reset member — the repair parked
+   for the whole pause while its retry budget burned (a NACK'd 4-KiB DATA
+   packet under FEC + PAUSE produced zero wire traffic until RESUME). The
+   retransmit exemption now rides through the deferral as a captured flag:
+   the three deferral sites capture `m_isRetransmitting` at schedule time
+   and the new `SendDeferredEgressInternal` re-checks the latch with it.
+   Test: `PFC pause does not park a DEFERRED LLR repair (FEC hold)`.
+2. **The PFC re-defer loop accumulated expired events in the endpoint
+   ledger** (medium). Each 500-ns re-defer appended another EventId to
+   `m_deferredEgressEvents` without pruning; pruning ran only at
+   `SendPacketOnDevice` entry, which a held callback never re-enters. One
+   held paced callback retained ~600k expired entries after a 10-ms pause
+   (~2M entries/s per held callback). The loop now prunes at every append
+   (`PruneDeferredEgressEvents`, `std::erase_if` on `IsExpired` — the same
+   convention as `TrackBacklogDecrement`). Tests: `PFC re-defer loop prunes
+   dead EventIds from the egress ledger` plus the new
+   `GetDeferredEgressEventCountForTest` /
+   `GetLiveDeferredEgressEventCountForTest` seams.
+3. **Completed multicast FEC events retained their packet references until
+   disposal** (medium). `NvSwitch::m_deferredResultEvents` was never pruned
+   during operation: 1,000 completed FEC result sends retained 1,000
+   expired entries, each pinning its captured `pkt` (the final packet's
+   refcount stayed 2 until DoDispose) — memory grew with completed traffic
+   despite result-store retirement. All four append sites now call the new
+   `PruneDeferredResultEvents`. Test: `NvSwitch result-event ledger prunes
+   dead EventIds` (via `SeedResultFlow`/`InjectResultNack` and the new
+   count seams).
+4. **`ApplyBundle` silently ignored `bundle.llrMode`** (medium). The
+   documented bundle contract ("gobackn | sack (applied to LlrManager)")
+   was never applied: a bundle with `llrEnabled=1, llrMode=sack` left the
+   manager in GO_BACK_N, so losses triggered suffix retransmissions
+   instead of selective repairs. The CLI masked this by setting the mode
+   separately. `ApplyBundle` now routes the bundle's mode to each
+   endpoint's manager. Test: `ApplyBundle applies bundle.llrMode to the
+   LlrManager`.
+5. **Transfer stencil ranks and VCs silently narrowed without validation**
+   (low). `src`/`dst`/`vc` were `static_cast` to their wire fields with no
+   range check: with `numGpus=2`, `src=65536, dst=1, vc=256` compiled to
+   (rank 0, rank 1, VC 0) and executed a different operation than the one
+   written. `Compile` now rejects values beyond the field widths AND ranks
+   `>= numGpus`, with the offending field named in the error. Test:
+   `Transfer stencil rejects out-of-range ranks and VCs` (three cases:
+   src overflow, dst beyond numGpus, in-range still compiles).
+
+Suite state: gpu-cluster EXTENSIVE 165 PASS / 0 FAIL (5 new C++ tests),
+integration 5 PASS, surrogate pytest 99 passed, 14/14 parity scripts,
+valgrind on the three round-28 probes (deferred repair, egress ledger,
+switch result ledger) 0 errors / no leaks.
+
 ### Fixed — codex round 27: nine defects across PFC egress coordination, SHARP result retirement, the surrogate degenerate partition grid, and watcher-ledger growth
 
 1. **PFC-held bulk transfers drop every fragment after the first**

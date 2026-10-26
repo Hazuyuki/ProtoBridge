@@ -9269,6 +9269,8 @@ class PfcEndpointHarness : public FabricEndpoint
     using FabricEndpoint::ProcessPfcResumePacket;
     using FabricEndpoint::IsPfcPausedForDest;
     using FabricEndpoint::ProcessNackPacket;
+    using FabricEndpoint::GetDeferredEgressEventCountForTest;
+    using FabricEndpoint::GetLiveDeferredEgressEventCountForTest;
 };
 
 NS_OBJECT_ENSURE_REGISTERED(PfcEndpointHarness);
@@ -9810,6 +9812,305 @@ class PfcWatcherLedgerPruningTest : public TestCase
             "each watcher lifts its pause once the VOQ drains");
         sw->Dispose();
         Simulator::Destroy();
+    }
+};
+
+// (codex round 28, finding 1) A DEFERRED LLR repair keeps its PFC exemption.
+// SendRetransmission raises m_isRetransmitting only around the synchronous
+// SendPacketOnDevice call; with FEC encode latency every egress is deferred,
+// and the fire-time gate used to read the (already-reset) member — the repair
+// parked for the whole pause. The exemption now rides through the deferral
+// as a captured flag.
+class PfcDeferredLlrRepairExemptTest : public TestCase
+{
+  public:
+    PfcDeferredLlrRepairExemptTest()
+        : TestCase("PFC pause does not park a DEFERRED LLR repair (FEC hold)") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+        s.a->SetLlrEnabled(true);
+        s.a->SetLlrRetryLimit(10000);
+        // FEC encode latency: every egress (data AND repair) defers through
+        // SendDeferredEgressInternal.
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        fec->SetFecParams(544, 514, 15);
+        fec->SetEncodeLatency(MicroSeconds(5));
+        fec->SetDecodeLatency(MicroSeconds(5));
+        s.a->SetFecModel(fec);
+
+        std::vector<uint8_t> buf(4096, 0);
+        s.a->SendData(1, buf.data(), 4096, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        const size_t txAfterSend = s.tx.size();
+        NS_TEST_ASSERT_MSG_GT(txAfterSend, 0u, "the original send transmits");
+
+        // Pause dest 1, then NACK seq 0: the repair takes the FEC-deferred
+        // path and must STILL reach the wire during the pause (pre-fix: the
+        // fire-time gate read the reset m_isRetransmitting and parked it).
+        s.PauseFor(1);
+        FabricHeader nack;
+        nack.SetPacketType(FabricPacketType::NACK);
+        nack.SetFabricType(FabricType::ETHERNET);
+        nack.SetSourceRank(1);
+        nack.SetDestRank(0);
+        nack.SetSequenceNumber(0);
+        nack.SetFlowId(0);
+        nack.SetVirtualChannel(0);
+        Ptr<Packet> nackPkt = Create<Packet>(0);
+        nackPkt->AddHeader(nack);
+        s.a->ProcessNackPacket(nackPkt, nack);
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(s.tx.size(), txAfterSend,
+            "the deferred LLR repair must transmit under the pause (pre-fix: "
+            "the fire-time gate read the reset m_isRetransmitting and parked "
+            "the repair until RESUME)");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 28, finding 2) The PFC re-defer loop prunes fired EventIds at
+// every append. One paced callback held 10 ms re-defers every 500 ns; the
+// ledger must hold only live entries (pre-fix: ~600k dead EventIds, ~2M
+// entries/s per held callback).
+class PfcDeferredEgressLedgerPruningTest : public TestCase
+{
+  public:
+    PfcDeferredEgressLedgerPruningTest()
+        : TestCase("PFC re-defer loop prunes dead EventIds from the egress ledger") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+        Ptr<DcqcnRateMachine> rate = CreateObject<DcqcnRateMachine>();
+        rate->SetAttribute("PerQpCeilingGbps", DoubleValue(0.1));
+        s.a->SetDcqcnRateMachine(rate);
+        std::vector<uint8_t> buf(1000, 0);
+        s.a->SendDataWithProtocol(1, buf.data(), 1000, NcclProtocol::LL, 1, 0);
+        s.a->SendDataWithProtocol(1, buf.data(), 1000, NcclProtocol::LL, 1, 0);
+        Simulator::Schedule(MicroSeconds(1), [&s]() { s.PauseFor(1); });
+        // Hold 10 ms: ~20k re-defer appends if unpruned.
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+        const size_t total = s.a->GetDeferredEgressEventCountForTest();
+        const size_t live = s.a->GetLiveDeferredEgressEventCountForTest();
+        NS_TEST_ASSERT_MSG_LT(live, 100u,
+            "a single held callback must keep at most a handful of live "
+            "deferred events");
+        NS_TEST_ASSERT_MSG_EQ(total, live,
+            "the re-defer loop must prune fired EventIds at every append "
+            "(pre-fix: 600k+ dead entries after a 10-ms hold)");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 28, finding 3) NvSwitch's deferred-result ledger prunes fired
+// EventIds at every append: completed FEC result sends used to retain their
+// EventIds (and the packets the lambdas capture by value) until DoDispose —
+// 1,000 completed sends kept 1,000 expired entries.
+class NvSwitchResultLedgerPruningTest : public TestCase
+{
+  public:
+    NvSwitchResultLedgerPruningTest()
+        : TestCase("NvSwitch result-event ledger prunes dead EventIds") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        struct Harness : NvSwitch
+        {
+            using NvSwitch::SeedResultFlow;
+            using NvSwitch::InjectResultNack;
+            using NvSwitch::GetDeferredResultEventCountForTest;
+            using NvSwitch::GetLiveDeferredResultEventCountForTest;
+        };
+        Ptr<Harness> sw = CreateObject<Harness>();
+        nodes.Get(0)->AddDevice(sw);
+        sw->AddPort(link.Get(0));
+
+        Ptr<FecModel> fec = CreateObject<FecModel>();
+        fec->SetFecParams(544, 514, 15);
+        fec->SetEncodeLatency(MicroSeconds(1));
+        fec->SetDecodeLatency(MicroSeconds(1));
+        sw->SetFecModel(fec);
+        sw->SetLlrEnabled(true); // the result store is LLR-gated
+
+        // 200 completed FEC retransmits through the real result path: each
+        // fires SendMulticastResultOnPort, whose codec hold appends to the
+        // ledger.
+        for (uint32_t i = 0; i < 200; ++i)
+        {
+            sw->SeedResultFlow(1, 1, i);
+            NS_TEST_ASSERT_MSG_EQ(sw->InjectResultNack(1, i), true,
+                                  "each seeded result repairs");
+            Simulator::Stop(MicroSeconds(5));
+            Simulator::Run();
+        }
+        const size_t total = sw->GetDeferredResultEventCountForTest();
+        const size_t live = sw->GetLiveDeferredResultEventCountForTest();
+        // All sends completed: nothing is live, and the next append already
+        // pruned everything that fired — the ledger must be (near) empty,
+        // not 200 entries.
+        NS_TEST_ASSERT_MSG_LT(total, 10u,
+            "completed result sends must not accumulate in the ledger "
+            "(pre-fix: 1 expired entry per send, 200 after 200 sends)");
+        NS_TEST_ASSERT_MSG_EQ(live, 0u,
+            "no result event is still pending after the sends complete");
+        sw->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 28, finding 4) ProtocolConfigRunner::ApplyBundle applies
+// bundle.llrMode to each endpoint's LlrManager, honoring the documented
+// bundle contract ("gobackn | sack (applied to LlrManager)").
+class ApplyBundleLlrModeTest : public TestCase
+{
+  public:
+    ApplyBundleLlrModeTest()
+        : TestCase("ApplyBundle applies bundle.llrMode to the LlrManager") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+        std::vector<Ptr<FabricEndpoint>> eps;
+        for (int i = 0; i < 2; ++i)
+        {
+            Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+            nodes.Get(i)->AddApplication(ep);
+            ep->SetRank(i);
+            ep->SetLocalRankRange(i, 1);
+            ep->AddNetDevice(link.Get(i));
+            ep->SetRoutingEntry(1 - i, 0);
+            ep->Initialize();
+            eps.push_back(ep);
+        }
+        ProtocolBundle bundle;
+        bundle.llrEnabled = true;
+        bundle.llrMode = "sack";
+        ProtocolConfigRunner::ApplyBundle(eps, bundle, 65536);
+        NS_TEST_ASSERT_MSG_EQ(
+            eps[0]->GetLlrManager()->GetLlrMode() == LlrMode::SACK, true,
+            "bundle llrMode=sack must reach the LlrManager (pre-fix: the "
+            "manager stayed in GO_BACK_N — losses triggered suffix "
+            "retransmissions instead of selective repairs)");
+        // gobackn (and the empty default) select GO_BACK_N.
+        bundle.llrMode = "gobackn";
+        ProtocolConfigRunner::ApplyBundle(eps, bundle, 65536);
+        NS_TEST_ASSERT_MSG_EQ(
+            eps[0]->GetLlrManager()->GetLlrMode() == LlrMode::GO_BACK_N, true,
+            "bundle llrMode=gobackn selects GO_BACK_N");
+        for (auto& ep : eps)
+        {
+            ep->Dispose();
+        }
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 28, finding 5) Transfer stencil ranks and VC are validated
+// against their wire fields and the fabric's numGpus: src=65536 used to
+// silently narrow to rank 0 and vc=256 to VC 0, executing a different
+// operation than the one written.
+class TransferStencilRangeValidationTest : public TestCase
+{
+  public:
+    TransferStencilRangeValidationTest()
+        : TestCase("Transfer stencil rejects out-of-range ranks and VCs") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        const std::string cfgPath = "/tmp/protobridge_r28_stencil_range.cfg";
+        {
+            std::ofstream cfgFile(cfgPath);
+            cfgFile << "[op]\n"
+                    << "param.N = numGpus\n"
+                    << "transfer.0.kind = DATA\n"
+                    << "transfer.0.src = 65536\n"
+                    << "transfer.0.dst = 1\n"
+                    << "transfer.0.bytes = 1024\n"
+                    << "transfer.0.vc = 256\n";
+        }
+        ProtocolConfig cfg;
+        std::string err;
+        NS_TEST_ASSERT_MSG_EQ(cfg.Load(cfgPath, &err), true,
+                              "stencil cfg loads: " << err);
+        ProtocolTransactionGraph graph;
+        ProtocolTransactionNodeId term =
+            cfg.Compile(graph, CreateObject<NcclProtocolModel>(), 2, 1024,
+                        /*baseFlowId=*/1, &err);
+        NS_TEST_ASSERT_MSG_EQ(term, PROTOCOL_TRANSACTION_INVALID_NODE,
+            "src=65536 must be rejected, not narrowed to rank 0");
+        NS_TEST_ASSERT_MSG_NE(err.find("out of range"), std::string::npos,
+            "the error names the offending field: " << err);
+
+        // dst beyond numGpus is rejected too.
+        const std::string cfgPath2 = "/tmp/protobridge_r28_stencil_range2.cfg";
+        {
+            std::ofstream cfgFile2(cfgPath2);
+            cfgFile2 << "[op]\n"
+                     << "param.N = numGpus\n"
+                     << "transfer.0.kind = DATA\n"
+                     << "transfer.0.src = 0\n"
+                     << "transfer.0.dst = 5\n"
+                     << "transfer.0.bytes = 1024\n"
+                     << "transfer.0.vc = 0\n";
+        }
+        ProtocolConfig cfg2;
+        NS_TEST_ASSERT_MSG_EQ(cfg2.Load(cfgPath2, &err), true,
+                              "dst cfg loads: " << err);
+        ProtocolTransactionGraph graph2;
+        ProtocolTransactionNodeId term2 =
+            cfg2.Compile(graph2, CreateObject<NcclProtocolModel>(), 2, 1024,
+                         /*baseFlowId=*/1, &err);
+        NS_TEST_ASSERT_MSG_EQ(term2, PROTOCOL_TRANSACTION_INVALID_NODE,
+            "dst=5 with numGpus=2 must be rejected, not narrowed");
+        NS_TEST_ASSERT_MSG_NE(err.find("exceeds numGpus"), std::string::npos,
+            "the error names the numGpus violation: " << err);
+
+        // An in-range stencil still compiles (no over-blocking).
+        const std::string cfgPath3 = "/tmp/protobridge_r28_stencil_range3.cfg";
+        {
+            std::ofstream cfgFile3(cfgPath3);
+            cfgFile3 << "[op]\n"
+                     << "param.N = numGpus\n"
+                     << "transfer.0.kind = DATA\n"
+                     << "transfer.0.src = 0\n"
+                     << "transfer.0.dst = 1\n"
+                     << "transfer.0.bytes = 1024\n"
+                     << "transfer.0.vc = 3\n";
+        }
+        ProtocolConfig cfg3;
+        NS_TEST_ASSERT_MSG_EQ(cfg3.Load(cfgPath3, &err), true,
+                              "in-range cfg loads: " << err);
+        ProtocolTransactionGraph graph3;
+        ProtocolTransactionNodeId term3 =
+            cfg3.Compile(graph3, CreateObject<NcclProtocolModel>(), 2, 1024,
+                         /*baseFlowId=*/1, &err);
+        NS_TEST_ASSERT_MSG_NE(term3, PROTOCOL_TRANSACTION_INVALID_NODE,
+            "an in-range stencil still compiles: " << err);
     }
 };
 
@@ -12699,6 +13000,14 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new PfcDeferredEgressLatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpRetireCompletionOrderTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcWatcherLedgerPruningTest, TestCase::Duration::QUICK);
+
+    // Codex round 28 regressions (deferred-repair PFC exemption + egress/
+    // result-event ledger pruning + bundle llrMode + stencil range checks).
+    AddTestCase(new PfcDeferredLlrRepairExemptTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcDeferredEgressLedgerPruningTest, TestCase::Duration::QUICK);
+    AddTestCase(new NvSwitchResultLedgerPruningTest, TestCase::Duration::QUICK);
+    AddTestCase(new ApplyBundleLlrModeTest, TestCase::Duration::QUICK);
+    AddTestCase(new TransferStencilRangeValidationTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

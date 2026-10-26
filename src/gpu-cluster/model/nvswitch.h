@@ -355,6 +355,33 @@ class NvSwitch : public FabricSwitch
   protected:
     void DoDispose() override;
 
+    /**
+     * @brief Test seam: total deferred-result-event ledger size (live +
+     *        expired). Tests measure the ledger's growth through this
+     *        accessor (codex round 28, finding 3 — completed FEC result
+     *        sends retained their EventIds and captured packet references
+     *        until DoDispose: 1,000 completed sends, 1,000 expired entries).
+     */
+    size_t GetDeferredResultEventCountForTest() const
+    {
+        return m_deferredResultEvents.size();
+    }
+
+    /// @brief Test seam: deferred-result-event entries still live (not
+    ///        IsExpired). Pruning keeps total == live in steady state.
+    size_t GetLiveDeferredResultEventCountForTest() const
+    {
+        size_t live = 0;
+        for (const EventId& ev : m_deferredResultEvents)
+        {
+            if (!ev.IsExpired())
+            {
+                live++;
+            }
+        }
+        return live;
+    }
+
     /// Per-VOQ packet capacity (packets). Read accessor for congestion
     /// subclasses (EthernetSwitch's dynamic PFC threshold scales against it).
     uint32_t GetVoqDepth() const { return m_voqDepth; }
@@ -411,6 +438,14 @@ class NvSwitch : public FabricSwitch
      *        OnPacketEnqueue depth arguments.
      */
     void EnqueueForTest(uint32_t outPort, const VoqEntry& entry);
+
+    /// @brief Drop fired (IsExpired) deferred-result EventIds from the
+    ///        ledger. Called at every append site: completed multicast FEC
+    ///        sends retained their EventIds (and the packets the lambdas
+    ///        capture by value) until DoDispose — memory grew with completed
+    ///        traffic, 1,000 expired entries after 1,000 sends (codex round
+    ///        28, finding 3).
+    void PruneDeferredResultEvents();
 
     /**
      * @brief Congestion hook called when a packet is enqueued to a VOQ.

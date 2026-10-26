@@ -793,6 +793,11 @@ main(int argc, char* argv[])
             if (!s.empty()) llrEnabled = (s == "1" || s == "true");
         }
         applyS(llrModeStr, "llrMode");
+        // ApplyBundle now routes bundle.llrMode to the endpoints' LLR
+        // managers (codex round 28, finding 4), so the bundle must carry
+        // the RESOLVED mode (CLI --llrMode, overridden by the profile) or
+        // it would clobber it with Build()'s default.
+        pbundle.llrMode = llrModeStr;
 
         // A `.cfg` whose [op] declares `collective =` / `algorithm =` (and
         // optionally `topology =`) overrides the CLI values, then falls through

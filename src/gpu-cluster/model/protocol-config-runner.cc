@@ -10,6 +10,7 @@
 #include "protocol-config-runner.h"
 #include "protocol-model.h"
 #include "fabric-header.h"
+#include "llr-manager.h"
 #include "ns3/log.h"
 #include "ns3/nstime.h"
 #include "ns3/simulator.h"
@@ -76,6 +77,26 @@ ProtocolConfigRunner::ApplyBundle(const std::vector<Ptr<FabricEndpoint>>& endpoi
         }
         ep->SetFlowControlPolicy(bundle.flowControl);
         ep->SetLlrEnabled(bundle.llrEnabled);
+        // The bundle's llrMode is part of the documented contract
+        // ("gobackn | sack (applied to LlrManager)", protocol-profile.h):
+        // without this the manager stayed in its default GO_BACK_N even
+        // with llrMode=sack, so losses triggered suffix retransmissions
+        // instead of selective repairs (codex round 28, finding 4 — the
+        // CLI masked it by setting the mode separately before this call).
+        if (bundle.llrMode == "sack")
+        {
+            if (ep->GetLlrManager())
+            {
+                ep->GetLlrManager()->SetLlrMode(LlrMode::SACK);
+            }
+        }
+        else if (bundle.llrMode == "gobackn" || bundle.llrMode.empty())
+        {
+            if (ep->GetLlrManager())
+            {
+                ep->GetLlrManager()->SetLlrMode(LlrMode::GO_BACK_N);
+            }
+        }
         ep->SetBulkChunkSize(bulkChunkSize);
     }
 }

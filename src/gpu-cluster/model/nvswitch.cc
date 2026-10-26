@@ -555,6 +555,13 @@ NvSwitch::EnqueueForTest(uint32_t outPort, const VoqEntry& entry)
     }
 }
 
+void
+NvSwitch::PruneDeferredResultEvents()
+{
+    std::erase_if(m_deferredResultEvents,
+                  [](const EventId& ev) { return ev.IsExpired(); });
+}
+
 size_t
 NvSwitch::GetSharpResultStoreSize(uint16_t destRank) const
 {
@@ -1289,6 +1296,8 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
                      receivedEffectiveBytes - 1) /
                         receivedEffectiveBytes;
             }
+            // Prune fired events at every append (codex round 28, finding 3).
+            PruneDeferredResultEvents();
             m_deferredResultEvents.push_back(
                 Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
                                     &NvSwitch::MulticastAllReducePartition, this,
@@ -1331,6 +1340,8 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
             // (empty begin() deref, SIGSEGV). The collective is one-shot;
             // once its result has gone out, later fragments are wire noise.
             m_allReduceLegacyMulticastDone.insert(flowId);
+            // Prune fired events at every append (codex round 28, finding 3).
+            PruneDeferredResultEvents();
             m_deferredResultEvents.push_back(
                 Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
                                     &NvSwitch::MulticastAllReduceResult, this,
@@ -1844,6 +1855,8 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
 
     if (allComplete)
     {
+        // Prune fired events at every append (codex round 28, finding 3).
+        PruneDeferredResultEvents();
         m_deferredResultEvents.push_back(
             Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
                                 &NvSwitch::MulticastAllGatherResult, this,
@@ -1995,6 +2008,12 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
 
     if (codingLatency > Seconds(0))
     {
+        // Prune fired events at every append: this site fires once per FEC
+        // result fragment and its lambda captures pkt BY VALUE — without
+        // pruning, completed sends pin their packets until DoDispose
+        // (codex round 28, finding 3: 1,000 completed sends retained 1,000
+        // expired entries, the final packet's refcount stuck at 2).
+        PruneDeferredResultEvents();
         m_deferredResultEvents.push_back(
             Simulator::Schedule(codingLatency, [this, portIdx, pkt]() {
                 if (portIdx < m_ports.size() && m_ports[portIdx])
