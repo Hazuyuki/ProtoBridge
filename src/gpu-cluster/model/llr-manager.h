@@ -206,20 +206,6 @@ class LlrManager : public Object
     typedef Callback<void, uint32_t, uint16_t, uint16_t, uint8_t> TimeoutCallback;
     void SetTimeoutCallback(TimeoutCallback cb);
 
-    /**
-     * @brief Sever every endpoint-binding and cancel every armed timer.
-     *
-     * Called by the owning FabricEndpoint::DoDispose BEFORE it drops its
-     * m_llrManager reference. The timeout and permanent-loss callbacks hold
-     * the endpoint's raw `this`, and the per-entry retry timers can outlive
-     * the endpoint when an external holder keeps the manager alive via
-     * GetLlrManager() — a firing timer then invokes OnLlrRetryTimeout on
-     * freed endpoint memory (codex round 17, finding 3). Nulling the
-     * callbacks makes a late OnRetryTimeout a no-op; Clear() cancels the
-     * timers outright.
-     */
-    void DetachFromEndpoint();
-
     // --- Buffer size ---
 
     void SetMaxBufferSize(uint32_t maxSize);
@@ -253,6 +239,29 @@ class LlrManager : public Object
     // collective layer can access effectiveDataSize, flowId, etc.
     typedef Callback<void, FabricHeader> PermanentLossCallback;
     void SetPermanentLossCallback(PermanentLossCallback cb);
+
+    /**
+     * @brief Sever every endpoint-binding and cancel every armed timer.
+     *
+     * Called by the owning FabricEndpoint::DoDispose BEFORE it drops its
+     * m_llrManager reference. The timeout and permanent-loss callbacks hold
+     * the endpoint's raw `this`, and the per-entry retry timers can outlive
+     * the endpoint when an external holder keeps the manager alive via
+     * GetLlrManager() — a firing timer then invokes OnLlrRetryTimeout on
+     * freed endpoint memory (codex round 17, finding 3). Nulling the
+     * callbacks makes a late OnRetryTimeout a no-op; Clear() cancels the
+     * timers outright.
+     *
+     * Identity-detach discipline (codex round 31, finding 1): a disposing
+     * endpoint passes its OWN callback bindings as owners and only severs
+     * the ones it installed. When a successor endpoint has already re-bound
+     * either callback, the manager belongs to the successor: the disposing
+     * endpoint detaches nothing, so the successor's bindings and — crucially
+     * — its stored retry entries (Clear() drops them) survive. Null owners
+     * (the default) mean the unconditional legacy teardown.
+     */
+    void DetachFromEndpoint(TimeoutCallback timeoutOwner = TimeoutCallback(),
+                            PermanentLossCallback lossOwner = PermanentLossCallback());
 
     // Traced callbacks
     typedef TracedCallback<uint32_t, uint16_t> RetryTracedCallback;

@@ -250,12 +250,27 @@ FabricEndpoint::DoDispose()
     // (codex round 16, finding 2 — a 64-B packet over a 100-us link, with
     // the receiver disposed and released at 1 us, produced
     // valgrind-confirmed invalid reads at the 100-us arrival).
+    // Identity-detach (codex round 31, finding 2): clear only the binding
+    // THIS endpoint installed. A device can be SHARED — a successor
+    // endpoint that bound its own promisc callback over ours would be
+    // disconnected by the unconditional null-out: its deliveries stopped
+    // the moment the predecessor disposed. If the stored binding is not
+    // ours, leave it alone (the successor's dispose owns clearing it).
     for (const auto& device : m_devices)
     {
         if (device)
         {
-            device->SetPromiscReceiveCallback(
-                MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+            const auto ours = MakeCallback(&FabricEndpoint::ReceiveFromDevice,
+                                           this);
+            // Null-check first: Callback::IsEqual dereferences its impl, so
+            // comparing against an already-nulled binding (e.g. a successor
+            // that shared this device disposed before us) would assert.
+            const auto current = device->GetPromiscReceiveCallback();
+            if (!current.IsNull() && current.IsEqual(ours))
+            {
+                device->SetPromiscReceiveCallback(
+                    MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+            }
         }
     }
     m_devices.clear();
@@ -283,9 +298,16 @@ FabricEndpoint::DoDispose()
     // timers can fire long after the endpoint is freed — detach both
     // callbacks and cancel every timer BEFORE dropping our reference
     // (codex round 17, finding 3).
+    // Identity-detach (codex round 31, finding 1): pass OUR bindings so a
+    // successor endpoint that re-bound either callback keeps the manager —
+    // its callbacks, its retry stores, and its armed timers all survive
+    // this endpoint's disposal. Only when both bindings are still ours do
+    // we null them and Clear() the stores.
     if (m_llrManager)
     {
-        m_llrManager->DetachFromEndpoint();
+        m_llrManager->DetachFromEndpoint(
+            MakeCallback(&FabricEndpoint::OnLlrRetryTimeout, this),
+            MakeCallback(&FabricEndpoint::NotifyPermanentLoss, this));
     }
     m_llrManager = nullptr;
     m_gbnNextAckSeq.clear();
@@ -2452,6 +2474,15 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
             // 100-us memory latency and dispose+release at 1 us, valgrind
             // confirmed invalid reads in SendMemoryResponse's member access
             // at the 100-us firing).
+            // Append-site pruning (codex round 31, finding 3): with a short
+            // memory latency, a stream of read requests at high frequency
+            // schedules hundreds of live deferred responses back-to-back —
+            // SendPacketOnDevice's entry-side prune never gets a chance to
+            // run because the responses fire before any later event lands
+            // in the ledger, and the ledger grows without bound for the
+            // lifetime of the stream. Prune here so every append site owns
+            // its own expired-entry removal.
+            PruneDeferredEgressEvents();
             m_deferredEgressEvents.push_back(
                 Simulator::Schedule(m_memoryLatency,
                                     &FabricEndpoint::SendMemoryResponse,

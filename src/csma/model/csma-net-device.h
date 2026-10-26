@@ -324,6 +324,7 @@ class CsmaNetDevice : public NetDevice
     Address GetMulticast(Ipv6Address addr) const override;
 
     void SetPromiscReceiveCallback(PromiscReceiveCallback cb) override;
+    PromiscReceiveCallback GetPromiscReceiveCallback() const override;
     bool SupportsSendFrom() const override;
 
     /**

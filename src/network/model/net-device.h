@@ -353,6 +353,22 @@ class NetDevice : public Object
     virtual void SetPromiscReceiveCallback(PromiscReceiveCallback cb) = 0;
 
     /**
+     * @return the currently installed promiscuous-mode receive callback
+     *         (a null callback if none is installed).
+     *
+     * The identity-detach discipline (an owner clearing only the binding IT
+     * installed — see CreditManager::DetachFromEndpoint) needs to read the
+     * stored binding back; devices that keep the callback in a member simply
+     * return it. The base default returns a null callback so device
+     * implementations that do not support the read are unaffected.
+     */
+    virtual PromiscReceiveCallback GetPromiscReceiveCallback() const
+    {
+        return MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t,
+                                const Address&, const Address&, PacketType>();
+    }
+
+    /**
      * @return true if this interface supports a bridging mode, false otherwise.
      */
     virtual bool SupportsSendFrom() const = 0;

@@ -8991,6 +8991,7 @@ class DenyingGateEndpoint : public FabricEndpoint
     unsigned gateCalls = 0;
     using FabricEndpoint::GetDeferredEgressEventCountForTest;
     using FabricEndpoint::GetLiveDeferredEgressEventCountForTest;
+    using FabricEndpoint::StartApplication;
 
   protected:
     bool FlowControlGate(uint8_t, uint32_t, bool) override
@@ -10603,6 +10604,234 @@ class MemorySemanticLedgerPruningTest : public TestCase
             "after 1,000 requests)");
         NS_TEST_ASSERT_MSG_EQ(live, 0u,
             "no completion event is still pending after the requests fire");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 31, finding 1) LlrManager::DetachFromEndpoint unconditionally
+// nulled both endpoint callbacks and Cleared the retry stores, even when a
+// SUCCESSOR endpoint had re-bound the callbacks on the shared manager: the
+// successor's outstanding packets vanished and its timeout/permanent-loss
+// paths went dead the moment the predecessor disposed. Detach is now an
+// identity-detach: the disposing endpoint passes its own bindings and only
+// severs them when they are still the installed ones.
+namespace {
+unsigned g_r31LlrTimeouts = 0;
+unsigned g_r31LlrLosses = 0;
+
+void
+R31SuccessorTimeout(uint32_t, uint16_t, uint16_t, uint8_t)
+{
+    g_r31LlrTimeouts++;
+}
+
+void
+R31SuccessorLoss(FabricHeader)
+{
+    g_r31LlrLosses++;
+}
+
+Ptr<Packet>
+R31LlrDataPacket(uint32_t seq)
+{
+    FabricHeader h;
+    h.SetPacketType(FabricPacketType::DATA);
+    h.SetSourceRank(0);
+    h.SetDestRank(1);
+    h.SetFlowId(7);
+    h.SetSequenceNumber(seq);
+    h.SetPayloadSize(64);
+    h.SetEffectiveDataSize(64);
+    Ptr<Packet> p = Create<Packet>(64);
+    p->AddHeader(h);
+    return p;
+}
+} // namespace
+
+class LlrSuccessorBindingSurvivesPredecessorDisposeTest : public TestCase
+{
+  public:
+    LlrSuccessorBindingSurvivesPredecessorDisposeTest()
+        : TestCase("LLR successor bindings and stores survive predecessor dispose") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        g_r31LlrTimeouts = 0;
+        g_r31LlrLosses = 0;
+
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->Initialize();
+        ep->EnableLlrTimeoutRetransmit();
+        Ptr<LlrManager> llr = ep->GetLlrManager();
+
+        // A successor takes over the manager: it re-binds BOTH callbacks.
+        llr->SetTimeoutCallback(MakeCallback(&R31SuccessorTimeout));
+        llr->SetPermanentLossCallback(MakeCallback(&R31SuccessorLoss));
+        llr->SetRetryTimeout(NanoSeconds(50));
+        llr->SetRetryLimit(0);
+
+        llr->StorePacket(0, R31LlrDataPacket(0), 1);
+        llr->ArmRetryTimeoutAtTransmission(0, 1, 7, 0);
+        NS_TEST_ASSERT_MSG_EQ(llr->HasOutstandingPacket(0, 1, 7), true,
+            "the successor's packet is outstanding before the predecessor "
+            "disposes");
+
+        // Predecessor dispose — pre-fix this nulled the successor's
+        // callbacks AND Clear()ed the store.
+        ep->Dispose();
+        ep = nullptr;
+
+        NS_TEST_ASSERT_MSG_EQ(llr->HasOutstandingPacket(0, 1, 7), true,
+            "the successor's outstanding packet must survive the "
+            "predecessor's dispose (pre-fix: DetachFromEndpoint Cleared the "
+            "store, pending 1->0)");
+
+        // The successor keeps using the manager: another store, then run
+        // past the retry timeout. Pre-fix: zero callbacks ever fired.
+        llr->StorePacket(1, R31LlrDataPacket(1), 1);
+        llr->ArmRetryTimeoutAtTransmission(1, 1, 7, 0);
+        Simulator::Stop(NanoSeconds(100));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(g_r31LlrTimeouts, 0u,
+            "the re-bound timeout callback must fire for the successor's "
+            "outstanding packets (pre-fix: the predecessor's dispose nulled "
+            "it)");
+        llr->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 31, finding 2) FabricEndpoint::DoDispose unconditionally
+// nulled the promisc callback on every device it held, including SHARED
+// devices where a successor endpoint had installed its own binding: the
+// successor's deliveries stopped the moment the predecessor disposed. The
+// teardown is now an identity-detach (via the new
+// NetDevice::GetPromiscReceiveCallback), clearing only the binding this
+// endpoint installed.
+namespace {
+unsigned g_r31SuccessorDeliveries = 0;
+
+void
+R31SuccessorDelivered(uint16_t, Ptr<Packet>, FabricHeader)
+{
+    g_r31SuccessorDeliveries++;
+}
+} // namespace
+
+class DeviceCallbackSuccessorSurvivesPredecessorDisposeTest : public TestCase
+{
+  public:
+    DeviceCallbackSuccessorSurvivesPredecessorDisposeTest()
+        : TestCase("Device promisc callbacks survive a predecessor endpoint's dispose") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        g_r31SuccessorDeliveries = 0;
+
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(10)));
+        auto link = p2p.Install(nodes);
+
+        // Two endpoints share d.Get(1): the first (predecessor) binds its
+        // promisc callback at Initialize, then the successor binds OVER it.
+        Ptr<FabricEndpoint> old = CreateObject<FabricEndpoint>();
+        old->SetRank(1);
+        old->AddNetDevice(link.Get(1));
+        old->Initialize();
+
+        Ptr<FabricEndpoint> successor = CreateObject<FabricEndpoint>();
+        successor->SetRank(1);
+        successor->AddNetDevice(link.Get(1));
+        successor->SetBypassReorderBuffer(true);
+        successor->SetReceiveCallback(MakeCallback(&R31SuccessorDelivered));
+        successor->Initialize();
+
+        old->Dispose();
+
+        Ptr<Packet> pkt = R31LlrDataPacket(0);
+        link.Get(0)->Send(pkt, link.Get(1)->GetAddress(), 0x0800);
+        Simulator::Stop(MicroSeconds(1));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(g_r31SuccessorDeliveries, 1u,
+            "the successor's device binding must survive the predecessor's "
+            "dispose (pre-fix: the unconditional null-out stopped its "
+            "deliveries)");
+        NS_TEST_ASSERT_MSG_EQ(successor->GetRxPackets(), 1u,
+            "the successor endpoint must receive the packet");
+        successor->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 31, finding 3) The MEMORY endpoint's local read service
+// appended its SendMemoryResponse deferral without pruning
+// m_deferredEgressEvents first — the last unpruned append site. With a short
+// memory latency and a high request rate the ledger grew without bound
+// (SendPacketOnDevice's entry-side prune never ran because a gate-denied
+// response never reached it). The append site now prunes like every other.
+class MemoryResponseLedgerPruningTest : public TestCase
+{
+  public:
+    MemoryResponseLedgerPruningTest()
+        : TestCase("Gate-denied memory responses prune the egress ledger") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes);
+
+        // The MEMORY endpoint runs behind an always-denying gate: its
+        // responses never reach SendPacketOnDevice's entry-side prune.
+        Ptr<DenyingGateEndpoint> ep = CreateObject<DenyingGateEndpoint>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1);
+        ep->AddNetDevice(link.Get(0));
+        ep->SetRoutingEntry(1, 0);
+        ep->SetDeviceType(DeviceType::MEMORY);
+        ep->SetMemorySize(64);
+        ep->SetMemoryLatency(NanoSeconds(50));
+        ep->StartApplication();
+
+        // The SOURCE must not deny its own requests (only the MEMORY
+        // endpoint's responses are gate-denied).
+        Ptr<FabricEndpoint> src = CreateObject<FabricEndpoint>();
+        nodes.Get(1)->AddApplication(src);
+        src->SetRank(1);
+        src->SetLocalRankRange(1, 1);
+        src->AddNetDevice(link.Get(1));
+        src->SetRoutingEntry(0, 0);
+        src->Initialize();
+
+        // 1,000 read requests: each schedules a response deferral that fires
+        // 50 ns later and is then gate-denied on the wire.
+        for (unsigned i = 0; i < 1000; ++i)
+        {
+            src->SendMemoryRead(0, 0, 8);
+            Simulator::Stop(MicroSeconds(1));
+            Simulator::Run();
+        }
+        NS_TEST_ASSERT_MSG_EQ(ep->GetRxPackets(), 1000u,
+            "all read requests reached the MEMORY endpoint");
+        const size_t total = ep->GetDeferredEgressEventCountForTest();
+        const size_t live = ep->GetLiveDeferredEgressEventCountForTest();
+        // Pre-fix: 1,000 expired entries. Post-fix: near-empty.
+        NS_TEST_ASSERT_MSG_LT(total, 10u,
+            "fired memory-response deferrals must not accumulate in the "
+            "ledger (pre-fix: one expired entry per request, 1,000 after "
+            "1,000 requests)");
+        NS_TEST_ASSERT_MSG_EQ(live, 0u,
+            "no response deferral is still pending after the requests fire");
+        src->Dispose();
         ep->Dispose();
         Simulator::Destroy();
     }
@@ -13518,6 +13747,14 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new RemainingSendPathsRespectFlowControlGateTest,
                 TestCase::Duration::QUICK);
     AddTestCase(new MemorySemanticLedgerPruningTest, TestCase::Duration::QUICK);
+
+    // Codex round 31 regressions (LLR successor binding survival, shared-
+    // device promisc-callback survival, memory-response ledger pruning).
+    AddTestCase(new LlrSuccessorBindingSurvivesPredecessorDisposeTest,
+                TestCase::Duration::QUICK);
+    AddTestCase(new DeviceCallbackSuccessorSurvivesPredecessorDisposeTest,
+                TestCase::Duration::QUICK);
+    AddTestCase(new MemoryResponseLedgerPruningTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

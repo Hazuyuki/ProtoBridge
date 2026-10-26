@@ -151,12 +151,25 @@ NvSwitch::DoDispose()
     // round 16, finding 2 — a 64-B packet over a 100-us link, with the
     // receiving switch disposed and released at 1 us, produced
     // valgrind-confirmed invalid reads AND writes at the 100-us arrival).
+    // Identity-detach (codex round 31, finding 2): clear only the binding
+    // THIS switch installed — a successor switch (or endpoint) sharing the
+    // port keeps its own binding, exactly like FabricEndpoint's device
+    // detach.
     for (const auto& port : m_ports)
     {
         if (port)
         {
-            port->SetPromiscReceiveCallback(
-                MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+            const auto ours =
+                MakeCallback(&NvSwitch::ReceiveFromPort, this);
+            // Null-check first: Callback::IsEqual dereferences its impl, so
+            // comparing against an already-nulled binding (a successor
+            // sharing this port disposed before us) would assert.
+            const auto current = port->GetPromiscReceiveCallback();
+            if (!current.IsNull() && current.IsEqual(ours))
+            {
+                port->SetPromiscReceiveCallback(
+                    MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+            }
         }
     }
     m_ports.clear();

@@ -136,7 +136,57 @@ integration 5 PASS, surrogate pytest 99 passed, 15/15 parity scripts,
 valgrind on all three modes of the codex round-30 probe (gate, ledger,
 pfc) 0 errors / no leaks.
 
+### Fixed — codex round 31: three defects — the LLR teardown destroying a successor's takeover, the shared-device promisc teardown disconnecting a successor, and the memory-response ledger
 
+1. **A disposing endpoint destroyed a successor's LLR takeover**
+   (medium). `LlrManager::DetachFromEndpoint` unconditionally nulled both
+   endpoint callbacks and `Clear()`ed the retry stores. When a successor
+   endpoint had re-bound the callbacks on the shared manager (external
+   `GetLlrManager()` holder), the predecessor's dispose erased the
+   successor's bindings AND its stored outstanding packets: codex probe —
+   store+arm a packet, re-bind callbacks, dispose the old endpoint, and the
+   successor's pending entry went 1→0 with zero timeout/loss callbacks
+   ever firing. Detach is now an identity-detach (the round-19
+   `CreditManager` pattern): the disposing endpoint passes its OWN
+   timeout/permanent-loss bindings as owners; each is severed only when it
+   is still the installed one, and any successor re-bind halts the teardown
+   (no null-out, no `Clear()`) — the successor's own dispose owns the
+   lifecycle from then on. Null owners (the default) keep the legacy
+   unconditional teardown.
+2. **A disposing endpoint disconnected a successor sharing its NetDevice**
+   (medium). `FabricEndpoint::DoDispose` and `NvSwitch::DoDispose`
+   unconditionally nulled the promisc callback on every device/port they
+   held. On a SHARED device — a successor endpoint that installed its own
+   binding over the predecessor's — the predecessor's dispose severed the
+   successor's binding instead of its own: codex probe — two endpoints on
+   one port, dispose the first, and the successor's deliveries dropped to
+   0 (1 without the dispose). Both teardowns are now identity-detaches:
+   they clear the binding only when `GetPromiscReceiveCallback().IsEqual`
+   matches the binding THEY installed. That required a new
+   `NetDevice::GetPromiscReceiveCallback()` virtual (null-callback
+   default; implemented by `PointToPointNetDevice` and `CsmaNetDevice` —
+   the two device models this module ships). The comparison null-checks
+   first: `Callback::IsEqual` dereferences its impl, so comparing against
+   a binding a predecessor already nulled would assert.
+3. **Gate-denied memory responses accumulated in the egress ledger**
+   (low). The MEMORY endpoint's local read service appended its
+   `SendMemoryResponse` deferral without pruning `m_deferredEgressEvents`
+   first — the last unpruned append site (rounds 28-30 pruned the rest).
+   With a short memory latency and a gate denying every response on the
+   wire, the ledger grew without bound: codex probe — 1,000 read requests
+   through an always-denying gate left total=1000 live=0 expired entries
+   (the entry-side prune in `SendPacketOnDevice` never ran because the
+   responses never got that far). The append site now calls
+   `PruneDeferredEgressEvents` like every other (post-fix: total=1
+   live=0). Test: `Gate-denied memory responses prune the egress ledger`.
+
+Suite state: gpu-cluster EXTENSIVE 175 PASS / 0 FAIL (3 new C++ tests:
+`LLR successor bindings and stores survive predecessor dispose`,
+`Device promisc callbacks survive a predecessor endpoint's dispose`,
+`Gate-denied memory responses prune the egress ledger`), integration 6
+PASS, surrogate pytest 99 passed, 15/15 parity scripts, valgrind on all
+four modes of the codex round-31 probe (llr, memory, device,
+device_control) 0 errors / no leaks.
 
 1. **One switch's PFC RESUME cleared another switch's outstanding pause**
    (medium). The endpoint's pause state was a dest-only set

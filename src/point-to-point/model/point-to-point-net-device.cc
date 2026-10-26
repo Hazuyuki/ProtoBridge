@@ -590,6 +590,12 @@ PointToPointNetDevice::SetPromiscReceiveCallback(NetDevice::PromiscReceiveCallba
     m_promiscCallback = cb;
 }
 
+NetDevice::PromiscReceiveCallback
+PointToPointNetDevice::GetPromiscReceiveCallback() const
+{
+    return m_promiscCallback;
+}
+
 bool
 PointToPointNetDevice::SupportsSendFrom() const
 {
