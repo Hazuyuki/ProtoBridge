@@ -87,6 +87,84 @@ Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
 scripts (test_random_traffic.py extended with a goodput-excludes-losses
 check), valgrind QUICK exit 0 with zero errors.
 
+### Fixed — codex round 25: nine defects across multicast byte accounting, disposal safety, and API propagation
+
+1. **Partition multicast puts effective bytes on payload fragments**
+   (medium). `MulticastAllReducePartition` divided effective bytes
+   across every chunk index including the trailing zero-payload chunks
+   (numChunks floors up to the lane count): D=8 B / 8 partitions /
+   2 lanes emitted (payload=1, effective=0) + (payload=0, effective=1)
+   per partition — a zero-payload fragment carried the effective bytes.
+   The split is now anchored to the wire offset (the same rule
+   `SendCollectiveBulk` adopted in round 19). Test:
+   `Partition multicast puts effective bytes on payload fragments`.
+2. **Collective effective-byte split does not overflow at 6 GiB**
+   (medium). `SendCollectiveBulk`'s proportional split multiplied
+   `effectiveSize * offset` in uint64 before dividing: a 6-GiB / ~8-GiB
+   upload over 18 lanes advertised 9,305,762,474 effective bytes for
+   6,442,450,944 payload bytes (inflated ledgers can trip aggregation
+   before the payload arrives). Intermediates are now `__int128` — the
+   codebase's established wide type. Test: `Collective effective-byte
+   split does not overflow at 6 GiB`.
+3. **SendCollective carries 64-bit volumes** (medium). The wrapper's
+   size parameter was uint32_t while NVLS AllGather computes uint64_t
+   chunks — at N=2 / D=8 GiB each 4-GiB chunk truncated to zero and
+   `SendCollectiveBulk` aborted the upload. Now uint64_t, mirroring
+   `SendBulkWireTransfer`'s round-24 widening. Test: `SendCollective
+   carries 64-bit volumes`.
+4. **Gateway Dispose cancels pending gateway-delay forwardings**
+   (medium). `ScheduleForwarding` scheduled `ForwardToFabric` on raw
+   `this` without retaining the EventId: queueing a 100-µs forwarding
+   then disposing the gateway at 2 µs left the event armed to fire on
+   freed state (valgrind-confirmed UAF). Events are retained (pruned of
+   fired entries) and `DoDispose` cancels them. Test: `Gateway Dispose
+   cancels pending gateway-delay forwardings`; valgrind re-run exits 0.
+5. **Queued sends consult the overridden FlowControlGate** (medium).
+   `TrySendQueuedPackets` re-implemented the CREDIT policy inline
+   (`HasCredits` + `ConsumeCredit`) instead of dispatching through the
+   virtual `FlowControlGate`, so a subclass overriding the gate to deny
+   was bypassed — a denied MEMORY_READ was queued and then transmitted
+   on the drain pass. The drain now uses the same gate as every send
+   path (the creditBypass arm keeps So entries credit-free). Test:
+   `Queued sends consult the overridden FlowControlGate`.
+6. **SetLlrRetryLimit configures the active LLR manager** (medium).
+   The setter updated only the endpoint member while the active
+   `LlrManager` kept its own default (3): after `SetLlrRetryLimit(0)`
+   the endpoint reported zero while a NACK still produced a
+   retransmission. The setter propagates to the manager, and the
+   `LlrRetryLimit` attribute is routed through the setter pair instead
+   of writing the member directly. Test: `SetLlrRetryLimit configures
+   the active LLR manager`.
+7. **Queuing tail variance honors the topology cap** (low). The queuing
+   arm of `_step_variance` computed both utilization and service rate
+   from the raw `BW_link`: a 50-GB/s bisection cap left 16 MiB / N=8
+   ring / 32 credits / BER=0 / 25-GB/s competing traffic at
+   p99-minus-mean 2.821 µs where the capped-rate evaluation gives
+   32.270 µs — the same capped contract as the mean path (round 22 #6),
+   the heavy-tail branch (round 23 #4) and the retransmission arm
+   (round 24 #8). `topology=None` stays byte-identical. Test:
+   `test_queuing_variance_topology_cap`.
+8. **SHARP result store retires completed flows** (low). Repair windows
+   were never retired at flow completion and `DoDispose` never cleared
+   the store — 100 completed flows kept 100 windows per destination
+   until disposal. Each dest now retains only the
+   `SHARP_RESULT_GENERATIONS` (2) most recent flows' windows; retiring
+   the flow's OWN window at its own completion broke late-NACK repairs
+   racing the tail of delivery, and retiring at the NEXT flow's
+   completion killed in-flight repairs too, so the bound is a
+   generation count. `DoDispose` clears the store with the other
+   per-flow state. Test: `SHARP result store retires completed flows`.
+9. **Rate-machine docs prescribe MakeRateFlowKey** (low). The
+   DCQCN/RTTCC header docs still prescribed `MakeSeqKey` while the
+   endpoints key on `MakeRateFlowKey` (sender-ranked since round 23) —
+   following the stale doc updated a key no send path reads. Both docs
+   now prescribe the sender-ranked key with the round-23 context.
+
+Suite state: EXTENSIVE 148 PASS / 0 FAIL (7 new C++ tests), integration
+5 PASS, surrogate pytest 97 passed (1 new round-25 test), 14/14 parity
+scripts, valgrind on the gateway disposal scenario exit 0 with zero
+errors.
+
 ### Fixed — codex round 23: four defects in flow-key isolation and switch-side surrogate geometry
 
 1. **DCQCN/RTTCC flow keys carry the sender rank** (medium). The
