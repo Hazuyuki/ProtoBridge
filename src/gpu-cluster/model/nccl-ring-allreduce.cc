@@ -166,6 +166,30 @@ NcclRingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
         m_numChannels = m_gpusPerNode; // one crossing per rail at most
     }
     m_totalSteps = 2 * (numGpus - 1);
+    // The (channel, step) pair is encoded into a 16-bit flow ID as
+    // flowIdBase + channel*totalSteps + step (SendStepData), and the receiver
+    // decodes it back with a divide/modulo. The space must actually fit:
+    // at N=182 with C=182 channels the 65,884 encodings exceed the 65,535
+    // usable IDs (base 1, 0 reserved as the "below base" reject sentinel),
+    // so channel 181's step 13 wrapped to flow ID 0 — below m_flowIdBase —
+    // and OnPacketReceived silently dropped every such chunk, stalling that
+    // channel and the collective forever (codex round 26, finding 3).
+    // Clamp the channel count (the ring already treats C as best-effort
+    // parallelism — it is capped at gpusPerNode above for rail reasons):
+    // C_max = (65535 - base + 1) / totalSteps, at least 1.
+    {
+        const uint64_t usableIds = 65536ull - m_flowIdBase;
+        const uint64_t maxChannels = usableIds / m_totalSteps;
+        if (static_cast<uint64_t>(m_numChannels) > maxChannels)
+        {
+            NS_LOG_WARN("NcclRingAllReduce: clamping channels " << m_numChannels
+                        << " -> " << maxChannels
+                        << ": (channel, step) pairs must fit the 16-bit flow-ID "
+                           "space (base " << m_flowIdBase << ", "
+                        << m_totalSteps << " steps)");
+            m_numChannels = static_cast<uint32_t>(std::max<uint64_t>(maxChannels, 1));
+        }
+    }
     // The C*N chunk grid must COVER dataSize, not truncate it: plain integer
     // division drops dataSize % (C*N) bytes (2 nodes x 2 GPUs, 2 channels,
     // dataSize=15 -> chunkSize=1 -> only 8 of 15 tensor bytes represented,
@@ -402,6 +426,13 @@ NcclRingAllReduce::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fabric
     uint16_t flowId = header.GetFlowId();
     if (destRank >= m_numGpus || flowId < m_flowIdBase)
     {
+        // A flow ID below base is either foreign traffic sharing the callback
+        // or a (channel, step) encoding that wrapped past the 16-bit space —
+        // Initialize clamps the channel count so our own encodings never
+        // land here (codex round 26, finding 3), but a wrapped ID must never
+        // silently stall a channel again: log it so a regression is visible.
+        NS_LOG_WARN("NcclRingAllReduce: dropping DATA with flowId " << flowId
+                    << " (< base " << m_flowIdBase << ") from rank " << srcRank);
         return;
     }
     uint32_t channel = (flowId - m_flowIdBase) / m_totalSteps;

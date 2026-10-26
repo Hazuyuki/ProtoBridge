@@ -1625,3 +1625,49 @@ def test_queuing_variance_topology_cap():
                                topology=None, **kw)
     assert (t99_no - m_no) == pytest.approx(2.821, rel=1e-2), \
         t99_no - m_no
+
+
+def test_nvls_allreduce_partition_grid_is_integer():
+    """The AllReduce reliability model must fragment the switch's INTEGER
+    partition grid, not a uniform fractional D/P. NvSwitch computes
+    partitionSize = dataSize / numPartitions in uint64 with the LAST
+    partition carrying the remainder: D=18,874,369 / P=8 gives seven
+    2,359,296-B partitions (exactly 18 x 131,072-B fragments) plus one
+    2,359,297-B tail of 19 smaller fragments. The pre-fix model passed
+    data_bytes / num_partitions (a float) to the fragment helper, handing
+    EVERY partition the tail's 19-fragment geometry — 0.283 expected
+    losses instead of ~0.597 at BER 2.3e-6 / retry 10,000 / LLR on, wrongly
+    passing the 0.5 strict-reliability cutoff (codex round 26, finding 4).
+    The exact per-size accounting (body and tail fragments kept separate)
+    gives 0.597278."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 18874369, 2
+    # Grid geometry: 7 body partitions at 18 x 131,072 B + 1 tail at 19
+    # fragments of 124,174 B (ceil(2,359,297/19)).
+    body_frags, body_bytes = nvls._switch_multicast_fragments(D // 8)
+    tail_frags, tail_bytes = nvls._switch_multicast_fragments(D - (D // 8) * 7)
+    assert body_frags == 18 and body_bytes == 131072
+    assert tail_frags == 19 and tail_bytes == 124174
+    # Exact expected losses: N * [(P-1) * 18 * p_body^65 + 19 * p_tail^65]
+    # (uploads at retry 10,000 contribute ~0 at this BER).
+    ber = 2.3e-6
+    p_body = 1 - (1 - ber) ** (131072 * 8)
+    p_tail = 1 - (1 - ber) ** (124174 * 8)
+    expected = N * (7 * 18 * p_body ** 65 + 19 * p_tail ** 65)
+    losses = nvls.expected_permanent_losses(
+        D, N, "nvls", ber, 10000,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce",
+        llr_enabled=True)
+    assert abs(losses - expected) < 1e-12, losses
+    assert abs(losses - 0.597278) < 1e-4, losses
+    # The strict gate must REJECT: expected losses exceed the 0.5 cutoff.
+    t = nvls.predict(D, N, "nvls", 128, ber=ber, retry_limit=10000,
+                     strict_reliability=True, collective="allreduce",
+                     llr_enabled=True)
+    assert not math.isfinite(t)
+    # Aligned partitions (D % P == 0) are unchanged: body == tail.
+    losses_aligned = nvls.expected_permanent_losses(
+        16 * 1024 * 1024, 8, "nvls", 1e-10, 0,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce")
+    assert losses_aligned == pytest.approx(0.107369, rel=1e-3), \
+        losses_aligned

@@ -9335,6 +9335,259 @@ class PfcEndpointHoldTest : public TestCase
     }
 };
 
+// (codex round 26, finding 1) MulticastAllReducePartition's chunk loop never
+// decremented bytesRemaining and never stopped at the wire end: with
+// effective=wire=8 B, 8 partitions and 18 lanes (numChunks floored to 18),
+// chunks past the wire end kept firing — thisChunkSize clamped to 0 but
+// offset kept advancing, so wireSpanEnd < offset and effectiveEnd -
+// effectiveBegin underflowed to ~4.29e9 per trailing chunk. One destination
+// received 144 payload bytes advertising 549,755,812,808 effective bytes —
+// enough to trip receive completion long before the real data arrived.
+// The loop now breaks at bytesRemaining == 0.
+class PartitionTrailingChunkUnderflowTest : public TestCase
+{
+  public:
+    PartitionTrailingChunkUnderflowTest()
+        : TestCase("Partition multicast stops at the wire end (no underflow)") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // 18 lanes to one destination rank, driven through the aggregation
+        // seam (same scaffold as PartitionEffectiveOnPayloadFragmentsTest).
+        NodeContainer switchNode;
+        switchNode.Add(CreateObject<Node>());
+        NodeContainer peer;
+        peer.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("400Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(10)));
+
+        uint64_t effSum = 0;
+        uint64_t wireSum = 0;
+        uint32_t fragments = 0;
+        uint32_t hugeEffective = 0;
+        auto sniffer = [&](Ptr<NetDevice>, Ptr<const Packet> p, uint16_t,
+                           const Address&, const Address&, NetDevice::PacketType) {
+            FabricHeader h;
+            Ptr<Packet> c = p->Copy();
+            c->RemoveHeader(h);
+            effSum += h.GetEffectiveDataSize();
+            wireSum += h.GetPayloadSize();
+            fragments++;
+            if (h.GetEffectiveDataSize() > (1u << 30) ||
+                (h.GetPayloadSize() == 0 && h.GetEffectiveDataSize() > 0))
+            {
+                hugeEffective++;
+            }
+            return true;
+        };
+        for (int i = 0; i < 18; i++)
+        {
+            NetDeviceContainer d = p2p.Install(peer.Get(0), switchNode.Get(0));
+            d.Get(0)->SetPromiscReceiveCallback(sniffer);
+            // switch-side ports appended below in port order.
+        }
+        // Rebuild so ports are on the switch node in known order.
+        // (Install above put the switch-side device at index 1.)
+        // Simpler: install fresh links and register the switch-side devices.
+        // -- replaced by direct construction below.
+
+        NodeContainer swNodes;
+        swNodes.Add(CreateObject<Node>());
+        NodeContainer peer2;
+        peer2.Add(CreateObject<Node>());
+        effSum = 0; wireSum = 0; fragments = 0; hugeEffective = 0;
+        auto sniffer2 = [&](Ptr<NetDevice>, Ptr<const Packet> p, uint16_t,
+                            const Address&, const Address&, NetDevice::PacketType) {
+            FabricHeader h;
+            Ptr<Packet> c = p->Copy();
+            c->RemoveHeader(h);
+            effSum += h.GetEffectiveDataSize();
+            wireSum += h.GetPayloadSize();
+            fragments++;
+            if (h.GetEffectiveDataSize() > (1u << 30) ||
+                (h.GetPayloadSize() == 0 && h.GetEffectiveDataSize() > 0))
+            {
+                hugeEffective++;
+            }
+            return true;
+        };
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        swNodes.Get(0)->AddDevice(sw);
+        for (int i = 0; i < 18; i++)
+        {
+            NetDeviceContainer d = p2p.Install(swNodes.Get(0), peer2.Get(0));
+            sw->AddPort(d.Get(0));
+            sw->AddRankPort(0, static_cast<uint32_t>(i));
+            d.Get(1)->SetPromiscReceiveCallback(sniffer2);
+        }
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        sw->SetAllReduceDataSize(8);
+        sw->SetAllReduceNumPartitions(8);
+        sw->SetAllReduceAggregationDelay(0);
+        sw->InjectAggregateUpload(0x1234, 0, 0, 8, false);
+
+        Simulator::Stop(MicroSeconds(100));
+        Simulator::Run();
+        // Pre-fix: 144 wire bytes / 549,755,812,808 effective bytes / 128
+        // bogus fragments (16 trailing chunks per... actually 18 chunks x
+        // 8 partitions). Post-fix: 8 fragments carry the 8+8 bytes total.
+        NS_TEST_ASSERT_MSG_EQ(hugeEffective, 0u,
+            "no fragment may advertise >1 GiB effective bytes or effective "
+            "bytes without payload (pre-fix: trailing chunks underflowed "
+            "effectiveEnd - effectiveBegin to ~4.29e9 each)");
+        NS_TEST_ASSERT_MSG_EQ(effSum, 8u,
+            "the partition's effective bytes must sum to the data size "
+            "(pre-fix: 549,755,812,808)");
+        NS_TEST_ASSERT_MSG_EQ(wireSum, 8u,
+            "the partition's wire bytes must sum to the wire size "
+            "(pre-fix: 144)");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 26, finding 2) The partition multicast's proportional
+// effective-byte products multiplied effectivePartitionSize * offset in
+// uint64 before dividing. At a 6-GiB partition over 18 lanes the coalesced
+// chunk size is 8,323,581 B and the first wrapped product made chunk 343
+// advertise 1,439,979,346 effective bytes instead of 8,323,581. The
+// intermediates are now __int128 (same as SendCollectiveBulk, round 25
+// finding 2). Receiver-side check: fragment effective sizes must sum to
+// exactly the effective partition size (uint64 wrap made the sum explode).
+class PartitionEffectiveOverflowTest : public TestCase
+{
+  public:
+    PartitionEffectiveOverflowTest()
+        : TestCase("Partition multicast effective split does not overflow at 6 GiB") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer swNodes;
+        swNodes.Add(CreateObject<Node>());
+        NodeContainer peer;
+        peer.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("400Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+
+        uint64_t effSum = 0;
+        uint64_t wireSum = 0;
+        uint32_t fragments = 0;
+        uint32_t hugeEffective = 0;
+        auto sniffer = [&](Ptr<NetDevice>, Ptr<const Packet> p, uint16_t,
+                           const Address&, const Address&, NetDevice::PacketType) {
+            FabricHeader h;
+            Ptr<Packet> c = p->Copy();
+            c->RemoveHeader(h);
+            effSum += h.GetEffectiveDataSize();
+            wireSum += h.GetPayloadSize();
+            fragments++;
+            if (h.GetEffectiveDataSize() > (1u << 30))
+            {
+                hugeEffective++;
+            }
+            return true;
+        };
+        Ptr<NvSwitchAggHarness> sw = CreateObject<NvSwitchAggHarness>();
+        swNodes.Get(0)->AddDevice(sw);
+        for (int i = 0; i < 18; i++)
+        {
+            NetDeviceContainer d = p2p.Install(swNodes.Get(0), peer.Get(0));
+            sw->AddPort(d.Get(0));
+            sw->AddRankPort(0, static_cast<uint32_t>(i));
+            d.Get(1)->SetPromiscReceiveCallback(sniffer);
+        }
+        // 6-GiB effective == wire partition (12-GiB result, 2 partitions).
+        // The aggregation seam is uint32-sized, so drive the partition
+        // multicast directly through the deferred-partition schedule the
+        // seam produces: upload the 6 GiB in 512-MiB chunks so the effective
+        // ledger reaches the partition boundary, then inspect fragments.
+        // (The seam's per-call size caps at 4 GiB-1; 12 x 512 MiB works.)
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        const uint64_t sixGiB = 6ull * 1024 * 1024 * 1024;
+        sw->SetAllReduceDataSize(sixGiB);
+        sw->SetAllReduceNumPartitions(1); // single partition = whole 6 GiB
+        sw->SetAllReduceAggregationDelay(0);
+        const uint32_t chunkUpload = 512u * 1024 * 1024;
+        for (uint32_t i = 0; i < sixGiB / chunkUpload; i++)
+        {
+            sw->InjectAggregateUpload(0x4321, 0, i, chunkUpload, false);
+        }
+        Simulator::Stop(MilliSeconds(200));
+        Simulator::Run();
+        // 6 GiB over 18 lanes coalesces to 774 chunks of 8,323,581 B (plus
+        // remainder handling); the wrapped product at chunk 343 previously
+        // advertised 1,439,979,346 B. The exact fragment count depends on
+        // the coalescing path, so assert on the SUMS and the sanity bound.
+        NS_TEST_ASSERT_MSG_EQ(hugeEffective, 0u,
+            "no fragment may advertise >1 GiB effective bytes (pre-fix: "
+            "chunk 343 advertised 1,439,979,346 B for an 8,323,581-B span)");
+        NS_TEST_ASSERT_MSG_EQ(effSum, sixGiB,
+            "the partition's effective bytes must sum to exactly 6 GiB");
+        NS_TEST_ASSERT_MSG_EQ(wireSum, sixGiB,
+            "the partition's wire bytes must sum to exactly 6 GiB");
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 26, finding 3) NcclRingAllReduce encoded (channel, step)
+// into the 16-bit flow ID as base + channel*totalSteps + step. At N=182
+// with C=182 channels the 65,884 encodings exceed the 65,535 usable IDs:
+// channel 181's step 13 wrapped to flow ID 0, which the receiver rejects
+// (below base) — that channel stalled and the collective never completed.
+// Initialize now clamps the channel count to the flow-ID space.
+class NcclRingFlowIdSpaceClampTest : public TestCase
+{
+  public:
+    NcclRingFlowIdSpaceClampTest()
+        : TestCase("NcclRing channel count clamps to the 16-bit flow-ID space") {}
+    void DoRun() override
+    {
+        // Pure Initialize-time probe: no fabric needed — the clamp happens
+        // in Initialize before any wire traffic. A minimal endpoint vector
+        // satisfies the interface (Initialize only stores it and probes the
+        // first endpoint's protocol model when data > 0; use dataSize=0 to
+        // stay on the trivial path and keep the probe hermetic).
+        const uint16_t numGpus = 182;
+        std::vector<Ptr<FabricEndpoint>> eps(numGpus);
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1);
+        eps[0] = ep;
+
+        Ptr<NcclRingAllReduce> ar = CreateObject<NcclRingAllReduce>();
+        // 182 GPUs on ONE node so the gpusPerNode rail cap (channels <=
+        // gpusPerNode) does not pre-empt the flow-ID clamp: C=182 is legal
+        // by the rail rule and only the 16-bit flow-ID space rejects it.
+        ar->SetNumNodes(1);
+        ar->SetGpusPerNode(182);
+        ar->SetNumChannels(182);
+        // dataSize must be nonzero for the real grid; the endpoints vector
+        // only needs the first element (protocol model probe).
+        ar->Initialize(numGpus, 33124, eps);
+        // totalSteps = 2*(182-1) = 362; usable IDs = 65535; max channels =
+        // 65535/362 = 181. The requested 182 must clamp to 181.
+        NS_TEST_ASSERT_MSG_EQ(ar->GetResolvedNumChannels(), 181u,
+            "channels must clamp to (65535 - base + 1) / totalSteps = 181 "
+            "so every (channel, step) encoding fits the 16-bit flow-ID space "
+            "(pre-fix: channel 181 step 13 wrapped to flow ID 0 and its "
+            "packets were dropped, stalling the collective)");
+        // And every resulting encoding round-trips through the receiver's
+        // decode (channel = (fid - base)/steps, step = (fid - base)%steps).
+        const uint32_t steps = 2u * (numGpus - 1);
+        const uint32_t base = 1;
+        for (uint32_t ch = 0; ch < ar->GetResolvedNumChannels(); ++ch)
+        {
+            const uint32_t fid = base + ch * steps + (steps - 1);
+            NS_TEST_ASSERT_MSG_LT(fid, 65536u,
+                "flow ID must fit 16 bits after the clamp");
+        }
+        Simulator::Destroy();
+    }
+};
+
 
 // Multicast result sequence numbering must be per-destination: endpoint
 // reorder buffers (the module default, SetBypassReorderBuffer(false)) key on
@@ -11953,6 +12206,11 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     // PFC (802.1Qbb-style) opt-in congestion arm.
     AddTestCase(new EthernetSwitchPfcTriggerTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcEndpointHoldTest, TestCase::Duration::QUICK);
+
+    // Codex round 26 regressions.
+    AddTestCase(new PartitionTrailingChunkUnderflowTest, TestCase::Duration::QUICK);
+    AddTestCase(new PartitionEffectiveOverflowTest, TestCase::Duration::EXTENSIVE);
+    AddTestCase(new NcclRingFlowIdSpaceClampTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

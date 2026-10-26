@@ -87,6 +87,66 @@ Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
 scripts (test_random_traffic.py extended with a goodput-excludes-losses
 check), valgrind QUICK exit 0 with zero errors.
 
+### Fixed — codex round 26: four defects in multicast loop bounds, wide effective-byte products, flow-ID encoding space, and the surrogate partition grid
+
+1. **Partition multicast stops at the wire end** (medium).
+   `MulticastAllReducePartition`'s chunk loop never decremented
+   `bytesRemaining` and never tested the loop condition against it: with
+   effective=wire=8 B, 8 partitions, and 18 lanes (numChunks floored to
+   the lane count), chunks past the wire end kept firing — `thisChunkSize`
+   clamped to 0 but `offset` kept advancing, so `wireSpanEnd < offset` and
+   `effectiveEnd − effectiveBegin` underflowed to ~4.29e9 per trailing
+   chunk. One destination received 144 payload bytes advertising
+   549,755,812,808 effective bytes — enough to trip receive completion
+   long before the real data arrived. The loop now breaks at
+   `bytesRemaining == 0` (and decrements it). Test:
+   `Partition multicast stops at the wire end (no underflow)`.
+2. **Partition multicast effective-byte products are `__int128`**
+   (medium). The switch's proportional split multiplied
+   `effectivePartitionSize * offset` in `uint64` before dividing — the
+   endpoint-side `__int128` fix (round 25 #2) did not cover these
+   multiplications. At a 6-GiB partition over 18 lanes the coalesced
+   chunk size is 8,323,581 B and the first wrapped product made chunk 343
+   advertise 1,439,979,346 effective bytes instead of 8,323,581,
+   independently corrupting receive accounting before the trailing-chunk
+   issue above. The intermediates are now `__int128`, matching
+   `SendCollectiveBulk`. Test: `Partition multicast effective split does
+   not overflow at 6 GiB` (EXTENSIVE).
+3. **NcclRing channel count clamps to the 16-bit flow-ID space**
+   (medium). The ring encoded (channel, step) into the flow ID as
+   `base + channel*totalSteps + step`; at N=182 with C=182 channels the
+   65,884 encodings exceed the 65,535 usable IDs, so channel 181's step 13
+   wrapped to flow ID 0 — below `m_flowIdBase` — and `OnPacketReceived`
+   silently dropped every such chunk, stalling that channel and the
+   collective forever. `Initialize` now clamps
+   `C ≤ (65535 − base + 1) / totalSteps` (only reachable at N ≥ 182,
+   since the gpusPerNode rail cap binds first in every realistic
+   topology), and the below-base reject logs a warning so a future wrap
+   is visible. Tests: `NcclRing channel count clamps to the 16-bit
+   flow-ID space` + the new `GetResolvedNumChannels` probe.
+4. **Surrogate AllReduce reliability uses the switch's integer partition
+   grid** (medium). The model passed the uniform fraction `D/P` to the
+   fragment helper; the switch computes `partitionSize = dataSize /
+   numPartitions` in uint64 with the LAST partition carrying the
+   remainder. D=18,874,369 / P=8 is seven 2,359,296-B partitions of
+   exactly 18×131,072-B fragments plus one 2,359,297-B tail of 19; the
+   fractional model gave EVERY partition the tail's 19-fragment geometry
+   and estimated 0.283 expected losses where the grid gives ~0.597 at
+   BER 2.3e-6 / retry 10,000 — wrongly passing the 0.5
+   strict-reliability cutoff (~4,189 µs predicted for a config that
+   cannot complete). The body and tail fragment geometries are now
+   computed separately and their failure probabilities summed per size
+   (0.597278 at the repro point, matching the exact per-size accounting).
+   Test: `test_nvls_allreduce_partition_grid_is_integer`.
+
+Suite state: gpu-cluster EXTENSIVE 153 PASS (3 new C++ tests), integration
+5 PASS, surrogate pytest 98 passed (1 new round-26 test), 14/14 parity
+scripts, valgrind on the partition-multicast probe 0 errors / no leaks.
+One non-reproducible harness flake observed during the EXTENSIVE loop
+(`ProtocolTransactionExecutor::Start` asserting `m_graphSet` at t=0,
+~47 consecutive passes around it on both sides of the changes — tracked
+for observation, not attributed).
+
 ### Added — PFC (802.1Qbb-style) priority flow control, the opt-in no-drop arm of the So congestion contract
 
 The So fabric's three congestion behaviors now match real RDMA Ethernet:

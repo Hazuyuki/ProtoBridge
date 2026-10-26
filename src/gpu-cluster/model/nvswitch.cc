@@ -1463,7 +1463,7 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
 
         uint64_t bytesRemaining = wirePartitionSize;
         uint64_t offset = 0;
-        for (uint64_t chunkIdx = 0; chunkIdx < numChunks; chunkIdx++)
+        for (uint64_t chunkIdx = 0; chunkIdx < numChunks && bytesRemaining > 0; chunkIdx++)
         {
             uint32_t thisChunkSize = static_cast<uint32_t>(
                 std::min(static_cast<uint64_t>(chunkSize), bytesRemaining));
@@ -1480,13 +1480,22 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
             // payload, and the shares still sum to exactly
             // effectivePartitionSize (codex round 25, finding 1).
             uint64_t wireSpanEnd = std::min(offset + chunkSize, wirePartitionSize);
-            uint64_t effectiveBegin =
-                effectivePartitionSize * offset / std::max<uint64_t>(wirePartitionSize, 1);
-            uint64_t effectiveEnd = effectivePartitionSize * wireSpanEnd /
-                std::max<uint64_t>(wirePartitionSize, 1);
+            // 128-bit intermediates, same as SendCollectiveBulk (round 25,
+            // finding 2): effectivePartitionSize * offset overflows uint64
+            // before the division at multi-GB scales — a 6-GiB partition
+            // over 18 lanes advertised 1,439,979,346 effective bytes on a
+            // fragment whose wire span was 8,323,581 B (codex round 26,
+            // finding 2). __int128 is the codebase's established wide type.
+            uint64_t effectiveBegin = static_cast<uint64_t>(
+                static_cast<__int128_t>(effectivePartitionSize) * offset /
+                std::max<uint64_t>(wirePartitionSize, 1));
+            uint64_t effectiveEnd = static_cast<uint64_t>(
+                static_cast<__int128_t>(effectivePartitionSize) * wireSpanEnd /
+                std::max<uint64_t>(wirePartitionSize, 1));
             uint32_t thisEffectiveSize =
                 static_cast<uint32_t>(effectiveEnd - effectiveBegin);
             offset += thisChunkSize;
+            bytesRemaining -= thisChunkSize;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
 

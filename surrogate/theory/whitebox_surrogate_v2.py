@@ -1030,10 +1030,57 @@ class TheoryDerivedSurrogate:
                 # (codex round 23, finding 2): a single-link fabric's
                 # uploads stay whole packets while each result partition
                 # still fragments at ceil(D/P/128KiB) x 128-KiB chunks.
-                result_frags, result_frag_bytes = self._switch_multicast_fragments(
-                    data_bytes / num_partitions)
-                # Each dest receives every partition: P x frag(D/P) chunks.
-                result_frags_per_dest = num_partitions * result_frags
+                # The partition grid is the switch's INTEGER division
+                # (nvswitch.cc: partitionSize = dataSize / numPartitions as
+                # uint64, the LAST partition carrying the remainder -- NOT a
+                # uniform fractional D/P): D=18,874,369 / P=8 yields seven
+                # 2,359,296-B partitions of exactly 18 x 131,072-B fragments
+                # and one 2,359,297-B tail of 19 fragments. Modeling the
+                # uniform fraction 2,359,296.125 gave EVERY partition the
+                # tail's 19-fragment geometry (0.283 expected losses vs the
+                # grid's ~0.597 at BER 2.3e-6 / retry 10,000, wrongly
+                # passing the 0.5 strict-reliability cutoff -- codex round
+                # 26, finding 4).
+                partition_size = data_bytes // num_partitions
+                last_partition = (data_bytes
+                                  - partition_size * (num_partitions - 1))
+                if partition_size > 0:
+                    body_frags, body_frag_bytes = self._switch_multicast_fragments(
+                        partition_size)
+                    tail_frags, tail_frag_bytes = self._switch_multicast_fragments(
+                        last_partition)
+                else:
+                    # Degenerate grid (D < P): the switch still emits one
+                    # (sub-chunk) partition body each; keep at least one
+                    # fragment per partition.
+                    body_frags, body_frag_bytes = 1, max(1, last_partition)
+                    tail_frags, tail_frag_bytes = body_frags, body_frag_bytes
+                # Each dest receives every partition: (P-1) x frag(D//P)
+                # chunks plus the remainder tail's fragments. The two grid
+                # positions have DIFFERENT fragment sizes (18 x 131,072-B body
+                # fragments vs the tail's 19 smaller ones), so keep their
+                # failure probabilities separate instead of collapsing to
+                # the max-size approximation (0.6466 vs the exact 0.5973 at
+                # the repro point).
+                p_upload_frag = self._packet_failure_probability(
+                    ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
+                p_path_upload = 1.0 - (1.0 - p_upload_frag) ** max(
+                    1.0, optical_hops)
+                p_body_frag = self._packet_failure_probability(
+                    ber, fec_enabled, fec_n, fec_k, fec_t, body_frag_bytes)
+                p_tail_frag = self._packet_failure_probability(
+                    ber, fec_enabled, fec_n, fec_k, fec_t, tail_frag_bytes)
+                p_body_path = 1.0 - (1.0 - p_body_frag) ** max(
+                    1.0, optical_hops)
+                p_tail_path = 1.0 - (1.0 - p_tail_frag) ** max(
+                    1.0, optical_hops)
+                return ((num_gpus * upload_frags
+                         * p_path_upload ** upload_attempts
+                         + num_gpus * ((num_partitions - 1) * body_frags
+                                       * p_body_path ** result_attempts
+                                       + tail_frags
+                                       * p_tail_path ** result_attempts))
+                        * min(1.0, max(0.0, optical_fraction)))
             p_upload_frag = self._packet_failure_probability(
                 ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
             p_result_frag = self._packet_failure_probability(
