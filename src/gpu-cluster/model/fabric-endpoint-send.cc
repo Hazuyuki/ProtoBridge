@@ -509,7 +509,16 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
 
         if (creditBypass)
         {
-            // NVLS/SHARP: send directly, bypassing credit queue
+            // NVLS/SHARP: send directly, bypassing the credit QUEUE — but
+            // still through the virtual FlowControlGate (the documented
+            // send-gate seam), so a subclass overriding the gate sees this
+            // admission too (codex round 30, finding 2; creditBypass skips
+            // the credit consume, not the gate dispatch).
+            if (!FlowControlGate(0, seqNum, true))
+            {
+                NS_LOG_DEBUG("FlowControlGate denied collective single packet");
+                return;
+            }
             packet->AddHeader(header);
             uint32_t deviceIdx = m_devices.empty() ? 0 : (m_globalSprayOffset % m_devices.size());
             Mac48Address destMac = ResolveDestMac(destRank);
@@ -568,9 +577,25 @@ FabricEndpoint::SendP2p(uint16_t destRank, const uint8_t* data, uint32_t size,
     // P2P would drain the local VC pool with no return path and stall once
     // vcCredits exhausts.
     // IsLocalRank alone decides (no m_localRankCount > 1 gate — one GPU per
-    // node still has remote ranks; see GetProtocolModelForDest).
+    // node still has remote ranks; see GetProtocolModelForDest). The
+    // admission still dispatches through the virtual FlowControlGate (the
+    // documented send-gate seam) with the credit-bypass arm set — a subclass
+    // overriding the gate sees remote P2P too (codex round 30, finding 2).
     if (!IsLocalRank(destRank))
     {
+        if (!FlowControlGate(vcId, seqNum, true))
+        {
+            NS_LOG_DEBUG("FlowControlGate denied remote P2P on VC "
+                         << static_cast<int>(vcId));
+            SendQueueEntry entry;
+            entry.packet = packet;
+            entry.header = header;
+            entry.vcId = vcId;
+            entry.seqNum = seqNum;
+            m_sendQueue.push(entry);
+            TrySendQueuedPackets();
+            return;
+        }
         packet->AddHeader(header);
         uint32_t deviceIndex = ResolveDeviceIndex(destRank);
         SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(destRank));
@@ -855,7 +880,12 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
         // completion latency elapses (codex round 17, finding 2 — with a
         // 100-us sync latency and dispose+release at 1 us, valgrind
         // confirmed invalid reads in NotifyMemorySemanticComplete's
-        // callback member access at the 100-us firing).
+        // callback member access at the 100-us firing). Pruned before each
+        // append — a gate-denied memory request never reaches
+        // SendPacketOnDevice's entry-side prune, so without this the ledger
+        // retained one expired EventId per completed request forever
+        // (codex round 30, finding 3).
+        PruneDeferredEgressEvents();
         m_deferredEgressEvents.push_back(
             Simulator::Schedule(NanoSeconds(latencyNs),
                                 &FabricEndpoint::NotifyMemorySemanticComplete,
@@ -877,7 +907,8 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     // Schedule completion callback at the memory-semantic latency.
     // Tracked in m_deferredEgressEvents so DoDispose cancels it (same
     // rationale as the credit-blocked path above — codex round 17,
-    // finding 2).
+    // finding 2). Pruned before each append (codex round 30, finding 3).
+    PruneDeferredEgressEvents();
     m_deferredEgressEvents.push_back(
         Simulator::Schedule(NanoSeconds(latencyNs),
                             &FabricEndpoint::NotifyMemorySemanticComplete,

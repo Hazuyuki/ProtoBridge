@@ -107,6 +107,14 @@ NvSwitch::NvSwitch()
       m_routeUnavailableDrops(0)
 {
     NS_LOG_FUNCTION(this);
+    // Allocate a unique MAC from the global pool. Nothing else sets a
+    // switch address (SetAddress has no caller), so without this every
+    // switch shared the all-zero default — and the PFC pause-ownership key
+    // (dest, PAUSE SourceMac = the emitting switch's GetAddress) collapsed
+    // distinct switches' holds into one entry (codex round 30, finding 1).
+    // Mac48Address::Allocate is the same allocator NetDevices use, so
+    // switch and NIC MACs never collide.
+    m_address = Mac48Address::Allocate();
     // Default arbitration strategy: the historical non-blocking crossbar.
     // A config-provided "Arbiter" attribute or SetArbiter() overrides this.
     if (!m_arbiter)

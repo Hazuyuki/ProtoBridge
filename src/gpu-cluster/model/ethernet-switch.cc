@@ -186,12 +186,20 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
         return;
     }
 
-    // PAUSE toward the source behind this ingress. The FabricHeader carries
-    // the (dest=source, source=dest) mirror of the original — the same
-    // reversal EmitNackBack uses. The sequence-number field carries the
-    // paused VOQ's depth (the PauseHeader qlen analog; zero quanta here
-    // means "paused until an explicit RESUME", not the 802.1Qbb timer
-    // expiry).
+    // PAUSE toward the source behind this ingress. The ranks carry the
+    // (dest=source, source=dest) mirror of the original — the same reversal
+    // EmitNackBack uses. The sequence-number field carries the paused VOQ's
+    // depth (the PauseHeader qlen analog; zero quanta here means "paused
+    // until an explicit RESUME", not the 802.1Qbb timer expiry).
+    // The PAUSE's SourceMac is THIS SWITCH's own MAC (GetAddress), not the
+    // mirrored end-to-end data MAC: the endpoint keys pause ownership by
+    // (dest, SourceMac), and the end-to-end MACs are preserved across hops
+    // — two switches pausing the same flow would emit the SAME mirrored
+    // MAC, collapsing their holds into one entry again (the round-29 fix's
+    // emission half, codex round 30, finding 1). DestMac keeps the mirror
+    // (the endpoint's address) so the frame still routes to the paused
+    // source; the RESUME replays the stored header verbatim, so it carries
+    // the same switch MAC.
     FabricHeader pause;
     pause.SetPacketType(FabricPacketType::PFC_PAUSE);
     pause.SetFabricType(fh.GetFabricType());
@@ -200,7 +208,7 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
     pause.SetSequenceNumber(static_cast<uint32_t>(voqDepth));
     pause.SetFlowId(fh.GetFlowId());
     pause.SetVirtualChannel(fh.GetVirtualChannel());
-    pause.SetSourceMac(fh.GetDestMac());
+    pause.SetSourceMac(Mac48Address::ConvertFrom(GetAddress()));
     pause.SetDestMac(fh.GetSourceMac());
 
     Ptr<Packet> pausePkt = Create<Packet>(0);

@@ -1101,6 +1101,21 @@ FabricEndpoint::PumpBulkTxWindow()
         // paths (small unfragmented remote sends, local Su packets), which
         // must not free a bulk window slot they never consumed.
         m_bulkTxWindowSeqs.emplace(desc.destRank, desc.vcId, desc.flowId, seqNum);
+        // Admission through the virtual FlowControlGate (the documented
+        // send-gate seam) BEFORE the device chokepoint — the windowed So
+        // dispatch used to call SendPacketOnDevice directly, bypassing a
+        // subclass's gate override (codex round 30, finding 2; the same
+        // fix every other send path received in round 29). The window slot
+        // and membership were already taken, so a denial just skips the
+        // wire: the chunk stays counted as inflight, and the gate denying
+        // again on a later pump keeps the window quiescent — the release
+        // paths (ACK / permanent loss / resume) own the slot from here.
+        if (!FlowControlGate(desc.vcId, seqNum, !IsLocalRank(desc.destRank)))
+        {
+            NS_LOG_DEBUG("FlowControlGate denied windowed bulk chunk on VC "
+                         << static_cast<int>(desc.vcId));
+            break;
+        }
         if (!SendPacketOnDevice(chunkPacket, desc.deviceIndex,
                                 ResolveDestMac(desc.destRank)))
         {

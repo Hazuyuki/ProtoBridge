@@ -87,7 +87,56 @@ Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
 scripts (test_random_traffic.py extended with a goodput-excludes-losses
 check), valgrind QUICK exit 0 with zero errors.
 
-### Fixed — codex round 29: four defects — per-switch PFC pause ownership, the FEC receive-deferral ledger, bulk paths bypassing the FlowControlGate, and config mode clobbering --fecEnabled
+### Fixed — codex round 30: three defects — PFC PAUSE frames carrying the wrong switch identity, three more send paths bypassing the FlowControlGate, and the memory-semantic completion ledger
+
+1. **PFC PAUSE frames carried the mirrored end-to-end data MAC, not the
+   emitting switch's identity** (medium). Round 29 keyed endpoint pause
+   ownership by (dest, PAUSE SourceMac), but the switch stamped the PAUSE
+   with `fh.GetDestMac()` — the original data header's end-to-end
+   destination MAC, preserved unchanged across every hop. Two switches
+   pausing the same flow therefore emitted the SAME ownership key and
+   their holds collapsed back into one entry: the first switch's RESUME
+   (replaying the same MAC) cleared the endpoint latch while the second
+   switch was still paused (codex probe: two switches, distinct MACs,
+   same flow — both PAUSEs carried source `00:00:00:00:00:02`; A's
+   RESUME cleared the latch, tx=1 across still-paused B). The PAUSE now
+   stamps `GetAddress()` — the emitting switch's own MAC — and the RESUME
+   replays it verbatim, so the (dest, SourceMac) key actually
+   distinguishes switches. Since nothing ever assigned a switch address
+   (SetAddress has no caller; every switch defaulted to all-zero),
+   `NvSwitch`'s constructor now allocates a unique MAC from the global
+   `Mac48Address::Allocate()` pool (the same allocator NetDevices use, so
+   switch and NIC MACs never collide). Test: `PFC PAUSE carries the
+   emitting switch's own MAC`.
+2. **Three more send paths bypassed the virtual FlowControlGate**
+   (medium). Round 29 routed eight site-groups through the gate but
+   missed three: the windowed So bulk dispatch (`PumpBulkTxWindow` —
+   called the device chokepoint directly, so a denying gate subclass
+   transmitted a windowed transfer anyway), the single-packet
+   NVLS/SHARP collective branch (`SendCollectiveBulk`'s `creditBypass`
+   arm), and the remote-P2P branch (`SendP2p`'s So arm). All three now
+   dispatch through `FlowControlGate` — credit bypass is preserved where
+   it was (bypass skips the credit CONSUME, not the gate dispatch), and
+   the windowed dispatch keeps its slot/membership conventions (a denial
+   after the slot is taken just skips the wire; the release paths own the
+   slot). Test: `Windowed bulk, single collective, and remote P2P consult
+   the overridden FlowControlGate`.
+3. **Gate-denied memory-semantic completions accumulated in the egress
+   ledger** (low). The two `NotifyMemorySemanticComplete` append sites
+   (the gate-denied branch and the post-send branch) never pruned
+   `m_deferredEgressEvents`, and a gate-denied request never reaches
+   `SendPacketOnDevice`'s entry-side prune — 1,000 completed requests
+   retained 1,000 expired EventIds (probe: total=1000 live=0). Both
+   append sites now call `PruneDeferredEgressEvents` (the round-28/29
+   append-site convention). Test: `Gate-denied memory-semantic
+   completions prune the ledger`.
+
+Suite state: gpu-cluster EXTENSIVE 171 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 99 passed, 15/15 parity scripts,
+valgrind on all three modes of the codex round-30 probe (gate, ledger,
+pfc) 0 errors / no leaks.
+
+
 
 1. **One switch's PFC RESUME cleared another switch's outstanding pause**
    (medium). The endpoint's pause state was a dest-only set

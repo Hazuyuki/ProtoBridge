@@ -8989,6 +8989,8 @@ class DenyingGateEndpoint : public FabricEndpoint
         return tid;
     }
     unsigned gateCalls = 0;
+    using FabricEndpoint::GetDeferredEgressEventCountForTest;
+    using FabricEndpoint::GetLiveDeferredEgressEventCountForTest;
 
   protected:
     bool FlowControlGate(uint8_t, uint32_t, bool) override
@@ -10338,6 +10340,269 @@ class BulkSendRespectsFlowControlGateTest : public TestCase
             "the overridden gate must be consulted on the memory-write path");
         NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
             "a memory write the gate denies must never transmit");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 30, finding 1) The PAUSE's SourceMac was the mirrored
+// end-to-end data DestMac — preserved across hops — so two switches pausing
+// the same flow emitted the SAME ownership key and their holds collapsed
+// into one map entry: the first switch's RESUME (replaying the same MAC)
+// cleared the endpoint latch while the second switch was still paused. The
+// PAUSE now carries the EMITTING switch's own MAC (GetAddress, allocated
+// uniquely at construction), and the RESUME replays it — so the round-29
+// (dest, switch-MAC) key actually distinguishes switches.
+class PfcPauseCarriesEmittingSwitchMacTest : public TestCase
+{
+  public:
+    PfcPauseCarriesEmittingSwitchMacTest()
+        : TestCase("PFC PAUSE carries the emitting switch's own MAC") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        // Capture sink for the emitted PAUSE frame (a struct-method callback
+        // — bare lambdas don't convert to CallbackBase).
+        struct PauseCap
+        {
+            Mac48Address srcMac;
+            bool saw{false};
+            bool OnPause(Ptr<NetDevice>, Ptr<const Packet> pkt, uint16_t,
+                         const Address&)
+            {
+                FabricHeader h;
+                pkt->PeekHeader(h);
+                if (h.GetPacketType() == FabricPacketType::PFC_PAUSE)
+                {
+                    srcMac = h.GetSourceMac();
+                    saw = true;
+                }
+                return true;
+            }
+        };
+        PauseCap capA, capB;
+
+        // Two distinct switches, each with one wired port, each driven past
+        // its pause threshold by the SAME data header (identical end-to-end
+        // MACs — the condition that used to collapse the ownership key).
+        auto makeSwitch = [&capA, &capB](bool first) {
+            NodeContainer nodes;
+            nodes.Create(2);
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes.Get(0), nodes.Get(1));
+            Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+            nodes.Get(0)->AddDevice(sw);
+            sw->AddPort(devs.Get(0));
+            sw->SetAttribute("PfcMode", UintegerValue(1));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(1));
+            devs.Get(1)->SetReceiveCallback(
+                MakeCallback(&PauseCap::OnPause, first ? &capA : &capB));
+            return sw;
+        };
+
+        Ptr<EthernetSwitchPfcHarness> swA = makeSwitch(true);
+        Ptr<EthernetSwitchPfcHarness> swB = makeSwitch(false);
+
+        Mac48Address macA, macB;
+        FabricHeader data;
+        data.SetPacketType(FabricPacketType::DATA);
+        data.SetFabricType(FabricType::ETHERNET);
+        data.SetSourceRank(0);
+        data.SetDestRank(1);
+        data.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+        data.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+        data.SetPayloadSize(64);
+        data.SetEffectiveDataSize(64);
+        Ptr<Packet> pktA = Create<Packet>(64);
+        pktA->AddHeader(data);
+        Ptr<Packet> pktB = pktA->Copy();
+
+        // Depth 1 >= threshold 1 fires the pause (the admission hook is
+        // driven directly, mirroring EthernetSwitchPfcTriggerTest).
+        swA->OnPacketEnqueue(pktA, 0, 0, 1);
+        swB->OnPacketEnqueue(pktB, 0, 0, 1);
+        Simulator::Stop(MicroSeconds(10));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(capA.saw, true,
+            "switch A emitted a PFC PAUSE");
+        NS_TEST_ASSERT_MSG_EQ(capB.saw, true,
+            "switch B emitted a PFC PAUSE");
+        macA = capA.srcMac;
+        macB = capB.srcMac;
+
+        // Each switch's PAUSE names ITSELF, not the shared data DestMac.
+        NS_TEST_ASSERT_MSG_EQ(macA, Mac48Address::ConvertFrom(swA->GetAddress()),
+            "the PAUSE's SourceMac must be the emitting switch's own MAC "
+            "(pre-fix: the mirrored end-to-end data MAC, identical across "
+            "switches)");
+        NS_TEST_ASSERT_MSG_EQ(macB, Mac48Address::ConvertFrom(swB->GetAddress()),
+            "each switch's PAUSE names that switch");
+        NS_TEST_ASSERT_MSG_NE(macA, macB,
+            "two distinct switches must emit distinct pause-ownership keys");
+
+        // And the endpoint latch distinguishes them: A's RESUME leaves B's
+        // hold standing. Reconstruct the frames from the captured MACs.
+        Ptr<PfcEndpointHarness> ep = CreateObject<PfcEndpointHarness>();
+        FabricHeader pauseA = data;
+        pauseA.SetPacketType(FabricPacketType::PFC_PAUSE);
+        pauseA.SetSourceRank(1);
+        pauseA.SetDestRank(0);
+        pauseA.SetSourceMac(macA);
+        pauseA.SetDestMac(data.GetSourceMac());
+        ep->ProcessPfcPausePacket(pauseA);
+        FabricHeader pauseB = pauseA;
+        pauseB.SetSourceMac(macB);
+        ep->ProcessPfcPausePacket(pauseB);
+        FabricHeader resumeA = pauseA;
+        resumeA.SetPacketType(FabricPacketType::PFC_RESUME);
+        ep->ProcessPfcResumePacket(resumeA);
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1), true,
+            "A's RESUME must not lift B's hold (the two PAUSEs carry "
+            "distinct switch MACs now)");
+        FabricHeader resumeB = pauseB;
+        resumeB.SetPacketType(FabricPacketType::PFC_RESUME);
+        ep->ProcessPfcResumePacket(resumeB);
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1), false,
+            "B's RESUME clears the last hold");
+        ep->Dispose();
+        swA->Dispose();
+        swB->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 30, finding 2) Three send paths still called the device
+// chokepoint directly after round 29's gate routing: the windowed bulk
+// dispatch (PumpBulkTxWindow), the single-packet NVLS/SHARP collective
+// branch (SendCollectiveBulk creditBypass), and the remote-P2P branch
+// (SendP2p) — an always-denying gate subclass transmitted on all three.
+// Each now dispatches through the virtual FlowControlGate (credit bypass
+// preserved where it was; the window slot/membership conventions intact).
+class RemainingSendPathsRespectFlowControlGateTest : public TestCase
+{
+  public:
+    RemainingSendPathsRespectFlowControlGateTest()
+        : TestCase("Windowed bulk, single collective, and remote P2P consult the "
+                   "overridden FlowControlGate") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        Ptr<DenyingGateEndpoint> ep = CreateObject<DenyingGateEndpoint>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 1); // dest 1 is REMOTE (So) on every probe
+        ep->AddNetDevice(link.Get(0));
+        ep->SetRoutingEntry(1, 0);
+        ep->SetBypassReorderBuffer(true);
+        ep->SetLlrEnabled(true);
+        ep->Initialize();
+
+        // Windowed bulk dispatch: soTxWindow=2, 256-B chunks -> the
+        // PumpBulkTxWindow path (round 27's TX window), not the inline
+        // send loops.
+        ep->SetSoTxWindow(2);
+        ep->SetBulkChunkSize(256);
+        ep->SendBulkWireTransferSize(1, 1024, 0, 7, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(ep->gateCalls, 0u,
+            "the overridden gate must be consulted on the windowed bulk "
+            "dispatch (pre-fix: PumpBulkTxWindow called the chokepoint "
+            "directly)");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
+            "a windowed bulk transfer the gate denies must never transmit");
+
+        // Single-packet NVLS/SHARP collective (creditBypass branch — the
+        // type decides, ALLREDUCE is a bypass type).
+        ep->gateCalls = 0;
+        ep->SendCollectiveBulk(FabricPacketType::ALLREDUCE, 1, 1024);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(ep->gateCalls, 0u,
+            "the overridden gate must be consulted on the credit-bypass "
+            "collective branch (bypass skips the credit CONSUME, not the "
+            "gate dispatch)");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
+            "a collective the gate denies must never transmit");
+
+        // Remote P2P (So bypass branch).
+        ep->gateCalls = 0;
+        uint8_t buf[64] = {0};
+        ep->SendP2p(1, buf, sizeof(buf), 9, 0);
+        Simulator::Stop(MicroSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_GT(ep->gateCalls, 0u,
+            "the overridden gate must be consulted on the remote-P2P "
+            "branch (pre-fix: remote P2P went straight to the chokepoint)");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
+            "a remote P2P packet the gate denies must never transmit");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 30, finding 3) The memory-semantic completion appends
+// (NotifyMemorySemanticComplete scheduled at the sync/async latency) never
+// pruned m_deferredEgressEvents, and a gate-denied request never reaches
+// SendPacketOnDevice's entry-side prune — 1,000 completed requests retained
+// 1,000 expired EventIds. Both append sites now prune.
+class MemorySemanticLedgerPruningTest : public TestCase
+{
+  public:
+    MemorySemanticLedgerPruningTest()
+        : TestCase("Gate-denied memory-semantic completions prune the ledger") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+
+        Ptr<DenyingGateEndpoint> ep = CreateObject<DenyingGateEndpoint>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 2); // dest 1 LOCAL: the gate-denied branch
+        ep->AddNetDevice(link.Get(0));
+        ep->SetRoutingEntry(1, 0);
+        ep->SetBypassReorderBuffer(true);
+        ep->SetSyncMemLatencyNs(50);
+        ep->Initialize();
+
+        // 1,000 SYNC_LOAD_STORE requests through a denying gate: each
+        // appends a completion event that fires 50 ns later.
+        uint8_t buf[64] = {0};
+        for (unsigned i = 0; i < 1000; ++i)
+        {
+            ep->SendMemorySemantic(1, 0, buf, 64, MemoryAccessType::SYNC_LOAD_STORE);
+            Simulator::Stop(MicroSeconds(1));
+            Simulator::Run();
+        }
+        const size_t total = ep->GetDeferredEgressEventCountForTest();
+        const size_t live = ep->GetLiveDeferredEgressEventCountForTest();
+        // Pre-fix: 1,000 expired entries. Post-fix: near-empty.
+        NS_TEST_ASSERT_MSG_LT(total, 10u,
+            "completed memory-semantic completions must not accumulate in "
+            "the ledger (pre-fix: one expired entry per request, 1,000 "
+            "after 1,000 requests)");
+        NS_TEST_ASSERT_MSG_EQ(live, 0u,
+            "no completion event is still pending after the requests fire");
         ep->Dispose();
         Simulator::Destroy();
     }
@@ -13245,6 +13510,14 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new PfcTwoSwitchPauseOwnershipTest, TestCase::Duration::QUICK);
     AddTestCase(new FecReceiveLedgerPruningTest, TestCase::Duration::QUICK);
     AddTestCase(new BulkSendRespectsFlowControlGateTest, TestCase::Duration::QUICK);
+
+    // Codex round 30 regressions (PAUSE carries the emitting switch's MAC +
+    // unique switch MAC allocation; windowed bulk / credit-bypass collective
+    // / remote P2P gate routing; memory-semantic completion ledger pruning).
+    AddTestCase(new PfcPauseCarriesEmittingSwitchMacTest, TestCase::Duration::QUICK);
+    AddTestCase(new RemainingSendPathsRespectFlowControlGateTest,
+                TestCase::Duration::QUICK);
+    AddTestCase(new MemorySemanticLedgerPruningTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);
