@@ -87,6 +87,49 @@ Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
 scripts (test_random_traffic.py extended with a goodput-excludes-losses
 check), valgrind QUICK exit 0 with zero errors.
 
+### Added — PFC (802.1Qbb-style) priority flow control, the opt-in no-drop arm of the So congestion contract
+
+The So fabric's three congestion behaviors now match real RDMA Ethernet:
+ECN + DCQCN (mark-and-backoff, lossless), VOQ tail-drop + NACK→LLR
+retransmit (lossy), and **PFC** (pause the sources feeding a congested
+egress before the queue overflows — the no-drop backstop RoCE layers under
+ECN; HPCC's `qbb-net-device`/`SwitchMmu` is the reference). All opt-in and
+default-off (byte-identical to the pre-PFC baseline, stash round-trip
+verified: `simTimeNs=70337` both sides of the ETH host-topology smoke run).
+
+1. **Switch side** (`ethernet-switch.cc`): `--switchPfcMode=0|1|2`
+   (off / static threshold / dynamic HPCC-style headroom-scaled threshold),
+   `--pfcPauseThreshold` (default 64), `--pfcResumeOffset` (default 8 —
+   the `resume_offset` hysteresis against pause/resume thrash). The pause
+   latches per (inPort→outPort) hop, idempotently (re-crossing while paused
+   emits nothing, matching `CheckShouldPause`'s `paused[]` guard); the
+   RESUME fires from a self-rescheduling drain watcher once the VOQ falls
+   to `threshold − offset`. `PFC_PAUSE`/`PFC_RESUME` are new
+   `FabricPacketType` control frames, mirrored like `EmitNackBack`.
+2. **Endpoint side** (`fabric-endpoint.cc`): a received PAUSE latches the
+   paused destination; the `SendPacketOnDevice` chokepoint parks DATA-class
+   sends toward it on the send queue (control/retry/feedback exempt —
+   pausing them would deadlock the reliability loop; LLR timers keep
+   running as the safety net); RESUME lifts the latch and drains.
+   `SendPacketOnDevice` now returns whether the send completed so callers
+   skip tx/window accounting for parked packets — the bulk TX-window pump,
+   the unbounded spray, the collective spray, and the retry re-send loop
+   all honor it.
+3. **Invariant + wiring**: `pfcPauseThreshold < voqDropThreshold` when both
+   arms are armed (the sim aborts otherwise — pause must fire before drop);
+   `ecnThreshold < pfcPauseThreshold` is the documented intended ordering
+   (mark first, pause as backstop). `MultiNodeTopologyHelper` applies the
+   attributes to every So switch; inert on switchless topologies
+   (fullmesh/ring/torus2d/dragonfly, warned like the lossy path).
+4. **Tests + docs**: `EthernetSwitchPfcTriggerTest` (mode 0/1/2 trigger
+   semantics, idempotent latch, control bypass) and `PfcEndpointHoldTest`
+   (pause parks sends, resume drains); CONFIG_GUIDE's congestion-contract
+   paragraph and CALIBRATION's RoCEv2/ETH sections document the third arm.
+   Like DCQCN, PFC is ns-3-only congestion behavior — the surrogate stays
+   the uncongested mean. Suite state: gpu-cluster EXTENSIVE 150 PASS (2
+   new), integration 5 PASS, 14/14 parity scripts, valgrind on the
+   mid-watcher switch disposal 0 errors / no leaks.
+
 ### Fixed — codex round 25: nine defects across multicast byte accounting, disposal safety, and API propagation
 
 1. **Partition multicast puts effective bytes on payload fragments**
