@@ -188,6 +188,76 @@ PASS, surrogate pytest 99 passed, 15/15 parity scripts, valgrind on all
 four modes of the codex round-31 probe (llr, memory, device,
 device_control) 0 errors / no leaks.
 
+### Fixed — codex round 32: four defects — a lost PFC RESUME pausing an endpoint forever, queued collectives losing their credit bypass, a 64-bit overflow in the partition wire ratio, and the surrogate tail ignoring optical hops
+
+1. **A lost PFC RESUME left the endpoint paused forever** (medium). The
+   switch never re-sent a RESUME: the endpoint does not acknowledge it,
+   so the switch cannot distinguish delivered from lost, and once the
+   link degradation model dropped the single RESUME the endpoint stayed
+   paused for the rest of the run while the switch had cleared its
+   latch and dropped the mirrored header (codex probe at 50% loss:
+   switch_paused=0, endpoint_paused=1, delivered=0, and the LLR store
+   empty after 1 ms). The switch now keeps the mirrored PAUSE header
+   for a bounded re-send arm: `CheckPfcResume` arms a budget of 8
+   re-sends (`PFC_RESUME_RESEND_LIMIT`) scheduled at 500-ns intervals,
+   and `ResendPfcResume` replays the stored header verbatim while
+   budget remains. A duplicate RESUME at an unpaused endpoint is a
+   no-op (`ProcessPfcResumePacket` early-returns), so re-sending on a
+   healthy link is safe; a fresh `MaybeSendPfcPause` erases the stale
+   budget so a new pause cycle owns the hop (post-fix probe:
+   endpoint_paused=0, delivered=1). Two post-fix defects found by the
+   regression battery and fixed before commit: `erase` on the map's
+   `end()` iterator when the budget was already retired corrupted the
+   red-black tree (infinite loop inside `_Rb_tree_increment`), and
+   `PfcWatcherLedgerPruningTest`'s exact RESUME count needed updating
+   for the new bounded re-send semantics. Test: `A lost PFC RESUME is
+   re-sent until it lands`.
+2. **Queued NVLS/SHARP fragments lost their credit bypass on the
+   drain** (medium). `TrySendQueuedPackets` re-admitted parked entries
+   through `FlowControlGate(vcId, seqNum, false)` — a hard-coded
+   `false` bypass. An ALLREDUCE/ALLGATHER fragment that had parked on
+   the send queue (gate denied, then re-opened) was admitted as a
+   credit-consuming send even though its type never consumes credits
+   on the direct path: codex probe with exactly one credit in the pool
+   — deny, send a 2-fragment ALLREDUCE, re-open — only one fragment
+   drained and the credit pool went 1→0 (stalled forever). The drain
+   now derives bypass from the ENTRY's own header
+   (`IsCreditBypassPacket() || !IsLocalRank(dest)`), matching the
+   direct send path's dispatch. Test: `Queued NVLS fragments keep
+   their credit bypass on the drain`.
+3. **The partition multicast's wire/effective ratio overflowed a
+   64-bit intermediate** (medium). `MulticastAllReducePartition`
+   computed the wire size as `thisPartitionSize * ratioWhole +
+   (thisPartitionSize * ratioRemainder + receivedEffectiveBytes - 1) /
+   receivedEffectiveBytes` in `uint64_t` — the
+   `thisPartitionSize * ratioRemainder` product wraps at multi-GiB
+   scales (64-bit products overflow around 18.4e18, but the operands
+   here reach that regime with 128/120 LL128 wire expansion on 32-GiB
+   effective uploads). The multicast emitted ~2 GiB too little result
+   WIRE data per destination (34.50 GB instead of 36.65 GB),
+   understating serialization time. The products are now `__int128`
+   intermediates — the same widening `SendCollectiveBulk`'s effective
+   split already uses. Test: `Partition wire-size ratio does not
+   overflow at 32 GiB` (sixteen 2-GiB-effective injected fragments;
+   aggregate volumes exceed the 32-bit per-packet counters, so the
+   harness counts via a capture NetDevice).
+4. **The surrogate's tail ignored `optical_hops` while the mean
+   compounded it** (low). `_step_variance` and the heavy-tail
+   `P_chunk` used the per-hop BER directly, while the mean's retry
+   terms compounded `1-(1-p)^max(1, optical_hops)`: 4 hops at BER 2e-7
+   and 1 hop at the equivalent BER 1-(1-2e-7)^4 agreed in the mean
+   (5081.19 µs) but diverged in p99 (5641.58 vs 8236.43 µs). Both tail
+   paths now compound per-hop like the mean (post-fix: both p99
+   8236.43 µs). Regression in the surrogate pytest suite
+   (`surrogate/test/test_theory.py::test_tail_optical_hops_compounds`)
+   — the C++ harness has no Python bridge.
+
+Suite state: gpu-cluster EXTENSIVE 177 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 100 passed, 15/15 parity scripts,
+valgrind on the three C++ modes of the codex round-32 probe (pfc,
+gate_one, ratio) 0 errors / no leaks; the fourth finding's regression
+lives in the surrogate pytest suite.
+
 1. **One switch's PFC RESUME cleared another switch's outstanding pause**
    (medium). The endpoint's pause state was a dest-only set
    (`m_pfcPausedDests`), but switches pause per-(inPort,outPort) hop: on a

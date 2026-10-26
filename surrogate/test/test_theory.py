@@ -1704,3 +1704,30 @@ def test_nvls_allreduce_degenerate_partition_grid():
                      strict_reliability=True, collective="allreduce",
                      llr_enabled=True)
     assert math.isfinite(t)
+
+
+def test_tail_optical_hops_compounds():
+    """The tail paths must compound BER over optical_hops like the mean.
+
+    A 4-hop path at BER 2e-7 has the same per-chunk path failure
+    probability as a 1-hop path at BER 1-(1-2e-7)^4. The mean's retry
+    terms already compound per-hop (_retry_overhead /
+    expected_permanent_losses), so the two agree in the mean — but the
+    per-step variance and the heavy-tail P_chunk omitted optical_hops, so
+    the p99s diverged (5641.58 vs 8236.43 µs at 16 MiB / N=8 ring / 32
+    credits / SACK / LLR, codex round 32, finding 4). Both tail terms now
+    compound per-hop, so equivalent paths agree in mean AND p99.
+    """
+    s = wb.make_h200_ring_theory()
+    kw = dict(data_bytes=16 << 20, num_gpus=8, algo="ring", credits=32,
+              llr_enabled=True, retry_mode="sack", collective="allreduce")
+    ber1, hops1 = 2e-7, 4
+    ber2 = 1 - (1 - 2e-7) ** 4  # the 4-hop equivalent single-hop BER
+    mean1 = s.predict(ber=ber1, optical_hops=hops1, **kw)
+    tail1 = s.predict_tail(ber=ber1, optical_hops=hops1, **kw)
+    mean2 = s.predict(ber=ber2, optical_hops=1, **kw)
+    tail2 = s.predict_tail(ber=ber2, optical_hops=1, **kw)
+    # The premise: the mean already treats these as equivalent.
+    assert mean1 == pytest.approx(mean2, rel=1e-9)
+    # The tail must too (pre-fix: tail1 ~5641.58 vs tail2 ~8236.43).
+    assert tail1 == pytest.approx(tail2, rel=1e-9)

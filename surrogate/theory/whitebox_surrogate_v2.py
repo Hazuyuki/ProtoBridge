@@ -1380,13 +1380,24 @@ class TheoryDerivedSurrogate:
     def _step_variance(self, T_step, D, N, algo, cr, ber, competing_bw, llr_enabled,
                        fec_enabled=False, fec_n=None, fec_k=None, fec_t=None,
                        retry_mode='gobackn', retry_buffer_entries=None,
-                       optical_fraction=1.0, collective=None, topology=None):
+                       optical_fraction=1.0, optical_hops=1.0,
+                       collective=None, topology=None):
         """Per-step delay variance from retransmission + queuing.
 
         Uses post-FEC BER when FEC is enabled (variance from corrected errors
         is near-zero; only uncorrectable errors trigger retransmission).
         BER is scaled by optical_fraction to mirror predict()'s retransmission
         arm: only the optical (error-bearing) fraction of traffic retries.
+
+        The per-chunk failure probability compounds over optical_hops
+        (codex round 32, finding 4): P_path = 1 - (1-P_chunk)^hops — the
+        same path-probability form _retry_overhead and
+        expected_permanent_losses use. The mean scaled with hops while the
+        variance did not, so 4 hops at BER 2e-7 and 1 hop at the equivalent
+        BER 1-(1-2e-7)^4 agreed in the mean (5081.19 µs) but diverged in
+        p99 (5641.58 vs 8236.43 µs) despite identical path failure
+        probability. optical_hops=1 (the default) is byte-identical to the
+        legacy behavior.
 
         Pipeline absorption factor: the Binomial variance K*p*(1-p)*Δ²
         computes the FULL retransmission delay variance, but only a fraction
@@ -1431,7 +1442,13 @@ class TheoryDerivedSurrogate:
         # Retransmission variance (only when LLR enabled)
         if effective_ber > 0 and llr_enabled:
             bits_per_chunk = self.chunk_size * 8
-            P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk
+            # Path failure probability over the optical hops (round 32,
+            # finding 4): the mean's retry terms compound per-fragment
+            # failure over max(1, optical_hops); the variance must too, or
+            # N-hop and single-hop-equivalent paths agree in the mean but
+            # not in the tail.
+            P_chunk = 1 - (1 - effective_ber) ** (
+                bits_per_chunk * max(1.0, optical_hops))
             retry_chunks = (1.0 if retry_mode.lower() == 'sack'
                             else (window + 1.0) / 2.0)
             # Topology-capped retransmission rate (see docstring).
@@ -1515,7 +1532,8 @@ class TheoryDerivedSurrogate:
                                         credits, ber, competing_bw, llr_enabled,
                                         fec_enabled, fec_n, fec_k, fec_t,
                                         retry_mode, retry_buffer_entries,
-                                        optical_fraction, collective,
+                                        optical_fraction, optical_hops,
+                                        collective,
                                         topology)
 
         if var_step <= 0:
@@ -1529,7 +1547,13 @@ class TheoryDerivedSurrogate:
                          if fec_enabled else ber)
         effective_ber *= min(1.0, max(0.0, optical_fraction))
         bits_per_chunk = self.chunk_size * 8
-        P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk if effective_ber > 0 else 0
+        # Path failure probability over the optical hops (round 32, finding
+        # 4): the heavy-tail cascade probability must compound per-hop like
+        # the mean's retry terms — 4 hops at BER 2e-7 and 1 hop at the
+        # equivalent BER 1-(1-2e-7)^4 then agree in BOTH mean and p99.
+        P_chunk = (1 - (1 - effective_ber) ** (
+            bits_per_chunk * max(1.0, optical_hops))
+            if effective_ber > 0 else 0)
         # The heavy-tail branch models a RETRANSMISSION cascade (expected
         # retry delay per chunk error). With LLR disabled there are no
         # retransmissions — a lost chunk is a permanent failure the mean

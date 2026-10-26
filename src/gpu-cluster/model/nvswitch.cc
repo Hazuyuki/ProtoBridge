@@ -1311,11 +1311,21 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
             {
                 ratioWhole = receivedWireBytes / receivedEffectiveBytes;
                 ratioRemainder = receivedWireBytes % receivedEffectiveBytes;
-                wirePartitionSize =
-                    thisPartitionSize * ratioWhole +
-                    (thisPartitionSize * ratioRemainder +
-                     receivedEffectiveBytes - 1) /
-                        receivedEffectiveBytes;
+                // 128-bit intermediates (codex round 32, finding 3): at a
+                // 16-GiB partition with LL128 expansion the 64-bit product
+                // thisPartitionSize * ratioRemainder overflowed BEFORE the
+                // divide — the partition multicast emitted ~2 GiB less wire
+                // data per destination than the uploads' expansion ratio
+                // implies (32-GiB effective / 128/120 wire / 2 partitions:
+                // result wire 34.5 GB instead of 36.65 GB), understating
+                // the serialization time. The same __int128 widening
+                // SendCollectiveBulk's effective split uses (round 25,
+                // finding 2).
+                wirePartitionSize = static_cast<uint64_t>(
+                    static_cast<__int128_t>(thisPartitionSize) * ratioWhole
+                    + (static_cast<__int128_t>(thisPartitionSize) * ratioRemainder
+                       + receivedEffectiveBytes - 1)
+                          / receivedEffectiveBytes);
             }
             // Prune fired events at every append (codex round 28, finding 3).
             PruneDeferredResultEvents();

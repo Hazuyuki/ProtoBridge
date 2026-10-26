@@ -339,6 +339,14 @@ FabricHeader::IsCollectivePacket() const
 }
 
 bool
+FabricHeader::IsCreditBypassPacket() const
+{
+    FabricPacketType type = GetPacketType();
+    return type == FabricPacketType::ALLREDUCE ||
+           type == FabricPacketType::ALLGATHER;
+}
+
+bool
 FabricHeader::IsP2pPacket() const
 {
     return GetPacketType() == FabricPacketType::P2P;

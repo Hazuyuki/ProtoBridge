@@ -18,6 +18,13 @@
 namespace ns3
 {
 
+// Bounded PFC RESUME re-sends after the first transmission (codex round 32,
+// finding 1). The endpoint does not acknowledge RESUMEs, so the switch cannot
+// tell delivered from lost; this caps the re-send chain so a dead link
+// cannot grow the re-send ledger forever. 8 x 500 ns covers a transient loss
+// window several µs long.
+static constexpr uint32_t PFC_RESUME_RESEND_LIMIT = 8;
+
 NS_LOG_COMPONENT_DEFINE("EthernetSwitch");
 NS_OBJECT_ENSURE_REGISTERED(EthernetSwitch);
 
@@ -129,6 +136,7 @@ EthernetSwitch::DoDispose()
     m_pfcResumeEvents.clear();
     m_pfcPaused.clear();
     m_lastPfcPauseHeader.clear();
+    m_pfcResumeResends.clear();
     NvSwitch::DoDispose();
 }
 
@@ -219,6 +227,11 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
     // Retain the mirrored header so the eventual RESUME (CheckPfcResume)
     // reverses exactly this pause: same ranks/MACs/fabric type.
     m_lastPfcPauseHeader[{inPort, outPort}] = pause;
+    // A fresh pause cycle retires any stale re-send budget from the
+    // previous cycle's RESUME (the new watcher owns the hop's resume
+    // state; the old chain's next fire would see IsPfcPaused and stop,
+    // but retiring here keeps the maps from holding dead entries).
+    m_pfcResumeResends.erase({inPort, outPort});
     m_pfcPausesSent++;
 
     // Resume hysteresis watcher: poll the drained VOQ; lift the pause once
@@ -281,9 +294,89 @@ EthernetSwitch::CheckPfcResume(uint32_t inPort, uint32_t outPort)
         Ptr<Packet> resumePkt = Create<Packet>(0);
         resumePkt->AddHeader(resume);
         GetPort(inPort)->Send(resumePkt, it->second.GetDestMac(), 0x0800);
-        m_lastPfcPauseHeader.erase(it);
+        // Bounded re-send arm (codex round 32, finding 1): the endpoint
+        // never acknowledges a RESUME, so the switch cannot distinguish
+        // delivered from lost. A single-shot RESUME that the link
+        // degradation model dropped left the endpoint paused FOREVER —
+        // the switch had cleared its latch and dropped the mirrored
+        // header, with no re-send path (codex probe: switch_paused=0,
+        // endpoint_paused=1, delivered=0, and the LLR store empty after
+        // 1 ms). Keep the header for a bounded number of re-sends; a
+        // duplicate RESUME at an unpaused endpoint is a no-op
+        // (ProcessPfcResumePacket early-returns when the dest is not in
+        // its latch), so re-sending is safe on a healthy link too.
+        m_pfcResumeResends[{inPort, outPort}] = PFC_RESUME_RESEND_LIMIT;
+        EventId resend = Simulator::Schedule(
+            NanoSeconds(500), &EthernetSwitch::ResendPfcResume,
+            this, inPort, outPort);
+        PrunePfcResumeEvents();
+        m_pfcResumeEvents.push_back(resend);
     }
     m_pfcResumesSent++;
+}
+
+void
+EthernetSwitch::ResendPfcResume(uint32_t inPort, uint32_t outPort)
+{
+    if (inPort >= GetNPorts())
+    {
+        return;
+    }
+    auto budget = m_pfcResumeResends.find({inPort, outPort});
+    if (budget == m_pfcResumeResends.end())
+    {
+        // A new pause cycle (or Dispose) already retired this hop's budget.
+        return;
+    }
+    if (budget->second == 0)
+    {
+        // Budget exhausted: retire.
+        m_pfcResumeResends.erase(budget);
+        m_lastPfcPauseHeader.erase({inPort, outPort});
+        return;
+    }
+    budget->second--;
+    auto it = m_lastPfcPauseHeader.find({inPort, outPort});
+    if (it == m_lastPfcPauseHeader.end())
+    {
+        m_pfcResumeResends.erase(budget);
+        return;
+    }
+    // A NEW pause cycle re-armed the watcher: it owns the hop's resume
+    // state now — stop the stale re-send chain (the fresh watcher will
+    // RESUME when the VOQ drains).
+    if (IsPfcPaused(inPort, outPort))
+    {
+        m_pfcResumeResends.erase(budget);
+        return;
+    }
+    FabricHeader resume;
+    resume.SetPacketType(FabricPacketType::PFC_RESUME);
+    resume.SetFabricType(it->second.GetFabricType());
+    resume.SetSourceRank(it->second.GetSourceRank());
+    resume.SetDestRank(it->second.GetDestRank());
+    resume.SetSequenceNumber(0);
+    resume.SetFlowId(it->second.GetFlowId());
+    resume.SetVirtualChannel(it->second.GetVirtualChannel());
+    resume.SetSourceMac(it->second.GetSourceMac());
+    resume.SetDestMac(it->second.GetDestMac());
+    Ptr<Packet> resumePkt = Create<Packet>(0);
+    resumePkt->AddHeader(resume);
+    GetPort(inPort)->Send(resumePkt, it->second.GetDestMac(), 0x0800);
+    m_pfcResumesSent++;
+    if (budget->second > 0)
+    {
+        EventId resend = Simulator::Schedule(
+            NanoSeconds(500), &EthernetSwitch::ResendPfcResume,
+            this, inPort, outPort);
+        PrunePfcResumeEvents();
+        m_pfcResumeEvents.push_back(resend);
+    }
+    else
+    {
+        m_pfcResumeResends.erase(budget);
+        m_lastPfcPauseHeader.erase({inPort, outPort});
+    }
 }
 
 bool

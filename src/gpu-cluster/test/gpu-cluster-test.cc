@@ -6,6 +6,8 @@
  */
 
 #include "ns3/test.h"
+#include "ns3/simple-net-device.h"
+#include "ns3/simple-channel.h"
 #include "ns3/fabric-header.h"
 #include "ns3/credit-manager.h"
 #include "ns3/reorder-buffer.h"
@@ -9811,8 +9813,15 @@ class PfcWatcherLedgerPruningTest : public TestCase
         }
         NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 10u,
             "each cycle latches one pause (idempotent within a cycle)");
-        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcResumesSent(), 10u,
-            "each watcher lifts its pause once the VOQ drains");
+        // The round-32 bounded re-send arm (a RESUME is unacknowledged, so
+        // the switch cannot distinguish delivered from lost) adds up to 8
+        // re-sends per lifted pause. The count must stay within that bound:
+        // 10 initial RESUMEs, at most 10*8 re-sends. An unbounded
+        // rescheduling loop would blow past the upper limit.
+        NS_TEST_ASSERT_MSG_LT(sw->GetPfcResumesSent(), 91u,
+            "re-send arm must stay bounded (10 initial + <=8 re-sends each)");
+        NS_TEST_ASSERT_MSG_GT_OR_EQ(sw->GetPfcResumesSent(), 10u,
+            "each watcher must lift its pause once the VOQ drains");
         sw->Dispose();
         Simulator::Destroy();
     }
@@ -10836,6 +10845,359 @@ class MemoryResponseLedgerPruningTest : public TestCase
         Simulator::Destroy();
     }
 };
+
+// (codex round 32, finding 1) A single PFC RESUME that the link degradation
+// model drops left the endpoint paused FOREVER: the switch cleared its latch
+// and dropped the mirrored header in the same breath, with no re-send path —
+// pre-fix, after a transient loss window the switch reported unpaused while
+// the endpoint stayed latched with zero deliveries. The switch now re-sends
+// the RESUME at bounded intervals (a duplicate at an unpaused endpoint is a
+// no-op).
+namespace {
+class R32PfcEndpoint : public FabricEndpoint
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::R32PfcEndpoint")
+                                .SetParent<FabricEndpoint>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<R32PfcEndpoint>();
+        return tid;
+    }
+    using FabricEndpoint::IsPfcPausedForDest;
+};
+
+unsigned g_r32Delivered = 0;
+
+void
+R32OnDelivered(uint16_t, Ptr<Packet>, FabricHeader)
+{
+    g_r32Delivered++;
+}
+} // namespace
+
+class PfcLostResumeRetransmittedTest : public TestCase
+{
+  public:
+    PfcLostResumeRetransmittedTest()
+        : TestCase("A lost PFC RESUME is re-sent until it lands") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("100000p"));
+        g_r32Delivered = 0;
+
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("100Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto a = p2p.Install(nodes.Get(0), nodes.Get(1));
+        auto b = p2p.Install(nodes.Get(1), nodes.Get(2));
+
+        Ptr<R32PfcEndpoint> src = CreateObject<R32PfcEndpoint>();
+        nodes.Get(0)->AddApplication(src);
+        src->SetRank(0);
+        src->SetAddress(Mac48Address::ConvertFrom(a.Get(0)->GetAddress()));
+        src->SetLocalRankRange(0, 1);
+        src->AddNetDevice(a.Get(0));
+        src->SetRoutingEntry(1, 0);
+        src->SetBypassReorderBuffer(true);
+        src->SetLlrEnabled(true);
+        src->EnableLlrTimeoutRetransmit();
+        src->Initialize();
+
+        Ptr<FabricEndpoint> dst = CreateObject<FabricEndpoint>();
+        nodes.Get(2)->AddApplication(dst);
+        dst->SetRank(1);
+        dst->SetAddress(Mac48Address::ConvertFrom(b.Get(1)->GetAddress()));
+        dst->SetLocalRankRange(1, 1);
+        dst->AddNetDevice(b.Get(1));
+        dst->SetRoutingEntry(0, 0);
+        dst->SetBypassReorderBuffer(true);
+        dst->SetReceiveCallback(MakeCallback(&R32OnDelivered));
+        dst->Initialize();
+        src->SetNeighborMac(1, dst->GetAddress());
+        dst->SetNeighborMac(0, src->GetAddress());
+
+        Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+        nodes.Get(1)->AddDevice(sw);
+        sw->AddPort(a.Get(1));
+        sw->AddPort(b.Get(0));
+        sw->AddStaticRoute(src->GetAddress(), 0);
+        sw->AddStaticRoute(dst->GetAddress(), 1);
+        sw->SetAttribute("PfcMode", UintegerValue(1));
+        sw->SetAttribute("PfcPauseThreshold", UintegerValue(1));
+        sw->SetLlrEnabled(true);
+
+        // The source's degradation model drops frames in a window that
+        // covers the first RESUME (500 ns after the pause lifts), then goes
+        // clean.
+        Ptr<LinkDegradationModel> errors = CreateObject<LinkDegradationModel>();
+        errors->SetBer(0);
+        auto rng = CreateObject<ConstantRandomVariable>();
+        rng->SetAttribute("Constant", DoubleValue(0));
+        errors->SetRandomStream(rng);
+        src->SetLinkDegradationModel(errors);
+
+        // Drive the PAUSE through the real admission hook: depth 1 fires it.
+        FabricHeader h;
+        h.SetPacketType(FabricPacketType::DATA);
+        h.SetFabricType(FabricType::ETHERNET);
+        h.SetSourceRank(0);
+        h.SetDestRank(1);
+        h.SetSourceMac(src->GetAddress());
+        h.SetDestMac(dst->GetAddress());
+        h.SetPayloadSize(64);
+        h.SetEffectiveDataSize(64);
+        Ptr<Packet> pkt = Create<Packet>(64);
+        pkt->AddHeader(h);
+        sw->OnPacketEnqueue(pkt, 1, 0, 1);
+
+        Simulator::Schedule(NanoSeconds(200), [src]() {
+            src->SendBulkWireTransferSize(1, 4096, 3, 7, 0);
+        });
+        // Loss window covering the first RESUME's re-send slots; the RESUME
+        // fires at ~500 ns (the watcher's first poll past the drain).
+        Simulator::Schedule(NanoSeconds(400), [errors]() {
+            errors->SetPacketLossRate(0.5);
+        });
+        Simulator::Schedule(NanoSeconds(3200), [errors]() {
+            errors->SetPacketLossRate(0);
+        });
+
+        Simulator::Stop(MilliSeconds(1));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 1), false,
+            "the switch itself has lifted the pause");
+        NS_TEST_ASSERT_MSG_EQ(src->IsPfcPausedForDest(1), false,
+            "the endpoint's pause must not outlive a lost RESUME "
+            "(pre-fix: paused forever, zero deliveries)");
+        NS_TEST_ASSERT_MSG_GT(g_r32Delivered, 0u,
+            "the parked transfer must drain once a re-sent RESUME lands");
+        src->Dispose();
+        dst->Dispose();
+        sw->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 32, finding 2) TrySendQueuedPackets derived creditBypass
+// solely from destination locality, so a gate-denied LOCAL ALLREDUCE
+// fragment consumed a credit on the drain that the switch's upload ACKs
+// never return — with one credit left, a denied two-fragment collective
+// drained one fragment, ate the credit, and stalled the second forever.
+// The drain now derives bypass from the ENTRY's type (the same
+// IsCreditBypassType rule the send path uses).
+namespace {
+class R32GateEndpoint : public FabricEndpoint
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::R32GateEndpoint")
+                                .SetParent<FabricEndpoint>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<R32GateEndpoint>();
+        return tid;
+    }
+    bool deny = false;
+    using FabricEndpoint::StartApplication;
+
+  protected:
+    bool FlowControlGate(uint8_t vc, uint32_t seq, bool bypass) override
+    {
+        return !deny && FabricEndpoint::FlowControlGate(vc, seq, bypass);
+    }
+};
+NS_OBJECT_ENSURE_REGISTERED(R32GateEndpoint);
+} // namespace
+
+class QueuedCollectiveKeepsCreditBypassTest : public TestCase
+{
+  public:
+    QueuedCollectiveKeepsCreditBypassTest()
+        : TestCase("Queued NVLS fragments keep their credit bypass on the drain") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // Two p2p devices so the spray path (two fragments) runs; the
+        // endpoint's rank range makes dest 1 LOCAL (the credit-consuming
+        // arm the bug lived in).
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(10)));
+        auto linkA = p2p.Install(nodes.Get(0), nodes.Get(1));
+        auto linkB = p2p.Install(nodes.Get(0), nodes.Get(2));
+
+        Ptr<R32GateEndpoint> ep = CreateObject<R32GateEndpoint>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        ep->SetLocalRankRange(0, 2);
+        ep->AddNetDevice(linkA.Get(0));
+        ep->AddNetDevice(linkB.Get(0));
+        ep->SetRoutingEntry(1, 0);
+        ep->SetLaneGroup(0, {0, 1});
+        ep->SetVcCredits(0, 1); // exactly ONE credit in the pool
+
+        // Deny the first admission: both fragments park on the send queue.
+        ep->deny = true;
+        ep->SendCollectiveBulk(FabricPacketType::ALLREDUCE, 1, 64);
+        // Re-open the gate and drain (SetCreditManager is the public drain
+        // trigger — the swap path calls TrySendQueuedPackets).
+        ep->deny = false;
+        ep->SetCreditManager(ep->GetCreditManager());
+
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 2u,
+            "both collective fragments must drain (pre-fix: one credit "
+            "meant one fragment sent and the second stalled forever)");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetCreditManager()->GetAvailableCredits(0), 1u,
+            "the switch never returns credits for ALLREDUCE uploads, so "
+            "the drain must not consume one (pre-fix: credits 1->0)");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 32, finding 3) The partition multicast's wire/effective
+// ratio mapping overflowed a 64-bit intermediate: thisPartitionSize *
+// ratioRemainder wrapped before the divide, so 32-GiB effective uploads
+// with LL128 (128/120) wire expansion emitted ~2 GiB too little result
+// WIRE data per destination (34.50 GB instead of 36.65 GB), understating
+// serialization time. __int128 intermediates now (the same widening
+// SendCollectiveBulk's effective split uses).
+namespace {
+uint64_t g_r32ResultWire = 0;
+uint64_t g_r32ResultEffective = 0;
+
+bool
+R32OnResult(Ptr<NetDevice>, Ptr<const Packet> p, uint16_t,
+            const Address&, const Address&, NetDevice::PacketType)
+{
+    FabricHeader h;
+    p->PeekHeader(h);
+    if (h.GetPacketType() == FabricPacketType::ALLREDUCE)
+    {
+        g_r32ResultWire += h.GetPayloadSize();
+        g_r32ResultEffective += h.GetEffectiveDataSize();
+    }
+    return true;
+}
+
+// A NetDevice that both counts the multicast results (Send) and feeds the
+// switch's receive path directly (Inject) — the aggregate volumes exceed
+// ns-3's 32-bit byte counters, so nothing may sit in a real queue.
+class R32CaptureDevice : public SimpleNetDevice
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::R32CaptureDevice")
+                                .SetParent<SimpleNetDevice>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<R32CaptureDevice>();
+        return tid;
+    }
+    bool IsLinkUp() const override { return true; }
+    void SetPromiscReceiveCallback(PromiscReceiveCallback c) override { cb = c; }
+    PromiscReceiveCallback GetPromiscReceiveCallback() const override { return cb; }
+    bool Send(Ptr<Packet> p, const Address&, uint16_t) override
+    {
+        FabricHeader h;
+        p->PeekHeader(h);
+        if (h.GetPacketType() == FabricPacketType::ALLREDUCE)
+        {
+            g_r32ResultWire += h.GetPayloadSize();
+            g_r32ResultEffective += h.GetEffectiveDataSize();
+        }
+        return true;
+    }
+    void Inject(Ptr<Packet> p)
+    {
+        cb(this, p, 0x0800, GetAddress(), GetAddress(), NetDevice::PACKET_HOST);
+    }
+    PromiscReceiveCallback cb;
+};
+NS_OBJECT_ENSURE_REGISTERED(R32CaptureDevice);
+} // namespace
+
+class PartitionWireRatioOverflowTest : public TestCase
+{
+  public:
+    PartitionWireRatioOverflowTest()
+        : TestCase("Partition wire-size ratio does not overflow at 32 GiB") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        g_r32ResultWire = 0;
+        g_r32ResultEffective = 0;
+
+        Ptr<R32CaptureDevice> dev = CreateObject<R32CaptureDevice>();
+        dev->SetPromiscReceiveCallback(MakeCallback(&R32OnResult));
+        Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+        sw->AddPort(dev);
+        sw->AddRankPort(0, 0);
+        sw->SetAllReduceEnabled(true);
+        sw->SetAllReduceThreshold(1);
+        sw->SetAllReduceNumPartitions(2);
+        const uint64_t D = 32ull * 1024 * 1024 * 1024; // 32 GiB effective
+        const uint64_t W = (D + 119) / 120 * 128;       // LL128 wire expansion
+        sw->SetAllReduceDataSize(D);
+
+        // Feed the real receive path with sixteen legal-sized upload
+        // fragments (2-GiB effective each, wire expanded 128/120), so the
+        // header's 32-bit size fields stay in range while the aggregate
+        // effective/wire volumes reach 32 GiB / 36.65 GB — the regime where
+        // the 64-bit product wrapped.
+        const uint64_t CH = 2ull * 1024 * 1024 * 1024;
+        uint64_t off = 0;
+        uint32_t seq = 0;
+        while (off < D)
+        {
+            const uint64_t e = std::min(CH, D - off);
+            const uint64_t w =
+                static_cast<uint64_t>((off + e) * (__uint128_t)W / D)
+                - static_cast<uint64_t>(off * (__uint128_t)W / D);
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::ALLREDUCE);
+            h.SetSourceRank(0);
+            h.SetDestRank(0);
+            h.SetSequenceNumber(seq++);
+            h.SetFlowId(9);
+            h.SetPayloadSize(static_cast<uint32_t>(w));
+            h.SetEffectiveDataSize(static_cast<uint32_t>(e));
+            h.SetSourceMac(Mac48Address("00:00:00:00:99:01"));
+            Ptr<Packet> q = Create<Packet>(static_cast<uint32_t>(w));
+            q->AddHeader(h);
+            dev->Inject(q);
+            off += e;
+        }
+        Simulator::Stop(Seconds(30));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(g_r32ResultEffective, D,
+            "the result multicast must carry the full effective volume");
+        NS_TEST_ASSERT_MSG_EQ(g_r32ResultWire, W,
+            "the result wire volume must match the uploads' expansion "
+            "ratio (pre-fix: ~2 GiB short at 32 GiB / LL128 / 2 "
+            "partitions — 34.50 GB instead of 36.65 GB)");
+        sw->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 32, finding 4) The surrogate's tail paths ignored
+// optical_hops while the mean's retry terms compounded it: 4 hops at BER
+// 2e-7 and 1 hop at the equivalent BER 1-(1-2e-7)^4 agreed in the mean
+// (5081.19 µs) but diverged in p99 (5641.58 vs 8236.43 µs). Both the
+// per-step variance and the heavy-tail P_chunk now compound per-hop. The
+// regression lives in the surrogate pytest suite
+// (surrogate/test/test_theory.py::test_tail_optical_hops_compounds) —
+// the C++ harness has no Python bridge.
 
 // (codex round 26, finding 1) MulticastAllReducePartition's chunk loop never
 // decremented bytesRemaining and never stopped at the wire end: with
@@ -13755,6 +14117,14 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new DeviceCallbackSuccessorSurvivesPredecessorDisposeTest,
                 TestCase::Duration::QUICK);
     AddTestCase(new MemoryResponseLedgerPruningTest, TestCase::Duration::QUICK);
+
+    // Codex round 32 regressions (lost PFC RESUME re-send, queued-collective
+    // credit bypass, partition wire-ratio overflow; the surrogate tail's
+    // optical_hops compounding is gated in surrogate pytest).
+    AddTestCase(new PfcLostResumeRetransmittedTest, TestCase::Duration::QUICK);
+    AddTestCase(new QueuedCollectiveKeepsCreditBypassTest,
+                TestCase::Duration::QUICK);
+    AddTestCase(new PartitionWireRatioOverflowTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

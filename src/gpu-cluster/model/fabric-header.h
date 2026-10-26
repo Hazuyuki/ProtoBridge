@@ -116,6 +116,12 @@ class FabricHeader : public Header
 
     bool IsControlPacket() const;
     bool IsCollectivePacket() const;
+    // NVLS/SHARP upload types (ALLREDUCE/ALLGATHER): the switch's SHARP
+    // engine has its own buffer pool separate from per-VC credits, so these
+    // bypass credit CONSUMPTION (not the FlowControlGate dispatch). Narrower
+    // than IsCollectivePacket — ALLTOALL/REDUCESCATTER/BROADCAST ride the
+    // DATA bulk path and DO consume credits.
+    bool IsCreditBypassPacket() const;
     bool IsP2pPacket() const;
     bool IsMemoryPacket() const;
     bool IsRetryPacket() const;

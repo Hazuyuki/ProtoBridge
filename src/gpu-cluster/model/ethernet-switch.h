@@ -101,6 +101,14 @@ class EthernetSwitch : public NvSwitch
     /// RESUME once the VOQ drains to threshold - offset).
     void CheckPfcResume(uint32_t inPort, uint32_t outPort);
 
+    /// Bounded RESUME re-send after the first transmission (codex round 32,
+    /// finding 1): the endpoint never acknowledges a RESUME, so a single
+    /// lost frame left it paused FOREVER (the switch cleared its latch and
+    /// dropped the mirrored header — no re-send path existed). The receiver
+    /// treats a duplicate RESUME as a no-op when its dest is not paused, so
+    /// re-sending is safe.
+    void ResendPfcResume(uint32_t inPort, uint32_t outPort);
+
     /// Drop fired watcher EventIds from m_pfcResumeEvents so the ledger
     /// tracks only LIVE polls (called at each append; codex round 27,
     /// finding 9).
@@ -137,7 +145,13 @@ class EthernetSwitch : public NvSwitch
     std::map<std::pair<uint32_t, uint32_t>, bool> m_pfcPaused;
     /// The mirrored header each PAUSE carried, per hop — the RESUME replays
     /// its reversal so it reaches the exact endpoint the pause silenced.
+    /// Kept for a bounded number of re-sends AFTER the first RESUME too
+    /// (codex round 32, finding 1): a lost RESUME must be re-playable.
     std::map<std::pair<uint32_t, uint32_t>, FabricHeader> m_lastPfcPauseHeader;
+    /// Re-sends remaining per hop (counts DOWN from the cap; the entry is
+    /// retired when it hits zero). Retransmitting forever would grow the
+    /// ledger on a dead link; the cap bounds the waste.
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> m_pfcResumeResends;
     /// Resume-hysteresis watcher EventIds, one per paused (inPort, outPort)
     /// hop. Tracked so DoDispose cancels whatever is still pending (the
     /// callbacks target raw `this` and dereference m_voqs/m_ports, which

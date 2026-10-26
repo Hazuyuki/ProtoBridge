@@ -2891,8 +2891,18 @@ FabricEndpoint::TrySendQueuedPackets(){
         // the receiver never returns credits for a remote source
         // (OnPacketDelivered's IsLocalRank guard), so consuming one here
         // would strand it.
+        // NVLS/SHARP queued entries keep their bypass too (codex round 32,
+        // finding 2): the drain derived bypass solely from destination
+        // locality, so a gate-denied LOCAL ALLREDUCE/ALLGATHER fragment
+        // consumed a credit on the drain that the switch's upload ACKs
+        // never return (they do not return credits for bypass types) — with
+        // one credit left, a denied two-fragment collective drained one
+        // fragment, ate the credit, and stalled the second forever. The
+        // entry's OWN type decides, exactly like the send-side
+        // IsCreditBypassType test.
         if (!FlowControlGate(entry.vcId, entry.seqNum,
-                             !IsLocalRank(entry.header.GetDestRank())))
+                             entry.header.IsCreditBypassPacket() ||
+                                 !IsLocalRank(entry.header.GetDestRank())))
         {
             NS_LOG_DEBUG("FlowControlGate denied queued packet on VC "
                          << static_cast<int>(entry.vcId));
