@@ -137,7 +137,7 @@ function setSize(bytes) {
   $("data-unit").value = String(unit);
   $("data-size").value = bytes / unit;
 }
-function loadConfig(id, request = null) {
+function loadConfig(id, request = null, copyName = true) {
   const config = state.catalog.configs.find((item) => item.id === id);
   if (!config) return;
   state.config = config;
@@ -154,7 +154,7 @@ function loadConfig(id, request = null) {
   $("seed").value = defaults.seed ?? 1;
   $("timeout").value = defaults.timeout ?? 120;
   $("run-name").value = request
-    ? `${request.name || config.title} · 副本`.slice(0, 80)
+    ? `${request.name || config.title}${copyName ? " · 副本" : ""}`.slice(0, 80)
     : "";
   $("cli-json").value = JSON.stringify(defaults.cli_overrides || {}, null, 2);
   setSize(defaults.data_size ?? 1048576);
@@ -393,7 +393,15 @@ function setTab(tab) {
   if (tab === "trace") loadTrace();
   if (tab === "log") loadLog();
 }
-async function selectRun(identifier, scroll = false) {
+function savedInputs(run) {
+  return {
+    ...run.request,
+    name: run.name,
+    config_text: run.config,
+    profile_text: run.profile,
+  };
+}
+async function selectRun(identifier, scroll = false, restoreInputs = false) {
   try {
     const run = await api(`/api/runs/${identifier}`);
     if (state.selected?.id !== identifier) {
@@ -403,6 +411,8 @@ async function selectRun(identifier, scroll = false) {
       $("run-log").textContent = "等待程序输出…";
     }
     state.selected = run;
+    if (restoreInputs)
+      loadConfig(run.request.config_id, savedInputs(run), false);
     history.replaceState(null, "", `#run=${identifier}`);
     renderSelected();
     renderHistory(true);
@@ -424,6 +434,8 @@ function renderSelected() {
     complete = run.status === "completed";
   $("result-empty").hidden = true;
   $("result-content").hidden = false;
+  $("selected-run-description").textContent =
+    `${run.name} · ${run.summary.collective} / ${run.summary.algorithm} · ${run.summary.ranks} ranks · ${bytesLabel(run.summary.data_size)}${run.summary.stencil ? " dataSize" : " / rank"}`;
   const status = $("selected-run-status");
   status.hidden = false;
   status.className = `status-badge ${run.status}`;
@@ -655,7 +667,7 @@ async function initialize() {
       )
       .join("");
     const match = location.hash.match(/^#run=([0-9a-f]{32})$/);
-    if (match) await selectRun(match[1]);
+    if (match) await selectRun(match[1], false, true);
     setInterval(poll, 1200);
   } catch (error) {
     $("connection-error").textContent = `无法加载工作区：${error.message}`;
@@ -750,12 +762,12 @@ document.querySelectorAll("[data-tab]").forEach((button) => {
 });
 $("history-rows").addEventListener("click", async (event) => {
   const open = event.target.closest("[data-run]");
-  if (open) await selectRun(open.dataset.run, true);
+  if (open) await selectRun(open.dataset.run, true, true);
   const clone = event.target.closest("[data-clone]");
   if (clone) {
     try {
       const run = await api(`/api/runs/${clone.dataset.clone}`);
-      loadConfig(run.request.config_id, run.request);
+      loadConfig(run.request.config_id, savedInputs(run));
       $("config-panel").scrollIntoView({ behavior: "smooth", block: "start" });
       notify("已载入配置，可修改后重新运行");
     } catch (error) {
@@ -844,6 +856,6 @@ document.addEventListener("keydown", (event) => {
 });
 window.addEventListener("hashchange", () => {
   const match = location.hash.match(/^#run=([0-9a-f]{32})$/);
-  if (match && state.catalog) selectRun(match[1]);
+  if (match && state.catalog) selectRun(match[1], false, true);
 });
 initialize();

@@ -1832,6 +1832,13 @@ dialog::backdrop {
   left: 0;
   top: 0;
 }
+.selected-run-description {
+  color: #7588a3;
+  font-size: 10px;
+  line-height: 1.8;
+  margin-bottom: 18px;
+  overflow-wrap: anywhere;
+}
 .history-table-wrap {
   position: relative;
 }
