@@ -258,6 +258,28 @@ valgrind on the three C++ modes of the codex round-32 probe (pfc,
 gate_one, ratio) 0 errors / no leaks; the fourth finding's regression
 lives in the surrogate pytest suite.
 
+### Added — ns3-rdma PFC alignment comparison (task #235 follow-up)
+
+Matched 2:1 incast head-to-head (2×50 MB, 40 Gbps, 1 µs, pausetime 5 µs)
+against ns3-rdma (ns-3.17 qbb-net-device + BroadcomNode), both sides
+instrumented for PAUSE/RESUME counts. Findings in
+`doc/PFC_NS3RDMA_ALIGNMENT.md`; headline numbers:
+
+- The 2.1× FCT gap at 1000-B chunks is ProtoBridge's per-packet chunk
+  overhead, NOT PFC behavior: PB's FCT is identical with PFC on/off
+  (42,951,160 ns), and at 9000-B chunks the gap closes to 1.16× —
+  matching the p2p overhead control (2.15× vs 1.17×) almost exactly.
+- Pause cadence is the same order of magnitude (~600/ms per paused port
+  both sides). Mode 3 re-asserts while congested (qbb's pausetime/2
+  re-check analog: 51.5k pauses, 4 resumes); mode 1 is quiet (4 pauses,
+  36 resumes) with identical FCT. Zero drops everywhere.
+- ns3-rdma pays ~9% FCT for PFC at this scale (18.58 → 20.29 ms);
+  with DCQCN on it emits zero PAUSEs. PB has no DCQCN arm, and its PFC
+  is FCT-invariant under this workload.
+
+Also: `gpu-cluster-sim` RESULT output now reports `pfcPausesSent`/
+`pfcResumesSent` aggregate switch counters (used by the experiments).
+
 ### Added — per-VC PFC (802.1Qbb priority classes) and mode 3 quanta (pause-time semantics), aligning the PFC arms with qbb-net-device
 
 Two feature arms requested for the ns3-rdma alignment (task #235):
