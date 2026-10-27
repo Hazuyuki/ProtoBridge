@@ -174,6 +174,7 @@ NvSwitch::DoDispose()
     }
     m_ports.clear();
     m_voqs.clear();
+    m_vcVoqDepth.clear();
     m_portDegradationModels.clear();
     m_macTable.clear();
     m_sourceBasedTable.clear();
@@ -201,6 +202,7 @@ NvSwitch::AddPort(Ptr<NetDevice> device)
     uint32_t portNum = m_ports.size();
     m_ports.push_back(device);
     m_voqs.push_back(std::queue<VoqEntry>());
+    m_vcVoqDepth.emplace_back();
     m_portDegradationModels.push_back(nullptr);
     m_outputBusyUntil.push_back(Seconds(0));
 
@@ -956,6 +958,15 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
     }
 
     m_voqs[outPort].push(entry);
+    // Shadow per-VC occupancy (O(1) GetVoqSizeForVc for the per-priority
+    // PFC thresholds).
+    {
+        FabricHeader h;
+        if (entry.packet && entry.packet->PeekHeader(h))
+        {
+            m_vcVoqDepth[outPort][h.GetVirtualChannel()]++;
+        }
+    }
 }
 
 bool
@@ -1025,6 +1036,20 @@ NvSwitch::Arbitrate()
             }
             VoqEntry entry = m_voqs[g.port].front();
             m_voqs[g.port].pop();
+            // Shadow per-VC occupancy: decrement at pop (erase the entry at
+            // zero so the map stays O(distinct live VCs)).
+            {
+                FabricHeader h;
+                if (entry.packet && entry.packet->PeekHeader(h))
+                {
+                    auto& vcMap = m_vcVoqDepth[g.port];
+                    auto it = vcMap.find(h.GetVirtualChannel());
+                    if (it != vcMap.end() && --(it->second) == 0)
+                    {
+                        vcMap.erase(it);
+                    }
+                }
+            }
             ForwardPacket(entry.packet, entry.srcAddr, entry.dstAddr, g.port);
         }
     }

@@ -258,6 +258,43 @@ valgrind on the three C++ modes of the codex round-32 probe (pfc,
 gate_one, ratio) 0 errors / no leaks; the fourth finding's regression
 lives in the surrogate pytest suite.
 
+### Added — per-VC PFC (802.1Qbb priority classes) and mode 3 quanta (pause-time semantics), aligning the PFC arms with qbb-net-device
+
+Two feature arms requested for the ns3-rdma alignment (task #235):
+
+1. **Per-VC PFC** (`EthernetSwitch::SetPfcPauseThresholdForVc(vc, threshold)`).
+   The FabricHeader's existing 8-bit VirtualChannel field names the
+   priority class — no wire-format change. Switch latches are keyed
+   (inPort, outPort, vc) via a `PfcHopKey`; endpoint holds are keyed
+   (dest, vc, switch-MAC). With per-VC thresholds configured, each class
+   compares its OWN VOQ occupancy (`NvSwitch::GetVoqSizeForVc`, an O(1)
+   shadow counter maintained at VOQ push/pop) against its own threshold —
+   a pause on one VC never silences another VC toward the same hop, the
+   qbb-net-device per-priority analog. With NO per-VC thresholds
+   configured, the whole-port depth + global threshold semantics are
+   byte-identical to the pre-VC behavior (single-class fabrics unchanged).
+2. **PFC mode 3 (quanta / pause-time)** — `--switchPfcMode=3 --pfcPauseTime=T`
+   (µs, new CLI knob, wired through `MultiNodeTopologyHelper::
+   SetInterNodeSwitchPfcPauseTime`). The PAUSE carries T in the
+   FabricHeader CreditCount field (unused by PFC frames); the endpoint's
+   hold auto-expires after T (qbb's `PauseFinish`), and the switch
+   re-checks at T/2, re-PAUSEing while the VOQ is still past the resume
+   level and emitting a RESUME once drained (qbb's `CheckQueueFull`
+   contract). Supersede rules: a re-asserted PAUSE cancels and replaces
+   the pending expiry; an explicit RESUME cancels it. Modes 1/2 keep the
+   explicit-RESUME contract (`--pfcPauseTime=0` is inert there).
+
+Both park below the OTP/PEX seam (SendPacketOnDevice / the send queue),
+so the transaction graph is untouched. Tests: `PFC pauses isolate per VC
+(802.1Qbb priorities)`, `PFC mode 3 quanta expires and re-asserts while
+congested`, `PFC mode 3 RESUME lifts a quanta hold early on drain`.
+Docs: `doc/CONFIG_GUIDE.md` PFC section (mode 3 + per-VC paragraphs).
+
+Suite state: gpu-cluster EXTENSIVE 183 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 101 passed, 15/15 parity scripts,
+valgrind on the feature probe's four modes (pervc, quanta, drain,
+destroy_only) 0 errors / no leaks.
+
 ### Fixed — codex round 33: four defects — the SimpleNetDevice teardown leaving a dangling callback, gate-denied single collectives discarded, control frames crossing failed links, and the mean GBN/reload terms ignoring optical hops
 
 1. **SimpleNetDevice's promisc callback survived an endpoint's dispose**

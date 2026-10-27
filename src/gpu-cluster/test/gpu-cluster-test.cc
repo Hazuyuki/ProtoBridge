@@ -10866,6 +10866,7 @@ class R32PfcEndpoint : public FabricEndpoint
         return tid;
     }
     using FabricEndpoint::IsPfcPausedForDest;
+    using FabricEndpoint::StartApplication;
 };
 
 unsigned g_r32Delivered = 0;
@@ -11421,6 +11422,280 @@ class SwitchControlFramesShareLinkFateTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(healthy.first, 2u,
             "a healthy link forwards DATA and ACK alike");
         NS_TEST_ASSERT_MSG_EQ(healthy.second, 0u, "no drops on a healthy link");
+    }
+};
+
+// (per-VC PFC) The 802.1Qbb priority analog: a pause on one VC must not
+// silence another VC's traffic toward the same destination, and the RESUME
+// lifts only its own class. The latch keys are (hop, VC) on the switch and
+// (dest, VC, switch-MAC) at the endpoint; per-VC thresholds compare the
+// per-class VOQ depth.
+class PfcPerVcIsolationTest : public TestCase
+{
+  public:
+    PfcPerVcIsolationTest()
+        : TestCase("PFC pauses isolate per VC (802.1Qbb priorities)") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto linkA = p2p.Install(nodes.Get(0), nodes.Get(1));
+        auto linkB = p2p.Install(nodes.Get(2), nodes.Get(1));
+        Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+        nodes.Get(1)->AddDevice(sw);
+        sw->AddPort(linkA.Get(1));
+        sw->AddPort(linkB.Get(1));
+        sw->SetAttribute("PfcMode", UintegerValue(1));
+        sw->SetAttribute("PfcPauseThreshold", UintegerValue(2));
+        // Per-VC thresholds configure the per-class depth comparison arm.
+        // VC 0 pauses at depth 2; VC 1's class threshold is high (1000) so
+        // the same-depth burst on the shared VOQ must NOT fire for it.
+        sw->SetPfcPauseThresholdForVc(0, 2);
+        sw->SetPfcPauseThresholdForVc(1, 1000);
+
+        Ptr<R32PfcEndpoint> src = CreateObject<R32PfcEndpoint>();
+        nodes.Get(0)->AddApplication(src);
+        src->SetRank(0);
+        src->SetLocalRankRange(0, 2);
+        src->AddNetDevice(linkA.Get(0));
+        src->SetRoutingEntry(1, 0);
+        // Arm the endpoint's receive callback so the PAUSE actually lands
+        // in ProcessPfcPausePacket (an unstarted application never binds
+        // its net devices' receive handlers).
+        src->StartApplication();
+
+        // Drive a VC-0 PAUSE across the real switch admission path (three
+        // pushes then the threshold-crossing fourth, all VC 0).
+        auto entry = [](uint8_t vc) {
+            VoqEntry e;
+            e.packet = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0);
+            fh.SetSourceRank(0);
+            fh.SetDestRank(1);
+            fh.SetVirtualChannel(vc);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            e.packet->AddHeader(fh);
+            e.srcAddr = fh.GetSourceMac();
+            e.dstAddr = fh.GetDestMac();
+            e.inPort = 0;
+            return e;
+        };
+        sw->EnqueueForTest(1, entry(0)); // fast path out
+        sw->EnqueueForTest(1, entry(0)); // depth 0
+        sw->EnqueueForTest(1, entry(0)); // depth 1
+        sw->EnqueueForTest(1, entry(0)); // depth 2 -> PAUSE vc 0
+        // Sample while the hold is live: the PAUSE lands at the endpoint
+        // ~100 ns in (link delay) and the mode-1 resume watcher's first
+        // drain check is at 500 ns — 300 ns sits between the two, with the
+        // VOQ backlog still nominally present at the switch.
+        Simulator::Stop(NanoSeconds(300));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 1u,
+            "the VC-0 threshold crossing emits exactly one PAUSE");
+        NS_TEST_ASSERT_MSG_EQ(src->IsPfcPausedForDest(1, 0), true,
+            "the endpoint latches the pause on VC 0");
+        NS_TEST_ASSERT_MSG_EQ(src->IsPfcPausedForDest(1, 1), false,
+            "VC 1 toward the same dest stays unpaused (per-VC isolation)");
+
+        // The switch's own latch is per (hop, VC): VC 0 latched, VC 1 not.
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 1, 0), true,
+            "switch holds the pause on (hop, vc=0)");
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 1, 1), false,
+            "switch holds no pause on (hop, vc=1)");
+
+        // A VC-1 burst at the same whole-VOQ depth does NOT re-trigger:
+        // its own class depth starts at 0 and its per-VC threshold (1000)
+        // governs — per-VC depths must not see VC-0's backlog, and the
+        // shared queue's occupancy must not trip VC 1's class.
+        uint64_t pausesBefore = sw->GetPfcPausesSent();
+        sw->EnqueueForTest(1, entry(1)); // vc1 class depth 0
+        sw->EnqueueForTest(1, entry(1)); // vc1 class depth 1
+        Simulator::Stop(NanoSeconds(300));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), pausesBefore,
+            "VC 1 at per-VC depth 1 (below its threshold) pauses nothing");
+
+        sw->Dispose();
+        src->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (PFC mode 3 — quanta) The 802.1Qbb pause-time semantics: a PAUSE carrying
+// a nonzero pause time auto-expires at the endpoint (qbb's PauseFinish),
+// and the switch re-asserts while congested at pausetime/2 (qbb's
+// CheckQueueFull). A zero pause time (modes 1/2) keeps the explicit-RESUME
+// contract.
+class PfcQuantaExpiryTest : public TestCase
+{
+  public:
+    PfcQuantaExpiryTest()
+        : TestCase("PFC mode 3 quanta expires and re-asserts while congested") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto linkA = p2p.Install(nodes.Get(0), nodes.Get(1));
+        // The egress (port-1) link is SLOW (1 Mbps): a 64-B packet takes
+        // ~512 us to serialize, so the VOQ backlog stays past the re-check
+        // level for the whole 20-us window — the "still congested"
+        // precondition of the qbb CheckQueueFull re-assert.
+        p2p.SetDeviceAttribute("DataRate", StringValue("1Mbps"));
+        auto linkB = p2p.Install(nodes.Get(2), nodes.Get(1));
+        Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+        nodes.Get(1)->AddDevice(sw);
+        sw->AddPort(linkA.Get(1));
+        sw->AddPort(linkB.Get(1));
+        sw->SetAttribute("PfcMode", UintegerValue(3));
+        sw->SetAttribute("PfcPauseThreshold", UintegerValue(2));
+        // A 4-us pause time: the endpoint's expiry and the switch's 2-us
+        // re-check interleave observably inside a 20-us window.
+        sw->SetAttribute("PfcPauseTime", UintegerValue(4));
+
+        Ptr<R32PfcEndpoint> src = CreateObject<R32PfcEndpoint>();
+        nodes.Get(0)->AddApplication(src);
+        src->SetRank(0);
+        src->SetLocalRankRange(0, 2);
+        src->AddNetDevice(linkA.Get(0));
+        src->SetRoutingEntry(1, 0);
+        src->StartApplication();
+
+        auto makeEntry = []() {
+            VoqEntry e;
+            e.packet = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0);
+            fh.SetSourceRank(0);
+            fh.SetDestRank(1);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            e.packet->AddHeader(fh);
+            e.srcAddr = fh.GetSourceMac();
+            e.dstAddr = fh.GetDestMac();
+            e.inPort = 0;
+            return e;
+        };
+        // Latch the pause with a persistent backlog (the VOQ drains slowly
+        // through the arbiter; at 400 Gbps a 64-B packet serializes in
+        // ~1.3 ns, so keep the queue deep enough to stay past the hysteresis
+        // level for the re-assert window).
+        sw->EnqueueForTest(1, makeEntry());
+        sw->EnqueueForTest(1, makeEntry());
+        sw->EnqueueForTest(1, makeEntry());
+        sw->EnqueueForTest(1, makeEntry()); // depth 2 -> PAUSE (quanta=4us)
+        Simulator::Stop(MicroSeconds(20));
+        Simulator::Run();
+
+        // The quanta expired at 4 us with the VOQ still past the hysteresis
+        // level: the switch's 2-us re-check re-PAUSEd (likely more than
+        // once) — pauses >= 2 (initial + at least one re-assert).
+        NS_TEST_ASSERT_MSG_GT_OR_EQ(sw->GetPfcPausesSent(), 2u,
+            "the congested re-check must re-assert the pause after the "
+            "quanta expiry (qbb CheckQueueFull semantics)");
+        // The endpoint is un-paused at the end ONLY if the backlog drained;
+        // with the re-assertions it should still be latched (or have just
+        // expired again) — the invariant to pin: it never got stuck paused
+        // WITHOUT a live re-assert, i.e. resumes+expiries interleaved. Pin
+        // the observable: the endpoint received at least one PAUSE and the
+        // switch never sent a RESUME while above the hysteresis level.
+        NS_TEST_ASSERT_MSG_EQ(src->IsPfcPausedForDest(1, 0), true,
+            "still congested at 20 us: the re-asserted holds keep the "
+            "endpoint paused");
+
+        sw->Dispose();
+        src->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (PFC mode 3 — quanta drain) Once the backlog drains past the hysteresis
+// level, the re-check emits a RESUME and the endpoint un-latches even
+// though its quanta had NOT yet expired (the explicit RESUME supersedes the
+// timer).
+class PfcQuantaDrainResumeTest : public TestCase
+{
+  public:
+    PfcQuantaDrainResumeTest()
+        : TestCase("PFC mode 3 RESUME lifts a quanta hold early on drain") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto linkA = p2p.Install(nodes.Get(0), nodes.Get(1));
+        auto linkB = p2p.Install(nodes.Get(2), nodes.Get(1));
+        Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+        nodes.Get(1)->AddDevice(sw);
+        sw->AddPort(linkA.Get(1));
+        sw->AddPort(linkB.Get(1));
+        sw->SetAttribute("PfcMode", UintegerValue(3));
+        sw->SetAttribute("PfcPauseThreshold", UintegerValue(2));
+        // LONG-enough quanta (20 us): the re-check fires at 10 us (half the
+        // pause time), the quanta would expire at 20 us — stopping at 15 us
+        // proves the RESUME (not the timer) lifted the hold.
+        sw->SetAttribute("PfcPauseTime", UintegerValue(20));
+
+        Ptr<R32PfcEndpoint> src = CreateObject<R32PfcEndpoint>();
+        nodes.Get(0)->AddApplication(src);
+        src->SetRank(0);
+        src->SetLocalRankRange(0, 2);
+        src->AddNetDevice(linkA.Get(0));
+        src->SetRoutingEntry(1, 0);
+        src->StartApplication();
+
+        auto makeEntry = []() {
+            VoqEntry e;
+            e.packet = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0);
+            fh.SetSourceRank(0);
+            fh.SetDestRank(1);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            e.packet->AddHeader(fh);
+            e.srcAddr = fh.GetSourceMac();
+            e.dstAddr = fh.GetDestMac();
+            e.inPort = 0;
+            return e;
+        };
+        sw->EnqueueForTest(1, makeEntry());
+        sw->EnqueueForTest(1, makeEntry());
+        sw->EnqueueForTest(1, makeEntry());
+        sw->EnqueueForTest(1, makeEntry()); // depth 2 -> PAUSE (20-us quanta)
+        // The arbiter drains the small backlog well inside 10 us; the
+        // 10-us re-check then finds the VOQ empty and RESUMEs. Stopping at
+        // 15 us (before the 20-us quanta expiry) pins the supersede: only
+        // the explicit RESUME could have lifted the hold by then.
+        Simulator::Stop(MicroSeconds(15));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcResumesSent(), 1u,
+            "the drained re-check must emit the RESUME");
+        NS_TEST_ASSERT_MSG_EQ(src->IsPfcPausedForDest(1, 0), false,
+            "the explicit RESUME lifts the endpoint's hold before the "
+            "20-us quanta expires (supersede semantics)");
+        sw->Dispose();
+        src->Dispose();
+        Simulator::Destroy();
     }
 };
 
@@ -14353,6 +14628,9 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new SimpleDeviceDetachSurvivesDisposeTest, TestCase::Duration::QUICK);
     AddTestCase(new DeniedSingleCollectiveParkedTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchControlFramesShareLinkFateTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcPerVcIsolationTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcQuantaExpiryTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcQuantaDrainResumeTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

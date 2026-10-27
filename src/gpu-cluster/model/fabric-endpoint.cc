@@ -242,7 +242,17 @@ FabricEndpoint::DoDispose()
     m_deferredEgressEvents.clear();
     // PFC pause latch goes with the rest of the send state: no resume will
     // arrive for a disposed endpoint, and a stale latch would hold the send
-    // queue forever if the object were ever re-initialized.
+    // queue forever if the object were ever re-initialized. The quanta
+    // expiry timers ride along (cancel the live ones first — each targets
+    // raw `this`).
+    for (auto& [key, ev] : m_pfcPauseExpiry)
+    {
+        if (!ev.IsExpired())
+        {
+            Simulator::Cancel(ev);
+        }
+    }
+    m_pfcPauseExpiry.clear();
     m_pfcPausedDests.clear();
     // Detach the promisc callbacks BEFORE dropping the device references:
     // they hold raw `this`, so a packet arriving on the channel after this
@@ -2831,23 +2841,142 @@ FabricEndpoint::ProcessPfcPausePacket(const FabricHeader& pauseHeader)
     // carries no port, so two pauses from the same switch MAC (multi-link
     // ingress to one switch) share one entry — the first RESUME lifts it;
     // the switch re-pauses if its VOQ refills.
-    m_pfcPausedDests[pausedDest].insert(pauseHeader.GetSourceMac());
+    const uint8_t vc = pauseHeader.GetVirtualChannel();
+    const bool wasPaused = IsPfcPausedForDest(pausedDest, vc);
+    m_pfcPausedDests[pausedDest][vc].insert(pauseHeader.GetSourceMac());
+    if (!wasPaused)
+    {
+        // Fresh pause on this (dest, vc): pump the send state so the
+        // newly-parked tail settles (the drain below re-runs on expiry).
+        TrySendQueuedPackets();
+    }
+
+    // Quanta mode (802.1Qbb pause-time semantics): a PAUSE carrying a
+    // nonzero pause time (the CreditCount field) auto-expires — the
+    // endpoint schedules its own un-pause (qbb-net-device's PauseFinish
+    // analog). The switch re-PAUSEs at pausetime/2 while still congested,
+    // so the expiry only opens a bounded re-check window. A zero pause
+    // time (modes 1/2) keeps the "paused until an explicit RESUME"
+    // contract unchanged.
+    const uint32_t quantaUs = pauseHeader.GetCreditCount();
+    if (quantaUs > 0)
+    {
+        const auto key = std::make_tuple(pausedDest, vc,
+                                         pauseHeader.GetSourceMac());
+        // Re-asserting PAUSEs refresh the timer: cancel the pending expiry
+        // (a live EventId; Cancel on an expired one is a no-op) and
+        // re-schedule from now.
+        auto pit = m_pfcPauseExpiry.find(key);
+        if (pit != m_pfcPauseExpiry.end())
+        {
+            Simulator::Cancel(pit->second);
+            m_pfcPauseExpiry.erase(pit);
+        }
+        EventId expiry = Simulator::Schedule(
+            MicroSeconds(quantaUs),
+            &FabricEndpoint::PfcPauseExpiredForDest, this,
+            pausedDest, vc, pauseHeader.GetSourceMac());
+        PrunePfcPauseExpiryEvents();
+        m_pfcPauseExpiry[key] = expiry;
+    }
+}
+
+void
+FabricEndpoint::PfcPauseExpiredForDest(uint16_t destRank, uint8_t vcId,
+                                       Mac48Address switchMac)
+{
+    // The quanta expired: lift THIS switch's hold on this (dest, vc) — the
+    // same per-owner lift ProcessPfcResumePacket performs — then drain what
+    // queued up. If the switch re-PAUSEd meanwhile (its pausetime/2 re-check
+    // found the VOQ still congested), a fresh entry + timer exist and this
+    // expiry is a no-op: the find on the owner set below simply re-inserts
+    // nothing... no — the entry was re-latched, so erasing the switch's MAC
+    // here would lift the RE-ASSERTED hold. Guard: only lift when the
+    // re-assert didn't happen (the pending expiry we're servicing is still
+    // the LIVE ledger entry — a re-assert cancels and replaces it, and a
+    // cancelled EventId never fires).
+    const auto key = std::make_tuple(destRank, vcId, switchMac);
+    auto pit = m_pfcPauseExpiry.find(key);
+    if (pit != m_pfcPauseExpiry.end())
+    {
+        // We are the live expiry (the scheduler fired us): retire the entry.
+        m_pfcPauseExpiry.erase(pit);
+    }
+    auto it = m_pfcPausedDests.find(destRank);
+    if (it == m_pfcPausedDests.end())
+    {
+        return;
+    }
+    auto vcIt = it->second.find(vcId);
+    if (vcIt == it->second.end())
+    {
+        return;
+    }
+    vcIt->second.erase(switchMac);
+    if (vcIt->second.empty())
+    {
+        it->second.erase(vcIt);
+    }
+    if (it->second.empty())
+    {
+        m_pfcPausedDests.erase(it);
+    }
+    // Sends toward this dest were being gated; drain what queued up (the
+    // same recovery as ProcessPfcResumePacket).
+    TrySendQueuedPackets();
+    PumpBulkTxWindow();
+}
+
+void
+FabricEndpoint::PrunePfcPauseExpiryEvents()
+{
+    std::erase_if(m_pfcPauseExpiry,
+                  [](const auto& kv) { return kv.second.IsExpired(); });
 }
 
 void
 FabricEndpoint::ProcessPfcResumePacket(const FabricHeader& resumeHeader)
 {
     const uint16_t resumedDest = resumeHeader.GetSourceRank();
-    NS_LOG_DEBUG("PFC RESUME toward dest " << resumedDest);
+    NS_LOG_DEBUG("PFC RESUME toward dest " << resumedDest
+                  << " vc " << static_cast<unsigned>(resumeHeader.GetVirtualChannel()));
     auto it = m_pfcPausedDests.find(resumedDest);
     if (it == m_pfcPausedDests.end())
     {
         return;
     }
-    // Lift only this switch's hold (the RESUME replays the PAUSE's MACs,
-    // so SourceMac names the switch whose pause it resumes). The dest
-    // stays paused while any other switch still holds a pause for it.
-    it->second.erase(resumeHeader.GetSourceMac());
+    // Lift only this switch's hold on the RESUMED priority class (the
+    // RESUME replays the PAUSE's MACs and VC, so SourceMac names the
+    // switch and VirtualChannel names the class whose pause it lifts).
+    // Other VCs and other switches' holds on this dest stay latched.
+    auto vcIt = it->second.find(resumeHeader.GetVirtualChannel());
+    if (vcIt == it->second.end())
+    {
+        return;
+    }
+    // An explicit RESUME supersedes a pending quanta expiry for this hold:
+    // cancel the timer so the expiry cannot double-lift (its erase is
+    // idempotent, but cancelling keeps the ledger honest).
+    {
+        const auto key = std::make_tuple(resumedDest,
+                                         resumeHeader.GetVirtualChannel(),
+                                         resumeHeader.GetSourceMac());
+        auto pit = m_pfcPauseExpiry.find(key);
+        if (pit != m_pfcPauseExpiry.end())
+        {
+            if (!pit->second.IsExpired())
+            {
+                Simulator::Cancel(pit->second);
+            }
+            m_pfcPauseExpiry.erase(pit);
+        }
+    }
+    vcIt->second.erase(resumeHeader.GetSourceMac());
+    if (!vcIt->second.empty())
+    {
+        return;
+    }
+    it->second.erase(vcIt);
     if (!it->second.empty())
     {
         return;
@@ -2869,6 +2998,18 @@ bool
 FabricEndpoint::IsPfcPausedForDest(uint16_t destRank) const
 {
     return m_pfcPausedDests.find(destRank) != m_pfcPausedDests.end();
+}
+
+bool
+FabricEndpoint::IsPfcPausedForDest(uint16_t destRank, uint8_t vcId) const
+{
+    auto it = m_pfcPausedDests.find(destRank);
+    if (it == m_pfcPausedDests.end())
+    {
+        return false;
+    }
+    auto vcIt = it->second.find(vcId);
+    return vcIt != it->second.end() && !vcIt->second.empty();
 }
 
 void
@@ -2918,7 +3059,7 @@ FabricEndpoint::TrySendQueuedPackets(){
         {
             const FabricHeader& hdr = entry.header;
             if (!hdr.IsControlPacket() && !hdr.IsRetryPacket()
-                && m_pfcPausedDests.count(hdr.GetDestRank()) > 0)
+                && IsPfcPausedForDest(hdr.GetDestRank(), hdr.GetVirtualChannel()))
             {
                 NS_LOG_DEBUG("PFC pause parks queued packet for dest "
                              << hdr.GetDestRank());
@@ -2984,7 +3125,8 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         if (!throttleHdr.IsControlPacket() && !throttleHdr.IsRetryPacket()
             && !m_isRetransmitting
             && !IsLocalRank(throttleHdr.GetDestRank())
-            && m_pfcPausedDests.count(throttleHdr.GetDestRank()) > 0)
+            && IsPfcPausedForDest(throttleHdr.GetDestRank(),
+                                  throttleHdr.GetVirtualChannel()))
         {
             SendQueueEntry entry;
             // Park the BODY, not the framed packet: every caller AddHeaders
@@ -3313,7 +3455,7 @@ FabricEndpoint::SendDeferredEgressInternal(Ptr<Packet> packet, uint32_t deviceIn
         packet->PeekHeader(hdr);
         if (!hdr.IsControlPacket() && !hdr.IsRetryPacket() && !isRetransmit
             && !IsLocalRank(hdr.GetDestRank())
-            && m_pfcPausedDests.count(hdr.GetDestRank()) > 0)
+            && IsPfcPausedForDest(hdr.GetDestRank(), hdr.GetVirtualChannel()))
         {
             // Prune fired EventIds at every append: this loop appends every
             // 500 ns while held and never re-enters SendPacketOnDevice's

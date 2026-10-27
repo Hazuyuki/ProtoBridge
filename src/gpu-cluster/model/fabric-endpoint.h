@@ -768,8 +768,35 @@ class FabricEndpoint : public Application
     void ProcessPfcResumePacket(const FabricHeader& resumeHeader);
 
     /// @brief True while a PFC pause from the switch silences sends toward
-    ///        destRank. Consulted by the send paths and the queue drain.
+    ///        destRank (any VC). Consulted by the send paths and the queue
+    ///        drain when no VC context is at hand.
     bool IsPfcPausedForDest(uint16_t destRank) const;
+
+    /// @brief True while a PFC pause silences sends toward destRank on the
+    ///        given VC. Per-VC PFC (the 802.1Qbb priority analog: the PAUSE
+    ///        frame's VirtualChannel field names the paused priority class,
+    ///        and traffic on OTHER VCs toward the same dest flows freely).
+    ///        A vc with no latched pause entry for this dest is unpaused.
+    bool IsPfcPausedForDest(uint16_t destRank, uint8_t vcId) const;
+
+    /// @brief Quanta-expiry handler (802.1Qbb pause-time semantics): lifts
+    ///        the named switch's hold on (destRank, vcId) when the pause
+    ///        time carried in the PAUSE frame elapses (qbb-net-device's
+    ///        PauseFinish analog). Only fires for the LIVE expiry — a
+    ///        re-asserted PAUSE cancels and replaces the pending entry, so
+    ///        a superseded expiry never lifts the refreshed hold.
+    void PfcPauseExpiredForDest(uint16_t destRank, uint8_t vcId,
+                                Mac48Address switchMac);
+
+    /// Quanta-expiry EventIds, one per live (dest, vc, switch) hold.
+    /// Pruned at each append (the fired entries drop out); DoDispose
+    /// cancels the live ones (the same ledger discipline as
+    /// m_deferredEgressEvents).
+    std::map<std::tuple<uint16_t, uint8_t, Mac48Address>, EventId> m_pfcPauseExpiry;
+
+    /// Drop fired quanta-expiry EventIds from m_pfcPauseExpiry so the
+    /// ledger tracks only LIVE timers (called at each append).
+    void PrunePfcPauseExpiryEvents();
 
   private:
 
@@ -826,13 +853,16 @@ class FabricEndpoint : public Application
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
     Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
     Ptr<RttccRateMachine> m_rttccRate{nullptr}; ///< RTTCC rate machine (So-only; null=dormant)
-    /// Destination ranks a switch PFC pause has silenced (So-only), with the
-    /// set of originating switch MACs still holding each pause (the PAUSE's
-    /// SourceMac; the RESUME replays it — keying per switch keeps one
-    /// switch's RESUME from lifting another's outstanding hold). A dest is
-    /// paused iff it has an entry with a nonempty MAC set. Cleared by
-    /// PFC_RESUME; DoDispose empties it with the rest of the send state.
-    std::map<uint16_t, std::set<Mac48Address>> m_pfcPausedDests;
+    /// Destination ranks a switch PFC pause has silenced (So-only), with
+    /// per-VC pause holds: dest -> (VC -> the set of originating switch
+    /// MACs still holding that VC's pause). The PAUSE's SourceMac is the
+    /// emitting switch (the RESUME replays it — keying per switch keeps
+    /// one switch's RESUME from lifting another's outstanding hold) and
+    /// its VirtualChannel names the paused priority class (per-VC PFC,
+    /// the 802.1Qbb priority analog). A (dest, vc) is paused iff its MAC
+    /// set is nonempty; a dest entry with no VCs left is erased. Cleared
+    /// by PFC_RESUME; DoDispose empties it with the rest of the send state.
+    std::map<uint16_t, std::map<uint8_t, std::set<Mac48Address>>> m_pfcPausedDests;
     std::unordered_map<uint64_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(sourceRank,VC,flowId) reorder buffers, key=(srcRank<<32)|(vcId<<16)|flowId
 
     // Send queue

@@ -36,6 +36,7 @@ MultiNodeTopologyHelper::MultiNodeTopologyHelper()
       m_switchPfcMode(0),
       m_switchPfcPauseThreshold(64),
       m_switchPfcResumeOffset(8),
+      m_switchPfcPauseTimeUs(0),
       m_arbiter(nullptr),
       m_intraNodeDataRate("3600Gbps"),
       m_intraNodeDelay("400ns"),
@@ -74,6 +75,7 @@ void MultiNodeTopologyHelper::SetInterNodeSwitchLlrEnabled(bool enabled) { m_int
 void MultiNodeTopologyHelper::SetInterNodeSwitchPfcMode(uint32_t mode) { m_switchPfcMode = mode; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchPfcPauseThreshold(uint32_t threshold) { m_switchPfcPauseThreshold = threshold; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchPfcResumeOffset(uint32_t offset) { m_switchPfcResumeOffset = offset; }
+void MultiNodeTopologyHelper::SetInterNodeSwitchPfcPauseTime(uint32_t pauseTimeUs) { m_switchPfcPauseTimeUs = pauseTimeUs; }
 void MultiNodeTopologyHelper::SetInterNodeSpines(uint32_t spines) { m_interNodeSpines = spines; }
 void MultiNodeTopologyHelper::SetInterNodeTorusWidth(uint32_t width) { m_interNodeTorusWidth = width; }
 void MultiNodeTopologyHelper::SetInterNodeDragonflyGroupSize(uint32_t groupSize) { m_interNodeDragonflyGroupSize = groupSize; }
@@ -115,6 +117,13 @@ MultiNodeTopologyHelper::ApplyPfcAttributes(Ptr<NvSwitch> sw) const
                                  UintegerValue(m_switchPfcPauseThreshold));
         sw->SetAttributeFailSafe("PfcResumeOffset",
                                  UintegerValue(m_switchPfcResumeOffset));
+        // Mode 3 (quanta): the 802.1Qbb pause time the PAUSE carries. 0 in
+        // modes 1/2 (pause until an explicit RESUME) — inert there.
+        if (m_switchPfcPauseTimeUs > 0)
+        {
+            sw->SetAttributeFailSafe("PfcPauseTime",
+                                     UintegerValue(m_switchPfcPauseTimeUs));
+        }
     }
 }
 

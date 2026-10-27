@@ -65,7 +65,7 @@ EthernetSwitch::GetTypeId()
                           "pause fires before the tail-drop.",
                           UintegerValue(0),
                           MakeUintegerAccessor(&EthernetSwitch::m_pfcMode),
-                          MakeUintegerChecker<uint32_t>(0, 2))
+                          MakeUintegerChecker<uint32_t>(0, 3))
             .AddAttribute("PfcPauseThreshold",
                           "PFC: VOQ depth (packets) at which the switch "
                           "PAUSEs the ingress feeding the congested "
@@ -74,6 +74,19 @@ EthernetSwitch::GetTypeId()
                           UintegerValue(64),
                           MakeUintegerAccessor(&EthernetSwitch::m_pfcPauseThreshold),
                           MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("PfcPauseTime",
+                          "PFC mode 3 (quanta) only: the pause time the "
+                          "PAUSE frame carries (microseconds, in the "
+                          "CreditCount field — the 802.1Qbb quanta / "
+                          "qbb-net-device PauseTime analog). The endpoint "
+                          "auto-resumes when the quanta expires; the "
+                          "switch re-checks every PfcPauseTime/2 and "
+                          "re-PAUSEs while the VOQ is still past the "
+                          "threshold. 0 = pause until an explicit RESUME "
+                          "(modes 1/2 semantics). Inert unless PfcMode=3.",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&EthernetSwitch::m_pfcPauseTimeUs),
+                          MakeUintegerChecker<uint32_t>(0))
             .AddAttribute("PfcResumeOffset",
                           "PFC resume hysteresis (packets): the pause "
                           "lifts once the VOQ drains to "
@@ -102,10 +115,27 @@ EthernetSwitch::GetVendorName() const
 }
 
 bool
+EthernetSwitch::IsPfcPaused(uint32_t inPort, uint32_t outPort, uint8_t vcId) const
+{
+    auto it = m_pfcPaused.find({inPort, outPort, vcId});
+    return it != m_pfcPaused.end() && it->second;
+}
+
+bool
 EthernetSwitch::IsPfcPaused(uint32_t inPort, uint32_t outPort) const
 {
-    auto it = m_pfcPaused.find({inPort, outPort});
-    return it != m_pfcPaused.end() && it->second;
+    // Any VC latched toward this hop (the pre-VC compatibility view).
+    for (auto it = m_pfcPaused.lower_bound({inPort, outPort, 0});
+         it != m_pfcPaused.end() && it->first.inPort == inPort
+         && it->first.outPort == outPort;
+         ++it)
+    {
+        if (it->second)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 void
@@ -137,6 +167,7 @@ EthernetSwitch::DoDispose()
     m_pfcPaused.clear();
     m_lastPfcPauseHeader.clear();
     m_pfcResumeResends.clear();
+    m_pfcQuantaArmed.clear();
     NvSwitch::DoDispose();
 }
 
@@ -170,6 +201,31 @@ EthernetSwitch::EffectivePfcPauseThreshold(uint32_t outPort) const
     return m_pfcPauseThreshold;
 }
 
+// Per-VC variant: the VC's configured threshold (or the global one) as the
+// base, compared against the PER-VC VOQ depth (802.1Qbb pauses a priority
+// class on its own occupancy, not the whole port's). The mode-2 headroom
+// scaling keys on the whole-port occupancy exactly like the port-level
+// variant (the shared-buffer pressure a class experiences is the port's).
+uint32_t
+EthernetSwitch::EffectivePfcPauseThreshold(uint32_t outPort, uint8_t vcId) const
+{
+    auto it = m_pfcPerVcThresholds.find(vcId);
+    const uint32_t base =
+        it != m_pfcPerVcThresholds.end() ? it->second : m_pfcPauseThreshold;
+    if (m_pfcMode == 2)
+    {
+        const uint32_t depth = GetVoqDepth();
+        if (depth > 0)
+        {
+            double occupancy = static_cast<double>(GetVoqSize(outPort))
+                               / static_cast<double>(depth);
+            double scaled = static_cast<double>(base) * (1.0 - occupancy);
+            return std::max<uint32_t>(1u, static_cast<uint32_t>(scaled));
+        }
+    }
+    return base;
+}
+
 void
 EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
                                   uint32_t inPort, size_t voqDepth)
@@ -185,20 +241,43 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
     {
         return;
     }
-    if (IsPfcPaused(inPort, outPort))
+    // Per-VC latch (the 802.1Qbb priority analog): the arriving packet's
+    // FabricHeader VirtualChannel names the class. A pause on one VC never
+    // silences another VC's traffic toward the same hop, and the idempotent
+    // re-trigger suppression is per (hop, VC) too. The depth the threshold
+    // compares against is the PER-VC occupancy (GetVoqSizeForVc) — a class
+    // pauses on its own backlog, like qbb-net-device's per-priority
+    // GetNBytes(j) check — EXCEPT when no per-VC thresholds are configured
+    // at all, where the whole-port depth keeps the pre-VC semantics
+    // byte-identical (single-class fabrics must not change behavior).
+    const uint8_t vcId = fh.GetVirtualChannel();
+    if (IsPfcPaused(inPort, outPort, vcId))
     {
-        return; // already paused toward this hop: idempotent
+        return; // already paused toward this hop on this class: idempotent
     }
-    if (voqDepth < EffectivePfcPauseThreshold(outPort))
+    if (m_pfcPerVcThresholds.empty())
     {
-        return;
+        // Legacy single-class semantics: whole-port depth vs the global
+        // threshold (byte-identical to the pre-VC behavior).
+        if (voqDepth < EffectivePfcPauseThreshold(outPort))
+        {
+            return;
+        }
+    }
+    else
+    {
+        if (GetVoqSizeForVc(outPort, vcId) < EffectivePfcPauseThreshold(outPort, vcId))
+        {
+            return;
+        }
     }
 
     // PAUSE toward the source behind this ingress. The ranks carry the
     // (dest=source, source=dest) mirror of the original — the same reversal
     // EmitNackBack uses. The sequence-number field carries the paused VOQ's
-    // depth (the PauseHeader qlen analog; zero quanta here means "paused
-    // until an explicit RESUME", not the 802.1Qbb timer expiry).
+    // depth (the PauseHeader qlen analog). Mode 3 (quanta) additionally
+    // carries the pause time in the CreditCount field (the 802.1Qbb
+    // quanta; 0 in modes 1/2 means "paused until an explicit RESUME").
     // The PAUSE's SourceMac is THIS SWITCH's own MAC (GetAddress), not the
     // mirrored end-to-end data MAC: the endpoint keys pause ownership by
     // (dest, SourceMac), and the end-to-end MACs are preserved across hops
@@ -216,6 +295,8 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
     pause.SetSequenceNumber(static_cast<uint32_t>(voqDepth));
     pause.SetFlowId(fh.GetFlowId());
     pause.SetVirtualChannel(fh.GetVirtualChannel());
+    pause.SetCreditCount(m_pfcMode == 3 ? static_cast<uint16_t>(m_pfcPauseTimeUs)
+                                        : 0);
     pause.SetSourceMac(Mac48Address::ConvertFrom(GetAddress()));
     pause.SetDestMac(fh.GetSourceMac());
 
@@ -223,16 +304,36 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
     pausePkt->AddHeader(pause);
     GetPort(inPort)->Send(pausePkt, fh.GetSourceMac(), 0x0800);
 
-    m_pfcPaused[{inPort, outPort}] = true;
+    m_pfcPaused[{inPort, outPort, vcId}] = true;
     // Retain the mirrored header so the eventual RESUME (CheckPfcResume)
     // reverses exactly this pause: same ranks/MACs/fabric type.
-    m_lastPfcPauseHeader[{inPort, outPort}] = pause;
+    m_lastPfcPauseHeader[{inPort, outPort, vcId}] = pause;
     // A fresh pause cycle retires any stale re-send budget from the
     // previous cycle's RESUME (the new watcher owns the hop's resume
     // state; the old chain's next fire would see IsPfcPaused and stop,
     // but retiring here keeps the maps from holding dead entries).
-    m_pfcResumeResends.erase({inPort, outPort});
+    m_pfcResumeResends.erase({inPort, outPort, vcId});
     m_pfcPausesSent++;
+
+    if (m_pfcMode == 3)
+    {
+        // Quanta mode (qbb-net-device's CheckQueueFull contract): the
+        // endpoint's quanta timer owns the un-pause, so the switch does
+        // NOT poll for drain here — it re-checks at pausetime/2 instead,
+        // re-PAUSEing if the VOQ is still past the threshold (the quanta
+        // will have expired by then) and emitting a RESUME once drained.
+        // The re-check runs on the same pruned ledger as the watchers.
+        m_pfcQuantaArmed.insert({inPort, outPort, vcId});
+        const uint64_t recheckNs = m_pfcPauseTimeUs > 0
+                                       ? (m_pfcPauseTimeUs * 1000ULL) / 2
+                                       : 500;
+        EventId recheck = Simulator::Schedule(
+            NanoSeconds(recheckNs), &EthernetSwitch::RecheckPfcPause,
+            this, inPort, outPort, vcId);
+        PrunePfcResumeEvents();
+        m_pfcResumeEvents.push_back(recheck);
+        return;
+    }
 
     // Resume hysteresis watcher: poll the drained VOQ; lift the pause once
     // it falls to threshold - offset (HPCC's resume_offset guard against
@@ -244,40 +345,121 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
     // ~2M entries/s per paused hop — codex round 27, finding 9).
     EventId watcher = Simulator::Schedule(NanoSeconds(500),
                                           &EthernetSwitch::CheckPfcResume,
-                                          this, inPort, outPort);
+                                          this, inPort, outPort, vcId);
     PrunePfcResumeEvents();
     m_pfcResumeEvents.push_back(watcher);
 }
 
 void
-EthernetSwitch::CheckPfcResume(uint32_t inPort, uint32_t outPort)
+EthernetSwitch::RecheckPfcPause(uint32_t inPort, uint32_t outPort, uint8_t vcId)
 {
-    if (!IsPfcPaused(inPort, outPort) || inPort >= GetNPorts())
+    // The re-check timer fired. Quanta mode's lifecycle: the endpoint's
+    // quanta may have expired (endpoint un-paused) or may still hold. The
+    // switch's OWN latch reflects what it last told the endpoint; if the
+    // VOQ is still congested we re-PAUSE (idempotent at the endpoint: a
+    // PAUSE for an already-paused (dest, vc, switch) just re-latches and
+    // re-arms the endpoint's timer); if it drained, we un-latch and send a
+    // RESUME (a no-op if the endpoint's quanta already expired).
+    m_pfcQuantaArmed.erase({inPort, outPort, vcId});
+    if (inPort >= GetNPorts())
     {
         return;
     }
-    uint32_t threshold = EffectivePfcPauseThreshold(outPort);
+    const size_t depth = m_pfcPerVcThresholds.empty()
+                             ? GetVoqSize(outPort)
+                             : GetVoqSizeForVc(outPort, vcId);
+    const uint32_t threshold = m_pfcPerVcThresholds.empty()
+                                   ? EffectivePfcPauseThreshold(outPort)
+                                   : EffectivePfcPauseThreshold(outPort, vcId);
     uint32_t resumeLevel = (threshold > m_pfcResumeOffset)
                                ? threshold - m_pfcResumeOffset
                                : 0;
-    if (GetVoqSize(outPort) > resumeLevel)
+    if (depth > resumeLevel)
+    {
+        // Still congested: re-PAUSE (the endpoint's quanta is expiring or
+        // has expired — this refreshes the hold), then re-arm the re-check.
+        auto it = m_lastPfcPauseHeader.find({inPort, outPort, vcId});
+        if (it != m_lastPfcPauseHeader.end())
+        {
+            FabricHeader pause = it->second;
+            Ptr<Packet> pausePkt = Create<Packet>(0);
+            pausePkt->AddHeader(pause);
+            GetPort(inPort)->Send(pausePkt, pause.GetDestMac(), 0x0800);
+            m_pfcPausesSent++;
+        }
+        m_pfcQuantaArmed.insert({inPort, outPort, vcId});
+        const uint64_t recheckNs = m_pfcPauseTimeUs > 0
+                                       ? (m_pfcPauseTimeUs * 1000ULL) / 2
+                                       : 500;
+        EventId recheck = Simulator::Schedule(
+            NanoSeconds(recheckNs), &EthernetSwitch::RecheckPfcPause,
+            this, inPort, outPort, vcId);
+        PrunePfcResumeEvents();
+        m_pfcResumeEvents.push_back(recheck);
+        return;
+    }
+    // Drained: un-latch and RESUME (a duplicate at an endpoint whose quanta
+    // already expired is a no-op). No re-check re-arm — the next congestion
+    // crossing re-PAUSEs from MaybeSendPfcPause.
+    m_pfcPaused[{inPort, outPort, vcId}] = false;
+    auto it = m_lastPfcPauseHeader.find({inPort, outPort, vcId});
+    if (it != m_lastPfcPauseHeader.end())
+    {
+        FabricHeader resume;
+        resume.SetPacketType(FabricPacketType::PFC_RESUME);
+        resume.SetFabricType(it->second.GetFabricType());
+        resume.SetSourceRank(it->second.GetSourceRank());
+        resume.SetDestRank(it->second.GetDestRank());
+        resume.SetSequenceNumber(0);
+        resume.SetFlowId(it->second.GetFlowId());
+        resume.SetVirtualChannel(it->second.GetVirtualChannel());
+        resume.SetSourceMac(it->second.GetSourceMac());
+        resume.SetDestMac(it->second.GetDestMac());
+        Ptr<Packet> resumePkt = Create<Packet>(0);
+        resumePkt->AddHeader(resume);
+        GetPort(inPort)->Send(resumePkt, it->second.GetDestMac(), 0x0800);
+        m_pfcResumesSent++;
+    }
+}
+
+void
+EthernetSwitch::CheckPfcResume(uint32_t inPort, uint32_t outPort, uint8_t vcId)
+{
+    if (!IsPfcPaused(inPort, outPort, vcId) || inPort >= GetNPorts())
+    {
+        return;
+    }
+    // Drained-past-hysteresis test on the same depth the pause latched on:
+    // per-VC depth when per-VC thresholds are configured, whole-port depth
+    // otherwise (the single-class legacy view — byte-identical resume
+    // behavior for fabrics that never configured per-VC PFC).
+    const size_t depth = m_pfcPerVcThresholds.empty()
+                             ? GetVoqSize(outPort)
+                             : GetVoqSizeForVc(outPort, vcId);
+    const uint32_t threshold = m_pfcPerVcThresholds.empty()
+                                   ? EffectivePfcPauseThreshold(outPort)
+                                   : EffectivePfcPauseThreshold(outPort, vcId);
+    uint32_t resumeLevel = (threshold > m_pfcResumeOffset)
+                               ? threshold - m_pfcResumeOffset
+                               : 0;
+    if (depth > resumeLevel)
     {
         // Still congested: keep watching (pruned at each append — see
         // MaybeSendPfcPause).
         EventId watcher = Simulator::Schedule(NanoSeconds(500),
                                               &EthernetSwitch::CheckPfcResume,
-                                              this, inPort, outPort);
+                                              this, inPort, outPort, vcId);
         PrunePfcResumeEvents();
         m_pfcResumeEvents.push_back(watcher);
         return;
     }
     // Drained past the hysteresis level: RESUME the paused source.
-    m_pfcPaused[{inPort, outPort}] = false;
+    m_pfcPaused[{inPort, outPort, vcId}] = false;
 
     // The RESUME re-targets whichever source the PAUSE silenced. The PAUSE
     // mirrored the ORIGINAL data header's ranks/MACs; replay that reversal
     // via m_lastPfcPauseHeader so the RESUME reaches the same endpoint.
-    auto it = m_lastPfcPauseHeader.find({inPort, outPort});
+    auto it = m_lastPfcPauseHeader.find({inPort, outPort, vcId});
     if (it != m_lastPfcPauseHeader.end())
     {
         FabricHeader resume;
@@ -305,10 +487,10 @@ EthernetSwitch::CheckPfcResume(uint32_t inPort, uint32_t outPort)
         // duplicate RESUME at an unpaused endpoint is a no-op
         // (ProcessPfcResumePacket early-returns when the dest is not in
         // its latch), so re-sending is safe on a healthy link too.
-        m_pfcResumeResends[{inPort, outPort}] = PFC_RESUME_RESEND_LIMIT;
+        m_pfcResumeResends[{inPort, outPort, vcId}] = PFC_RESUME_RESEND_LIMIT;
         EventId resend = Simulator::Schedule(
             NanoSeconds(500), &EthernetSwitch::ResendPfcResume,
-            this, inPort, outPort);
+            this, inPort, outPort, vcId);
         PrunePfcResumeEvents();
         m_pfcResumeEvents.push_back(resend);
     }
@@ -316,13 +498,13 @@ EthernetSwitch::CheckPfcResume(uint32_t inPort, uint32_t outPort)
 }
 
 void
-EthernetSwitch::ResendPfcResume(uint32_t inPort, uint32_t outPort)
+EthernetSwitch::ResendPfcResume(uint32_t inPort, uint32_t outPort, uint8_t vcId)
 {
     if (inPort >= GetNPorts())
     {
         return;
     }
-    auto budget = m_pfcResumeResends.find({inPort, outPort});
+    auto budget = m_pfcResumeResends.find({inPort, outPort, vcId});
     if (budget == m_pfcResumeResends.end())
     {
         // A new pause cycle (or Dispose) already retired this hop's budget.
@@ -332,11 +514,11 @@ EthernetSwitch::ResendPfcResume(uint32_t inPort, uint32_t outPort)
     {
         // Budget exhausted: retire.
         m_pfcResumeResends.erase(budget);
-        m_lastPfcPauseHeader.erase({inPort, outPort});
+        m_lastPfcPauseHeader.erase({inPort, outPort, vcId});
         return;
     }
     budget->second--;
-    auto it = m_lastPfcPauseHeader.find({inPort, outPort});
+    auto it = m_lastPfcPauseHeader.find({inPort, outPort, vcId});
     if (it == m_lastPfcPauseHeader.end())
     {
         m_pfcResumeResends.erase(budget);
@@ -345,7 +527,7 @@ EthernetSwitch::ResendPfcResume(uint32_t inPort, uint32_t outPort)
     // A NEW pause cycle re-armed the watcher: it owns the hop's resume
     // state now — stop the stale re-send chain (the fresh watcher will
     // RESUME when the VOQ drains).
-    if (IsPfcPaused(inPort, outPort))
+    if (IsPfcPaused(inPort, outPort, vcId))
     {
         m_pfcResumeResends.erase(budget);
         return;
@@ -368,14 +550,14 @@ EthernetSwitch::ResendPfcResume(uint32_t inPort, uint32_t outPort)
     {
         EventId resend = Simulator::Schedule(
             NanoSeconds(500), &EthernetSwitch::ResendPfcResume,
-            this, inPort, outPort);
+            this, inPort, outPort, vcId);
         PrunePfcResumeEvents();
         m_pfcResumeEvents.push_back(resend);
     }
     else
     {
         m_pfcResumeResends.erase(budget);
-        m_lastPfcPauseHeader.erase({inPort, outPort});
+        m_lastPfcPauseHeader.erase({inPort, outPort, vcId});
     }
 }
 

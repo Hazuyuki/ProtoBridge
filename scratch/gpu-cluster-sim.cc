@@ -403,6 +403,7 @@ main(int argc, char* argv[])
     uint32_t switchPfcMode = 0;
     uint32_t pfcPauseThreshold = 64;
     uint32_t pfcResumeOffset = 8;
+    uint32_t pfcPauseTimeUs = 0;
     // DCQCN rate machine (Phase B). Off by default: with no DcqcnRateMachine
     // mounted, CNPs are no-ops and SendPacketOnDevice adds zero shaping delay,
     // so all So runs stay bit-identical to the Phase-A baseline. On, a shared
@@ -662,9 +663,10 @@ main(int argc, char* argv[])
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
     cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
     cmd.AddValue("voqDropThreshold", "Lossy VOQ tail-drop threshold (pkts); 0=off. Plain ETH: always applied (default 8). RoCE: an EXPLICIT flag opts into the lossy/no-PFC regime (unset = lossless). Must be < switchVoqDepth (default 10000); keep > ecnThreshold for mark-before-drop", voqDropThreshold);
-    cmd.AddValue("switchPfcMode", "PFC (802.1Qbb-style) flow control on So switches: 0=off (default), 1=static pause threshold, 2=dynamic (HPCC SwitchMmu-style, scales with remaining VOQ headroom). Keep pfcPauseThreshold < voqDropThreshold so the pause fires before the tail-drop", switchPfcMode);
+    cmd.AddValue("switchPfcMode", "PFC (802.1Qbb-style) flow control on So switches: 0=off (default), 1=static pause threshold, 2=dynamic (HPCC SwitchMmu-style, scales with remaining VOQ headroom), 3=quanta (802.1Qbb pause-time semantics via --pfcPauseTime). Keep pfcPauseThreshold < voqDropThreshold so the pause fires before the tail-drop", switchPfcMode);
     cmd.AddValue("pfcPauseThreshold", "PFC: VOQ depth (pkts) at which the switch PAUSEs the ingress feeding the congested egress (default 64; inert when switchPfcMode=0)", pfcPauseThreshold);
     cmd.AddValue("pfcResumeOffset", "PFC resume hysteresis (pkts): the pause lifts once the VOQ drains to pfcPauseThreshold - offset (default 8; inert when switchPfcMode=0)", pfcResumeOffset);
+    cmd.AddValue("pfcPauseTime", "PFC mode 3 only: 802.1Qbb pause time (us) carried by each PAUSE. The endpoint auto-expires after this and the switch re-asserts at pausetime/2 while congested (qbb-net-device semantics). 0 with modes 1/2 = pause until explicit RESUME (default)", pfcPauseTimeUs);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
     cmd.AddValue("dcqcnTFastNs", "DCQCN fast-recovery timer interval in ns (0=default 50000)", dcqcnTFastNs);
@@ -1182,6 +1184,7 @@ main(int argc, char* argv[])
             multiTopo.SetInterNodeSwitchPfcMode(switchPfcMode);
             multiTopo.SetInterNodeSwitchPfcPauseThreshold(pfcPauseThreshold);
             multiTopo.SetInterNodeSwitchPfcResumeOffset(pfcResumeOffset);
+            multiTopo.SetInterNodeSwitchPfcPauseTime(pfcPauseTimeUs);
             // A pause needs a switch in the path to ORIGINATE it -- the same
             // inert-topology warning shape as the lossy drop below.
             if (interNodeTopology == "fullmesh" || interNodeTopology == "ring" ||

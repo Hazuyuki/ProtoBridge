@@ -392,6 +392,22 @@ class NvSwitch : public FabricSwitch
         return outPort < m_voqs.size() ? m_voqs[outPort].size() : 0;
     }
 
+    /// Current occupancy (packets) of a VOQ restricted to one priority
+    /// class (the FabricHeader's VirtualChannel) — the per-VC depth the
+    /// per-priority PFC thresholds compare against (802.1Qbb pauses a
+    /// class, not the whole port). O(1): a shadow per-(port, VC) counter
+    /// incremented at VOQ push and decremented at pop. 0 for unknown
+    /// ports/VCs.
+    size_t GetVoqSizeForVc(uint32_t outPort, uint8_t vcId) const
+    {
+        if (outPort >= m_vcVoqDepth.size())
+        {
+            return 0;
+        }
+        auto it = m_vcVoqDepth[outPort].find(vcId);
+        return it == m_vcVoqDepth[outPort].end() ? 0 : it->second;
+    }
+
     /**
      * @brief Test seam: feed an upload packet straight into the SHARP/NVLS
      * aggregation path, bypassing ReceiveFromPort's routing/preamble.
@@ -584,6 +600,11 @@ class NvSwitch : public FabricSwitch
     // Virtual Output Queues: outPort -> queue
     std::vector<std::queue<VoqEntry>> m_voqs;
     uint32_t m_voqDepth;                            ///< Max packets per VOQ
+    /// Shadow per-(port, VC) occupancy counters (packets), maintained at
+    /// VOQ push/pop so GetVoqSizeForVc is O(1). The FabricHeader's
+    /// VirtualChannel names the class; entries exist only for VCs that
+    /// have pushed. Resized with m_voqs.
+    std::vector<std::map<uint8_t, size_t>> m_vcVoqDepth;
 
     // Link degradation
     std::vector<Ptr<LinkDegradationModel>> m_portDegradationModels; ///< Per-port degradation models

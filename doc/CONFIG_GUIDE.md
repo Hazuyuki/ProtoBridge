@@ -102,7 +102,8 @@ NVLink is credit-based). Tuning `vcCredits` therefore only affects Su latency.
 **PFC (IEEE 802.1Qbb-style) is an opt-in third arm:** `--switchPfcMode=0`
 (default, off — byte-identical legacy), `1` = static pause threshold, `2` =
 dynamic (HPCC SwitchMmu-style: the threshold scales with the remaining VOQ
-headroom, so a nearly-full switch pauses earlier). Past
+headroom, so a nearly-full switch pauses earlier), `3` = quanta (the
+802.1Qbb pause-time semantics — see below). Past
 `--pfcPauseThreshold` (default 64) the So switch PAUSEs the ingress feeding
 the congested egress instead of dropping; the RESUME fires once the VOQ
 drains to `pfcPauseThreshold - pfcResumeOffset` (default offset 8 — the
@@ -118,6 +119,26 @@ in the inter-node path (`host`/`tor`/`rail`/`leafspine`) — on
 fullmesh/ring/torus2d/dragonfly it is inert (the sim warns). Like DCQCN,
 PFC is ns-3-only congestion behavior: the surrogate stays the uncongested
 mean and is untouched.
+
+**Mode 3 carries the 802.1Qbb pause time (quanta):** with
+`--switchPfcMode=3 --pfcPauseTime=T` (microseconds), each PAUSE carries T
+in the header's credit-count field. The endpoint's hold auto-expires after
+T (qbb-net-device's `PauseFinish`), and while the VOQ stays congested the
+switch re-checks at T/2 and re-PAUSEs (qbb's `CheckQueueFull` contract);
+once drained the re-check emits a RESUME that supersedes any pending
+expiry. A re-asserted PAUSE cancels and replaces the pending expiry; an
+explicit RESUME cancels it. Modes 1/2 keep the explicit-RESUME contract
+(`--pfcPauseTime=0`, the default, is inert there).
+
+**Per-priority (per-VC) PFC is API-level:** the FabricHeader's 8-bit
+virtual-channel field names the priority class (no wire change). With
+per-VC thresholds configured (C++: `EthernetSwitch::SetPfcPauseThresholdForVc(vc,
+threshold)`), each class pauses on its OWN VOQ occupancy against its OWN
+threshold — a pause on one VC never silences another VC toward the same
+hop, matching qbb-net-device's 8 per-priority queues. With NO per-VC
+thresholds configured, the whole-port depth + global threshold semantics
+are byte-identical to the pre-VC behavior (single-class fabrics must not
+change).
 
 **Lossy RoCE (no-PFC) is an explicit opt-in:** pass `--voqDropThreshold=N`
 (N>0) on a RoCE run to arm VOQ tail-drop + NACK→LLR retransmit beside ECN
