@@ -655,12 +655,19 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
         isControlPacket = fabricHeader.IsControlPacket() || fabricHeader.IsRetryPacket();
     }
 
-    if (inPort < m_portDegradationModels.size() && m_portDegradationModels[inPort]
-        && !isControlPacket)
+    if (inPort < m_portDegradationModels.size() && m_portDegradationModels[inPort])
     {
         Ptr<LinkDegradationModel> linkModel = m_portDegradationModels[inPort];
         bool failed = false;
 
+        // Physical failures apply to EVERY packet — control and retry
+        // included (codex round 33, finding 3): a DOWN link or a physical
+        // packet-loss draw is not a CRC/FEC event the control plane can
+        // bypass; the pre-fix blanket !isControlPacket guard let ACK/CNP
+        // feedback cross a failed link (probe: DATA dropped, ACK forwarded
+        // through the same DOWN/lossy port). Only the BER/FEC sampling arm
+        // below keeps the control exemption (the documented NVLink-style
+        // "control traffic is reliable against BER corruption" contract).
         if (!linkModel->IsLinkUp())
         {
             failed = true;
@@ -670,13 +677,13 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
         {
             failed = true;
         }
-        else if (PortUsesFec(inPort))
+        else if (!isControlPacket && PortUsesFec(inPort))
         {
             uint32_t payloadSize = hasFabricHeader ? fabricHeader.GetPayloadSize() : pkt->GetSize();
             failed = m_fecModel->DecodePacket(linkModel->GetBer(), payloadSize)
                      == FecResult::UNCORRECTABLE;
         }
-        else
+        else if (!isControlPacket)
         {
             // ProcessPacketBerOnly (not ProcessPacket): the loss-rate draw
             // already happened above — ProcessPacket would draw the loss

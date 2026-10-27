@@ -1731,3 +1731,38 @@ def test_tail_optical_hops_compounds():
     assert mean1 == pytest.approx(mean2, rel=1e-9)
     # The tail must too (pre-fix: tail1 ~5641.58 vs tail2 ~8236.43).
     assert tail1 == pytest.approx(tail2, rel=1e-9)
+
+
+def test_mean_gbn_and_reload_compound_optical_hops():
+    """The mean's legacy-GBN and source-reload terms compound hops too.
+
+    Round 33, finding 4: _gbn_cascade and _source_reload_penalty received
+    the per-hop effective_ber without compounding optical_hops, while the
+    SACK arm (_retry_overhead) did — so hop/BER renormalizations agreed in
+    path failure probability and in the SACK mean but diverged in the GBN
+    mean (43.32 vs 96.79 µs at 64 MiB / N=32 fullmesh AllReduce / 128
+    credits / LLR / no FEC) and in the finite-retry-buffer reload term
+    (934.70 vs 938.04 µs at 16 MiB / N=8 / 64 credits / buffer=1). Both
+    terms now compound per-hop like every other reliability term.
+    """
+    s = wb.make_h200_fullmesh_theory()
+    # GBN mean: hops=4 at BER 1e-8 vs hops=1 at the equivalent BER.
+    kw = dict(data_bytes=64 << 20, num_gpus=32, algo="fullmesh", credits=128,
+              llr_enabled=True, retry_mode="gobackn", collective="allreduce",
+              fec_enabled=False)
+    ber1, hops1 = 1e-8, 4
+    ber2 = 1 - (1 - 1e-8) ** 4
+    mean1 = s.predict(ber=ber1, optical_hops=hops1, **kw)
+    mean2 = s.predict(ber=ber2, optical_hops=1, **kw)
+    assert mean1 == pytest.approx(mean2, rel=1e-6), (mean1, mean2)
+
+    # Source-reload (finite retry buffer) with SACK: the reload term is the
+    # only hops-sensitive addend that differs between the two calls.
+    kw_r = dict(data_bytes=16 << 20, num_gpus=8, algo="ring", credits=64,
+                llr_enabled=True, retry_mode="sack", collective="allreduce",
+                fec_enabled=False, retry_buffer_entries=1)
+    ber1r, hops1r = 1e-7, 4
+    ber2r = 1 - (1 - 1e-7) ** 4
+    r1 = s.predict(ber=ber1r, optical_hops=hops1r, **kw_r)
+    r2 = s.predict(ber=ber2r, optical_hops=1, **kw_r)
+    assert r1 == pytest.approx(r2, rel=1e-6), (r1, r2)

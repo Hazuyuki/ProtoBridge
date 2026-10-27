@@ -11199,6 +11199,231 @@ class PartitionWireRatioOverflowTest : public TestCase
 // (surrogate/test/test_theory.py::test_tail_optical_hops_compounds) —
 // the C++ harness has no Python bridge.
 
+// (codex round 33, finding 1) SimpleNetDevice inherited NetDevice's null
+// default GetPromiscReceiveCallback despite having a binding installed, so
+// FabricEndpoint::DoDispose's identity-detach comparison always saw "not
+// ours" and skipped the detach — the device's callback stayed bound to the
+// disposed endpoint and the next delivery entered freed memory (codex's
+// valgrind probe: 9 invalid-access contexts + SIGSEGV). SimpleNetDevice now
+// overrides the getter like PointToPointNetDevice/CsmaNetDevice do.
+class SimpleDeviceDetachSurvivesDisposeTest : public TestCase
+{
+  public:
+    SimpleDeviceDetachSurvivesDisposeTest()
+        : TestCase("SimpleNetDevice promisc callbacks detach at dispose") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        // The disposed endpoint's binding must be gone from the device: the
+        // getter returns the stored callback, and DoDispose's identity
+        // comparison (null-check then IsEqual) matches and clears it.
+        Ptr<SimpleNetDevice> dev = CreateObject<SimpleNetDevice>();
+        dev->SetAddress(Mac48Address("00:00:00:00:77:01"));
+        Ptr<FabricEndpoint> ep = CreateObject<FabricEndpoint>();
+        ep->SetRank(0);
+        ep->SetAddress(Mac48Address("00:00:00:00:77:01"));
+        ep->AddNetDevice(dev);
+        ep->Initialize();
+        NS_TEST_ASSERT_MSG_EQ(dev->GetPromiscReceiveCallback().IsNull(), false,
+            "the endpoint's Initialize installs its promisc binding — a null "
+            "getter here means the override is missing (the round-33 bug)");
+        ep->Dispose();
+        ep = nullptr;
+        NS_TEST_ASSERT_MSG_EQ(dev->GetPromiscReceiveCallback().IsNull(), true,
+            "dispose must detach OUR binding from the shared device "
+            "(pre-fix: the null-default getter hid the installed callback, "
+            "the identity-detach skipped, and the next delivery crashed)");
+        // Deliver through the device AFTER the endpoint is gone: a dangling
+        // binding segfaults; a detached one is a clean no-op.
+        FabricHeader h;
+        h.SetPacketType(FabricPacketType::ACK);
+        h.SetSourceRank(1);
+        h.SetDestRank(0);
+        Ptr<Packet> p = Create<Packet>(0);
+        p->AddHeader(h);
+        Simulator::Schedule(MicroSeconds(1), &SimpleNetDevice::Receive, dev, p,
+                            uint16_t(0x0800), Mac48Address("00:00:00:00:77:03"),
+                            Mac48Address("00:00:00:00:77:02"));
+        Simulator::Stop(MicroSeconds(2));
+        Simulator::Run();
+        dev->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 33, finding 2) A gate denial of the single-packet collective
+// branch returned early and DISCARDED the packet: a temporary subclass gate
+// denial of a 64-byte ALLREDUCE transmitted 0 packets and stored 0 LLR
+// entries; reopening the gate had nothing to drain. The denial now parks the
+// packet on the send queue (the multi-fragment loops' recovery), and the
+// drain re-admits through the same virtual gate.
+namespace {
+class R33GateEndpoint : public FabricEndpoint
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::R33GateEndpoint")
+                                .SetParent<FabricEndpoint>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<R33GateEndpoint>();
+        return tid;
+    }
+    bool deny = false;
+    using FabricEndpoint::StartApplication;
+
+  protected:
+    bool FlowControlGate(uint8_t vc, uint32_t seq, bool bypass) override
+    {
+        return !deny && FabricEndpoint::FlowControlGate(vc, seq, bypass);
+    }
+};
+NS_OBJECT_ENSURE_REGISTERED(R33GateEndpoint);
+} // namespace
+
+class DeniedSingleCollectiveParkedTest : public TestCase
+{
+  public:
+    DeniedSingleCollectiveParkedTest()
+        : TestCase("Gate-denied single-packet collective parks for the drain") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(10)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+        Ptr<R33GateEndpoint> ep = CreateObject<R33GateEndpoint>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        ep->AddNetDevice(link.Get(0));
+        ep->SetRoutingEntry(1, 0);
+
+        // One small ALLREDUCE (<= spray threshold): the single-packet branch.
+        ep->deny = true;
+        ep->SendCollective(FabricPacketType::ALLREDUCE, 1, nullptr, 64);
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 0u,
+            "a denied admission must not transmit");
+        // Re-open the gate and drain: the parked packet must go out now
+        // (SetCreditManager's swap path calls TrySendQueuedPackets — the
+        // public drain trigger).
+        ep->deny = false;
+        ep->SetCreditManager(ep->GetCreditManager());
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 1u,
+            "the parked single collective must drain once the gate re-opens "
+            "(pre-fix: the denial discarded it — 0 transmissions forever)");
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 33, finding 3) The switch's degradation block guarded the
+// ENTIRE failure cascade behind !isControlPacket: a DOWN link or a physical
+// packet-loss draw dropped DATA but let ACK/CNP feedback through. Physical
+// failures now apply to every packet; only the BER/FEC sampling arm keeps
+// the control exemption (the documented NVLink-style contract).
+namespace {
+// Counts every forwarded packet and feeds the switch's receive path
+// directly (the round-33 probe's ReviewCapture shape).
+class R33CaptureDevice : public SimpleNetDevice
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::R33CaptureDevice")
+                                .SetParent<SimpleNetDevice>()
+                                .SetGroupName("GpuCluster")
+                                .AddConstructor<R33CaptureDevice>();
+        return tid;
+    }
+    bool IsLinkUp() const override { return true; }
+    void SetPromiscReceiveCallback(PromiscReceiveCallback c) override { cb = c; }
+    PromiscReceiveCallback GetPromiscReceiveCallback() const override { return cb; }
+    bool Send(Ptr<Packet>, const Address&, uint16_t) override
+    {
+        sent++;
+        return true;
+    }
+    void Inject(Ptr<Packet> p)
+    {
+        cb(this, p, 0x0800, GetAddress(), GetAddress(), NetDevice::PACKET_HOST);
+    }
+    PromiscReceiveCallback cb;
+    uint64_t sent = 0;
+};
+NS_OBJECT_ENSURE_REGISTERED(R33CaptureDevice);
+} // namespace
+class SwitchControlFramesShareLinkFateTest : public TestCase
+{
+  public:
+    SwitchControlFramesShareLinkFateTest()
+        : TestCase("Control frames share the link's physical fate") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        auto run = [](LinkState state, double lossRate) {
+            Ptr<NvSwitch> sw = CreateObject<NvSwitch>();
+            auto in = CreateObject<R33CaptureDevice>();
+            auto out = CreateObject<R33CaptureDevice>();
+            sw->AddPort(in);
+            sw->AddPort(out);
+            Mac48Address src("00:00:00:00:88:01"), dst("00:00:00:00:88:02");
+            sw->AddStaticRoute(dst, 1);
+            auto model = CreateObject<LinkDegradationModel>();
+            model->SetBer(0);
+            model->SetLinkState(state);
+            if (lossRate > 0)
+            {
+                model->SetPacketLossRate(lossRate);
+                auto rng = CreateObject<ConstantRandomVariable>();
+                rng->SetAttribute("Constant", DoubleValue(0));
+                model->SetRandomStream(rng);
+            }
+            sw->SetPortDegradationModel(0, model);
+            for (auto type : {FabricPacketType::DATA, FabricPacketType::ACK})
+            {
+                FabricHeader h;
+                h.SetPacketType(type);
+                h.SetSourceRank(0);
+                h.SetDestRank(1);
+                h.SetSourceMac(src);
+                h.SetDestMac(dst);
+                h.SetPayloadSize(64);
+                Ptr<Packet> p = Create<Packet>(64);
+                p->AddHeader(h);
+                in->Inject(p);
+            }
+            Simulator::Stop(MicroSeconds(1));
+            Simulator::Run();
+            const uint64_t forwarded = out->sent;
+            const uint64_t drops = sw->GetLinkErrorDrops();
+            sw->Dispose();
+            Simulator::Destroy();
+            return std::make_pair(forwarded, drops);
+        };
+        // DOWN link: BOTH the DATA and the ACK must drop (pre-fix: the ACK
+        // crossed the failed link — forwarded=1).
+        auto down = run(LinkState::DOWN, 0.0);
+        NS_TEST_ASSERT_MSG_EQ(down.first, 0u,
+            "a DOWN link must drop control frames too (pre-fix: ACK "
+            "forwarded across a failed link)");
+        NS_TEST_ASSERT_MSG_EQ(down.second, 2u,
+            "both packets must count as link-error drops");
+        // Certain physical loss: both drop as well.
+        auto loss = run(LinkState::UP, 0.5);
+        NS_TEST_ASSERT_MSG_EQ(loss.first, 0u,
+            "a physical loss draw must drop control frames too");
+        // Healthy link: both forward; control still bypasses BER sampling
+        // (BER=0 here, so this only pins the pass-through).
+        auto healthy = run(LinkState::UP, 0.0);
+        NS_TEST_ASSERT_MSG_EQ(healthy.first, 2u,
+            "a healthy link forwards DATA and ACK alike");
+        NS_TEST_ASSERT_MSG_EQ(healthy.second, 0u, "no drops on a healthy link");
+    }
+};
+
 // (codex round 26, finding 1) MulticastAllReducePartition's chunk loop never
 // decremented bytesRemaining and never stopped at the wire end: with
 // effective=wire=8 B, 8 partitions and 18 lanes (numChunks floored to 18),
@@ -14125,6 +14350,9 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new QueuedCollectiveKeepsCreditBypassTest,
                 TestCase::Duration::QUICK);
     AddTestCase(new PartitionWireRatioOverflowTest, TestCase::Duration::QUICK);
+    AddTestCase(new SimpleDeviceDetachSurvivesDisposeTest, TestCase::Duration::QUICK);
+    AddTestCase(new DeniedSingleCollectiveParkedTest, TestCase::Duration::QUICK);
+    AddTestCase(new SwitchControlFramesShareLinkFateTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

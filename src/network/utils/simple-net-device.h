@@ -125,6 +125,13 @@ class SimpleNetDevice : public NetDevice
     Address GetMulticast(Ipv6Address addr) const override;
 
     void SetPromiscReceiveCallback(PromiscReceiveCallback cb) override;
+    // The r31 identity-detach teardown (FabricEndpoint::DoDispose) compares
+    // GetPromiscReceiveCallback() against the binding it installed; the base
+    // NetDevice default returns a null callback, so without this override the
+    // comparison on a SimpleNetDevice always sees "not ours" and skips the
+    // detach — leaving the device's callback bound to a disposed endpoint
+    // (codex round 33, finding 1: use-after-free on the next delivery).
+    NetDevice::PromiscReceiveCallback GetPromiscReceiveCallback() const override;
     bool SupportsSendFrom() const override;
 
   protected:

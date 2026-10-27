@@ -547,6 +547,12 @@ SimpleNetDevice::SetPromiscReceiveCallback(PromiscReceiveCallback cb)
     m_promiscCallback = cb;
 }
 
+NetDevice::PromiscReceiveCallback
+SimpleNetDevice::GetPromiscReceiveCallback() const
+{
+    return m_promiscCallback;
+}
+
 bool
 SimpleNetDevice::SupportsSendFrom() const
 {

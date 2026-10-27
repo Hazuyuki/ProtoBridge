@@ -258,6 +258,61 @@ valgrind on the three C++ modes of the codex round-32 probe (pfc,
 gate_one, ratio) 0 errors / no leaks; the fourth finding's regression
 lives in the surrogate pytest suite.
 
+### Fixed — codex round 33: four defects — the SimpleNetDevice teardown leaving a dangling callback, gate-denied single collectives discarded, control frames crossing failed links, and the mean GBN/reload terms ignoring optical hops
+
+1. **SimpleNetDevice's promisc callback survived an endpoint's dispose**
+   (medium). The round-31 identity-detach teardown compares
+   `GetPromiscReceiveCallback()` against the binding it installed, but
+   `SimpleNetDevice` (unlike `PointToPointNetDevice`/`CsmaNetDevice`)
+   did not override the new getter — the base `NetDevice` default returns
+   a null callback, so the comparison always saw "not ours", the detach
+   was skipped, and the device's callback stayed bound to the disposed
+   endpoint: codex probe — attach a SimpleNetDevice, dispose and release
+   the endpoint, deliver one ACK 1 µs later — nine Valgrind invalid-access
+   contexts and SIGSEGV. SimpleNetDevice now overrides the getter
+   (returning `m_promiscCallback`) like its two siblings. Test:
+   `SimpleNetDevice promisc callbacks detach at dispose`.
+2. **A gate denial of the single-packet collective branch discarded the
+   packet** (medium). `SendCollective`'s single-packet (no-spray) branch
+   returned early on a `FlowControlGate` denial — unlike the
+   multi-fragment loops, which park each fragment on the send queue
+   (round 27): a temporary subclass gate denial of a 64-byte ALLREDUCE
+   transmitted 0 packets and stored 0 LLR entries; reopening the gate had
+   nothing to drain (codex probe: single=0/0 vs the open control's 1/1).
+   The denial now parks the packet on the send queue; the drain
+   re-admits through the same virtual gate with the entry's
+   header-derived bypass. Test: `Gate-denied single-packet collective
+   parks for the drain`.
+3. **Switch control frames bypassed physical link failure** (medium).
+   The switch's degradation block guarded the ENTIRE failure cascade
+   (link-down, physical packet loss, BER/FEC sampling) behind
+   `!isControlPacket`: an ingress marked DOWN — or a port with loss rate
+   0.5 and a constant-zero draw — dropped DATA but forwarded the ACK
+   through the same failed port (codex probe: forwarded=1, the ACK; the
+   healthy control forwards 2). Feedback crossing a failed link breaks
+   the failure model the degradation arm exists to represent. Physical
+   failures (link-down, packet-loss draws) now apply to EVERY packet;
+   only the BER/FEC sampling arm keeps the control/retry exemption (the
+   documented NVLink-style "control traffic is reliable against BER"
+   contract). Test: `Control frames share the link's physical fate`.
+4. **The mean's legacy-GBN and source-reload terms ignored
+   optical_hops** (low). `_gbn_cascade` and `_source_reload_penalty`
+   received the per-hop effective_ber without compounding
+   `optical_hops`, while the SACK arm (`_retry_overhead`) did: 4 hops at
+   BER 1e-8 and 1 hop at the equivalent BER 1-(1-1e-8)^4 agreed in path
+   failure probability and the SACK mean (29.9112 µs) but diverged in
+   the GBN mean (43.3215 vs 96.7861 µs) and the finite-retry-buffer
+   reload term (934.70 vs 938.04 µs). Both terms now compound per-hop
+   like every other reliability term (post-fix: all pairs agree).
+   Regression in the surrogate pytest suite
+   (`test_mean_gbn_and_reload_compound_optical_hops`).
+
+Suite state: gpu-cluster EXTENSIVE 180 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 101 passed, 15/15 parity scripts,
+valgrind on the round-33 probe's single / switch_down / simple_dispose
+modes 0 errors / no leaks; the fourth finding's regression lives in the
+surrogate pytest suite.
+
 1. **One switch's PFC RESUME cleared another switch's outstanding pause**
    (medium). The endpoint's pause state was a dest-only set
    (`m_pfcPausedDests`), but switches pause per-(inPort,outPort) hop: on a

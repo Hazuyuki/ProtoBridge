@@ -516,7 +516,21 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             // the credit consume, not the gate dispatch).
             if (!FlowControlGate(0, seqNum, true))
             {
-                NS_LOG_DEBUG("FlowControlGate denied collective single packet");
+                // A gate denial PARKS the packet on the send queue — the
+                // same recovery as the multi-fragment loops (codex round
+                // 33, finding 2): the pre-fix early return discarded it
+                // permanently (a temporary subclass gate denial of a
+                // single-packet collective transmitted 0 packets and stored
+                // 0 LLR entries; reopening the gate had nothing to drain).
+                // The drain re-admits through the same virtual gate with
+                // this entry's header-derived bypass (round 32, finding 2).
+                NS_LOG_DEBUG("FlowControlGate denied collective single packet; parking");
+                SendQueueEntry entry;
+                entry.packet = packet;
+                entry.header = header;
+                entry.vcId = 0;
+                entry.seqNum = seqNum;
+                m_sendQueue.push(entry);
                 return;
             }
             packet->AddHeader(header);

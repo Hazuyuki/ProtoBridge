@@ -1257,7 +1257,7 @@ class TheoryDerivedSurrogate:
 
     def _gbn_cascade(self, T_step, steps, D, N, algo, cr, ber, llr_enabled,
                      retry_mode='gobackn', retry_buffer_entries=None,
-                     collective=None, bw_eff=None):
+                     collective=None, bw_eff=None, optical_hops=1.0):
         """Link-retry overhead (additive, in microseconds).
 
         Only applies when llr_enabled=True AND ber>0 (after FEC reduction).
@@ -1285,7 +1285,14 @@ class TheoryDerivedSurrogate:
             return 0.0
 
         bits_per_chunk = self.chunk_size * 8
-        P_chunk = 1 - (1 - ber) ** bits_per_chunk
+        # Compound the per-chunk failure probability over optical_hops
+        # (codex round 33, finding 4): the SACK arm (_retry_overhead) already
+        # receives optical_hops and compounds per-hop; the legacy GBN term
+        # was passed only the per-hop effective_ber, so 4 hops at BER 1e-8
+        # and 1 hop at 1-(1-1e-8)^4 agreed in path failure probability but
+        # diverged in the GBN mean (43.32 vs 96.79 µs). optical_hops=1 (the
+        # default) is byte-identical to the legacy behavior.
+        P_chunk = 1 - (1 - ber) ** (bits_per_chunk * max(1.0, optical_hops))
         if P_chunk <= 0:
             return 0.0
 
@@ -1342,7 +1349,7 @@ class TheoryDerivedSurrogate:
 
     def _source_reload_penalty(self, D, N, algo, cr, ber, llr_enabled,
                                retry_mode, retry_buffer_entries,
-                               collective=None):
+                               collective=None, optical_hops=1.0):
         """Visible delay from reconstructing packets absent from the retry buffer."""
         resolved = self._validate_collective(collective)
         if ber <= 0 or not llr_enabled or retry_buffer_entries is None:
@@ -1354,7 +1361,9 @@ class TheoryDerivedSurrogate:
             return 0.0
         miss_fraction = 1.0 - max(0, retry_buffer_entries) / required
 
-        p_chunk = 1.0 - (1.0 - ber) ** (self.chunk_size * 8)
+        # Compound over optical_hops like the GBN and SACK arms (codex
+        # round 33, finding 4); optical_hops=1 is byte-identical to legacy.
+        p_chunk = 1.0 - (1.0 - ber) ** (self.chunk_size * 8 * max(1.0, optical_hops))
         if resolved == 'sendrecv':
             total_chunks = D / self.chunk_size
         else:
@@ -1746,7 +1755,8 @@ class TheoryDerivedSurrogate:
                     T_step, steps, data_bytes, num_gpus, algo, credits,
                     effective_ber, llr_enabled, retry_mode,
                     retry_buffer_entries, collective,
-                    bw_eff=min(self.BW_link, bsec))
+                    bw_eff=min(self.BW_link, bsec),
+                    optical_hops=optical_hops)
                 sack_floor = self._retry_overhead(
                     T_serial_step, steps, data_bytes, num_gpus, algo, credits,
                     ber, llr_enabled, fec_enabled and include_fec,
@@ -1758,7 +1768,8 @@ class TheoryDerivedSurrogate:
                 T_gbn = max(T_gbn_legacy, gbn_floor)
             T_reload = self._source_reload_penalty(
                 data_bytes, num_gpus, algo, credits, effective_ber, llr_enabled,
-                retry_mode, retry_buffer_entries, collective)
+                retry_mode, retry_buffer_entries, collective,
+                optical_hops=optical_hops)
         else:
             T_gbn = 0.0
             T_reload = 0.0
