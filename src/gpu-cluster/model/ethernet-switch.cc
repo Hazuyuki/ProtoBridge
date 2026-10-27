@@ -83,10 +83,16 @@ EthernetSwitch::GetTypeId()
                           "switch re-checks every PfcPauseTime/2 and "
                           "re-PAUSEs while the VOQ is still past the "
                           "threshold. 0 = pause until an explicit RESUME "
-                          "(modes 1/2 semantics). Inert unless PfcMode=3.",
+                          "(modes 1/2 semantics). Inert unless PfcMode=3. "
+                          "Upper bound 65535: the quanta rides the "
+                          "FabricHeader's 16-bit CreditCount field, so a "
+                          "larger configured value would truncate on the "
+                          "wire while the switch's re-check used the full "
+                          "value (endpoint expiring at T mod 65536 while "
+                          "the switch waits T/2).",
                           UintegerValue(0),
                           MakeUintegerAccessor(&EthernetSwitch::m_pfcPauseTimeUs),
-                          MakeUintegerChecker<uint32_t>(0))
+                          MakeUintegerChecker<uint32_t>(0, 65535))
             .AddAttribute("PfcResumeOffset",
                           "PFC resume hysteresis (packets): the pause "
                           "lifts once the VOQ drains to "
@@ -418,6 +424,19 @@ EthernetSwitch::RecheckPfcPause(uint32_t inPort, uint32_t outPort, uint8_t vcId)
         Ptr<Packet> resumePkt = Create<Packet>(0);
         resumePkt->AddHeader(resume);
         GetPort(inPort)->Send(resumePkt, it->second.GetDestMac(), 0x0800);
+        // Bounded re-send arm — the same contract as the mode-1 drain
+        // watcher (codex round 32, finding 1; missing here per codex round
+        // 34, finding 3): the endpoint never acknowledges a RESUME, so a
+        // lost mode-3 RESUME with pfcPauseTime=0 left the endpoint paused
+        // forever (the switch had cleared its latch with no expiry coming).
+        // With positive quanta the expiry eventually lifts the hold, but
+        // recovery waits the full quanta instead of 500 ns.
+        m_pfcResumeResends[{inPort, outPort, vcId}] = PFC_RESUME_RESEND_LIMIT;
+        EventId resend = Simulator::Schedule(
+            NanoSeconds(500), &EthernetSwitch::ResendPfcResume,
+            this, inPort, outPort, vcId);
+        PrunePfcResumeEvents();
+        m_pfcResumeEvents.push_back(resend);
         m_pfcResumesSent++;
     }
 }

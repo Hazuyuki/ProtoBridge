@@ -332,7 +332,7 @@ FabricEndpoint::DoDispose()
     // by its own DoDispose — a surviving ref would fire into freed memory
     // once the endpoint is gone.
     SetDcqcnRateMachine(nullptr);
-    m_sendQueue = std::queue<SendQueueEntry>();
+    m_sendQueue.clear();
     m_routingTable.clear();
     m_neighborMacTable.clear();
     m_memoryData.clear();
@@ -2974,11 +2974,21 @@ FabricEndpoint::ProcessPfcResumePacket(const FabricHeader& resumeHeader)
     vcIt->second.erase(resumeHeader.GetSourceMac());
     if (!vcIt->second.empty())
     {
+        // Other switches still hold THIS VC — but this VC's own hold for
+        // the resumed switch is gone and other VCs may be fully free:
+        // entries for the released classes can now transmit. Skipping the
+        // drain on a partial release stranded them until an unrelated
+        // trigger (codex round 34, finding 1).
+        TrySendQueuedPackets();
         return;
     }
     it->second.erase(vcIt);
     if (!it->second.empty())
     {
+        // Other VCs toward this dest remain paused — same as above: the
+        // released VC's parked entries must not wait for the dest to be
+        // wholly unpaused (the drain skips still-paused classes itself).
+        TrySendQueuedPackets();
         return;
     }
     m_pfcPausedDests.erase(it);
@@ -3016,9 +3026,18 @@ void
 FabricEndpoint::TrySendQueuedPackets(){
     NS_LOG_FUNCTION(this);
 
-    while (!m_sendQueue.empty())
+    // Priority-class-aware drain (codex round 34, finding 2): a still-paused
+    // class no longer HEAD-OF-LINE blocks the whole queue. 802.1Qbb's whole
+    // point is that a paused priority class only backpressures ITS OWN
+    // traffic while other classes keep flowing — a strict FIFO drain at the
+    // first paused head would silence every class (exactly the cross-class
+    // starvation PFC exists to prevent). The scan therefore SKIPS entries
+    // whose (dest, vc) is PFC-held, preserving FIFO order among the entries
+    // it does send (relative order of admissible entries never changes).
+    auto iter = m_sendQueue.begin();
+    while (iter != m_sendQueue.end())
     {
-        SendQueueEntry& entry = m_sendQueue.front();
+        SendQueueEntry& entry = *iter;
 
         // Send-gate — the same FlowControlGate the send paths consult
         // (codex round 25, finding 5). The drain used to re-implement the
@@ -3050,11 +3069,8 @@ FabricEndpoint::TrySendQueuedPackets(){
             break;
         }
 
-        // PFC-held entries park behind the pause: the queue is FIFO and a
-        // paused dest blocks only its own tail (a paused dest's entries stop
-        // the drain at the first held packet — the head-of-line effect a
-        // real paused NIC queue has, which is exactly what PFC head-of-line
-        // blocking IS). Control/retry entries pass: SendPacketOnDevice
+        // PFC-held entries park behind the pause of THEIR OWN class: skip
+        // them, keep scanning. Control/retry entries pass: SendPacketOnDevice
         // re-checks and exempts them.
         {
             const FabricHeader& hdr = entry.header;
@@ -3063,20 +3079,20 @@ FabricEndpoint::TrySendQueuedPackets(){
             {
                 NS_LOG_DEBUG("PFC pause parks queued packet for dest "
                              << hdr.GetDestRank());
-                break;
+                ++iter;
+                continue;
             }
         }
-
-        Ptr<Packet> pkt = entry.packet->Copy();
-        pkt->AddHeader(entry.header);
 
         if (m_devices.empty())
         {
             NS_LOG_ERROR("No NetDevices configured");
-            m_sendQueue.pop();
+            iter = m_sendQueue.erase(iter);
             continue;
         }
 
+        Ptr<Packet> pkt = entry.packet->Copy();
+        pkt->AddHeader(entry.header);
         uint32_t deviceIndex = (entry.deviceIndex != UINT32_MAX)
                                    ? entry.deviceIndex
                                    : ResolveDeviceIndex(entry.header.GetDestRank());
@@ -3084,7 +3100,9 @@ FabricEndpoint::TrySendQueuedPackets(){
         if (!SendPacketOnDevice(pkt, deviceIndex, destMac))
         {
             // PFC re-parked it (the authoritative check lives in the
-            // chokepoint): stop draining, leave the entry queued.
+            // chokepoint): stop draining, leave the entry queued. A
+            // re-park affects the entry's own class only; stop here (the
+            // latch just changed under us — the next drain re-scans).
             break;
         }
 
@@ -3092,7 +3110,7 @@ FabricEndpoint::TrySendQueuedPackets(){
         m_txPackets++;
         m_txBytes += pkt->GetSize();
 
-        m_sendQueue.pop();
+        iter = m_sendQueue.erase(iter);
     }
 }
 
@@ -3141,7 +3159,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             entry.vcId = throttleHdr.GetVirtualChannel();
             entry.seqNum = throttleHdr.GetSequenceNumber();
             entry.deviceIndex = deviceIndex;
-            m_sendQueue.push(entry);
+            m_sendQueue.push_back(entry);
             NS_LOG_DEBUG("PFC pause holds packet for dest "
                          << throttleHdr.GetDestRank() << " on the send queue");
             return false;
@@ -3866,7 +3884,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                 entry.vcId = vcId;
                 entry.seqNum = seqNum;
                 entry.deviceIndex = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
-                m_sendQueue.push(entry);
+                m_sendQueue.push_back(entry);
 
                 // Queue remaining chunks
                 for (uint64_t j = i + 1; j < numChunks; j++)
@@ -3924,7 +3942,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     remEntry.vcId = vcId;
                     remEntry.seqNum = remSeqNum;
                     remEntry.deviceIndex = sendDevices[(m_globalSprayOffset + j) % sendDevices.size()];
-                    m_sendQueue.push(remEntry);
+                    m_sendQueue.push_back(remEntry);
                 }
                 TrySendQueuedPackets();
                 break;
@@ -4004,7 +4022,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
             entry.header = header;
             entry.vcId = vcId;
             entry.seqNum = seqNum;
-            m_sendQueue.push(entry);
+            m_sendQueue.push_back(entry);
             TrySendQueuedPackets();
             return;
         }

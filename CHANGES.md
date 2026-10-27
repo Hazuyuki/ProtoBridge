@@ -269,13 +269,16 @@ instrumented for PAUSE/RESUME counts. Findings in
   overhead, NOT PFC behavior: PB's FCT is identical with PFC on/off
   (42,951,160 ns), and at 9000-B chunks the gap closes to 1.16× —
   matching the p2p overhead control (2.15× vs 1.17×) almost exactly.
-- Pause cadence is the same order of magnitude (~600/ms per paused port
-  both sides). Mode 3 re-asserts while congested (qbb's pausetime/2
-  re-check analog: 51.5k pauses, 4 resumes); mode 1 is quiet (4 pauses,
-  36 resumes) with identical FCT. Zero drops everywhere.
-- ns3-rdma pays ~9% FCT for PFC at this scale (18.58 → 20.29 ms);
-  with DCQCN on it emits zero PAUSEs. PB has no DCQCN arm, and its PFC
-  is FCT-invariant under this workload.
+- Pause cadence is the same order of magnitude (~1.2-1.3k/ms summed over
+  the two paused ingresses, both sides). Mode 3 re-asserts while
+  congested (qbb's pausetime/2 re-check analog: 51.5k pauses, 4
+  resumes); mode 1 is quiet (4 pauses, 36 resumes) with identical FCT.
+  Zero drops everywhere.
+- ns3-rdma FCT is likewise PFC-invariant (20.29 ms with and without PFC
+  — the corrected coherent-limit control; an earlier single-limit control
+  overflowed the ingress headroom and produced a bogus 9% reading, fixed
+  in round 34); with DCQCN on it emits zero PAUSEs. PB has no DCQCN arm,
+  and its PFC is FCT-invariant under this workload.
 
 Also: `gpu-cluster-sim` RESULT output now reports `pfcPausesSent`/
 `pfcResumesSent` aggregate switch counters (used by the experiments).

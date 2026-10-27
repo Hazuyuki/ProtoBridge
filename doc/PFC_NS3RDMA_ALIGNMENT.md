@@ -17,11 +17,15 @@ Two senders → one receiver (2:1 incast):
   packets × 1000 B), 40 Gbps links, 1 µs latency, PAUSE_TIME 5 µs, QCN off.
   Flows start at t = 1.0 s; FCT measured as the time the seq-49999 packet
   of each flow is enqueued at the receiver.
-- **ProtoBridge**: `--topology=switched --collective=incast --numNodes=3
+- **ProtoBridge**: `--topology=switched --collective=incast --numGpus=3
+  --numNodes=3 --gpusPerNode=1 --interNodeTopology=host
   --interNodeBandwidth=40 --interNodeLatency=1000 --dataSize=50000000
   --bulkChunkSize=1000 --switchPfcMode=<mode> --pfcPauseThreshold=20
   --pfcPauseTime=5 --pfcResumeOffset=8` (mode 1 omits the pause time).
-  Same 2× 50 MB of payload, same 40 Gbps, same 1 µs links.
+  `--gpusPerNode=1 --interNodeTopology=host` are REQUIRED: the defaults
+  (8 GPUs/node, inter-node fullmesh) build a 24-rank fullmesh fabric with
+  no leaf switch, where PFC is inert. Same 2× 50 MB of payload, same
+  40 Gbps, same 1 µs links.
 
 Both sides carry PAUSE instrumentation: ns3-rdma via `PAUSE_SENT`/
 `RESUME_SENT` prints added to `qbb-net-device.cc` `CheckQueueFull()`;
@@ -39,7 +43,7 @@ therefore compared per ingress/port, not as a global equivalence.
 |---|---|---|---|---|
 | ns3-rdma, static thr | 20.29 ms | 27,035 | 2,254 | 0 |
 | ns3-rdma, dynamic thr (α=16) | 19.51 ms | 24,936 | 2,078 | 0 |
-| ns3-rdma, PFC off (control) | 18.58 ms | 0 | 0 | 0 |
+| ns3-rdma, PFC off (control) | 20.29 ms | 0 | 0 | 0 |
 | ns3-rdma, DCQCN on (control) | ~20.3 ms | 0 | 0 | 0 |
 | PB mode 1 (explicit RESUME) | 42.95 ms | 4 | 36 | 0 |
 | PB mode 3 (quanta 5 µs) | 42.95 ms | 51,518 | 4 | 0 |
@@ -48,8 +52,13 @@ therefore compared per ingress/port, not as a global equivalence.
 | PB, PFC off (control) | 42.95 ms | — | — | 0 |
 
 (PB FCT is `simTimeNs` for the same 2×50 MB incast. "PFC off" on the
-ns3-rdma side was produced by raising the ingress PG limit for the
-control run only.)
+ns3-rdma side raises the SwitchMmu ingress limits coherently — PG shared
+limit, headroom, SP limit, and max buffer all to 400 MB — so no XOFF is
+emitted and no admission path overflows. An earlier control that raised
+ONLY the PG shared limit overflowed the ingress headroom: 2.46 M drops
+and endless retransmission, which briefly produced a bogus "PFC costs 9%
+FCT" reading; the coherent control shows FCT is PFC-INVARIANT on ns3-rdma
+at this workload, same as ProtoBridge.)
 
 ### FCT
 
@@ -62,20 +71,24 @@ control run only.)
   chunks. At 9000-B chunks the ProtoBridge FCT is 23.49 ms vs ns3-rdma's
   20.3 ms, a 1.16× residual that matches the p2p overhead factor almost
   exactly.
-- On the ns3-rdma side, PFC costs ~9% FCT (18.58 → 20.29 ms). That cost
-  comes with 0 drops in both configurations here (9 MB switch buffer
-  absorbs the incast), so at this scale PFC is purely a latency cost.
+- On the ns3-rdma side, FCT is also PFC-invariant (20.29 ms with the
+  static threshold, 20.29 ms with PFC off) — the 9 MB switch buffer
+  absorbs the incast with 0 drops either way, so PFC's pause parking
+  costs no transfer time at this workload on either simulator. (The
+  dynamic threshold runs marginally faster, 19.51 ms, because its
+  admission accounting admits slightly more in flight — a threshold
+  effect, not a PFC effect.)
 
 ### PAUSE/RESUME counts
 
 - ns3-rdma emits ~27k PAUSEs and ~2.2k RESUMEs over a ~20 ms transfer —
-  roughly 670 pauses/ms summed over 2 paused ingresses, and about one
-  RESUME per 12 PAUSEs. With the dynamic threshold the counts drop ~8%
-  (24.9k/2.1k) and FCT improves ~4%.
+  roughly 1,332 pauses/ms summed over 2 paused ingresses (≈666 per
+  ingress), and about one RESUME per 12 PAUSEs. With the dynamic
+  threshold the counts drop ~8% (24.9k/2.1k) and FCT improves ~4%.
 - ProtoBridge mode 3 emits a comparable pause *cadence* at matched packet
-  size (51.5k pauses over 43 ms ≈ 600/ms per paused port, vs ~335/ms per
-  ingress on ns3-rdma — same order of magnitude) but almost never lifts
-  the pause: 4 RESUMEs total, because the mode-3 re-check at
+  size (51.5k pauses over 43 ms ≈ 1,198/ms summed over 2 paused ingresses,
+  vs 1,332/ms on ns3-rdma — same order of magnitude) but almost never
+  lifts the pause: 4 RESUMEs total, because the mode-3 re-check at
   `pausetime/2` re-asserts PAUSE whenever the output queue still exceeds
   the threshold, and under sustained 2:1 incast it never drains below it
   mid-run.

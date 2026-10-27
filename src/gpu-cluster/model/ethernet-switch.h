@@ -90,19 +90,28 @@ class EthernetSwitch : public NvSwitch
      * Configure a per-VC PFC pause threshold (the 802.1Qbb per-priority
      * headroom analog): traffic on vcId pauses at this VOQ depth instead of
      * the global PfcPauseThreshold. VCs without an entry keep the global
-     * threshold. Inert when PfcMode=0. Setting a VC to the global value
-     * (or erasing it) restores the shared-threshold behavior.
+     * threshold. Inert when PfcMode=0.
+     *
+     * The entry is RETAINED even when threshold == the global value: the
+     * mere PRESENCE of any entry selects the per-VC occupancy comparison
+     * (per-class VOQ depth) over the legacy whole-port comparison. Erasing
+     * an equal-valued entry silently flipped that selection back (codex
+     * round 34, finding 4): with only equal-valued entries configured, the
+     * class compared the WHOLE-PORT depth against the threshold, so another
+     * class's backlog paused this class at zero occupancy of its own. Use
+     * ClearPfcPauseThresholdForVc to restore shared-threshold behavior.
      */
     void SetPfcPauseThresholdForVc(uint8_t vcId, uint32_t threshold)
     {
-        if (threshold == m_pfcPauseThreshold)
-        {
-            m_pfcPerVcThresholds.erase(vcId);
-        }
-        else
-        {
-            m_pfcPerVcThresholds[vcId] = threshold;
-        }
+        m_pfcPerVcThresholds[vcId] = threshold;
+    }
+
+    /// Erase a per-VC threshold entry: the VC reverts to the global
+    /// PfcPauseThreshold (and the legacy whole-port comparison when no
+    /// entries remain).
+    void ClearPfcPauseThresholdForVc(uint8_t vcId)
+    {
+        m_pfcPerVcThresholds.erase(vcId);
     }
 
     /**

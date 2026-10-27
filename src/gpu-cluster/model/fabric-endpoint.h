@@ -866,7 +866,7 @@ class FabricEndpoint : public Application
     std::unordered_map<uint64_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(sourceRank,VC,flowId) reorder buffers, key=(srcRank<<32)|(vcId<<16)|flowId
 
     // Send queue
-    std::queue<SendQueueEntry> m_sendQueue;         ///< Pending send queue
+    std::deque<SendQueueEntry> m_sendQueue;         ///< Pending send queue (deque: the PFC drain skips still-paused classes instead of head-of-line blocking on them)
     std::unordered_map<uint64_t, uint32_t> m_nextSeqNum; ///< Next sequence number per (destRank, vcId) key
     /// Deferred-egress events scheduled by SendPacketOnDevice (pacer/FEC/WFQ
     /// holds). Each captures raw `this` and touches m_devices, so DoDispose
