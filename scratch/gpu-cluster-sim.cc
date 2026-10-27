@@ -2858,6 +2858,8 @@ main(int argc, char* argv[])
     uint64_t switchVoqDrops = 0;
     uint64_t switchRouteUnavailableDrops = 0;
     uint64_t ecnMarkedPackets = 0;
+    uint64_t pfcPausesSent = 0;
+    uint64_t pfcResumesSent = 0;
     for (auto node = NodeList::Begin(); node != NodeList::End(); ++node)
     {
         for (uint32_t device = 0; device < (*node)->GetNDevices(); ++device)
@@ -2876,6 +2878,8 @@ main(int argc, char* argv[])
             if (ethSwitch)
             {
                 ecnMarkedPackets += ethSwitch->GetEcnMarkedPackets();
+                pfcPausesSent += ethSwitch->GetPfcPausesSent();
+                pfcResumesSent += ethSwitch->GetPfcResumesSent();
             }
         }
     }
@@ -2890,6 +2894,8 @@ main(int argc, char* argv[])
     std::cout << "switchVoqDrops=" << switchVoqDrops << std::endl;
     std::cout << "switchRouteUnavailableDrops="
               << switchRouteUnavailableDrops << std::endl;
+    std::cout << "pfcPausesSent=" << pfcPausesSent << std::endl;
+    std::cout << "pfcResumesSent=" << pfcResumesSent << std::endl;
     uint64_t retransmittedPackets = 0;
     uint64_t retryBufferOverflows = 0;
     uint64_t permanentLosses = 0;
