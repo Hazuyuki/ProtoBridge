@@ -120,19 +120,23 @@ def run_gbn(tx_window, plr, strict, timeout=600):
 def test_default_off_legacy_pin():
     fields, out = run_gbn(tx_window=16, plr="1e-2", strict=False)
     assert fields.get("status") == "complete", out[-500:]
-    assert fields.get("simTimeNs") == 3116865, (
-        "default-off GBN lossy run changed: simTimeNs={} != 3116865 "
+    # Re-pinned 3116865/696 -> 2576551/837 (cut-through accounting fix:
+    # serialization-only egress busy-until). Faster egress drain changes the
+    # per-window loss pattern; retx moves with it.
+    assert fields.get("simTimeNs") == 2576551, (
+        "default-off GBN lossy run changed: simTimeNs={} != 2576551 "
         "(strict branch leaking into the default path, or the fabric "
         "convention moved under the pin?)".format(fields.get("simTimeNs")))
-    assert fields.get("retransmittedPackets") == 696, fields
+    assert fields.get("retransmittedPackets") == 837, fields
     assert fields.get("permanentLosses") == 0, fields
 
 
 def test_strict_lossless_baseline():
     fields, out = run_gbn(tx_window=64, plr="0", strict=True)
     assert fields.get("status") == "complete", out[-500:]
-    assert fields.get("simTimeNs") == 2521509, (
-        "strict-on lossless baseline changed: simTimeNs={} != 2521509 "
+    # Re-pinned 2521509 -> 1659309 (cut-through accounting fix).
+    assert fields.get("simTimeNs") == 1659309, (
+        "strict-on lossless baseline changed: simTimeNs={} != 1659309 "
         "(strict acceptance semantics shifted)".format(fields.get("simTimeNs")))
     # The 4 KiB cap-enforced regime keeps w=64 in-flight chunks in-order on
     # the wire, so strict acceptance is inert at zero loss (retx=0).
@@ -143,12 +147,13 @@ def test_strict_lossy_pin():
     fields, out = run_gbn(tx_window=64, plr="1e-2", strict=True)
     assert fields.get("status") == "complete", out[-500:]
     assert fields.get("permanentLosses") == 0, fields
-    assert fields.get("retransmittedPackets") == 3029, (
-        "strict-on retransmission volume changed: retx={} != 3029 "
+    # Re-pinned 3029/4276850 -> 2402/2581677 (cut-through accounting fix).
+    assert fields.get("retransmittedPackets") == 2402, (
+        "strict-on retransmission volume changed: retx={} != 2402 "
         "(discard/NAK-per-gap semantics regressed?)".format(
             fields.get("retransmittedPackets")))
-    assert fields.get("simTimeNs") == 4276850, (
-        "strict-on lossy pin changed: simTimeNs={} != 4276850".format(
+    assert fields.get("simTimeNs") == 2581677, (
+        "strict-on lossy pin changed: simTimeNs={} != 2581677".format(
             fields.get("simTimeNs")))
 
 

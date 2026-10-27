@@ -48,11 +48,13 @@ Two cases, mirroring the two ``--llrRetryLimit`` regimes documented in the
  ran GBN before the override (blanket retransmits: 149 drops / 314 retx /
  permLoss=9 at rlim=8 with a "graceful" completion that was really GBN's
  blanket-retransmit byte accounting double-counting retransmitted fragments).
- True SACK retransmits selectively: 27 drops / 27 retx, permLoss=0 for every
- rlim >= 4 at 192 KiB, and a permanent loss always stalls by design (the
- executor counts delivered effective bytes; PERMANENT_LOSS events are ignored
- rather than credited -- stall-not-corrupt). The contrast point is therefore
- rlim=3 (permLoss=1, incomplete), not rlim=8.
+ True SACK retransmits selectively: post cut-through-accounting-fix the
+ incast drains at line rate and every drop is recovered by its first
+ selective retransmit, so permLoss=0 for every rlim >= 1 (pre-fix the
+ contrast point was rlim=3). A permanent loss always stalls by design (the
+ executor counts delivered effective bytes; PERMANENT_LOSS events are
+ ignored rather than credited -- stall-not-corrupt). The contrast point is
+ therefore rlim=0 (permLoss=11, incomplete).
 
 Run:
     python3 -m pytest test/parity/test_ethernet_lossy_recovery.py -v
@@ -144,19 +146,25 @@ def test_ethernet_incast_recovers():
 
 
 def test_ethernet_permanent_loss_fallback():
-    # rlim=3 is the contrast point under true SACK (see the module docstring):
-    # below the recovery threshold (rlim>=4 recovers everything at 192 KiB),
-    # retries exhaust, the permanent-loss fallback fires end-to-end
-    # (NotifyPermanentLoss -> PERMANENT_LOSS packet -> receiver MarkPermanentGap)
-    # and the run degrades to the deliberate stall-not-corrupt incomplete
-    # state (the executor's PERMANENT_LOSS guard).
-    fields, out = run_incast(3)
+    # rlim=0 is the contrast point under true SACK (see the module docstring):
+    # no retry budget at all, so the first VOQ drop exhausts immediately, the
+    # permanent-loss fallback fires end-to-end (NotifyPermanentLoss ->
+    # PERMANENT_LOSS packet -> receiver MarkPermanentGap) and the run degrades
+    # to the deliberate stall-not-corrupt incomplete state (the executor's
+    # PERMANENT_LOSS guard).
+    # Pre cut-through-accounting-fix the contrast point was rlim=3: the
+    # serial pipeline charge derated egress enough that retransmits were
+    # themselves dropped and even a 3-deep budget exhausted. Post-fix the
+    # incast drains at line rate, every drop is recovered by its FIRST
+    # selective retransmit at any rlim>=1 (verified up to 4 MiB / 255 drops),
+    # so only rlim=0 exercises the fallback.
+    fields, out = run_incast(0)
     assert fields.get("permanentLosses", 0) > 0, (
-        "incast rlim=3: permanentLosses={} (the permanent-loss fallback should "
+        "incast rlim=0: permanentLosses={} (the permanent-loss fallback should "
         "fire once retries exhaust -- the lossy-Ethernet degradation)"
         .format(fields.get("permanentLosses")))
     assert fields.get("status") == "incomplete", (
-        "incast rlim=3: status={} (a permanent loss must stall the run, not "
+        "incast rlim=0: status={} (a permanent loss must stall the run, not "
         "complete with missing bytes -- stall-not-corrupt)".format(
             fields.get("status")))
 

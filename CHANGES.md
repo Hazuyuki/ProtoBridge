@@ -6,6 +6,137 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — the 2:1 incast stall the cut-through fix unmasked: soTxWindow inert without LLR, and the ACK-clocked window deadlocked with LLR off
+
+**The regression.** After the cut-through accounting fix (next section),
+the 1000-B-chunk 2:1 incast alignment scenario (50 MB, 3 nodes, host
+topology) stalled: `status=incomplete` pinned at the 3600-s ceiling with
+`switchVoqDrops=42633` and 0 retransmits — identical with PFC mode 3
+(10,418 pauses) and PFC off. Root cause chain, verified by env-gated
+instrumentation of the drop site and the endpoint PFC latch:
+
+1. `--soTxWindow` (the perftest tx_depth analog bounding in-flight bulk
+   chunks) was wired ONLY inside the `llrEnabled` block of
+   gpu-cluster-sim.cc — with LLR off (the lossless-RoCE default) the
+   flag was silently inert, so the bulk send path dispatched the ENTIRE
+   transfer synchronously at t=0 (unbounded window). Instrumentation
+   proved the senders finished every `SendPacketOnDevice` call before
+   the first PFC PAUSE arrived (~8.8 µs in): the pause latch can only
+   park NEW sends, and there were none left.
+2. Two senders at 40G into one 40G egress fill the receiver-switch VOQ
+   at exactly 1 packet per serialization time (VOQ depth trace: +1000
+   packets per 208 µs — the linear 2:1 oversubscription ramp). At
+   depth 10000 the `m_voqDepth` hard cap drops silently (no NACK; and
+   with `llr=off` lossless RoCE there is no retransmit backstop), so
+   the transfer can never complete.
+3. Pre-fix, the serial cut-through charge derated first-hop egress by
+   ~2× at 1000-B chunks, which accidentally rate-matched the senders
+   to the receiver's drain rate — the defect was acting as implicit
+   congestion control and masking all of the above.
+
+**The fixes.** Three changes, each independently necessary:
+
+- `scratch/gpu-cluster-sim.cc`: `soTxWindow`/`soGbnStrict` wiring moved
+  out of the `llrEnabled` block to an unconditional loop over all
+  endpoints — they are LLR-free opt-ins.
+- `FabricEndpoint::ProcessAckPacket`: the TX-window slot release is now
+  the FIRST action, outside the `llrEnabled` gate — the ACK proves
+  delivery regardless of whether the LLR retry store exists. The
+  membership-set erase (`m_bulkTxWindowSeqs`) is the exactly-once guard;
+  the LLR-gated release inside the block was removed (it would
+  double-release).
+- `FabricEndpoint::SendLlrAckPacket`: the plain per-packet ACK is
+  emitted when `soTxWindow > 0` even with LLR off — the ACK is the
+  window's clock, but the emission guard returned early on
+  `!m_llrEnabled`, so a windowed lossless run deadlocked with the
+  window full (128 chunks sent, event queue drained). The RETRY_ACK /
+  cumulative paths and the LLR store bookkeeping stay LLR-gated inside.
+
+**Result.** The stalled scenario completes: 1000-B 2:1 incast now reads
+21.90 ms (PFC off) / 23.60 ms (mode 1) / 24.38 ms (mode 3) — 1.08× the
+20.29 ms theoretical floor, vs 42.95 ms pre-fix (the derate). 0 drops in
+every mode. The 9000-B variants are byte-identical with or without the
+window (21.153216 ms; their BDP never approaches the VOQ cap), and the
+9000-B no-window pause counts (16,871/18) reproduce exactly — no
+regression for previously-working configurations. `--soTxWindow=1`
+completes too (392 ms, RTT-serialized), proving window robustness.
+
+**PFC behavior now visible.** With the window ACK-clocked, mode-3's
+pause cadence changed from latched (51.5k pauses / 4 resumes pre-window)
+to breathing (13,932 / 13,932 — one lift per quanta window), and mode 1
+runs a ~10× quieter control plane (1,548 pauses / 13,932 resumes).
+`doc/PFC_NS3RDMA_ALIGNMENT.md` tables and narrative updated to the true
+post-fix numbers.
+
+Suite state: gpu-cluster EXTENSIVE 187 PASS / 0 FAIL, integration PASS,
+surrogate pytest 101 passed, 15/15 parity scripts (0 FAIL), valgrind on
+the fixed windowed incast (mode 3, 5 MB) 0 errors / no leaks.
+
+### Fixed — cut-through egress accounting: the per-packet pipeline charge that halved small-chunk line rate
+
+**The defect.** `NvSwitch::SendFrom` charged the fixed cut-through
+pipeline delay (`m_cutThroughDelayNs`, default 200 ns) SERIALLY before
+every packet's egress serialization in `m_outputBusyUntil[outPort]`:
+`busyUntil = start + pipeline + serialization`. On a real cut-through
+switch the head-processing pipeline is per-hop LATENCY — it overlaps the
+egress serializer, and back-to-back packets achieve line rate. Charging
+it serially made the port occupancy per packet `L + s` instead of `s`, an
+effective derate of `(s+L)/s`: a 1000-B chunk on 400G (s = 20 ns wire
+time at the chunk's 1050-B wire size) occupied the port ~2× its wire
+time; a 16-KiB chunk 1.6×. Every multi-packet transfer through an
+NVSwitch egress was bandwidth-limited by the derate, not the wire.
+
+**The fix** (codex-modeled recommendation, `/tmp/codex_cutthrough_out.txt`
+consult): `m_outputBusyUntil[outPort] = startTime + serializationTime` —
+logical egress service availability, serialization-only. The arrival
+expression keeps the pipeline term per packet (`totalDelay = wait + L +
+serialization + codec + propagation`), so single-packet LATENCY is
+unchanged: the isolated-packet probe reads identical pre/post-fix
+(1442/1642/1242 ns at L=200/400/0). FEC/store-and-forward and the L=0
+`Send()` fallback paths are untouched. Consumers already treated the
+field as service availability (empty-VOQ fast path, arbiter
+`SelectGrants`, next-fire computation) — no changes needed there.
+
+**Timing invariants verified** (probe `/tmp/ct_probe.cc`): isolated
+latency moves 1:1 with L; a 100-packet saturated burst delivers 100/100
+at `L + Σs` total occupancy (3521 ns at L=200 vs the pre-fix 74
+delivered by 100 µs); egress inter-packet spacing is `max(gap, s)` — L
+never appears; L=0 falls back unchanged. The A/B against the old formula
+reproduced the derate exactly.
+
+**Calibration impact** (all re-fit / re-pinned post-fix):
+
+- Tree AllReduce 36-point joint refit: `t_min_switch` 4.10 → **1.06 µs**,
+  `tree_bw` 275400 → **308300 B/µs** (η 0.72 → 0.81 vs the 382500 B/µs
+  trunk physics), MAPE 12.65% → **1.88%** (per-N 2.4/1.3/1.6/2.3%). The
+  old fit was absorbing the derate into BOTH constants — the documented
+  "D-structured pipeline-fill residual" was this simulator artifact, and
+  the rejected fill-term experiment (3.96% MAPE) was fitting a bug. The
+  structural α(N)=1/2/3 model now matches ns-3 almost exactly.
+- `make_surrogate_from_wire` `eta_tree` 0.61 → 0.685 (tree = 308250
+  derived vs 308300 calibrated).
+- RoCE p2p `ib_write_lat` sweep: best fit UNCHANGED
+  (`startup=950/lat=100/ct=200`, MAPE 5.26%) — single packets cannot
+  distinguish the accounting schemes (the additive-ct formula holds
+  under both).
+- Parity pins re-recorded (deterministic, faster drain): so_topologies
+  8 pins (rail==tor 297430 → 295030 consistency signal preserved);
+  so-hier 2n/4n 15307388/13421212 → 15287388/13403612 (su-baseline
+  4769616 unchanged — single-node has no switch egress hop); ncclring
+  444189 → 361593; contention multi-node 4 pins (single-node 3 pins
+  unchanged); gbn_strict 3 pins; rttcc baseline + loop pins.
+- Two parity SCENARIOS re-anchored, not just re-pinned: the
+  permanent-loss fallback contrast moved rlim=3 → rlim=0 (post-fix every
+  drop is recovered by its first selective retransmit at any rlim≥1 —
+  verified to 4 MiB / 255 drops), and the RTTCC loop target moved
+  3000 → 1000 ns (the incast's max RTT fell 5849 → 1164 ns; the old
+  target sat above the observed RTT so the controller never throttled).
+  Both scenarios' behavioral assertions still fire.
+
+Suite state: gpu-cluster QUICK 169 PASS / 0 FAIL post-fix, surrogate
+pytest 101 passed (tree GT test re-anchored to the new sweep at a
+tightened 5% tolerance, from 16%), 15/15 parity scripts.
+
 ### Fixed — codex round 24: eight defects across forwarded-traffic shaping, repair-state isolation, and surrogate tail geometry
 
 1. **Legacy AllReduce results use the upload spray geometry** (medium).
@@ -319,6 +450,78 @@ Suite state: gpu-cluster EXTENSIVE 183 PASS / 0 FAIL (3 new C++ tests),
 integration 5 PASS, surrogate pytest 101 passed, 15/15 parity scripts,
 valgrind on the feature probe's four modes (pervc, quanta, drain,
 destroy_only) 0 errors / no leaks.
+
+### Fixed — codex round 34: eight defects across per-class PFC drain, mode-3 RESUME delivery, and the ns3-rdma alignment controls
+
+1. **Endpoint send queues stopped at the first PFC-held entry**
+   (high). `TrySendQueuedPackets` broke out of the drain loop the
+   moment it hit an entry whose (dest, VC) was paused, so a RESUME
+   releasing one class could not push past a still-paused entry for a
+   DIFFERENT class ahead of it — the released class's backlog stayed
+   parked until something else drained the queue head. The queue is now
+   a `std::deque` and the drain skips paused entries (continue) instead
+   of stopping (break), so a partial RESUME releases exactly the
+   un-paused classes; gate-denied entries still break (credit ordering
+   is FIFO). The same partial-release paths in
+   `ProcessPfcResumePacket` now drain after updating the latch, and
+   `DoDispose` clears the queue outright. Test: `PfcPartialResumeDrains
+   Test` (VC0 and VC1 parked, VC1 resumed — the VC1 entries transmit
+   past the paused VC0 head).
+2. **Mode-3 RESUME was sent exactly once and could be lost**
+   (medium). Mode 3 (quanta) derives RESUME from a periodic re-check,
+   but the re-check emitted RESUME only on the pause→unpause transition
+   edge — a single lost control frame left the upstream endpoint
+   paused forever. `RecheckPfcPause`'s drain branch now arms a bounded
+   re-send (`PFC_RESUME_RESEND_LIMIT` 8 at 500-ns intervals, matching
+   the PAUSE re-send convention) via `ResendPfcResume`, tracked in the
+   same `m_pfcResumeEvents` event ledger. Test: `PfcQuantaResumeResend
+   Test` (loss window over the first RESUME — 9 sends land, latch
+   clears, endpoint unpauses).
+3. **A per-VC threshold equal to the global silently stopped isolating
+   the class** (medium). `SetPfcPauseThresholdForVc` erased the
+   per-VC entry when the new value equaled the global threshold,
+   intending "revert to global", but the check ran per VC — a
+   deployment that deliberately pins VC0 to the same numeric value as
+   the global (e.g. to freeze it against a later global change) lost
+   the pin. The setter now always installs the explicit entry;
+   `ClearPfcPauseThresholdForVc` is the explicit revert. Test:
+   `PfcEqualThresholdPerVcTest` (VC1 pinned to global-equal 2 — VC1
+   backlog pauses only VC1).
+4. **The PFC pause-time attribute accepted values the wire can't carry**
+   (low). Mode-3 quanta ride in the 16-bit `CreditCount` field, so
+   `PfcPauseTime=65537` truncated to 1 µs on the wire while the switch
+   re-checked at the untruncated 32.7 ms — the endpoint expired long
+   before the switch agreed. The attribute checker is now bounded to
+   [0, 65535] with a doc note explaining the field bound.
+5. **Endpoint `DoDispose` kept the send queue as a live object graph**
+   (low). The old `m_sendQueue = {}` assignment on `std::queue` left
+   the deque's backing storage reachable via the queue adapter during
+   teardown; with the deque conversion the dispose is a plain
+   `clear()`, consistent with the other endpoint ledgers.
+6. **`PfcQuantaDrainResumeTest` asserted the pre-re-send RESUME count**
+   (test-only). With the bounded re-send (finding 2) the quanta drain
+   emits 1 + 8 = 9 RESUMEs; the assertion moved from 1 to 9 with a
+   comment tying it to the re-send budget.
+7. **The ns3-rdma PFC-off control was invalid** (alignment only). The
+   round's control run raised only `m_pg_shared_limit_cell`, which
+   pushed packets into the SP-limit/headroom admission branch and
+   produced 2.46 M headroom drops / 3.69 M retransmission events — the
+   earlier "FCT 18.58 ms, PFC costs 9%" reading was a retransmission
+   artifact, not a PFC cost. The valid control raises ALL ingress
+   limits coherently (`maxBuffer`, `pg_shared`, `pg_shared_off`,
+   headroom, SP, `port_max_shared` to 400 MB): 0 drops, 0 pauses, FCT
+   20.29 ms — identical to PFC-on. `doc/PFC_NS3RDMA_ALIGNMENT.md` and
+   the CHANGES alignment entry now state PFC-invariance on both sides
+   (at 2:1 incast with zero drops, PFC's pause parking never engages
+   enough to move FCT).
+8. **`SetPfcPauseThresholdForVc`'s doc comment still described the
+   erase-on-equal behavior** (doc-only). Updated to the always-install
+   semantics with the `ClearPfcPauseThresholdForVc` revert.
+
+Suite state: gpu-cluster EXTENSIVE 186 PASS / 0 FAIL (3 new C++ tests),
+integration PASS, surrogate pytest 101 passed, 15/15 parity scripts,
+valgrind on the fix probe's two modes (drain, resend) 0 errors / no
+leaks.
 
 ### Fixed — codex round 33: four defects — the SimpleNetDevice teardown leaving a dangling callback, gate-denied single collectives discarded, control frames crossing failed links, and the mean GBN/reload terms ignoring optical hops
 

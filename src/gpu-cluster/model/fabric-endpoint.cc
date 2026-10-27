@@ -2277,26 +2277,29 @@ void
 FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
 {
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
+
+    // ACK-clocked TX window, independent of LLR: the ACK proves the receiver
+    // got the chunk, so its window slot is free — the same "delivery means
+    // slot release" contract NotifyPermanentLoss holds for the loss side.
+    // This used to live inside the llrEnabled block, so with LLR off
+    // (lossless RoCE) every ACK was discarded after reception: the window
+    // filled with the first soTxWindow chunks of the transfer and nothing
+    // ever re-pumped — a pure deadlock (128 chunks sent, event queue
+    // drained, simTime pinned at the 3600-s ceiling with status=incomplete;
+    // the 2:1 incast stall investigation). The membership erase is the
+    // exactly-once guard: only PumpBulkTxWindow-dispatched bulk fragments
+    // enter m_bulkTxWindowSeqs, and a duplicate ACK finds no entry.
+    if (m_soTxWindow > 0 &&
+        m_bulkTxWindowSeqs.erase({header.GetSourceRank(),
+                                  header.GetVirtualChannel(),
+                                  header.GetFlowId(),
+                                  header.GetSequenceNumber()}) > 0)
+    {
+        ReleaseBulkTxSlot();
+    }
+
     if (m_llrEnabled && m_llrManager)
     {
-        // Release a TX-window slot exactly once per chunk: the exact
-        // window-membership set (destRank, seqNum) says whether this ACK is
-        // for a PumpBulkTxWindow-dispatched bulk fragment. The old
-        // remoteness + LLR-outstanding heuristic also matched small
-        // unfragmented remote sends (they share the LLR store but never
-        // held a window slot), releasing a slot that belonged to an
-        // in-flight bulk fragment — with soTxWindow=1 the next fragment
-        // dispatched while the previous one was still outstanding. The key
-        // carries the full (dest, vc, flow) identity because seq counters
-        // are allocated per (dest, vc, flow): an ACK from an unwindowed
-        // flow sharing only (dest, seq) must not release another flow's
-        // bulk slot.
-        const bool heldWindowSlot =
-            m_soTxWindow > 0 &&
-            m_bulkTxWindowSeqs.erase({header.GetSourceRank(),
-                                      header.GetVirtualChannel(),
-                                      header.GetFlowId(),
-                                      header.GetSequenceNumber()}) > 0;
         // Peek the stored entry's type BEFORE RemovePacket destroys it:
         // credit-bypass types (NVLS/SHARP uploads — the switch's LLR ack for
         // them lands here too) consumed no credit on send, so none is owed
@@ -2315,10 +2318,6 @@ FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
                                        header.GetSourceRank(),
                                        header.GetFlowId(),
                                        header.GetVirtualChannel());
-        if (heldWindowSlot)
-        {
-            ReleaseBulkTxSlot();
-        }
         if (removed && !creditBypassEntry)
         {
             // R9#2: the ACK proves the receiver got the packet, so the send's
@@ -2616,7 +2615,18 @@ FabricEndpoint::SendCreditPacket(uint16_t destRank, uint8_t vcId, uint16_t count
 void
 FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumulative)
 {
-    if (!m_llrEnabled || !m_llrManager || m_devices.empty())
+    // The ACK has two consumers: the LLR retry store (LLR on) and the So TX
+    // window (soTxWindow > 0 — the ACK is the window's clock, the perftest
+    // tx_depth analog's completion notification). LLR-off used to suppress
+    // the ACK entirely, so a windowed lossless-RoCE run deadlocked: the
+    // window filled with its first soTxWindow chunks and no ACK ever came
+    // to release a slot (the 2:1 incast stall investigation). Keep the LLR
+    // store dependencies inside; the plain ACK itself needs neither.
+    if ((!m_llrEnabled || !m_llrManager) && m_soTxWindow == 0)
+    {
+        return;
+    }
+    if (m_devices.empty())
     {
         return;
     }

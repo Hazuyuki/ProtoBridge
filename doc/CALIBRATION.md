@@ -23,7 +23,7 @@ recipe below carries the exact runtime values it uses.
 |-----------|-----------------|--------|-------|
 | Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive; against the 18-link spray fabric (the profile's linksPerGpu=18, the same convention the tree calibration anchors) the preset sits ≈1.07–1.17× ABOVE ns-3 — not a lower bound (the η_nvls=1.2 multicast amplification exceeds the 382500 B/µs trunk); the historical "≈0.566×" note's run conditions were unrecorded and match no current convention — 2026-09 drift finding, see `examples/gpu-cluster/surrogate_ns3_consistency.py` |
 | Theory-derived full-mesh (`surrogate/theory/`) | ns-3-calibrated — `fullmesh_bw=449890 B/µs` back-fit to the ns-3 `FullMeshAllReduce`/`FullMeshAllGather` sweep (η=0.9998 vs the 18×25000 dedicated-bundle physics) | vs ns-3 | MAPE 0.10% on the SIMPLE-regime sweep points (N∈{4,8,16}, 1–256 MiB); parity within 0.3% at N=8 AR+AG {16,64,256} MiB (see the Full-mesh section below) |
-| Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — the ORIGINAL two-parameter form: serial term = α(N)·D/trunk with the STRUCTURAL α(N) = 1/2/3 (single edge / root with two children / interior node; `tree_bw_per_level=275400 B/µs`, η=0.72 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs; `t_min_switch=4.10 µs`) — both constants back-fit jointly to the post-local-rank-fix ns-3 `TreeAllReduce` at the TRUE H200 fabric — `--linksPerGpu=18` separate point-to-point NVLink4 lanes @ 170 Gbps each, spray-routed, aggregate 3060 Gbps trunk, credits unconstrained (`configs/calibration/tree_ns3_sweep.py`; the retired `--linkDataRate=3060` convention collapsed the 18 lanes into ONE pipe — no spray, no per-link queues). The D-dependent pipeline-fill residual is deliberately absorbed into the fitted pair rather than modeled (a dedicated fill term bought 3.96% MAPE but turned the formula into a 5-constant curve fit — rejected) | vs ns-3 | MAPE 12.65% over all 36 fresh sweep points (N∈{4,8,16,32} × 1–256 MiB), 6.97% on the SIMPLE regime, per-N 10.6/11.0/14.0/15.1%; relative-error-weighted (1/T²) joint least squares — no H200 tree HW ground truth exists in this repo |
+| Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — the ORIGINAL two-parameter form: serial term = α(N)·D/trunk with the STRUCTURAL α(N) = 1/2/3 (single edge / root with two children / interior node; `tree_bw_per_level=308300 B/µs`, η=0.81 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs; `t_min_switch=1.06 µs`) — both constants back-fit jointly to the post-cut-through-accounting-fix ns-3 `TreeAllReduce` at the TRUE H200 fabric — `--linksPerGpu=18` separate point-to-point NVLink4 lanes @ 170 Gbps each, spray-routed, aggregate 3060 Gbps trunk, credits unconstrained (`configs/calibration/tree_ns3_sweep.py`; the retired `--linkDataRate=3060` convention collapsed the 18 lanes into ONE pipe — no spray, no per-link queues). The pre-fix fit (275400 B/µs, 4.10 µs, MAPE 12.65%) was absorbing the per-packet cut-through serialization derate into both constants; the old "pipeline-fill residual absorbed into the fitted pair" caveat is gone | vs ns-3 | MAPE 1.88% over all 36 fresh sweep points (N∈{4,8,16,32} × 1–256 MiB), 2.00% on the SIMPLE regime, per-N 2.39/1.28/1.63/2.25%; relative-error-weighted (1/T²) joint least squares — no H200 tree HW ground truth exists in this repo |
 
 ## Generate fresh ns-3 baselines
 
@@ -383,32 +383,42 @@ fitted: (`t_min_switch`, `tree_bw`).
 
 The residual against ns-3 is D-structured — at small D ns-3 runs FASTER than
 the structural load predicts (pipeline fill / credit-window ramp-up not yet
-in steady state), at large D slightly slower — and is deliberately absorbed
-into the fitted pair rather than modeled. A dedicated additive fill term
+in steady state), at large D slightly slower — and was absorbed into the
+fitted pair rather than modeled. A dedicated additive fill term
 `min(F·steps, κ·D)` (commits a1fa05d→1fb92ba) drove the MAPE from ~12.7% to
-3.96%, but at the cost of three extra constants and per-N fitted α∞ —
-effectively a curve fit wearing a physics costume. Rejected in favor of the
-original form; the residual is documented, not hidden in constants.
+3.96% on the PRE-cut-through-fix binary, but at the cost of three extra
+constants and per-N fitted α∞ — effectively a curve fit wearing a physics
+costume. Rejected in favor of the original form.
+
+**The residual was the cut-through accounting defect, not physics.** The
+switch charged the fixed 200-ns cut-through pipeline SERIALLY before every
+packet's egress serialization, derating small-chunk back-to-back throughput
+(a 1000-B chunk on 400G occupied the port 400 ns per 200 ns of wire time).
+With the fix (egress busy-until = serialization-only logical service
+availability; the pipeline overlaps the serializer as on a real
+cut-through switch) the D-structured residual collapsed: the same
+two-parameter form now fits ns-3 at **MAPE 1.88%** (below the rejected fill
+form's 3.96%!) with NO extra constants. The fill-term experiment is
+historically documented above; it was fitting a simulator artifact.
 
 ### Sweep + fit (`configs/calibration/tree_ns3_sweep.py`)
 
-N ∈ {4,8,16,32} × 1–256 MiB (36 points, fresh runs on the current binary —
-the 9/18 fit CSV predated the 9/30 single-node local-rank fix e1cdd9c,
-which made all rank pairs exchange credits and shifted tree times up to
-~8%; the constants had to be re-fit regardless of form). Relative-error-
-weighted (1/T²) joint least squares over the two constants. Result:
-`t_min_switch = 4.10 µs`, `tree_bw = 275400 B/µs` (η = 0.72 vs the
-382500 B/µs trunk physics). MAPE 12.65% all-36 / 6.97% SIMPLE regime,
-per-N 10.6/11.0/14.0/15.1%. Raw sweep: `tree_sweep.csv`;
+N ∈ {4,8,16,32} × 1–256 MiB (36 points). The constants have been re-fit
+TWICE: after the 9/30 local-rank fix e1cdd9c, and again after the
+cut-through accounting fix (the earlier 4.10 µs / 275400 B/µs fit was
+absorbing the per-packet pipeline derate into BOTH constants).
+Relative-error-weighted (1/T²) joint least squares over the two constants.
+Result: `t_min_switch = 1.06 µs`, `tree_bw = 308300 B/µs` (η = 0.81 vs the
+382500 B/µs trunk physics). MAPE 1.88% all-36 / 2.00% SIMPLE regime,
+per-N 2.39/1.28/1.63/2.25%. Raw sweep: `tree_sweep.csv`;
 fit record: `tree_calib.json`.
 
 ### Scope + limits
 
-- Looser than the full-mesh fit (0.10%) and looser than the rejected fill
-  form (3.96%): the price of keeping two physical constants. The per-size
-  error is regime-structured (worst single point −36.29% at N=16/8 MiB —
-  the unmodeled pipeline-fill deficit — and +24% at N=32/1 MiB; N≥32 is
-  extrapolation territory, per-N MAPE 15.1%).
+- Post-cut-through-fix fit quality (1.88%) approaches the full-mesh fit
+  (0.10%); the worst per-N MAPE is 2.39% at N=4 (the pre-fix error was
+  15.1% at N=32 — the "pipeline-fill deficit" was the simulator's serial
+  pipeline charge, since corrected).
 - **Credit convention**: the sweep runs the inline 1-VC fabric model with
   credits unconstrained (`--vcCredits=104857600`) — NOT the profile's
   `vcCredits=64` (a PEX-bundle value consumed only by the stencil runner's

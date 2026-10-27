@@ -77,11 +77,11 @@ class TheoryDerivedSurrogate:
       Bandwidth — serialized-bytes term (bytes/µs):
         packet_bw_bytes_per_us         (177000)  retransmission chunk serialize (ber>0)
         ring_bw_bytes_per_us           (177000)  ring per-step transfer        [ring mean]
-        tree_bw_per_level_bytes_per_us (275400)  tree GPU<->NVSwitch trunk     [tree mean]
+        tree_bw_per_level_bytes_per_us (308300)  tree GPU<->NVSwitch trunk     [tree mean]
         nvls_bw_bytes_per_us           (535500)  NVLS aggregate transfer       [nvls mean]
       Latency — fixed term (µs unless noted):
         link_latency_us                (0.4 = 400 ns) per-hop propagation  [ring/nvls mean]
-        t_min_switch_us                 (4.10)   NVSwitch fixed pipeline cost [tree mean]
+        t_min_switch_us                 (1.06)   NVSwitch fixed pipeline cost [tree mean]
         startup_us                      (15.0)   protocol startup (LL/LL128) [all mean]
         nvls_startup_us                 (23.0)   NVLS startup (used for nvls) [nvls mean]
         fec_encode_ns / fec_decode_ns   (50 / 80 ns) FEC pipeline latency   [FEC on]
@@ -104,7 +104,7 @@ class TheoryDerivedSurrogate:
     def __init__(self,
                  packet_bw_bytes_per_us=177000,
                  ring_bw_bytes_per_us=177000,
-                 tree_bw_per_level_bytes_per_us=275400,
+                 tree_bw_per_level_bytes_per_us=308300,
                  nvls_bw_bytes_per_us=535500,
                  fullmesh_bw_bytes_per_us=449890,
                  link_latency_us=0.4,
@@ -113,7 +113,7 @@ class TheoryDerivedSurrogate:
                  spray_chunk_bytes=131072,
                  bulk_chunk_bytes=8 * 1024 * 1024,
                  num_lanes=18,
-                 t_min_switch_us=4.10,
+                 t_min_switch_us=1.06,
                  fec_n=544, fec_k=514, fec_t=15,
                  fec_symbol_bits=10,
                  fec_encode_ns=50, fec_decode_ns=80,
@@ -1796,7 +1796,7 @@ def make_h200_ring_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=275400,
+        tree_bw_per_level_bytes_per_us=308300,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=0.4,
         credit_bdp_ring_packets=91.5,
@@ -1804,7 +1804,7 @@ def make_h200_ring_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=4,
-        t_min_switch_us=4.10,
+        t_min_switch_us=1.06,
         startup_us=15.0,
     )
     defaults.update(overrides)
@@ -1818,14 +1818,20 @@ def make_h200_tree_theory(**overrides):
     H200 fabric (``--linksPerGpu=18`` separate NVLink4 lanes @ 170 Gbps,
     spray-routed; every tree edge carries the full D; see
     ``configs/calibration/tree_ns3_sweep.py`` / ``tree_calib.json``). TWO
-    fitted parameters: ``tree_bw_per_level`` = 275400 B/us the GPU<->NVSwitch
-    trunk rate (eta = 0.72 vs the 18 x 170 Gbps = 382500 B/us trunk physics)
-    and ``t_min_switch`` = 4.10 us the fixed per-step cost (which also absorbs
-    the D-dependent pipeline-fill residual -- at small D ns-3 runs faster than
-    the structural alpha(N)=1/2/3 trunk load predicts, at large D slightly
-    slower, see CALIBRATION.md). MAPE 12.65% over the 36-point
-    N={4,8,16,32} x 1-256 MB ns-3 sweep (per-N 10.6/11.0/14.0/15.1%). ns-3
-    anchored -- no H200 tree hardware ground truth exists in this repo.
+    fitted parameters: ``tree_bw_per_level`` = 308300 B/us the GPU<->NVSwitch
+    trunk rate (eta = 0.81 vs the 18 x 170 Gbps = 382500 B/us trunk physics)
+    and ``t_min_switch`` = 1.06 us the fixed per-step cost. Both re-fit after
+    the cut-through accounting fix (the switch's egress busy-until now models
+    serialization-only logical service availability -- the fixed cut-through
+    pipeline overlaps the serializer instead of serializing before it, so
+    back-to-back packets achieve line rate): the old fit (275400 B/us,
+    4.10 us, MAPE 12.65%) was absorbing the per-packet derate into BOTH
+    constants. The new fit: MAPE 1.88% over the 36-point
+    N={4,8,16,32} x 1-256 MB ns-3 sweep (per-N 2.4/1.3/1.6/2.3%) -- the
+    structural alpha(N)=1/2/3 model now matches ns-3 almost exactly, so the
+    old "pipeline-fill residual absorbed into the fitted pair" caveat is
+    gone. ns-3 anchored -- no H200 tree hardware ground truth exists in this
+    repo.
     Accepts the same ``overrides`` as the ring profile (defaults to
     ``num_lanes=18``).
     """
@@ -1841,7 +1847,7 @@ def make_h200_nvls_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=275400,
+        tree_bw_per_level_bytes_per_us=308300,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=0.4,
         credit_bdp_ring_packets=91.5,
@@ -1849,7 +1855,7 @@ def make_h200_nvls_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=18,
-        t_min_switch_us=4.10,
+        t_min_switch_us=1.06,
         startup_us=23.0,
         nvls_startup_us=23.0,
     )
@@ -1878,7 +1884,7 @@ def make_h200_fullmesh_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=177000,
         ring_bw_bytes_per_us=177000,
-        tree_bw_per_level_bytes_per_us=275400,
+        tree_bw_per_level_bytes_per_us=308300,
         nvls_bw_bytes_per_us=535500,
         fullmesh_bw_bytes_per_us=449890,
         link_latency_us=0.4,
@@ -1887,7 +1893,7 @@ def make_h200_fullmesh_theory(**overrides):
         spray_chunk_bytes=131072,
         bulk_chunk_bytes=8 * 1024 * 1024,
         num_lanes=18,
-        t_min_switch_us=4.10,
+        t_min_switch_us=1.06,
         startup_us=15.0,
     )
     defaults.update(overrides)
@@ -1935,7 +1941,7 @@ def make_h200_roce_theory(**overrides):
     Spec-derived, UNCALIBRATED lower bound (anchored to ns-3, not real HW):
     400GbE per-link unidirectional wire rate (50 GB/s = 50000 B/us), 8 NICs
     per node, ~1 us per-hop propagation (vs NVLink 0.4), ~1.5 us Ethernet
-    switch pipeline (vs NVSwitch 4.10), ~40 us RDMA startup (vs NCCL 15), and
+    switch pipeline (vs NVSwitch 1.06), ~40 us RDMA startup (vs NCCL 15), and
     0.95 wire efficiency (Eth+IP+UDP+IB header overhead -- mirrors the ns-3
     RoceProtocolModel's GetWireSize = data/0.95). The schedule bandwidths
     derive from the Ethernet wire rate the same way NVLink does (ring_bw =
@@ -1948,7 +1954,7 @@ def make_h200_roce_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=160000,
         ring_bw_bytes_per_us=160000,
-        tree_bw_per_level_bytes_per_us=275400,
+        tree_bw_per_level_bytes_per_us=308300,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=1.0,
         # Credit-UNCONSTRAINED: the ns-3 So (inter-node) path bypasses the
@@ -2003,7 +2009,7 @@ def make_h200_ethernet_theory(**overrides):
     defaults = dict(
         packet_bw_bytes_per_us=160000,
         ring_bw_bytes_per_us=160000,
-        tree_bw_per_level_bytes_per_us=275400,
+        tree_bw_per_level_bytes_per_us=308300,
         nvls_bw_bytes_per_us=535500,
         link_latency_us=3.0,
         # Credit-UNCONSTRAINED -- same reason as the RoCE profile (the ns-3 So
@@ -2105,7 +2111,7 @@ def make_surrogate(algo, **overrides):
 
 
 def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
-                             eta_ring=0.40, eta_tree=0.61, eta_nvls=1.20,
+                             eta_ring=0.40, eta_tree=0.685, eta_nvls=1.20,
                              eta_fullmesh=1.0, **overrides):
     """Derive every schedule bandwidth from ONE NVLink wire-rate input.
 
@@ -2119,10 +2125,10 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
                                   bus bw 2(N-1)/N * alBw ~= 0.69 * B_agg,
                                   in NCCL's typical 60-80% band)
       tree_bw = eta_tree * B_agg
-                           ~0.61 (effective GPU<->NVSwitch trunk realization:
-                                  the ns-3 back-fit 275400 B/us over the
-                                  382500 B/us trunk = eta 0.72 vs the
-                                  effective 170 Gbps/lane rate, i.e. 0.61 of
+                           ~0.69 (effective GPU<->NVSwitch trunk realization:
+                                  the ns-3 back-fit 308300 B/us over the
+                                  382500 B/us trunk = eta 0.81 vs the
+                                  effective 170 Gbps/lane rate, i.e. 0.69 of
                                   the 25000 B/us physical wire aggregate)
       nvls_bw = eta_nvls * B_agg
                            ~1.20 (NVSwitch hardware multicast amplification)
@@ -2132,8 +2138,8 @@ def make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
                                   serialization, unlike nvls)
 
     For H200 (b_link=25000 B/us, num_lanes=18, B_agg=450000) this yields
-    ring/packet=180000 (calibrated 177000, +1.7%), tree=274500 (ns-3-calibrated
-    275400, -0.3%), nvls=540000 (calibrated 535500, +0.8%), fullmesh=450000
+    ring/packet=180000 (calibrated 177000, +1.7%), tree=308250 (ns-3-calibrated
+    308300, -0.02%), nvls=540000 (calibrated 535500, +0.8%), fullmesh=450000
     (ns-3-calibrated, the dedicated 18-lane-per-pair bundle within the fit
     band). Pass ``ring_bw_bytes_per_us=`` etc.
     in ``overrides`` to override any derived value. The calibrated

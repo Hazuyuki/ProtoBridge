@@ -9629,6 +9629,57 @@ class PfcLlrRetransmitExemptTest : public TestCase
     }
 };
 
+// (the 2:1 incast stall investigation) The So TX window must be ACK-clocked
+// with LLR OFF too — lossless RoCE's default. Pre-fix, two coupled defects
+// starved the clock: SendLlrAckPacket returned early on !m_llrEnabled (the
+// receiver never ACKed), and ProcessAckPacket's slot release lived inside
+// the llrEnabled block (even a delivered ACK freed nothing). A windowed
+// lossless transfer delivered exactly soTxWindow chunks and then the event
+// queue drained — a pure deadlock (the 50-MB 1000-B incast pinned at the
+// 3600-s ceiling with status=incomplete).
+class SoTxWindowLlrOffClockTest : public TestCase
+{
+  public:
+    SoTxWindowLlrOffClockTest()
+        : TestCase("So TX window is ACK-clocked with LLR off (lossless RoCE)") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+        s.a->SetBulkChunkSize(4096);
+        s.a->SetSoTxWindow(2);
+        // The window is a fabric-wide setting (gpu-cluster-sim wires it on
+        // EVERY endpoint): the RECEIVER's ACK emission keys on its own
+        // m_soTxWindow, so both sides must carry it for the clock to run.
+        s.b->SetSoTxWindow(2);
+        // LLR stays DISABLED on both endpoints — the lossless default. The
+        // window's clock is the plain per-packet ACK, not the LLR store.
+        s.a->SendBulkWireTransferSize(1, 16384, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        uint64_t effectiveSum = 0;
+        for (const auto& delivered : s.wire)
+        {
+            if (delivered.second.GetPacketType() == FabricPacketType::DATA)
+            {
+                effectiveSum += delivered.second.GetEffectiveDataSize();
+            }
+        }
+        // 16 KiB in 4-KiB chunks = 4 chunks through a window of 2: the ACKs
+        // for the first pair must re-open the window for the second pair
+        // (pre-fix: exactly 8192 effective bytes — one window's worth — and
+        // then the transfer deadlocked).
+        NS_TEST_ASSERT_MSG_EQ(effectiveSum, 16384u,
+            "the window must re-open on ACK with LLR off "
+            "(pre-fix: the first soTxWindow chunks delivered, then deadlock)");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
 // (codex round 27, finding 5) A PFC pause arriving DURING a pacing hold must
 // hold the deferred egress too — the deferred callback used to dev->Send()
 // directly, bypassing the chokepoint. Two 4-KiB sends paced at 1 Gbps with
@@ -14886,6 +14937,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new PfcParkBodyNotFramedTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcBulkFragmentResumeDeliversAllTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcSoTxWindowResumeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SoTxWindowLlrOffClockTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcLlrRetransmitExemptTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcDeferredEgressLatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpRetireCompletionOrderTest, TestCase::Duration::QUICK);

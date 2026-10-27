@@ -95,7 +95,7 @@ def test_surrogate_from_wire_derives_h200_bandwidths():
     s = wb.make_surrogate_from_wire(
         b_link_bytes_per_us=25000, num_lanes=18, algo="ring")
     assert abs(s.ring_bw - 177000) / 177000 <= 0.025
-    assert abs(s.tree_bw_per_level - 275400) / 275400 <= 0.025
+    assert abs(s.tree_bw_per_level - 308300) / 308300 <= 0.025
     assert abs(s.nvls_bw - 535500) / 535500 <= 0.025
 
 
@@ -248,7 +248,7 @@ def test_collective_explicit_reproduces_calibrated():
     assert s.predict(D, 8, "ring", credits=128, ber=0,
                      collective="allreduce") == pytest.approx(1325.49, rel=1e-3)
     assert s.predict(D, 8, "tree", credits=128, ber=0,
-                     collective="allreduce") == pytest.approx(2973.32, rel=1e-3)
+                     collective="allreduce") == pytest.approx(2633.87, rel=1e-3)
     assert s.predict(D, 8, "nvls", credits=128, ber=0,
                      collective="allgather") == pytest.approx(1018.01, rel=1e-3)
 
@@ -375,20 +375,20 @@ def test_tree_per_step_is_alpha_d_over_steps():
 
 
 def test_tree_reproduces_ns3_ground_truth():
-    """The original-form tree preset (2 fitted params: tree_bw=275400,
-    t_min_switch=4.10) reproduces the fresh (post-local-rank-fix e1cdd9c
-    binary) ns-3 TreeAllReduce simTimeUs at the TRUE H200 fabric
+    """The original-form tree preset (2 fitted params: tree_bw=308300,
+    t_min_switch=1.06 -- re-fit after the cut-through accounting fix)
+    reproduces the ns-3 TreeAllReduce simTimeUs at the TRUE H200 fabric
     (--linksPerGpu=18 x 170 Gbps spray-routed; the calibration ground truth,
-    configs/calibration/tree_ns3_sweep.py) within 16% at 256 MiB (fit
-    MAPE 12.65% over all 36 points, per-N 10.6/11.0/14.0/15.1%). startup_us=46
+    configs/calibration/tree_ns3_sweep.py) within 5% at 256 MiB (fit
+    MAPE 1.88% over all 36 points, per-N 2.4/1.3/1.6/2.3%). startup_us=46
     is the profile's SIMPLE startup (the model takes startup by D regime,
     like the sweep's back-fit)."""
     s = wb.make_h200_tree_theory()
     D = 256 * 1024 * 1024
-    for n, gt in ((4, 1745.9), (8, 2699.4), (16, 2789.7), (32, 2816.3)):
+    for n, gt in ((4, 1716.1), (8, 2630.4), (16, 2714.0), (32, 2716.3)):
         pred = s.predict(D, n, "tree", credits=128, ber=0, startup_us=46.0,
                          collective="allreduce")
-        assert abs(pred - gt) / gt <= 0.16, (n, pred, gt)
+        assert abs(pred - gt) / gt <= 0.05, (n, pred, gt)
 
 
 def test_tree_latency_not_decreasing_in_n():

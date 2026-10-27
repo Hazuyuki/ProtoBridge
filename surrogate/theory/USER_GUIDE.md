@@ -114,11 +114,11 @@ The full `__init__` parameter list (21 knobs, all defaulted) is in the
 | Parameter | Units | Affects | H200 ring |
 |-----------|-------|---------|-----------|
 | `ring_bw_bytes_per_us` | bytes/µs | ring serialization | 177000 |
-| `tree_bw_per_level_bytes_per_us` | bytes/µs | tree GPU↔NVSwitch trunk (ns-3-calibrated) | 275400 |
+| `tree_bw_per_level_bytes_per_us` | bytes/µs | tree GPU↔NVSwitch trunk (ns-3-calibrated) | 308300 |
 | `nvls_bw_bytes_per_us` | bytes/µs | NVLS serialization | 535500 |
 | `fullmesh_bw_bytes_per_us` | bytes/µs | full-mesh serialization (ns-3-calibrated) | 449890 |
 | `link_latency_us` | µs (400 ns = 0.4) | ring/nvls/fullmesh propagation | 0.4 |
-| `t_min_switch_us` | µs | tree fixed (NVSwitch pipeline cost) | 4.10 |
+| `t_min_switch_us` | µs | tree fixed (NVSwitch pipeline cost) | 1.06 |
 | `credit_bdp_ring_packets` | packets | ring credit pressure Φ_credit | 91.5 |
 | `credit_bdp_tree_packets` | packets | tree credit pressure Φ_credit | 35.5 |
 | `startup_us` / `nvls_startup_us` | µs | protocol startup (fixed) | 15.0 / 23.0 |
@@ -333,7 +333,7 @@ Su (NVLink) stage:
 | `ring_bw_bytes_per_us` | NVLink schedule bw | Ethernet schedule bw (e.g. 160000 = 400GbE × 8 NIC) | per-fabric wire rate |
 | `num_lanes` | NVLink links/GPU (18) | NICs/node (8) | So counts NICs, not NVLink lanes |
 | `link_latency_us` | 0.4 | ~1.0 | per-hop propagation |
-| `t_min_switch_us` | 4.10 (NVSwitch) | ~1.5 (Ethernet pipeline) | switch fill |
+| `t_min_switch_us` | 1.06 (NVSwitch) | ~1.5 (Ethernet pipeline) | switch fill |
 | `startup_us` | 15 (NCCL) | ~40 (RDMA) | software launch |
 | `wire_efficiency` | 1.0 (no L3/L4 header) | 0.95 (Eth+IP+UDP+IB) | header overhead on T_serial |
 | `tree_bw` / `nvls_bw` | used on Su | inherited, unused on So | So stage runs the ring path |

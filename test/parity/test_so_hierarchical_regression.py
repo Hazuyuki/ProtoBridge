@@ -138,8 +138,13 @@ def assert_lossless(fields, label):
 # LLR force has disturbed the RoCE path.
 PARITY_NS = {
     "su-baseline": 4769616,
-    2: 15307388,
-    4: 13421212,
+    # 2/4-node re-pinned 15307388/13421212 -> 15287388/13403612 (cut-through
+    # accounting fix: egress busy-until is serialization-only; the 200-ns
+    # pipeline overlaps the serializer instead of derating small-chunk
+    # throughput). Su single-node fabric has no NVSwitch egress hop —
+    # unchanged.
+    2: 15287388,
+    4: 13403612,
 }
 
 

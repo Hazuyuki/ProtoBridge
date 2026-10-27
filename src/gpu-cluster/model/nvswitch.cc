@@ -1143,9 +1143,16 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
         serializationTime = Seconds(static_cast<double>(wireSize * 8) / outputRate.GetBitRate());
     }
 
-    // Update port busy time: port is occupied during serialization
+    // Update port busy time: logical egress service availability. Only the
+    // serialization occupies the output link — the fixed cut-through pipeline
+    // (m_cutThroughDelayNs) is per-hop LATENCY, overlapped with the egress
+    // serializer exactly as on a real cut-through switch, so back-to-back
+    // packets achieve line rate. Charging it serially here would derate
+    // effective bandwidth (e.g. 200 ns pipeline + 200 ns wire time for a
+    // 1000-B chunk on 400G = 2.0x derate). The pipeline term still appears
+    // per packet in the arrival delay below.
     Time startTime = std::max(Simulator::Now(), m_outputBusyUntil[outPort]);
-    m_outputBusyUntil[outPort] = startTime + NanoSeconds(m_cutThroughDelayNs) + serializationTime;
+    m_outputBusyUntil[outPort] = startTime + serializationTime;
 
     // Egress serialization + cut-through pipeline + propagation delay
     // models the full packet traversal including per-port contention.

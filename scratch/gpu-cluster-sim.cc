@@ -570,8 +570,11 @@ main(int argc, char* argv[])
     cmd.AddValue("soTxWindow",
                  "Bound the number of in-flight So bulk chunks per endpoint "
                  "(NIC send-queue depth, perftest tx_depth analog; ACK-clocked "
-                 "via LLR per-packet ACKs, so it requires --llrEnabled). "
-                 "Default 0 = legacy unbounded synchronous dispatch.",
+                 "with or without LLR). Set this for congested incast "
+                 "scenarios: the default unbounded dispatch dumps the whole "
+                 "transfer at t=0, which overruns the switch VOQ hard cap "
+                 "under multi-sender incast. Default 0 = legacy unbounded "
+                 "synchronous dispatch.",
                  soTxWindow);
     cmd.AddValue("soGbnStrict",
                  "Strict go-back-N receive semantics for So flows in "
@@ -1867,15 +1870,25 @@ main(int argc, char* argv[])
                 {
                     ep->EnableLlrTimeoutRetransmit();
                 }
-                if (soTxWindow > 0)
-                {
-                    ep->SetSoTxWindow(soTxWindow);
-                }
-                if (soGbnStrict)
-                {
-                    ep->SetSoGbnStrict(true);
-                }
             }
+        }
+    }
+
+    // soTxWindow / soGbnStrict are independent LLR-free opt-ins (the perftest
+    // tx_depth analog). They used to live inside the llrEnabled block, so a
+    // run with LLR off (lossless RoCE) silently ignored --soTxWindow — an
+    // unbounded bulk TX window that dumped the whole transfer before the
+    // first PFC PAUSE could arrive (the 2:1 incast stall: switchVoqDrops
+    // 42633, status=incomplete). Wire them unconditionally here.
+    for (auto& ep : endpoints)
+    {
+        if (soTxWindow > 0)
+        {
+            ep->SetSoTxWindow(soTxWindow);
+        }
+        if (soGbnStrict)
+        {
+            ep->SetSoGbnStrict(true);
         }
     }
 

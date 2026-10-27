@@ -330,9 +330,12 @@ class FabricEndpoint : public Application
      * @brief Bound the number of in-flight bulk chunks to a remote (So) rank,
      *        modeling a NIC send-queue depth (perftest tx_depth). 0 (default)
      *        keeps the legacy unbounded synchronous dispatch. The window is
-     *        ACK-clocked: a slot is released when the per-packet LLR ACK
-     *        purges the retry store (or on permanent loss). So-only; requires
-     *        LLR (without LLR ACKs no slot is ever released).
+     *        ACK-clocked: a slot is released when the receiver's per-packet
+     *        ACK proves delivery (or on permanent loss) — with or without
+     *        LLR. FABRIC-WIDE setting: set it on EVERY endpoint, not just
+     *        senders — the RECEIVER's ACK emission keys on its own
+     *        m_soTxWindow, so a sender-only window never gets its clock
+     *        (gpu-cluster-sim's --soTxWindow wires all endpoints).
      */
     void SetSoTxWindow(uint32_t chunks);
 

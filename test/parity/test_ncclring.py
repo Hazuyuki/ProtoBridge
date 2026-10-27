@@ -34,7 +34,11 @@ COMMON = [
     "--RngRun=1",
 ]
 
-NCCLRING_PIN_NS = 444189
+# Re-pinned 444189 -> 361593 (cut-through accounting fix): the switch's
+# egress busy-until no longer charges the fixed 200-ns pipeline serially
+# before each packet's serialization, so back-to-back chunks achieve line
+# rate and the 254-step ring drains ~19% faster.
+NCCLRING_PIN_NS = 361593
 
 
 def run(extra):
