@@ -61,7 +61,7 @@ fabric whose bisection bandwidth or path length differs from ideal NVSwitch.
 
 ```python
 make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo,
-                         eta_ring=0.40, eta_tree=0.61, eta_nvls=1.20,
+                         eta_ring=0.40, eta_tree=0.685, eta_nvls=1.20,
                          eta_fullmesh=1.0, **overrides)
 ```
 
@@ -74,7 +74,7 @@ efficiency factors. No per-bandwidth calibration needed.
 | `b_link_bytes_per_us` | single NVLink unidirectional wire rate | `25000` (25 GB/s) |
 | `num_lanes` | NVLink links per GPU | `18` |
 | `algo` | `ring` / `tree` / `nvls` / `fullmesh` (`fm`) | — |
-| `eta_ring` / `eta_tree` / `eta_nvls` / `eta_fullmesh` | efficiency factors (defaulted) | 0.40 / 0.61 / 1.20 / 1.0 |
+| `eta_ring` / `eta_tree` / `eta_nvls` / `eta_fullmesh` | efficiency factors (defaulted) | 0.40 / 0.685 / 1.20 / 1.0 |
 
 Derived bandwidths land within ~2% of the calibrated H200 values (see §11 of
 `WHITEBOX_SURROGATE.md`). This is the entry point for any new platform where

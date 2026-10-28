@@ -28,7 +28,7 @@ s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduc
 | `b_link_bytes_per_us` | single NVLink unidirectional wire rate | 25000 |
 | `num_lanes` | NVLink links per GPU | 18 |
 | `algo` | ring / tree / nvls / fullmesh | — |
-| `eta_ring`, `eta_tree`, `eta_nvls`, `eta_fullmesh` (optional, defaulted) | efficiency factors | 0.40 / 0.61 / 1.20 / 1.0 |
+| `eta_ring`, `eta_tree`, `eta_nvls`, `eta_fullmesh` (optional, defaulted) | efficiency factors | 0.40 / 0.685 / 1.20 / 1.0 |
 
 Derived bandwidths: `ring_bw = packet_bw = eta_ring * B_agg`,
 `tree_bw = eta_tree * B_agg`, `nvls_bw = eta_nvls * B_agg`
@@ -116,7 +116,7 @@ The current H200 profile uses:
 | Schedule | Effective transfer quantity |
 |---|---:|
 | Ring | 177,000 bytes/us |
-| Tree | 275,400 bytes/us per active level (ns-3-calibrated trunk; 0.61 × B_agg) |
+| Tree | 308,300 bytes/us per active level (ns-3-calibrated trunk; 0.685 × B_agg) |
 | NVLS | 535,500 bytes/us aggregate work bandwidth |
 
 Ring uses link propagation for `T_fixed`. Tree uses the switched-path pipeline
@@ -329,14 +329,14 @@ efficiency factors, with no per-bandwidth calibration:
 ```text
 B_agg = num_lanes * b_link                       (per-GPU NVLink aggregate)
 ring_bw = packet_bw = eta_ring * B_agg           ~0.40 (AllReduce algorithm bw)
-tree_bw = eta_tree * B_agg                       ~0.61 (ns-3 back-fit 275,400 = 0.61 x B_agg)
+tree_bw = eta_tree * B_agg                       ~0.685 (ns-3 back-fit 308,300 ~= 0.685 x B_agg)
 nvls_bw = eta_nvls * B_agg                       ~1.20 (NVSwitch multicast gain)
 ```
 
 For H200 (b_link = 25,000 B/us, num_lanes = 18, B_agg = 450,000), the
-defaults eta_ring=0.40, eta_tree=0.61, eta_nvls=1.20 yield ring/packet =
-180,000 (calibrated 177,000, +1.7%), tree = 274,500 (ns-3-calibrated
-275,400, -0.3%), nvls = 540,000
+defaults eta_ring=0.40, eta_tree=0.685, eta_nvls=1.20 yield ring/packet =
+180,000 (calibrated 177,000, +1.7%), tree = 308,250 (ns-3-calibrated
+308,300, -0.02%), nvls = 540,000
 (calibrated 535,500, +0.8%) -- all within 2%. The ring-bus bandwidth
 2(N-1)/N * alBw = 0.69 * B_agg falls in NCCL's typical 60-80% utilization
 band, anchoring eta_ring in physics rather than as a fit coefficient. The

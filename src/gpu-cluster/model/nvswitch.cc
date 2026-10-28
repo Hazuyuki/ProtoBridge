@@ -924,6 +924,22 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
         m_dropTrace(entry.packet);
         m_droppedPackets++;
         m_voqDrops++;
+        // A hard-cap drop in a lossless fabric is unrecoverable unless the
+        // source learns of it: NACK back so the LLR/SACK path retransmits,
+        // mirroring the tail-drop / headroom-exhaustion NACKs in
+        // EthernetSwitch::OnPacketEnqueue (codex round 35, finding 1 — with
+        // finite PFC headroom and a small switchVoqDepth the hard cap binds
+        // BEFORE the headroom budget exhausts, and the silent drop stalls
+        // the transfer). EmitNackBack no-ops unless m_llrEnabled, so the
+        // default LLR-off configuration is byte-identical; control/retry
+        // packets are exempt like every other congestion hook (a NACK about
+        // feedback is meaningless).
+        FabricHeader capHeader;
+        if (entry.packet && entry.packet->PeekHeader(capHeader)
+            && !capHeader.IsControlPacket() && !capHeader.IsRetryPacket())
+        {
+            EmitNackBack(capHeader, entry.inPort, capHeader.GetSourceMac());
+        }
         return;
     }
 

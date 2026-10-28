@@ -158,7 +158,12 @@ at this workload, same as ProtoBridge.)
    (the "ingress headroom full" analog) and the LLR/SACK path
    retransmits — with a finite headroom the sim forces `llrEnabled=1`
    exactly like the lossy tail-drop regime, because a silent drop in a
-   lossless fabric is unrecoverable. Verified on the matched workload:
+   lossless fabric is unrecoverable. The VOQ hard cap
+   (`--switchVoqDepth`) drops with the same NACK (round 35, finding 1):
+   with a finite headroom and a small hard cap the cap binds before the
+   budget exhausts, and a silent drop there stalls the transfer — every
+   hard-cap data drop now NACKs back and retransmits via LLR/SACK too.
+   Verified on the matched workload:
    headroom ≥ 12 chunks is FCT-identical to the legacy (21.899-ms
    PFC-off / 24.378-ms mode-3 values, byte-identical counters) — the
    budget simply never exhausts at this BDP, which reproduces ns3-rdma's
@@ -177,12 +182,15 @@ at this workload, same as ProtoBridge.)
   `build/scratch/third mix/config_static_small.txt` (and
   `config_dynamic_small.txt`, `config_nopfc.txt`, `config_qcn.txt`) from
   `/tmp/pfc_align/ns3rdma`.
-- ProtoBridge:
+- ProtoBridge (base 1000-B reproduction; the single-switch `host`
+  inter-node topology with one GPU per node is the structural twin of the
+  ns3-rdma star):
   `./build/scratch/ns3.47-gpu-cluster-sim-debug --topology=switched
-  --collective=incast --numNodes=3 --interNodeBandwidth=40
-  --interNodeLatency=1000 --dataSize=50000000 --bulkChunkSize=1000
-  --switchPfcMode=3 --pfcPauseThreshold=20 --pfcPauseTime=5
-  --pfcResumeOffset=8` and the mode-1 / 9000-B variants. The headroom
-  control adds `--soTxWindow=64 --pfcHeadroomChunks=<N>`
-  (0 = legacy, ≥12 = ns3-rdma-like never-exhausts at this BDP, 10 =
-  undersized: drop + LLR retransmit recovery).
+  --collective=incast --numNodes=3 --gpusPerNode=1 --interNodeTopology=host
+  --interNodeBandwidth=40 --interNodeLatency=1000 --dataSize=50000000
+  --bulkChunkSize=1000 --soTxWindow=64 --switchPfcMode=3
+  --pfcPauseThreshold=20 --pfcPauseTime=5 --pfcResumeOffset=8`
+  and the mode-1 / 9000-B variants. The headroom control adds
+  `--pfcHeadroomChunks=<N>` (0 = legacy, ≥12 = ns3-rdma-like
+  never-exhausts at this BDP, 10 = undersized: drop + LLR retransmit
+  recovery).
