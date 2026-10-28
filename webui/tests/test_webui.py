@@ -85,6 +85,105 @@ def test_catalog_and_real_parameter_preview(client):
     assert preview.json()["summary"]["ranks"] == 8
 
 
+def test_form_catalog_only_lists_native_algorithms_and_topologies(client):
+    options = client.get("/api/catalog").json()["options"]
+    assert len(options["topologies"]) == 14
+    assert "ndfullmesh" not in {item["value"] for item in options["topologies"]}
+    assert "2dfullmeshclos" not in {item["value"] for item in options["topologies"]}
+    allreduce = next(item for item in options["collectives"] if item["value"] == "allreduce")
+    assert {"tree", "ncclring", "nvls", "hierarchical"} <= set(allreduce["algorithms"])
+
+
+def test_operation_overrides_are_written_to_the_executed_snapshot(client):
+    identifier = submit(client, op_overrides={"collective": "allgather", "algorithm": "fullmesh", "topology": "fullmesh"})
+    run = wait(client, identifier)
+    assert run["summary"]["collective"] == "allgather"
+    assert "algorithm = fullmesh" in run["config"]
+    assert "topology = fullmesh" in run["config"]
+    assert not any(flag.startswith("--algorithm=") for flag in run["command"])
+
+
+def test_topology_dimensions_determine_the_actual_rank_count(client):
+    values = {"op_overrides": {"topology": "mesh"}, "cli_overrides": {"meshRows": 3, "meshCols": 4}}
+    identifier = submit(client, **values)
+    run = wait(client, identifier)
+    assert run["summary"]["ranks"] == 12
+    assert "--numGpus=12" in run["command"]
+    assert "--meshRows=3" in run["command"]
+
+
+def test_resolved_controls_follow_profile_precedence_and_stencil_credit_scope(client):
+    response = client.post("/api/preview", json={"cli_overrides": {"llrEnabled": True, "fecN": 600, "vcCredits": 17}})
+    settings = response.json()["summary"]["settings"]
+    assert response.status_code == 200
+    assert settings["llrEnabled"] == "0"  # profile wins
+    assert settings["fecN"] == "544"
+    assert settings["effectiveVcCredits"] == "17"  # inline VC stays CLI-sourced
+    response = client.post("/api/preview", json={"config_id": "p2p-single.cfg", "stack_overrides": {"vcCredits": 23, "llrEnabled": True, "llrMode": "sack", "fecEnabled": False}})
+    settings = response.json()["summary"]["settings"]
+    assert settings["llrEnabled"] == "1" and settings["llrMode"] == "sack"
+    assert settings["effectiveVcCredits"] == "23" and settings["fecEnabled"] == "0"
+
+
+def test_fabric_forced_llr_is_visible_in_preview(client):
+    response = client.post("/api/preview", json={"config_id": "eth-hierarchical.cfg", "num_nodes": 2, "gpus_per_node": 4, "stack_overrides": {"llrEnabled": False}})
+    assert response.status_code == 200
+    settings = response.json()["summary"]["settings"]
+    assert settings["llrRequested"] == "0" and settings["llrEnabled"] == "1"
+    assert any("强制开启" in notice for notice in response.json()["notices"])
+
+
+def test_cli_only_controls_in_stack_do_not_claim_to_be_enabled(client):
+    response = client.post("/api/preview", json={"stack_overrides": {"dcqcn": True, "packetLossRate": .1}, "cli_overrides": {"packetLossRate": .01}})
+    assert response.status_code == 200
+    settings = response.json()["summary"]["settings"]
+    assert settings["dcqcn"] == "0" and settings["packetLossRate"] == "0.01"
+    assert any("不会传给原生 CLI" in notice for notice in response.json()["notices"])
+
+
+def test_minimal_profile_has_native_bundle_and_inline_defaults(client):
+    minimal = "protocolModel = ns3::NcclProtocolModel\n"
+    response = client.post("/api/preview", json={"profile_text": minimal})
+    assert response.status_code == 200
+    settings = response.json()["summary"]["settings"]
+    assert settings["fecEnabled"] == "0" and settings["fecN"] == "0"
+    assert settings["berInterRackOptical"] == "1e-9"
+    response = client.post("/api/preview", json={"config_id": "p2p-single.cfg", "profile_text": minimal, "cli_overrides": {"vcCredits": 17, "llrEnabled": True}})
+    settings = response.json()["summary"]["settings"]
+    assert settings["fecEnabled"] == "1" and settings["fecN"] == "544"
+    assert settings["vcCredits"] == "64" and settings["llrEnabled"] == "0"
+
+
+@pytest.mark.parametrize("values", [
+    {"op_overrides": {"profile": "/etc/passwd"}},
+    {"op_overrides": {"algorithm": "unknown"}},
+    {"op_overrides": {"algorithm": "nvls"}},
+    {"op_overrides": {"collective": "broadcast", "algorithm": "tree"}},
+    {"op_overrides": {"algorithm": "hierarchical"}},
+    {"op_overrides": {"topology": "ndfullmesh"}},
+    {"op_overrides": {"topology": "2dfullmeshclos"}},
+    {"op_overrides": {"topology": "leafspine"}},
+    {"op_overrides": {"topology": "mesh"}, "cli_overrides": {"meshRows": 32, "meshCols": 32}},
+    {"stack_overrides": {"fecN": 514}},
+    {"stack_overrides": {"fecT": 16}},
+    {"stack_overrides": {"flowControl": "rate"}},
+    {"stack_overrides": {"berIntraNodeElectrical": -0.1}},
+    {"stack_overrides": {"vcCount": 256}},
+    {"config_id": "p2p-single.cfg", "op_overrides": {"collective": "allreduce"}},
+    {"cli_overrides": {"errorMode": "burst", "ber": 0.000001}},
+    {"cli_overrides": {"errorMode": "burst"}, "stack_overrides": {"fecEnabled": False}},
+    {"num_nodes": 2, "stack_overrides": {"interNodeFabricType": "ETH"}, "cli_overrides": {"dcqcn": True}},
+    {"num_nodes": 2, "stack_overrides": {"interNodeFabricType": "ETH"}, "cli_overrides": {"switchPfcMode": 1}},
+    {"num_nodes": 2, "stack_overrides": {"interNodeFabricType": "RoCE"}, "cli_overrides": {"voqDropThreshold": 4, "ecnThreshold": 4, "dcqcn": True, "interNodeTopology": "tor"}},
+    {"num_nodes": 2, "stack_overrides": {"interNodeFabricType": "RoCE"}, "cli_overrides": {"switchPfcMode": 3}},
+    {"op_overrides": {"topology": "leafspine"}, "cli_overrides": {"leafSwitches": 2, "spineSwitches": 2, "interSwitchMedium": "optical", "failedOpticalLink": 4}},
+])
+def test_incompatible_native_options_are_rejected_before_queuing(client, values):
+    response = client.post("/api/runs", json=values)
+    assert response.status_code == 422, response.text
+    assert client.get("/api/runs").json()["runs"] == []
+
+
 @pytest.mark.parametrize("values", [
     {"num_gpus": 1}, {"num_gpus": 8.5}, {"data_size": 0},
     {"num_nodes": 32, "gpus_per_node": 64},

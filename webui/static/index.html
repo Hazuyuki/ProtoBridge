@@ -11,6 +11,7 @@
     <title>ProtoBridge · 互联仿真实验室</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/options.js" defer></script>
     <script src="/static/app.js" defer></script>
   </head>
   <body>
@@ -202,6 +203,37 @@
                     读取 configs/protocol_configs/
                   </p>
                 </div>
+                <div class="form-divider"><span>通信与拓扑</span></div>
+                <div class="field" id="collective-field">
+                  <label for="collective-select">Collective 操作</label>
+                  <select id="collective-select"></select>
+                </div>
+                <div class="field" id="algorithm-field">
+                  <label for="algorithm-select">Collective 算法</label>
+                  <select id="algorithm-select"></select>
+                  <p class="field-hint" id="operation-hint"></p>
+                </div>
+                <div class="field" id="physical-topology-field">
+                  <label for="physical-topology">物理拓扑</label>
+                  <select id="physical-topology"></select>
+                  <p class="field-hint" id="physical-topology-hint"></p>
+                </div>
+                <p class="field-hint" id="stencil-operation-hint" hidden>
+                  当前为自定义传输，操作由 transfer.* 决定。切换 collective
+                  算法请先选择集合通信模板。
+                </p>
+                <details class="advanced" id="topology-options">
+                  <summary>
+                    <svg><use href="#i-sliders" /></svg>拓扑与算法参数
+                  </summary>
+                  <div class="advanced-content">
+                    <p class="field-hint">
+                      留空沿用配置或原生默认值；按维度构建的拓扑会自动计算实际
+                      GPU 数。
+                    </p>
+                    <div id="topology-option-fields" class="option-grid"></div>
+                  </div>
+                </details>
                 <div class="form-divider"><span>参与规模</span></div>
                 <div id="single-node-fields" class="field">
                   <label for="num-gpus">GPU 数量 <span>ranks</span></label>
@@ -221,6 +253,9 @@
                       aria-label="自定义 GPU 数量"
                     />
                   </div>
+                  <p class="field-hint" id="dimension-ranks-hint" hidden>
+                    GPU 数由拓扑维度决定，请在“拓扑与算法参数”中调整。
+                  </p>
                 </div>
                 <div id="multi-node-fields" class="form-row" hidden>
                   <div class="field">
@@ -342,10 +377,11 @@
                     </div>
                   </div>
                 </div>
+                <div id="native-options"></div>
                 <details class="advanced">
                   <summary>
                     <svg><use href="#i-sliders" /></svg>高级设置<span
-                      >RngRun、重试与流量</span
+                      >RngRun、附加 CLI</span
                     >
                   </summary>
                   <div class="advanced-content">
@@ -440,7 +476,8 @@
                       aria-label="Profile 源码"
                     ></textarea>
                     <p class="field-hint">
-                      修改应用于本次实验的独立副本。表单中的链路与节点间选项会覆盖源码同名设置，预览显示最终值。
+                      修改应用于本次实验的独立副本。表单中显式填写的参数会覆盖源码和附加
+                      CLI 的同名设置；留空时沿用原值，预览显示实际执行参数。
                     </p>
                     <button
                       id="apply-source"
@@ -521,6 +558,11 @@
                   ><strong id="effective-profile">—</strong>
                 </div>
               </div>
+              <div
+                id="effective-options"
+                class="effective-options"
+                aria-live="polite"
+              ></div>
               <div id="preview-notices" class="preview-notices" hidden></div>
             </section>
             <section class="panel results-panel" aria-labelledby="result-title">
@@ -637,6 +679,11 @@
                       <small>重传包 / 交换机丢包</small>
                     </div>
                   </div>
+                  <div
+                    id="control-results"
+                    class="control-results"
+                    hidden
+                  ></div>
                   <div class="result-footnote">
                     <span id="run-timing"></span
                     ><span id="run-identifier" class="mono"></span>

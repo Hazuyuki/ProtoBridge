@@ -9,6 +9,9 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .options import (ALGORITHMS, COLLECTIVES, OPTION_GROUPS, TOPOLOGIES,
+                      TOPOLOGY_FIELDS, validate_configuration, validate_value)
+
 
 class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -24,6 +27,7 @@ class RunRequest(BaseModel):
     seed: int = Field(default=1, ge=1, le=2147483647, strict=True)
     timeout: int = Field(default=120, ge=1, le=300, strict=True)
     stack_overrides: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    op_overrides: dict[str, str] = Field(default_factory=dict)
     cli_overrides: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -77,6 +81,22 @@ CLI_FIELDS: dict[str, dict[str, Any]] = {
     "randWarmupNs": {"type": "int", "min": 0, "max": 10000000},
     "randMeasureNs": {"type": "int", "min": 1, "max": 10000000},
 }
+
+# The same controls and ranges drive the browser and HTTP validation.
+for _field in [*TOPOLOGY_FIELDS, *[item for group in OPTION_GROUPS for item in group["fields"] if item["target"] == "cli"]]:
+    CLI_FIELDS[_field["key"]] = (
+        {"choices": [choice["value"] for choice in _field["choices"]]}
+        if "choices" in _field else
+        {"type": _field["type"], "min": _field["min"], "max": _field["max"]}
+    )
+CLI_FIELDS.update({
+    "llrEnabled": {"type": "bool"}, "llrMode": {"choices": ["gobackn", "sack"]},
+    "fecN": {"type": "int", "min": 2, "max": 4096},
+    "fecK": {"type": "int", "min": 1, "max": 4095},
+    "fecT": {"type": "int", "min": 0, "max": 2047},
+    "fecEncodeLatency": {"type": "int", "min": 0, "max": 1000000000},
+    "fecDecodeLatency": {"type": "int", "min": 0, "max": 1000000000},
+})
 
 PRESETS = {
     "h200-ring-allreduce.cfg": ("Ring AllReduce", "单节点归约，H200 / NVLink", "collective", {}),
@@ -136,21 +156,7 @@ def validate_cli(values: dict[str, Any]) -> dict[str, str]:
             raise ValueError(f"不支持 CLI 参数 {key}；硬件和协议参数请在配置中编辑。")
         field = CLI_FIELDS[key]
         text = scalar(value)
-        if "choices" in field:
-            if text not in field["choices"]:
-                raise ValueError(f"{key} 可选值：{', '.join(field['choices'])}")
-        elif field["type"] == "bool":
-            if text not in {"0", "1", "true", "false"}:
-                raise ValueError(f"{key} 需要 0 或 1。")
-        else:
-            if field["type"] == "int" and not re.fullmatch(r"\d+", text):
-                raise ValueError(f"{key} 需要非负整数。")
-            try:
-                number = float(text)
-            except ValueError:
-                raise ValueError(f"{key} 需要数值。") from None
-            if not field["min"] <= number <= field["max"]:
-                raise ValueError(f"{key} 范围为 {field['min']}–{field['max']}。")
+        validate_value(key, text, field)
         result[key] = text
     return result
 
@@ -183,6 +189,9 @@ class Catalog:
         order = list(PRESETS)
         configs.sort(key=lambda c: order.index(c["id"]) if c["id"] in order else 100)
         return {"configs": configs, "cli_fields": CLI_FIELDS,
+                "options": {"collectives": COLLECTIVES, "algorithms": ALGORITHMS,
+                            "topologies": TOPOLOGIES, "topology_fields": TOPOLOGY_FIELDS,
+                            "groups": OPTION_GROUPS},
                 "profiles": [{"id": p.name, "text": p.read_text()} for p in sorted(self.profile_dir.glob("*.profile"))]}
 
     def prepare(self, request: RunRequest) -> dict[str, Any]:
@@ -191,6 +200,12 @@ class Catalog:
         config = parse_values(text, sections=True)
         if not config.get("op") or not config.get("stack", {}).get("profile"):
             raise ValueError("配置需要 [stack] profile 和非空 [op]。")
+        if request.op_overrides:
+            if set(request.op_overrides) - {"collective", "algorithm", "topology"}:
+                raise ValueError("操作覆盖只支持 collective、algorithm 和 topology。")
+            if "collective" not in config["op"] and set(request.op_overrides) & {"collective", "algorithm"}:
+                raise ValueError("传输 stencil 请保留 transfer.*；修改 collective 算法请先选择集合通信模板。")
+            config["op"].update({key: scalar(value) for key, value in request.op_overrides.items()})
         stack = config["stack"]
         profile_path = (self.repo/stack["profile"]).resolve()
         if request.profile_text is None:
@@ -220,7 +235,7 @@ class Catalog:
         cli = validate_cli(request.cli_overrides)
         if len(request.stack_overrides) > 80 or len(request.cli_overrides) > 80:
             raise ValueError("单次实验最多支持 80 项覆盖参数。")
-        ranks = request.num_nodes * request.gpus_per_node if request.num_nodes > 1 else request.num_gpus
+        ranks, settings, notices, topology_params = validate_configuration(config["op"], resolved, cli, request)
         for key in ["rootRank", "bgP2pSrc", "bgP2pDst"]:
             if key in cli and int(cli[key]) >= ranks:
                 raise ValueError(f"{key} 必须小于总 rank 数 {ranks}。")
@@ -230,7 +245,6 @@ class Catalog:
         stencil = "collective" not in op
         if stencil and not any(key.startswith("transfer.") for key in op):
             raise ValueError("[op] 需要 collective / algorithm，或 transfer.* 传输。")
-        notices = []
         if request.config_id == "h200-request-response.cfg" and stencil:
             notices.append("请求和响应大小由 transfer.*.bytes 决定；默认分别为 4 KiB 和 64 KiB。")
         if not stencil and any(k in stack for k in ["vcCredits", "vcCount", "flowControl"]):
@@ -238,10 +252,12 @@ class Catalog:
         if request.num_nodes > 1 and cli.get("interNodeTopology") and "interNodeTopology" in resolved:
             notices.append("[stack] interNodeTopology 会覆盖同名 CLI 选择；请以配置预览与结果为准。")
         summary = {"collective": "transfer stencil" if stencil else op.get("collective", ""),
-                   "algorithm": "stencil" if stencil else op.get("algorithm", "auto"),
+                   "algorithm": "stencil" if stencil else op.get("algorithm", "ring"),
                    "topology": op.get("topology", "ring"), "ranks": ranks,
                    "num_nodes": request.num_nodes, "gpus_per_node": request.gpus_per_node,
                    "data_size": request.data_size, "stencil": stencil,
+                   "settings": settings, "topology_params": topology_params,
+                   "intra_node_topology": cli.get("intraNodeTopology", "switched"),
                    "inter_node_topology": resolved.get("interNodeTopology", cli.get("interNodeTopology", "fullmesh")),
                    "inter_node_bandwidth_gbps": resolved.get("interNodeBandwidthGbps", "400"),
                    "inter_node_latency_ns": resolved.get("interNodeLatencyNs", "10000"),
@@ -255,6 +271,10 @@ class Catalog:
         stack["profile"] = "profile.profile"
         rendered = "\n\n".join("["+section+"]\n"+"\n".join(f"{k} = {v}" for k, v in config[section].items())
                                for section in ["stack", "op"])+"\n"
+        title = selected["title"]
+        if request.op_overrides and not stencil:
+            label = next(item["label"] for item in COLLECTIVES if item["value"] == op["collective"])
+            title = f"{label} · {op.get('algorithm', 'ring')}"
         return {"config": rendered, "profile": profile_text, "resolved": resolved,
                 "summary": summary, "notices": notices, "cli": cli,
-                "title": request.name.strip() or selected["title"]}
+                "title": request.name.strip() or title}

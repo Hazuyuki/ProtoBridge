@@ -27,11 +27,13 @@ requires authentication and stronger per-user process isolation.
 
 1. Choose collective communication, a multi-node network, or a transfer stencil.
    The configuration selector reads all eleven shipped `.cfg` files.
-2. Set rank count, application bytes per rank, and optional link overrides. The
-   preview resolves the profile and `[stack]` values before the run.
-3. For custom experiments, edit or import `.cfg` and `.profile` text. Advanced
-   settings accept validated CLI parameters as a JSON object; the page lists the
-   available parameters and ranges.
+2. Choose the collective, algorithm, and physical topology independently. Set
+   rank count, application bytes per rank, and optional link overrides. The
+   preview resolves the profile, `[stack]`, and `[op]` values before the run.
+3. Open the flow-control, error-injection, or recovery sections to change native
+   parameters without editing JSON. For custom experiments, edit or import
+   `.cfg` and `.profile` text; the advanced section still accepts validated CLI
+   parameters as JSON.
 4. Run the simulation. The page polls queued/running/terminal state, displays
    the native `RESULT_START`/`RESULT_END` fields, and retains stdout/stderr.
 5. Inspect step-completion timestamps, reload an experiment's inputs, compare
@@ -54,6 +56,46 @@ The timing panel uses actual `stepTraceFile` records when the selected injector
 produces them. A point is a completion time relative to `collectiveStartNs`;
 it is not a per-step duration. Scenes without trace rows display an empty state.
 Incomplete/failed/cancelled runs are excluded from completed-latency comparisons.
+
+## Optional configuration
+
+The form reads its choices, descriptions, and numeric ranges from the backend.
+Explicit form values override the corresponding source/advanced-CLI values;
+blank fields retain them. The preview shows the resolved settings, including
+LLR forced on by the native Ethernet/lossy-RoCE/PFC-headroom path. Saved runs
+restore both operation overrides and protocol parameters.
+
+| Section | Choices |
+| --- | --- |
+| Collective | AllReduce, AllGather, ReduceScatter, AllToAll, Broadcast, Reduce; compatible Ring, Tree, Full mesh, NVLS/SHARP, Hierarchical, NCCL pipelined ring, and Auto paths |
+| Physical topology | 14 native topologies, including Ring, Full mesh, NVSwitch, Fat-tree, Rail fat-tree, Leaf–spine, NVL72, Torus, Mesh, Hypercube, 2D full mesh, three-level, Dragonfly+, and Multi-plane |
+| Multi-node topology | Eight inter-node choices, intra-node NVSwitch/Full mesh, and topology-specific dimensions |
+| Flow control | Per-VC credits, So transmit window, VOQ depth/drop threshold, PFC static/dynamic/quanta modes and headroom, DCQCN/ECN, RTTCC, per-QP rate ceiling |
+| Error injection | Uniform or per-tier BER, independent/burst errors, random packet loss, codeword and burst parameters |
+| Recovery | FEC enable/scope and RS parameters, LLR enable, Go-back-N/SACK, retry count/timeout/buffer/overflow, timeout retransmission, strict So GBN |
+| Link failure | Optical Leaf–spine link removal and native failure-aware routing |
+
+The form supplies editable dimensions when selecting a topology. Torus, Mesh,
+Hypercube, and 2D full mesh derive the actual rank count from those dimensions.
+NVLS/SHARP require single-node NVSwitch; hierarchical algorithms require node
+groups. AllToAll's non-hierarchical choices share `AlltoAllInjector` (CollNet
+names are aliases). Invalid FEC tuples and PFC/ECN/drop-threshold orderings are
+rejected before a process starts.
+
+Use **0.1% packet loss + SACK** in the error section for a small loss experiment.
+It sets 4 KiB bulk packets, selective retry, a 200 µs retransmission timeout,
+and sufficient credits; multi-node runs also receive a 64-chunk send window.
+**No errors** clears global and tier BERs and random packet loss. Uniform BER
+overrides inherited tiers; explicit tier fields can then specialize it.
+
+`flowControl=window/rate` are unimplemented native policy seams, so the form uses
+the implemented So TX window and rate machines instead. The native multi-rack
+`2dfullmeshclos` builder still lacks complete routing and is not offered as a
+working topology. Burst experiments require FEC off and a positive uniform BER:
+the native FEC receive path uses its own independent-error decode model.
+
+FEC enable/disable is honored by both the profile bundle and the delegated
+native path. Rebuild `gpu-cluster-sim` after pulling this change.
 
 ## Storage and execution
 
@@ -94,12 +136,17 @@ options are `--repo` and `--data-dir`.
 python -m pip install -r webui/requirements-dev.txt
 python -m pytest webui/tests -q
 node --check webui/static/app.js
+node --check webui/static/options.js
 ```
 
 The API tests cover input validation, immutable snapshots, result-block parsing,
 failure/incomplete status, cancellation, timeout, queue continuation, trace
 semantics, restart persistence, downloads, and CSV export. They use an explicitly
 fake executable to exercise exceptional paths without expensive simulations.
+`test_native_options.py` additionally checks real FEC toggling, collective
+selection, optical link removal, and recovery under random loss; it is skipped
+when the simulator has not been built. The native `gpu-cluster` suite also
+checks the profile's FEC switch.
 
 The HTTP API is documented at `/docs` while the server is running. The interface
 does not build or modify the simulator automatically; rebuild `gpu-cluster-sim`

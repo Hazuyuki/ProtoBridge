@@ -35,6 +35,8 @@ const state = {
   scene: "collective",
   config: null,
   baseStack: {},
+  baseOp: {},
+  controls: null,
   ready: false,
   preview: null,
   previewVersion: 0,
@@ -148,6 +150,7 @@ function loadConfig(id, request = null, copyName = true) {
   $("profile-editor").value = request?.profile_text ?? config.profile_text;
   const defaults = { ...config.defaults, ...request };
   state.baseStack = { ...(defaults.stack_overrides || {}) };
+  state.baseOp = { ...(defaults.op_overrides || {}) };
   $("num-gpus").value = defaults.num_gpus ?? 8;
   $("num-nodes").value = defaults.num_nodes > 1 ? defaults.num_nodes : 2;
   $("gpus-per-node").value = defaults.gpus_per_node ?? 4;
@@ -171,6 +174,12 @@ function loadConfig(id, request = null, copyName = true) {
     state.baseStack.interNodeTopology ||
     config.text.match(/^interNodeTopology\s*=\s*(\w+)/m)?.[1] ||
     "fullmesh";
+  state.controls.reset(defaults);
+  $("cli-json").value = JSON.stringify(
+    state.controls.extraCli(defaults.cli_overrides),
+    null,
+    2,
+  );
   formError();
   updateLocalLabels();
   refreshPreview();
@@ -214,7 +223,7 @@ function requestBody() {
     stack.interNodeFabricType = $("inter-fabric").value;
     stack.interNodeTopology = $("inter-topology").value;
   }
-  return {
+  return state.controls.apply({
     name: $("run-name").value.trim(),
     config_id: state.config.id,
     config_text: $("config-editor").value,
@@ -228,8 +237,9 @@ function requestBody() {
     seed: Number($("seed").value),
     timeout: Number($("timeout").value),
     stack_overrides: stack,
+    op_overrides: { ...state.baseOp },
     cli_overrides: cli,
-  };
+  });
 }
 async function refreshPreview() {
   if (!state.config) return;
@@ -241,6 +251,13 @@ async function refreshPreview() {
     });
     if (version !== state.previewVersion) return;
     state.preview = result;
+    state.controls.update(result.summary);
+    if (
+      state.scene !== "multinode" &&
+      result.summary.ranks !== Number($("num-gpus").value)
+    ) {
+      $("num-gpus").value = result.summary.ranks;
+    }
     document.querySelector('label[for="data-size"]').textContent = result
       .summary.stencil
       ? "dataSize 输入参数"
@@ -276,6 +293,7 @@ async function refreshPreview() {
   }
 }
 function schedulePreview() {
+  state.controls?.sync();
   updateLocalLabels();
   clearTimeout(previewTimer);
   previewTimer = setTimeout(refreshPreview, 350);
@@ -297,7 +315,7 @@ function renderTopology(summary) {
     for (let n = 0; n < shown; n++) {
       const x = start + n * (boxWidth + gap),
         center = x + boxWidth / 2;
-      svg += `<rect x="${x}" y="32" width="${boxWidth}" height="201" rx="10" fill="#ffffffeb" stroke="#dfe7f2"/><text x="${x + 16}" y="55" font-size="9" fill="#8597b1">NODE ${n}</text><text x="${center}" y="197" text-anchor="middle" font-size="9" fill="#8498b8">NVLink / NVSwitch</text>`;
+      svg += `<rect x="${x}" y="32" width="${boxWidth}" height="201" rx="10" fill="#ffffffeb" stroke="#dfe7f2"/><text x="${x + 16}" y="55" font-size="9" fill="#8597b1">NODE ${n}</text><text x="${center}" y="197" text-anchor="middle" font-size="9" fill="#8498b8">NVLink / ${summary.intra_node_topology === "fullmesh" ? "Full mesh" : "NVSwitch"}</text>`;
       const visible = Math.min(summary.gpus_per_node, 4);
       for (let g = 0; g < visible; g++) {
         const gx = visible > 2 ? center + (g % 2 ? 32 : -32) : center;
@@ -465,6 +483,42 @@ function renderSelected() {
     `端点接收 ${number(result.endpointRxPackets)}`;
   $("metric-retries").textContent = number(result.retransmittedPackets);
   $("metric-drops").textContent = `/ ${number(result.switchDroppedPackets)}`;
+  const settings = run.summary.settings || {};
+  const enabled = (key) => ["1", "true"].includes(String(settings[key]));
+  const controlResults = [];
+  if (Number(settings.switchPfcMode) > 0 || result.pfcPausesSent > 0) {
+    controlResults.push(
+      ["PFC PAUSE", result.pfcPausesSent],
+      ["PFC RESUME", result.pfcResumesSent],
+    );
+  }
+  if (enabled("dcqcn") || result.ecnMarkedPackets > 0) {
+    controlResults.push(
+      ["ECN 标记", result.ecnMarkedPackets],
+      ["CNP 反馈", result.cnpPacketsReceived],
+    );
+  }
+  if (enabled("rttcc") || result.rttccRttSamples > 0)
+    controlResults.push(["RTT 采样", result.rttccRttSamples]);
+  if (enabled("llrEnabled") || result.permanentLosses > 0)
+    controlResults.push(["永久丢失", result.permanentLosses]);
+  if (enabled("fecEnabled") && !run.summary.stencil)
+    controlResults.push(
+      ["FEC 可纠正", result.fecCorrectable],
+      ["FEC 不可纠正", result.fecUncorrectable],
+    );
+  if (result.opticalInterSwitchLinks > 0)
+    controlResults.push([
+      "可用光链路",
+      `${result.operationalOpticalInterSwitchLinks} / ${result.opticalInterSwitchLinks}`,
+    ]);
+  $("control-results").hidden = active || !controlResults.length || !run.result;
+  $("control-results").innerHTML = controlResults
+    .map(
+      ([key, value]) =>
+        `<div><span>${esc(key)}</span><strong>${esc(typeof value === "number" ? number(value) : (value ?? "—"))}</strong></div>`,
+    )
+    .join("");
   $("run-timing").textContent =
     run.wall_seconds != null
       ? `程序运行 ${run.wall_seconds.toFixed(3)} s · RngRun=${run.request.seed}`
@@ -656,6 +710,9 @@ async function initialize() {
       api("/api/runs"),
     ]);
     state.catalog = catalog;
+    state.controls = new SimulationOptions(catalog.options, () => ({
+      multi: state.scene === "multinode",
+    }));
     state.runs = list.runs;
     renderEngine(engine);
     setScene("collective");
