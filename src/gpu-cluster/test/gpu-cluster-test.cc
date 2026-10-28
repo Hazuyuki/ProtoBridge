@@ -3636,6 +3636,13 @@ class ProtocolProfileBundleTest : public TestCase
                               "credit-based flow control selected");
         NS_TEST_ASSERT_MSG_EQ(b.llrEnabled, false, "LLR disabled for H200 NVLink");
         NS_TEST_ASSERT_MSG_EQ(b.llrMode, "gobackn", "GBN retry mode");
+        NS_TEST_ASSERT_MSG_EQ(b.fec->IsEnabled(), true, "FEC defaults to enabled");
+        profile.Set("fecEnabled", "0");
+        ProtocolBundle disabled = profile.Build();
+        NS_TEST_ASSERT_MSG_EQ(disabled.fec->IsEnabled(), false,
+                              "profile switch disables FEC on stencil endpoints");
+        NS_TEST_ASSERT_MSG_EQ(disabled.fec->GetEncodedSize(1024), 1024u,
+                              "disabled FEC has no wire expansion");
     }
 };
 

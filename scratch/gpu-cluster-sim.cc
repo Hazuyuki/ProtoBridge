@@ -797,6 +797,13 @@ main(int argc, char* argv[])
         applyU32(fecT, "fecT");
         applyU64(fecEncodeLatencyNs, "fecEncodeLatencyNs");
         applyU64(fecDecodeLatencyNs, "fecDecodeLatencyNs");
+        {
+            const std::string s = prof.Get("fecEnabled", "");
+            if (!s.empty()) fecEnabled = (s == "1" || s == "true");
+            // ApplyBundle later installs this FEC instance on stencil
+            // endpoints. Preserve the resolved CLI/profile switch there too.
+            if (pbundle.fec) pbundle.fec->SetEnabled(fecEnabled);
+        }
         // Link BER.
         applyD(berIntraNodeElectrical, "berIntraNodeElectrical");
         applyD(berIntraRackElectrical, "berIntraRackElectrical");

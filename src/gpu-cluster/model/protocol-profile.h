@@ -13,6 +13,7 @@
  *   protocolModel           TypeId string, e.g. "ns3::NcclProtocolModel"
  *   forceProtocol           0=auto, else a protocol id
  *   fecN / fecK / fecT      FEC codeword params (RS-style)
+ *   fecEnabled              0/1, enable FEC (default 1)
  *   fecEncodeLatencyNs      per-codeword encode latency
  *   fecDecodeLatencyNs      per-codeword decode latency
  *   vcCount                 number of virtual channels to initialize

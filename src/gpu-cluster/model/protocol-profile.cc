@@ -30,7 +30,7 @@ NS_LOG_COMPONENT_DEFINE("ProtocolProfile");
 // Reserved keys that Build() consumes directly (not forwarded as attributes).
 static const char* RESERVED[] = {
     "protocolModel", "forceProtocol",
-    "fecN", "fecK", "fecT",
+    "fecN", "fecK", "fecT", "fecEnabled",
     "fecEncodeLatencyNs", "fecDecodeLatencyNs",
     "vcCount", "vcCredits",
     "berIntraNodeElectrical", "berIntraRackElectrical", "berInterRackOptical",
@@ -206,6 +206,8 @@ ProtocolProfile::Build() const
     uint64_t decNs = std::stoul(Get("fecDecodeLatencyNs", "80"));
     fec->SetEncodeLatency(NanoSeconds(encNs));
     fec->SetDecodeLatency(NanoSeconds(decNs));
+    const std::string fecEnabled = Get("fecEnabled", "1");
+    fec->SetEnabled(fecEnabled == "1" || fecEnabled == "true");
     b.fec = fec;
 
     // --- Credit manager ---------------------------------------------------
