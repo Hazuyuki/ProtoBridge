@@ -9133,6 +9133,7 @@ class EthernetSwitchPfcHarness : public EthernetSwitch
     }
     EthernetSwitchPfcHarness() = default;
     using EthernetSwitch::OnPacketEnqueue; // public on the base already; keep parity
+    using EthernetSwitch::RecheckPfcPauseForTest; // drive the mode-3 re-latch
     /// Drive the full admission path exactly as EnqueueToVoq would (the
     /// pre-push congestion hook + the VOQ push), minus port bookkeeping.
     bool Admit(Ptr<Packet> p, uint32_t outPort, uint32_t inPort)
@@ -9251,6 +9252,140 @@ class EthernetSwitchPfcTriggerTest : public TestCase
             NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 64), true,
                                   "mode 2 at depth 64: pause fires");
             NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 1u, "dynamic pause fired");
+            sw->Dispose();
+        }
+        Simulator::Destroy();
+    }
+};
+
+// PFC headroom (XOFF in-flight absorption, ns3-rdma m_pg_hdrm_limit analog):
+// while a hop is PAUSE-latched, data admissions draw a finite per-hop budget;
+// exhaustion drops + NACKs. The budget resets at each fresh latch, control /
+// retry bypass the gate, and headroom=0 keeps the legacy unbounded admission
+// (byte-identical default).
+class PfcHeadroomBudgetTest : public TestCase
+{
+  public:
+    PfcHeadroomBudgetTest()
+        : TestCase("EthernetSwitch PFC headroom budget (XOFF in-flight absorption)")
+    {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        auto makeSwitch = []() {
+            NodeContainer nodes;
+            nodes.Create(2);
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes.Get(0), nodes.Get(1));
+            Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+            nodes.Get(0)->AddDevice(sw);
+            sw->AddPort(devs.Get(0));
+            return sw;
+        };
+        auto makeEthData = []() {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0);
+            fh.SetSourceRank(1);
+            fh.SetDestRank(0);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            pkt->AddHeader(fh);
+            return pkt;
+        };
+
+        // (1) Default 0 = off: admission while paused is unbounded (legacy).
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            sw->SetAttribute("PfcMode", UintegerValue(1));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(10));
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 10), true,
+                                  "threshold crossing admits + latches a pause");
+            NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 0), true, "pause latched");
+            for (int i = 0; i < 1000; i++)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 10 + i),
+                                      true,
+                                      "headroom 0 = legacy unbounded admission");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 0u,
+                                  "headroom 0 must never drop on the budget");
+            sw->Dispose();
+        }
+
+        // (2) Finite budget: exactly N admissions after the latch, then
+        // drop + NACK. Control and retry packets bypass (feedback must flow
+        // even at exhaustion).
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            sw->SetAttribute("PfcMode", UintegerValue(1));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(10));
+            sw->SetAttribute("PfcHeadroomChunks", UintegerValue(4));
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 10), true,
+                                  "the latch-triggering packet itself admits");
+            for (int i = 0; i < 4; i++)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), true,
+                                      "in-budget admission while paused");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 0u, "budget not yet spent");
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), false,
+                                  "budget exhausted: drop");
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), false,
+                                  "and stays dropped while paused");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 2u,
+                                  "each over-budget admission counts a drop");
+            // Control bypasses the budget even at exhaustion.
+            Ptr<Packet> ctrl = Create<Packet>(16);
+            FabricHeader cfh;
+            cfh.SetPacketType(FabricPacketType::CREDIT);
+            cfh.SetFabricType(FabricType::ETHERNET);
+            ctrl->AddHeader(cfh);
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(ctrl, 0, 0, 11), true,
+                                  "control bypasses the headroom budget");
+            sw->Dispose();
+        }
+
+        // (3) Budget resets at a fresh latch (each XOFF in flight owns its
+        // own absorption window), e.g. after a mode-3 re-PAUSE.
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            sw->SetAttribute("PfcMode", UintegerValue(3));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(10));
+            sw->SetAttribute("PfcPauseTime", UintegerValue(5));
+            sw->SetAttribute("PfcHeadroomChunks", UintegerValue(3));
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 10), true,
+                                  "latch");
+            for (int i = 0; i < 3; i++)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), true,
+                                      "spend the budget");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), false,
+                                  "exhausted");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 1u, "one drop");
+            // The re-check with a (here synthetic-empty) real VOQ drains: it
+            // unlatches AND retires the spent budget (both reset sites).
+            sw->RecheckPfcPauseForTest(0, 0, 0);
+            NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 0), false,
+                                  "drained re-check lifts the pause");
+            // Re-crossing the threshold latches a FRESH pause cycle — which
+            // owns a FRESH budget (an XOFF in flight is a new absorption
+            // window, not a continuation of the old one).
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), true,
+                                  "re-crossing re-PAUSEs and admits");
+            for (int i = 0; i < 3; i++)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), true,
+                                      "fresh latch = fresh budget");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), false,
+                                  "exhausts again at the same size");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 2u, "second cycle's drop");
             sw->Dispose();
         }
         Simulator::Destroy();
@@ -14925,6 +15060,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
 
     // PFC (802.1Qbb-style) opt-in congestion arm.
     AddTestCase(new EthernetSwitchPfcTriggerTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcHeadroomBudgetTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcEndpointHoldTest, TestCase::Duration::QUICK);
 
     // Codex round 26 regressions.

@@ -143,6 +143,32 @@ at this workload, same as ProtoBridge.)
    threshold. ProtoBridge has no DCQCN arm; its PFC is the only
    congestion backpressure, and (as the controls show) it does not
    change the transfer time.
+5. **XOFF in-flight absorption (headroom).** ns3-rdma's SwitchMmu keeps
+   a dedicated ingress headroom (`m_pg_hdrm_limit` = 100 cells = 103 KB
+   in the mix config) so the data still in flight when the XOFF leaves
+   the switch — link RTT plus the source's already-serialized burst —
+   has somewhere to land under PFC's no-drop contract (credit-based
+   fabrics never oversend; lossy fabrics drop instead). ProtoBridge's
+   original semantics admitted unbounded toward the VOQ hard cap while
+   a hop was paused, which is behaviorally an infinite headroom.
+   `--pfcHeadroomChunks` (EthernetSwitch attribute
+   `PfcHeadroomChunks`, default 0 = legacy unbounded) now models the
+   budget explicitly: while a hop is PAUSE-latched, each post-XOFF data
+   admission draws the per-hop budget; exhaustion drops with a NACK
+   (the "ingress headroom full" analog) and the LLR/SACK path
+   retransmits — with a finite headroom the sim forces `llrEnabled=1`
+   exactly like the lossy tail-drop regime, because a silent drop in a
+   lossless fabric is unrecoverable. Verified on the matched workload:
+   headroom ≥ 12 chunks is FCT-identical to the legacy (21.899-ms
+   PFC-off / 24.378-ms mode-3 values, byte-identical counters) — the
+   budget simply never exhausts at this BDP, which reproduces ns3-rdma's
+   PFC-invariance; headroom 10 chunks exhausts (99k drops) and completes
+   only via 536k LLR retransmissions (115.3 ms) — the drop+retry cost
+   of an undersized headroom. This closes the mechanism inventory: the
+   earlier "PB lacks headroom" hypothesis for the mode-3 residual is
+   disproven (the residual is quanta quantization, threshold vs quanta
+   sizing), and the knob's value is mechanism isomorphism with
+   `m_pg_hdrm_limit`, not FCT.
 
 ## Reproduction
 
@@ -156,4 +182,7 @@ at this workload, same as ProtoBridge.)
   --collective=incast --numNodes=3 --interNodeBandwidth=40
   --interNodeLatency=1000 --dataSize=50000000 --bulkChunkSize=1000
   --switchPfcMode=3 --pfcPauseThreshold=20 --pfcPauseTime=5
-  --pfcResumeOffset=8` and the mode-1 / 9000-B variants.
+  --pfcResumeOffset=8` and the mode-1 / 9000-B variants. The headroom
+  control adds `--soTxWindow=64 --pfcHeadroomChunks=<N>`
+  (0 = legacy, ≥12 = ns3-rdma-like never-exhausts at this BDP, 10 =
+  undersized: drop + LLR retransmit recovery).

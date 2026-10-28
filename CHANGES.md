@@ -6,6 +6,52 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Added — PFC headroom (XOFF in-flight absorption, the ns3-rdma m_pg_hdrm_limit analog): `--pfcHeadroomChunks`
+
+**What.** 802.1Qbb PFC's no-drop contract requires the switch to buffer
+everything still in flight when the XOFF leaves — the link RTT's worth of
+data plus the source's already-serialized burst. ns3-rdma's SwitchMmu
+accounts for this with a dedicated ingress headroom (`m_pg_hdrm_limit` =
+100 cells = 103 KB in the mix config); ProtoBridge's original semantics
+admitted unbounded toward the VOQ hard cap while a hop was paused —
+behaviorally an infinite headroom. `--pfcHeadroomChunks N` (EthernetSwitch
+attribute `PfcHeadroomChunks`, default 0 = legacy unbounded admission,
+byte-identical to before) makes the budget explicit: while a hop is
+PAUSE-latched, each post-XOFF data admission draws the per-hop budget
+(the threshold-crossing packet that triggered the XOFF does not — it is
+admitted to the shared buffer in ns3-rdma's model); exhausting the budget
+drops with a NACK back to the source (the "ingress headroom full" analog)
+and the LLR/SACK path retransmits. The budget resets at every fresh latch
+(including mode-3's RecheckPfcPause re-PAUSE — a new XOFF in flight is a
+new absorption window) and is retired at RESUME. Control and retry
+packets bypass the budget, same exemption as every other congestion
+hook. A new `pfcHeadroomDrops` RESULT counter reports the exhaustion
+count (summed over EthernetSwitches).
+
+**Safety wiring.** A finite headroom makes the fabric lossy in a specific
+way (the headroom-full drop), so gpu-cluster-sim forces `llrEnabled=1`
+when `--switchPfcMode>0` and `--pfcHeadroomChunks>0` — exactly like the
+lossy tail-drop regime — because a drop without the NACK→LLR/SACK
+retransmit backstop is a silent permanent loss in an otherwise-lossless
+fabric (verified: headroom 10 with LLR off stalls `incomplete` with
+`retransmittedPackets=0`; with LLR armed the same run completes).
+
+**Verified on the 2:1 incast alignment workload** (50 MB, 1000-B chunks,
+mode 3 thr=20 quanta 5µs, soTxWindow=64): headroom ≥ 12 chunks is
+FCT-identical to legacy (21.899/24.378 ms, byte-identical pause/resume
+counters) — the budget never exhausts at this BDP, reproducing
+ns3-rdma's PFC-invariance; headroom 10 exhausts (99,103 drops) and
+completes at 115.3 ms via 535,648 LLR retransmissions — the drop+retry
+cost of an undersized headroom. This also DISPROVES the "PB lacks
+headroom" hypothesis for the mode-3 FCT residual: the residual is quanta
+quantization (FCT scales monotonically with the quanta), not missing
+absorption budget. Default-0 keeps every existing run byte-identical:
+mode-1 thr=20 = 23.604 ms, 9000-B rows = 21.153216 ms, all 15 parity
+scripts 0 FAIL, gpu-cluster EXTENSIVE 188/188 PASS, surrogate pytest
+101 passed. New regression test `EthernetSwitch PFC headroom budget
+(XOFF in-flight absorption)` pins the budget accounting (default-0
+unbounded, finite budget + NACK drop, control bypass, fresh-latch reset).
+
 ### Fixed — the 2:1 incast stall the cut-through fix unmasked: soTxWindow inert without LLR, and the ACK-clocked window deadlocked with LLR off
 
 **The regression.** After the cut-through accounting fix (next section),
