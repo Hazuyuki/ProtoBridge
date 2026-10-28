@@ -11,10 +11,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .catalog import RunRequest
+from .i18n import canonical_message, catalog_labels, run_labels
 from .simulation import SimulationService, TERMINAL, git_identity
 
 STATIC = Path(__file__).parent/"static"
@@ -34,17 +38,30 @@ def create_app(repo: Path | None = None, data_dir: Path | None = None, binary: P
 
     application = FastAPI(title="ProtoBridge Web Lab", version="0.1.0", lifespan=lifespan)
 
+    @application.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, error: StarletteHTTPException):
+        detail = canonical_message(error.detail) if isinstance(error.detail, str) else error.detail
+        return JSONResponse({"detail": detail}, status_code=error.status_code, headers=error.headers)
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, error: RequestValidationError):
+        issues = error.errors()
+        for issue in issues:
+            message = issue["msg"]
+            issue["msg"] = canonical_message(message.removeprefix("Value error, "))
+        return JSONResponse({"detail": jsonable_encoder(issues)}, status_code=422)
+
     @application.middleware("http")
     async def request_policy(request: Request, call_next):
         if request.method in {"POST", "PUT", "DELETE"}:
             origin = request.headers.get("origin")
             if origin and urlsplit(origin).netloc != request.headers.get("host"):
-                return JSONResponse({"detail": "请从当前网页提交任务。"}, status_code=403)
+                return JSONResponse({"detail": "Submit jobs from the current WebUI origin."}, status_code=403)
             try:
                 if int(request.headers.get("content-length", "0")) > 200000:
-                    return JSONResponse({"detail": "请求超过 200 KB。"}, status_code=413)
+                    return JSONResponse({"detail": "The request exceeds 200 KB."}, status_code=413)
             except ValueError:
-                return JSONResponse({"detail": "无效的请求长度。"}, status_code=400)
+                return JSONResponse({"detail": "Invalid request length."}, status_code=400)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
@@ -73,18 +90,21 @@ def create_app(repo: Path | None = None, data_dir: Path | None = None, binary: P
 
     @application.get("/api/catalog")
     async def catalog():
-        return service().catalog.listing()
+        return catalog_labels(service().catalog.listing())
 
     @application.post("/api/preview")
     async def preview(body: RunRequest):
         try:
-            return service().catalog.prepare(body)
+            prepared = service().catalog.prepare(body)
+            return {**prepared,
+                    "title": prepared["title"] if body.name.strip() else canonical_message(prepared["title"]),
+                    "notices": [canonical_message(message) for message in prepared["notices"]]}
         except ValueError as error:
             raise HTTPException(422, str(error)) from None
 
     @application.get("/api/runs")
     async def runs():
-        return {"runs": service().summaries()}
+        return {"runs": [run_labels(run, service().jobs[run["id"]]) for run in service().summaries()]}
 
     @application.get("/api/runs/export.csv")
     async def export_csv():
@@ -94,7 +114,7 @@ def create_app(repo: Path | None = None, data_dir: Path | None = None, binary: P
     @application.post("/api/runs", status_code=202)
     async def submit(body: RunRequest):
         try:
-            return service().submit(body)
+            return run_labels(service().submit(body))
         except ValueError as error:
             raise HTTPException(422, str(error)) from None
         except RuntimeError as error:
@@ -104,12 +124,12 @@ def create_app(repo: Path | None = None, data_dir: Path | None = None, binary: P
 
     @application.get("/api/runs/{identifier}")
     async def get_run(identifier: str):
-        return job(identifier)
+        return run_labels(job(identifier))
 
     @application.post("/api/runs/{identifier}/cancel")
     async def cancel(identifier: str):
         job(identifier)
-        return await service().cancel(identifier)
+        return run_labels(await service().cancel(identifier))
 
     @application.get("/api/runs/{identifier}/trace")
     async def trace(identifier: str):
@@ -153,7 +173,9 @@ def create_app(repo: Path | None = None, data_dir: Path | None = None, binary: P
     @application.get("/")
     async def index():
         html = (STATIC/"index.html").read_text()
-        for token, filename in [("STYLES_VERSION", "styles.css"), ("OPTIONS_VERSION", "options.js"), ("APP_VERSION", "app.js")]:
+        for token, filename in [("STYLES_VERSION", "styles.css"), ("OPTIONS_VERSION", "options.js"),
+                                ("APP_VERSION", "app.js"), ("I18N_VERSION", "i18n.js"),
+                                ("LOCALES_VERSION", "locales.json")]:
             version = hashlib.sha256((STATIC/filename).read_bytes()).hexdigest()[:12]
             html = html.replace("__"+token+"__", version)
         return HTMLResponse(html)

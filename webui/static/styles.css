@@ -188,6 +188,37 @@ textarea:focus {
   align-items: center;
   gap: 23px;
 }
+.language-switch {
+  display: flex;
+  flex-shrink: 0;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #f6f8fc;
+}
+.language-switch button {
+  min-width: 38px;
+  min-height: 30px;
+  border: 0;
+  border-radius: 4px;
+  padding: 5px 8px;
+  background: transparent;
+  color: #66768d;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.language-switch button[aria-pressed="true"] {
+  color: var(--blue);
+  background: #fff;
+  box-shadow: 0 1px 3px #25385815;
+}
+.field label > span.i18n-text,
+.advanced summary > span.i18n-text {
+  color: inherit;
+  font: inherit;
+  margin-left: 0;
+}
 .branch {
   font: 10px var(--mono);
   color: #7b8799;
@@ -1800,7 +1831,19 @@ dialog::backdrop {
   }
   .topbar {
     padding: 0 18px;
-    height: 67px;
+    min-height: 100px;
+    height: auto;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+  .topbar-right {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .wordmark > span {
+    display: inline;
   }
   .wordmark {
     font-size: 20px;

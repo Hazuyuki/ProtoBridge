@@ -1,16 +1,24 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#f6f7f9" />
     <meta
       name="description"
-      content="ProtoBridge 互联通信仿真实验室：选择配置、运行 ns-3、查看交付时长与运行记录。"
+      content="ProtoBridge interconnect simulation: configure a scenario, run ns-3, and inspect delivery times and run history."
+      data-i18n-content="ProtoBridge interconnect simulation: configure a scenario, run ns-3, and inspect delivery times and run history."
     />
-    <title>ProtoBridge · 互联仿真实验室</title>
+    <title data-i18n="ProtoBridge · Interconnect Simulator">
+      ProtoBridge · Interconnect Simulator
+    </title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/styles.css?v=__STYLES_VERSION__" />
+    <script
+      src="/static/i18n.js?v=__I18N_VERSION__"
+      data-catalog="/static/locales.json?v=__LOCALES_VERSION__"
+      defer
+    ></script>
     <script src="/static/options.js?v=__OPTIONS_VERSION__" defer></script>
     <script src="/static/app.js?v=__APP_VERSION__" defer></script>
   </head>
@@ -64,24 +72,41 @@
         </symbol>
       </defs>
     </svg>
-    <a class="skip-link" href="#config-panel">跳转到实验配置</a>
-    <aside class="rail" aria-label="主导航">
-      <a href="#" class="brand-mark" aria-label="ProtoBridge 首页"
+    <a
+      class="skip-link"
+      href="#config-panel"
+      data-i18n="Skip to experiment setup"
+      >Skip to experiment setup</a
+    >
+    <aside
+      class="rail"
+      aria-label="Main navigation"
+      data-i18n-aria-label="Main navigation"
+    >
+      <a
+        href="#"
+        class="brand-mark"
+        aria-label="ProtoBridge home"
+        data-i18n-aria-label="ProtoBridge home"
         ><img src="/static/favicon.svg" alt="" width="36" height="36"
       /></a>
       <nav>
         <a
           class="rail-button selected"
           href="#workspace"
-          aria-label="仿真工作区"
-          title="仿真工作区"
+          aria-label="Simulation workspace"
+          title="Simulation workspace"
+          data-i18n-aria-label="Simulation workspace"
+          data-i18n-title="Simulation workspace"
           ><svg><use href="#i-grid" /></svg
         ></a>
         <a
           class="rail-button"
           href="#history"
-          aria-label="运行记录"
-          title="运行记录"
+          aria-label="Run history"
+          title="Run history"
+          data-i18n-aria-label="Run history"
+          data-i18n-title="Run history"
           ><svg><use href="#i-clock" /></svg
         ></a>
       </nav>
@@ -89,8 +114,10 @@
         class="rail-button rail-help"
         type="button"
         data-help
-        aria-label="使用帮助"
-        title="使用帮助"
+        aria-label="Help"
+        title="Help"
+        data-i18n-aria-label="Help"
+        data-i18n-title="Help"
       >
         <svg><use href="#i-help" /></svg>
       </button>
@@ -102,25 +129,75 @@
           >ProtoBridge<span>NICS-EFC</span></a
         >
         <div class="topbar-right">
+          <div
+            class="language-switch"
+            role="group"
+            aria-label="Language"
+            data-i18n-aria-label="Language"
+          >
+            <button
+              type="button"
+              data-language="en"
+              lang="en"
+              aria-label="English"
+              aria-pressed="true"
+            >
+              EN
+            </button>
+            <button
+              type="button"
+              data-language="zh"
+              lang="zh-CN"
+              aria-label="中文"
+              aria-pressed="false"
+            >
+              中文
+            </button>
+          </div>
           <span class="branch" id="branch-label">local workspace</span
           ><span class="engine-state" id="engine-state"
-            ><i></i>连接仿真引擎</span
+            ><i></i
+            ><span class="i18n-text" data-i18n="Connecting to simulator"
+              >Connecting to simulator</span
+            ></span
           ><button class="text-button help-top" data-help type="button">
-            使用指南 <svg><use href="#i-help" /></svg>
+            <span class="i18n-text" data-i18n="User guide">User guide</span>
+            <svg><use href="#i-help" /></svg>
           </button>
         </div>
       </header>
       <main id="workspace">
         <div class="page-heading">
           <div>
-            <div class="eyebrow">WORKSPACE <span>/</span> 仿真实验</div>
-            <h1>配置一次通信仿真<span class="title-dot">.</span></h1>
-            <p>选择场景，调整通信与链路参数，运行 ns-3 并查看结果。</p>
+            <div class="eyebrow">
+              <span data-i18n="WORKSPACE">WORKSPACE</span> <span>/</span>
+              <span class="i18n-text" data-i18n="Simulation">Simulation</span>
+            </div>
+            <h1>
+              <span
+                class="i18n-text"
+                data-i18n="Set up a communication simulation"
+                >Set up a communication simulation</span
+              ><span class="title-dot">.</span>
+            </h1>
+            <p
+              data-i18n="Choose a scenario, set communication and link parameters, and inspect the ns-3 results."
+            >
+              Choose a scenario, set communication and link parameters, and
+              inspect the ns-3 results.
+            </p>
           </div>
           <div class="architecture-tag">
-            <span>OTP<span class="tag-sub">操作与依赖</span></span
+            <span
+              >OTP<span class="tag-sub" data-i18n="Operations and dependencies"
+                >Operations and dependencies</span
+              ></span
             ><svg><use href="#i-arrow" /></svg
-            ><span>PEX<span class="tag-sub">网络与交付</span></span>
+            ><span
+              >PEX<span class="tag-sub" data-i18n="Network and delivery"
+                >Network and delivery</span
+              ></span
+            >
           </div>
         </div>
         <div
@@ -138,14 +215,18 @@
             <div class="panel-heading">
               <div class="section-title">
                 <span class="step-index">01</span>
-                <h2 id="config-title">实验配置</h2>
+                <h2 id="config-title" data-i18n="Experiment setup">
+                  Experiment setup
+                </h2>
               </div>
               <button
                 id="reset-button"
                 class="icon-button"
                 type="button"
-                title="恢复当前场景默认值"
-                aria-label="恢复场景默认值"
+                title="Restore template defaults"
+                aria-label="Restore scenario defaults"
+                data-i18n-title="Restore template defaults"
+                data-i18n-aria-label="Restore scenario defaults"
               >
                 <svg><use href="#i-reset" /></svg>
               </button>
@@ -153,15 +234,20 @@
             <form id="simulation-form">
               <div class="form-scroll">
                 <div class="field">
-                  <label for="run-name">实验名称 <span>可选</span></label
+                  <label for="run-name"
+                    ><span class="i18n-text" data-i18n="Experiment name"
+                      >Experiment name</span
+                    >
+                    <span data-i18n="Optional">Optional</span></label
                   ><input
                     id="run-name"
                     maxlength="80"
-                    placeholder="例如：8 GPU · 1 MiB 基准"
+                    placeholder="Example: 8 GPUs · 1 MiB baseline"
+                    data-i18n-placeholder="Example: 8 GPUs · 1 MiB baseline"
                   />
                 </div>
                 <fieldset class="scene-fieldset">
-                  <legend>仿真场景</legend>
+                  <legend data-i18n="Scenario">Scenario</legend>
                   <div class="scene-options" id="scene-options">
                     <button
                       type="button"
@@ -170,7 +256,7 @@
                       aria-pressed="true"
                     >
                       <span class="scene-symbol">◈</span
-                      ><strong>集体通信</strong
+                      ><strong data-i18n="Collectives">Collectives</strong
                       ><small>AllReduce / AllGather</small>
                     </button>
                     <button
@@ -180,7 +266,9 @@
                       aria-pressed="false"
                     >
                       <span class="scene-symbol">▤</span
-                      ><strong>多节点网络</strong><small>Ethernet / RoCE</small>
+                      ><strong data-i18n="Multi-node network"
+                        >Multi-node network</strong
+                      ><small>Ethernet / RoCE</small>
                     </button>
                     <button
                       type="button"
@@ -189,38 +277,69 @@
                       aria-pressed="false"
                     >
                       <span class="scene-symbol">⇄</span
-                      ><strong>自定义传输</strong><small>P2P / 请求响应</small>
+                      ><strong data-i18n="Custom transfers"
+                        >Custom transfers</strong
+                      ><small data-i18n="P2P / request–response"
+                        >P2P / request–response</small
+                      >
                     </button>
                   </div>
                 </fieldset>
                 <div class="field">
                   <label for="config-select"
-                    >配置模板 <span id="config-count"></span></label
+                    ><span class="i18n-text" data-i18n="Configuration template"
+                      >Configuration template</span
+                    >
+                    <span id="config-count"></span></label
                   ><select id="config-select" required>
-                    <option>加载仓库配置…</option>
+                    <option data-i18n="Loading repository configurations…">
+                      Loading repository configurations…
+                    </option>
                   </select>
-                  <p class="field-hint" id="config-description">
-                    读取 configs/protocol_configs/
+                  <p
+                    class="field-hint"
+                    id="config-description"
+                    data-i18n="Reads configs/protocol_configs/"
+                  >
+                    Reads configs/protocol_configs/
                   </p>
                 </div>
-                <div class="form-divider"><span>通信与拓扑</span></div>
+                <div class="form-divider">
+                  <span data-i18n="Communication and topology"
+                    >Communication and topology</span
+                  >
+                </div>
                 <div class="field" id="collective-field">
-                  <label for="collective-select">Collective 操作</label>
+                  <label
+                    for="collective-select"
+                    data-i18n="Collective operation"
+                    >Collective operation</label
+                  >
                   <select id="collective-select" disabled>
-                    <option>正在加载可选操作…</option>
+                    <option data-i18n="Loading operation choices…">
+                      Loading operation choices…
+                    </option>
                   </select>
                 </div>
                 <div class="field" id="algorithm-field">
-                  <label for="algorithm-select">Collective 算法</label>
+                  <label for="algorithm-select" data-i18n="Collective algorithm"
+                    >Collective algorithm</label
+                  >
                   <select id="algorithm-select" disabled>
-                    <option>正在加载可选算法…</option>
+                    <option data-i18n="Loading algorithm choices…">
+                      Loading algorithm choices…
+                    </option>
                   </select>
                   <p class="field-hint" id="operation-hint"></p>
                 </div>
                 <div class="field" id="physical-topology-field">
-                  <label for="physical-topology">物理拓扑</label>
+                  <label for="physical-topology" data-i18n="Physical topology"
+                    >Physical topology</label
+                  >
                   <select id="physical-topology" disabled>
-                    <option>正在加载可选拓扑…</option>
+                    <option data-i18n="Loading topology choices…">
+                      Loading topology choices…
+                    </option>
                   </select>
                   <p class="field-hint" id="physical-topology-hint"></p>
                 </div>
@@ -228,7 +347,9 @@
                 <div id="multi-topology-controls" hidden>
                   <div class="form-row">
                     <div class="field">
-                      <label for="inter-fabric">节点间 Fabric</label>
+                      <label for="inter-fabric" data-i18n="Inter-node fabric"
+                        >Inter-node fabric</label
+                      >
                       <select id="inter-fabric">
                         <option value="ETH">Ethernet</option>
                         <option value="RoCE">RoCE</option>
@@ -236,7 +357,11 @@
                       </select>
                     </div>
                     <div class="field">
-                      <label for="inter-topology">节点间拓扑</label>
+                      <label
+                        for="inter-topology"
+                        data-i18n="Inter-node topology"
+                        >Inter-node topology</label
+                      >
                       <select id="inter-topology">
                         <option value="host">Host</option>
                         <option value="tor">ToR</option>
@@ -250,21 +375,34 @@
                     </div>
                   </div>
                 </div>
-                <p class="field-hint" id="stencil-operation-hint" hidden>
-                  当前为自定义传输，操作由 transfer.* 决定。切换 collective
-                  算法请先选择集合通信模板。
+                <p
+                  class="field-hint"
+                  id="stencil-operation-hint"
+                  hidden
+                  data-i18n="This template defines transfers with transfer.*. Choose a collective template to select a collective algorithm."
+                >
+                  This template defines transfers with transfer.*. Choose a
+                  collective template to select a collective algorithm.
                 </p>
                 <details class="advanced" id="topology-options">
                   <summary>
                     <svg><use href="#i-sliders" /></svg
-                    ><span id="topology-options-title" class="options-title"
-                      >拓扑参数（可选）</span
+                    ><span
+                      id="topology-options-title"
+                      class="options-title"
+                      data-i18n="Topology parameters (optional)"
+                      >Topology parameters (optional)</span
                     >
                   </summary>
                   <div class="advanced-content">
-                    <p class="field-hint" id="topology-options-description">
-                      设置所选网络的结构，例如 Leaf / Spine 数量或 Mesh
-                      行列数。已有默认值，可以直接运行。
+                    <p
+                      class="field-hint"
+                      id="topology-options-description"
+                      data-i18n="Set the selected network&#x27;s structure, such as leaf/spine counts or mesh dimensions. The defaults are ready to run."
+                    >
+                      Set the selected network&#x27;s structure, such as
+                      leaf/spine counts or mesh dimensions. The defaults are
+                      ready to run.
                     </p>
                     <div id="topology-option-fields" class="option-grid"></div>
                   </div>
@@ -272,8 +410,11 @@
                 <details class="advanced" id="algorithm-options">
                   <summary>
                     <svg><use href="#i-sliders" /></svg
-                    ><span id="algorithm-options-title" class="options-title"
-                      >算法参数（可选）</span
+                    ><span
+                      id="algorithm-options-title"
+                      class="options-title"
+                      data-i18n="Algorithm parameters (optional)"
+                      >Algorithm parameters (optional)</span
                     >
                   </summary>
                   <div class="advanced-content">
@@ -284,9 +425,16 @@
                     <div id="algorithm-option-fields" class="option-grid"></div>
                   </div>
                 </details>
-                <div class="form-divider"><span>参与规模</span></div>
+                <div class="form-divider">
+                  <span data-i18n="Simulation scale">Simulation scale</span>
+                </div>
                 <div id="single-node-fields" class="field">
-                  <label for="num-gpus">GPU 数量 <span>ranks</span></label>
+                  <label for="num-gpus"
+                    ><span class="i18n-text" data-i18n="GPU count"
+                      >GPU count</span
+                    >
+                    <span>ranks</span></label
+                  >
                   <div class="segmented" id="gpu-presets">
                     <button type="button" data-gpus="4">4</button
                     ><button type="button" data-gpus="8" class="active">
@@ -300,16 +448,23 @@
                       min="2"
                       max="256"
                       required
-                      aria-label="自定义 GPU 数量"
+                      aria-label="Custom GPU count"
+                      data-i18n-aria-label="Custom GPU count"
                     />
                   </div>
-                  <p class="field-hint" id="dimension-ranks-hint" hidden>
-                    GPU 数由拓扑维度决定，请在“拓扑参数”中调整。
+                  <p
+                    class="field-hint"
+                    id="dimension-ranks-hint"
+                    hidden
+                    data-i18n="GPU count comes from the topology dimensions. Change it under Topology parameters."
+                  >
+                    GPU count comes from the topology dimensions. Change it
+                    under Topology parameters.
                   </p>
                 </div>
                 <div id="multi-node-fields" class="form-row" hidden>
                   <div class="field">
-                    <label for="num-nodes">节点数量</label
+                    <label for="num-nodes" data-i18n="Nodes">Nodes</label
                     ><input
                       id="num-nodes"
                       type="number"
@@ -319,7 +474,8 @@
                     />
                   </div>
                   <div class="field">
-                    <label for="gpus-per-node">每节点 GPU</label
+                    <label for="gpus-per-node" data-i18n="GPUs per node"
+                      >GPUs per node</label
                     ><input
                       id="gpus-per-node"
                       type="number"
@@ -330,7 +486,9 @@
                   </div>
                 </div>
                 <div class="field">
-                  <label for="data-size">每 rank 应用数据量</label>
+                  <label for="data-size" data-i18n="Application bytes per rank"
+                    >Application bytes per rank</label
+                  >
                   <div class="input-unit">
                     <input
                       id="data-size"
@@ -339,7 +497,11 @@
                       step="any"
                       value="1"
                       required
-                    /><select id="data-unit" aria-label="数据量单位">
+                    /><select
+                      id="data-unit"
+                      aria-label="Data size unit"
+                      data-i18n-aria-label="Data size unit"
+                    >
                       <option value="1024">KiB</option>
                       <option value="1048576" selected>MiB</option>
                       <option value="1">bytes</option>
@@ -348,17 +510,25 @@
                   </div>
                   <div class="range-labels">
                     <span id="data-bytes">1,048,576 bytes</span
-                    ><span>单次操作</span>
+                    ><span data-i18n="Single operation">Single operation</span>
                   </div>
                   <p class="field-hint" id="stencil-hint" hidden></p>
                 </div>
                 <div class="form-divider">
-                  <span>链路参数</span
-                  ><span class="optional">留空时使用配置值</span>
+                  <span data-i18n="Link parameters">Link parameters</span
+                  ><span
+                    class="optional"
+                    data-i18n="Blank fields use configuration values"
+                    >Blank fields use configuration values</span
+                  >
                 </div>
                 <div class="form-row">
                   <div class="field">
-                    <label for="bandwidth">链路带宽 <span>Gbps</span></label
+                    <label for="bandwidth"
+                      ><span class="i18n-text" data-i18n="Link bandwidth"
+                        >Link bandwidth</span
+                      >
+                      <span>Gbps</span></label
                     ><input
                       id="bandwidth"
                       type="number"
@@ -369,7 +539,11 @@
                     />
                   </div>
                   <div class="field">
-                    <label for="latency">链路延迟 <span>ns</span></label
+                    <label for="latency"
+                      ><span class="i18n-text" data-i18n="Link latency"
+                        >Link latency</span
+                      >
+                      <span>ns</span></label
                     ><input
                       id="latency"
                       type="number"
@@ -384,7 +558,12 @@
                   <div class="form-row">
                     <div class="field">
                       <label for="inter-bandwidth"
-                        >节点间带宽 <span>Gbps</span></label
+                        ><span
+                          class="i18n-text"
+                          data-i18n="Inter-node bandwidth"
+                          >Inter-node bandwidth</span
+                        >
+                        <span>Gbps</span></label
                       ><input
                         id="inter-bandwidth"
                         type="number"
@@ -394,7 +573,10 @@
                     </div>
                     <div class="field">
                       <label for="inter-latency"
-                        >节点间延迟 <span>ns</span></label
+                        ><span class="i18n-text" data-i18n="Inter-node latency"
+                          >Inter-node latency</span
+                        >
+                        <span>ns</span></label
                       ><input
                         id="inter-latency"
                         type="number"
@@ -407,8 +589,11 @@
                 <div id="native-options"></div>
                 <details class="advanced">
                   <summary>
-                    <svg><use href="#i-sliders" /></svg>高级设置<span
-                      >RngRun、附加 CLI</span
+                    <svg><use href="#i-sliders" /></svg
+                    ><span class="i18n-text" data-i18n="Advanced settings"
+                      >Advanced settings</span
+                    ><span data-i18n="RngRun / extra CLI flags"
+                      >RngRun / extra CLI flags</span
                     >
                   </summary>
                   <div class="advanced-content">
@@ -425,7 +610,11 @@
                         />
                       </div>
                       <div class="field">
-                        <label for="timeout">运行上限 <span>秒</span></label
+                        <label for="timeout"
+                          ><span class="i18n-text" data-i18n="Job timeout"
+                            >Job timeout</span
+                          >
+                          <span data-i18n="seconds">seconds</span></label
                         ><input
                           id="timeout"
                           type="number"
@@ -438,12 +627,22 @@
                     </div>
                     <label class="toggle-row"
                       ><span
-                        >记录每步完成时刻<small
-                          >支持的 injector 会输出 step trace</small
+                        ><span
+                          class="i18n-text"
+                          data-i18n="Record step-completion times"
+                          >Record step-completion times</span
+                        ><small
+                          data-i18n="Supported injectors write a step trace"
+                          >Supported injectors write a step trace</small
                         ></span
-                      ><span class="fixed-label">始终记录</span></label
+                      ><span class="fixed-label" data-i18n="Always recorded"
+                        >Always recorded</span
+                      ></label
                     ><label for="cli-json"
-                      >附加 CLI 参数 <span class="mono">JSON</span></label
+                      ><span class="i18n-text" data-i18n="Extra CLI flags"
+                        >Extra CLI flags</span
+                      >
+                      <span class="mono">JSON</span></label
                     ><textarea
                       id="cli-json"
                       class="code-input small-code"
@@ -451,29 +650,45 @@
                       placeholder='{"ber": 0, "llrRetryLimit": 10}'
                     >
 {}</textarea>
-                    <p class="field-hint">
-                      支持的参数见输入框下方说明。硬件参数请编辑 [stack]。
+                    <p
+                      class="field-hint"
+                      data-i18n="See the flag reference below. Set hardware parameters in [stack]."
+                    >
+                      See the flag reference below. Set hardware parameters in
+                      [stack].
                     </p>
                     <button
                       id="parameter-help"
                       class="text-button"
                       type="button"
                     >
-                      查看可用 CLI 参数 <svg><use href="#i-arrow" /></svg>
+                      <span
+                        class="i18n-text"
+                        data-i18n="View supported CLI flags"
+                        >View supported CLI flags</span
+                      >
+                      <svg><use href="#i-arrow" /></svg>
                     </button>
                   </div>
                 </details>
                 <details class="advanced source-editor">
                   <summary>
-                    <svg><use href="#i-code" /></svg>编辑配置源码<span
-                      >.cfg / .profile</span
-                    >
+                    <svg><use href="#i-code" /></svg
+                    ><span
+                      class="i18n-text"
+                      data-i18n="Edit configuration source"
+                      >Edit configuration source</span
+                    ><span>.cfg / .profile</span>
                   </summary>
                   <div class="advanced-content">
                     <div class="editor-toolbar">
-                      <label for="config-editor">协议配置 .cfg</label
+                      <label
+                        for="config-editor"
+                        data-i18n="Protocol configuration .cfg"
+                        >Protocol configuration .cfg</label
                       ><label class="file-upload"
-                        >导入<input
+                        ><span class="i18n-text" data-i18n="Import">Import</span
+                        ><input
                           id="import-config"
                           type="file"
                           accept=".cfg,.txt"
@@ -484,12 +699,17 @@
                       id="config-editor"
                       class="code-input"
                       spellcheck="false"
-                      aria-label="配置源码"
+                      aria-label="Configuration source"
+                      data-i18n-aria-label="Configuration source"
                     ></textarea>
                     <div class="editor-toolbar">
-                      <label for="profile-editor">协议参数 .profile</label
+                      <label
+                        for="profile-editor"
+                        data-i18n="Protocol parameters .profile"
+                        >Protocol parameters .profile</label
                       ><label class="file-upload"
-                        >导入<input
+                        ><span class="i18n-text" data-i18n="Import">Import</span
+                        ><input
                           id="import-profile"
                           type="file"
                           accept=".profile,.txt"
@@ -500,18 +720,25 @@
                       id="profile-editor"
                       class="code-input"
                       spellcheck="false"
-                      aria-label="Profile 源码"
+                      aria-label="Profile source"
+                      data-i18n-aria-label="Profile source"
                     ></textarea>
-                    <p class="field-hint">
-                      修改应用于本次实验的独立副本。表单中显式填写的参数会覆盖源码和附加
-                      CLI 的同名设置；留空时沿用原值，预览显示实际执行参数。
+                    <p
+                      class="field-hint"
+                      data-i18n="Each run uses an independent input snapshot. Explicit form values override matching source and extra CLI values. Blank fields retain the original settings. The preview shows the effective inputs."
+                    >
+                      Each run uses an independent input snapshot. Explicit form
+                      values override matching source and extra CLI values.
+                      Blank fields retain the original settings. The preview
+                      shows the effective inputs.
                     </p>
                     <button
                       id="apply-source"
                       class="secondary-button"
                       type="button"
+                      data-i18n="Validate and preview"
                     >
-                      校验并预览配置
+                      Validate and preview
                     </button>
                   </div>
                 </details>
@@ -533,10 +760,13 @@
                   type="submit"
                   disabled
                 >
-                  <svg><use href="#i-play" /></svg><span>运行仿真</span
+                  <svg><use href="#i-play" /></svg
+                  ><span data-i18n="Run simulation">Run simulation</span
                   ><span class="key-hint">⌘ ↵</span>
                 </button>
-                <p>真实 ns-3 执行 · 运行记录自动保存</p>
+                <p data-i18n="Runs the real ns-3 simulator · history is saved">
+                  Runs the real ns-3 simulator · history is saved
+                </p>
               </div>
             </form>
           </section>
@@ -548,7 +778,9 @@
               <div class="panel-heading">
                 <div class="section-title">
                   <span class="step-index">02</span>
-                  <h2 id="topology-title">通信拓扑</h2>
+                  <h2 id="topology-title" data-i18n="Communication topology">
+                    Communication topology
+                  </h2>
                 </div>
                 <span class="pill" id="topology-badge">Ring · NVLink</span>
               </div>
@@ -560,7 +792,8 @@
                 class="topology-canvas"
                 id="topology-canvas"
                 role="img"
-                aria-label="通信拓扑示意"
+                aria-label="Communication topology schematic"
+                data-i18n-aria-label="Communication topology schematic"
               ></div>
               <div class="topology-bottom">
                 <div class="legend">
@@ -570,18 +803,22 @@
                     ><i class="legend-so"></i>Scale-out</span
                   >
                 </div>
-                <span>拓扑示意 · 非逐包轨迹</span>
+                <span data-i18n="Topology schematic · not a packet trace"
+                  >Topology schematic · not a packet trace</span
+                >
               </div>
               <div class="effective-strip">
                 <div>
-                  <span>有效带宽 / 链路</span
+                  <span data-i18n="Effective bandwidth / link"
+                    >Effective bandwidth / link</span
                   ><strong id="effective-bandwidth">—</strong>
                 </div>
                 <div>
-                  <span>链路延迟</span><strong id="effective-latency">—</strong>
+                  <span data-i18n="Link latency">Link latency</span
+                  ><strong id="effective-latency">—</strong>
                 </div>
                 <div>
-                  <span>协议 Profile</span
+                  <span data-i18n="Protocol profile">Protocol profile</span
                   ><strong id="effective-profile">—</strong>
                 </div>
               </div>
@@ -596,7 +833,9 @@
               <div class="panel-heading">
                 <div class="section-title">
                   <span class="step-index">03</span>
-                  <h2 id="result-title">仿真结果</h2>
+                  <h2 id="result-title" data-i18n="Simulation results">
+                    Simulation results
+                  </h2>
                   <span
                     id="selected-run-status"
                     class="status-badge"
@@ -609,19 +848,27 @@
                     class="text-button danger"
                     type="button"
                     hidden
+                    data-i18n="Cancel run"
                   >
-                    取消运行</button
+                    Cancel run</button
                   ><a
                     id="download-run"
                     class="icon-button"
-                    title="下载完整运行记录"
-                    aria-label="下载完整运行记录"
+                    title="Download the complete run archive"
+                    aria-label="Download the complete run archive"
                     hidden
+                    data-i18n-title="Download the complete run archive"
+                    data-i18n-aria-label="Download the complete run archive"
                     ><svg><use href="#i-download" /></svg
                   ></a>
                 </div>
               </div>
-              <div class="result-tabs" role="tablist" aria-label="结果视图">
+              <div
+                class="result-tabs"
+                role="tablist"
+                aria-label="Result views"
+                data-i18n-aria-label="Result views"
+              >
                 <button
                   id="result-tab-overview"
                   role="tab"
@@ -630,8 +877,9 @@
                   aria-selected="true"
                   tabindex="0"
                   data-tab="overview"
+                  data-i18n="Overview"
                 >
-                  运行概览</button
+                  Overview</button
                 ><button
                   id="result-tab-trace"
                   role="tab"
@@ -640,8 +888,9 @@
                   aria-selected="false"
                   tabindex="-1"
                   data-tab="trace"
+                  data-i18n="Completion trace"
                 >
-                  步骤时序</button
+                  Completion trace</button
                 ><button
                   id="result-tab-log"
                   role="tab"
@@ -650,8 +899,9 @@
                   aria-selected="false"
                   tabindex="-1"
                   data-tab="log"
+                  data-i18n="Raw log"
                 >
-                  原始日志</button
+                  Raw log</button
                 ><button
                   id="result-tab-snapshot"
                   role="tab"
@@ -660,8 +910,9 @@
                   aria-selected="false"
                   tabindex="-1"
                   data-tab="snapshot"
+                  data-i18n="Input snapshot"
                 >
-                  配置快照
+                  Input snapshot
                 </button>
               </div>
               <div class="tab-content" id="tab-overview" role="tabpanel">
@@ -669,9 +920,20 @@
                   <div class="empty-graphic">
                     <span></span><i></i><span></span><i></i><span></span>
                   </div>
-                  <h3>准备好，开始第一次实验</h3>
+                  <h3 data-i18n="Run your first simulation">
+                    Run your first simulation
+                  </h3>
                   <p>
-                    选择左侧配置后运行仿真。<br />这里会显示实际完成时长、收发统计和参数。
+                    <span
+                      class="i18n-text"
+                      data-i18n="Choose inputs on the left and run the simulation."
+                      >Choose inputs on the left and run the simulation.</span
+                    ><br /><span
+                      class="i18n-text"
+                      data-i18n="View actual completion time, packet counts, and effective inputs here."
+                      >View actual completion time, packet counts, and effective
+                      inputs here.</span
+                    >
                   </p>
                 </div>
                 <div id="result-content" hidden>
@@ -681,29 +943,43 @@
                   ></div>
                   <div id="run-progress" class="run-progress" hidden>
                     <div class="indeterminate"></div>
-                    <span id="progress-text">等待运行…</span>
+                    <span id="progress-text" data-i18n="Waiting to run…"
+                      >Waiting to run…</span
+                    >
                   </div>
                   <div id="run-error" class="alert error" hidden></div>
                   <div class="metric-grid">
                     <div class="metric primary-metric">
-                      <span>通信完成时长</span>
+                      <span data-i18n="Communication completion time"
+                        >Communication completion time</span
+                      >
                       <div>
                         <strong id="metric-duration">—</strong><span>µs</span>
                       </div>
-                      <small id="metric-exact">等待完成</small>
+                      <small
+                        id="metric-exact"
+                        data-i18n="Waiting for completion"
+                        >Waiting for completion</small
+                      >
                     </div>
                     <div class="metric">
-                      <span>端点发送包</span>
+                      <span data-i18n="Endpoint TX packets"
+                        >Endpoint TX packets</span
+                      >
                       <div><strong id="metric-packets">—</strong></div>
-                      <small id="metric-received">端点接收 —</small>
+                      <small id="metric-received" data-i18n="Endpoint RX —"
+                        >Endpoint RX —</small
+                      >
                     </div>
                     <div class="metric">
-                      <span>重传 / 丢包</span>
+                      <span data-i18n="Retries / drops">Retries / drops</span>
                       <div>
                         <strong id="metric-retries">—</strong
                         ><span id="metric-drops">/ —</span>
                       </div>
-                      <small>重传包 / 交换机丢包</small>
+                      <small data-i18n="Retransmitted packets / switch drops"
+                        >Retransmitted packets / switch drops</small
+                      >
                     </div>
                   </div>
                   <div
@@ -717,7 +993,10 @@
                   </div>
                   <details class="result-details">
                     <summary>
-                      查看全部结果字段 <span id="result-field-count"></span>
+                      <span class="i18n-text" data-i18n="View all result fields"
+                        >View all result fields</span
+                      >
+                      <span id="result-field-count"></span>
                     </summary>
                     <div class="field-table-wrap">
                       <table class="field-table">
@@ -729,38 +1008,61 @@
               </div>
               <div class="tab-content" id="tab-trace" role="tabpanel" hidden>
                 <div id="trace-content" class="trace-content">
-                  <div class="small-empty">
-                    完成仿真后可查看支持的 injector 输出的步骤完成时刻。
+                  <div
+                    class="small-empty"
+                    data-i18n="After a run, view step-completion timestamps from injectors that emit a trace."
+                  >
+                    After a run, view step-completion timestamps from injectors
+                    that emit a trace.
                   </div>
                 </div>
-                <div class="trace-caption">
-                  点表示步骤完成，横轴为相对 collectiveStartNs
-                  的时间；不表示包传输时长。
+                <div
+                  class="trace-caption"
+                  data-i18n="Each point marks a completed step. The horizontal axis measures time from collectiveStartNs, not a packet&#x27;s transfer duration."
+                >
+                  Each point marks a completed step. The horizontal axis
+                  measures time from collectiveStartNs, not a packet&#x27;s
+                  transfer duration.
                 </div>
               </div>
               <div class="tab-content" id="tab-log" role="tabpanel" hidden>
                 <div class="content-toolbar">
                   <span>stdout + stderr</span
                   ><a id="download-log" class="text-button" hidden
-                    >下载日志 <svg><use href="#i-download" /></svg
+                    ><span class="i18n-text" data-i18n="Download log"
+                      >Download log</span
+                    >
+                    <svg><use href="#i-download" /></svg
                   ></a>
                 </div>
-                <pre id="run-log" class="log-view" tabindex="0">
-运行后显示程序原始输出。</pre>
+                <pre
+                  id="run-log"
+                  class="log-view"
+                  tabindex="0"
+                  data-i18n="The simulator&#x27;s original output will appear here."
+                >
+The simulator&#x27;s original output will appear here.</pre>
               </div>
               <div class="tab-content" id="tab-snapshot" role="tabpanel" hidden>
                 <div class="content-toolbar">
-                  <span id="snapshot-label">本次运行的配置与版本</span
+                  <span
+                    id="snapshot-label"
+                    data-i18n="Inputs and version for this run"
+                    >Inputs and version for this run</span
                   ><button class="text-button" id="copy-config" type="button">
-                    复制配置 <svg><use href="#i-copy" /></svg>
+                    <span class="i18n-text" data-i18n="Copy configuration"
+                      >Copy configuration</span
+                    >
+                    <svg><use href="#i-copy" /></svg>
                   </button>
                 </div>
                 <pre
                   id="run-snapshot"
                   class="log-view config-view"
                   tabindex="0"
+                  data-i18n="The immutable input snapshot will appear after a run."
                 >
-运行后显示不可变配置快照。</pre>
+The immutable input snapshot will appear after a run.</pre>
               </div>
             </section>
           </div>
@@ -773,7 +1075,7 @@
           <div class="panel-heading">
             <div class="section-title">
               <svg class="heading-icon"><use href="#i-clock" /></svg>
-              <h2 id="history-title">运行记录</h2>
+              <h2 id="history-title" data-i18n="Run history">Run history</h2>
               <span class="count-badge" id="history-count">0</span>
             </div>
             <div class="history-actions">
@@ -783,9 +1085,15 @@
                 class="secondary-button"
                 disabled
               >
-                对比已选 <span id="compare-count">0</span></button
+                <span class="i18n-text" data-i18n="Compare selected"
+                  >Compare selected</span
+                >
+                <span id="compare-count">0</span></button
               ><a class="text-button" href="/api/runs/export.csv"
-                >导出 CSV <svg><use href="#i-download" /></svg
+                ><span class="i18n-text" data-i18n="Export CSV"
+                  >Export CSV</span
+                >
+                <svg><use href="#i-download" /></svg
               ></a>
             </div>
           </div>
@@ -794,118 +1102,199 @@
               <thead>
                 <tr>
                   <th class="checkbox-cell">
-                    <span class="sr-only">选择对比</span>
+                    <span class="sr-only" data-i18n="Select for comparison"
+                      >Select for comparison</span
+                    >
                   </th>
-                  <th>实验 / 配置</th>
-                  <th>规模</th>
+                  <th data-i18n="Experiment / configuration">
+                    Experiment / configuration
+                  </th>
+                  <th data-i18n="Scale">Scale</th>
                   <th
-                    title="Collective 通常为每 rank 数据量；stencil 由 transfer.* 决定"
+                    title="For collectives this is usually bytes per rank; stencil transfers use transfer.*."
+                    data-i18n="dataSize input"
+                    data-i18n-title="For collectives this is usually bytes per rank; stencil transfers use transfer.*."
                   >
-                    dataSize 输入
+                    dataSize input
                   </th>
-                  <th>通信时长</th>
-                  <th>状态</th>
-                  <th>运行时间</th>
-                  <th><span class="sr-only">操作</span></th>
+                  <th data-i18n="Completion time">Completion time</th>
+                  <th data-i18n="Status">Status</th>
+                  <th data-i18n="Run time">Run time</th>
+                  <th>
+                    <span class="sr-only" data-i18n="Actions">Actions</span>
+                  </th>
                 </tr>
               </thead>
               <tbody id="history-rows">
                 <tr>
-                  <td colspan="8" class="history-empty">
-                    尚无运行记录。完成一次仿真后，结果会保存在这里。
+                  <td
+                    colspan="8"
+                    class="history-empty"
+                    data-i18n="No runs yet. Completed and failed runs will appear here."
+                  >
+                    No runs yet. Completed and failed runs will appear here.
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
           <div class="history-bottom">
-            <span><i class="mini-dot"></i>配置、日志和版本随运行保存</span
-            ><span id="queue-label">单任务执行队列</span>
+            <span
+              ><i class="mini-dot"></i
+              ><span
+                class="i18n-text"
+                data-i18n="Inputs, logs, and versions are saved with each run"
+                >Inputs, logs, and versions are saved with each run</span
+              ></span
+            ><span id="queue-label" data-i18n="One simulation at a time"
+              >One simulation at a time</span
+            >
           </div>
         </section>
         <footer class="page-footer">
           <span
-            >ProtoBridge <span class="footer-separator">/</span> ns-3
-            互联通信仿真</span
-          ><span>通信仿真时间与程序运行时间分别记录。</span>
+            >ProtoBridge <span class="footer-separator">/</span>
+            <span class="i18n-text" data-i18n="ns-3 interconnect simulation"
+              >ns-3 interconnect simulation</span
+            ></span
+          ><span
+            data-i18n="Simulated communication time and program wall time are recorded separately."
+            >Simulated communication time and program wall time are recorded
+            separately.</span
+          >
         </footer>
       </main>
     </div>
     <dialog id="help-dialog">
       <div class="dialog-heading">
-        <h2>使用指南</h2>
-        <button class="icon-button" type="button" data-close aria-label="关闭">
+        <h2 data-i18n="User guide">User guide</h2>
+        <button
+          class="icon-button"
+          type="button"
+          data-close
+          aria-label="Close"
+          data-i18n-aria-label="Close"
+        >
           <svg><use href="#i-close" /></svg>
         </button>
       </div>
       <div class="dialog-body">
         <ol class="help-steps">
           <li>
-            <strong>选择场景和配置</strong>
-            <p>
-              从仓库模板开始。集体通信选择算法与物理拓扑，多节点场景还需设置节点数和节点间链路。
+            <strong data-i18n="Choose a scenario and configuration"
+              >Choose a scenario and configuration</strong
+            >
+            <p
+              data-i18n="Start with a repository template. Choose a collective algorithm and physical topology. For multiple nodes, set the node count and inter-node links."
+            >
+              Start with a repository template. Choose a collective algorithm
+              and physical topology. For multiple nodes, set the node count and
+              inter-node links.
             </p>
           </li>
           <li>
-            <strong>调整参数，检查预览</strong>
-            <p>
-              链路字段写入本次实验的 [stack] 覆盖。也可以导入或编辑完整 .cfg 和
-              .profile；原文件不会被修改。
+            <strong data-i18n="Adjust inputs and check the preview"
+              >Adjust inputs and check the preview</strong
+            >
+            <p
+              data-i18n="Link fields become [stack] overrides for this run. Import or edit .cfg and .profile text for custom experiments. Each run uses its own input snapshot."
+            >
+              Link fields become [stack] overrides for this run. Import or edit
+              .cfg and .profile text for custom experiments. Each run uses its
+              own input snapshot.
             </p>
           </li>
           <li>
-            <strong>运行并查看结果</strong>
-            <p>
-              服务器调用构建好的 gpu-cluster-sim。只有 status=complete
-              的结果会进入延迟对比；运行上限和取消操作会停止对应进程。
+            <strong data-i18n="Run and inspect the results"
+              >Run and inspect the results</strong
+            >
+            <p
+              data-i18n="The server executes the built gpu-cluster-sim binary. Only status=complete results enter latency comparisons. Cancellation and timeouts stop the corresponding process."
+            >
+              The server executes the built gpu-cluster-sim binary. Only
+              status=complete results enter latency comparisons. Cancellation
+              and timeouts stop the corresponding process.
             </p>
           </li>
           <li>
-            <strong>对比和导出</strong>
-            <p>
-              在运行记录中选择 2–6
-              个已完成实验。下载包包含输入、原始日志、结果字段、步骤 CSV
-              和程序版本。
+            <strong data-i18n="Compare and export">Compare and export</strong>
+            <p
+              data-i18n="Select 2–6 completed runs in the history. Download an archive with the inputs, raw log, result fields, step CSV, and program version."
+            >
+              Select 2–6 completed runs in the history. Download an archive with
+              the inputs, raw log, result fields, step CSV, and program version.
             </p>
           </li>
         </ol>
         <div class="help-note">
-          <strong>第一次使用</strong>
+          <strong data-i18n="First run">First run</strong>
           <pre>
 ./ns3 build gpu-cluster-sim
 python -m webui --port 8080</pre>
-          <p>步骤时序来自实际 trace；没有记录该数据的场景会显示为空。</p>
+          <p
+            data-i18n="Step timing comes from the actual trace. Scenarios without trace records show an empty view."
+          >
+            Step timing comes from the actual trace. Scenarios without trace
+            records show an empty view.
+          </p>
         </div>
       </div>
     </dialog>
     <dialog id="compare-dialog">
       <div class="dialog-heading">
         <div>
-          <div class="eyebrow">EXPERIMENT COMPARISON</div>
-          <h2>比较通信完成时长</h2>
+          <div class="eyebrow" data-i18n="EXPERIMENT COMPARISON">
+            EXPERIMENT COMPARISON
+          </div>
+          <h2 data-i18n="Compare completion times">Compare completion times</h2>
         </div>
-        <button class="icon-button" type="button" data-close aria-label="关闭">
+        <button
+          class="icon-button"
+          type="button"
+          data-close
+          aria-label="Close"
+          data-i18n-aria-label="Close"
+        >
           <svg><use href="#i-close" /></svg>
         </button>
       </div>
       <div class="dialog-body">
         <div id="comparison-chart"></div>
-        <p class="comparison-note">
-          比较前请核对操作、规模与硬件条件；横轴为实际记录的仿真完成时长（µs）。
+        <p
+          class="comparison-note"
+          data-i18n="Check the operation, scale, and hardware before comparing runs. Bars show recorded simulation completion times in µs."
+        >
+          Check the operation, scale, and hardware before comparing runs. Bars
+          show recorded simulation completion times in µs.
         </p>
       </div>
     </dialog>
     <dialog id="parameters-dialog">
       <div class="dialog-heading">
-        <h2>可用的附加 CLI 参数</h2>
-        <button class="icon-button" type="button" data-close aria-label="关闭">
+        <h2 data-i18n="Available extra CLI flags">Available extra CLI flags</h2>
+        <button
+          class="icon-button"
+          type="button"
+          data-close
+          aria-label="Close"
+          data-i18n-aria-label="Close"
+        >
           <svg><use href="#i-close" /></svg>
         </button>
       </div>
       <div class="dialog-body">
         <p>
-          使用 JSON 对象传入参数，例如
-          <code>{"rttcc": 1}</code>。范围会在提交前校验。
+          <span
+            class="i18n-text"
+            data-i18n="Enter extra flags as a JSON object, for example"
+            >Enter extra flags as a JSON object, for example</span
+          >
+          <code>{"rttcc": 1}</code
+          ><span
+            class="i18n-text"
+            data-i18n="Parameter ranges are checked before submission."
+            >Parameter ranges are checked before submission.</span
+          >
         </p>
         <div id="parameter-list" class="parameter-list"></div>
       </div>

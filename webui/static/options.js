@@ -46,9 +46,9 @@ class SimulationOptions {
       .map(
         (group) => `
       <details class="advanced option-group" id="options-${group.id}">
-        <summary><svg><use href="#i-sliders"/></svg>${this.escape(group.title)}<span>${this.escape(group.subtitle)}</span></summary>
-        <div class="advanced-content"><p class="field-hint">${this.escape(group.hint)}</p>
-          ${group.id === "errors" ? '<div class="option-actions"><button type="button" class="secondary-button" id="clear-errors">设为无错误</button><button type="button" class="secondary-button" id="loss-sack-preset">0.1% 丢包 + SACK</button></div>' : ""}
+        <summary><svg><use href="#i-sliders"/></svg><span class="options-title" data-i18n="${this.escape(group.title)}">${this.escape(t(group.title))}</span><span data-i18n="${this.escape(group.subtitle)}">${this.escape(t(group.subtitle))}</span></summary>
+        <div class="advanced-content"><p class="field-hint" data-i18n="${this.escape(group.hint)}">${this.escape(t(group.hint))}</p>
+          ${group.id === "errors" ? '<div class="option-actions"><button type="button" class="secondary-button" id="clear-errors" data-i18n="No errors">No errors</button><button type="button" class="secondary-button" id="loss-sack-preset" data-i18n="0.1% loss + SACK">0.1% loss + SACK</button></div>' : ""}
           <div class="option-grid">${group.fields.map((item) => this.renderField(item)).join("")}</div>
         </div>
       </details>`,
@@ -100,9 +100,9 @@ class SimulationOptions {
     const e = this.escape,
       id = `opt-${item.key}`;
     const input = item.choices
-      ? `<select id="${id}" data-native-key="${item.key}"><option value="">沿用配置</option>${item.choices.map((choice) => `<option value="${e(choice.value)}">${e(choice.label)}</option>`).join("")}</select>`
-      : `<input id="${id}" data-native-key="${item.key}" type="number" min="${item.min}" max="${item.max}" step="${item.type === "float" ? "any" : "1"}" placeholder="沿用配置" aria-describedby="${id}-effective ${id}-hint"/>`;
-    return `<div class="field" id="${id}-field"><label for="${id}">${e(item.label)}</label>${input}<small class="option-effective" id="${id}-effective"></small>${item.hint ? `<p class="field-hint" id="${id}-hint">${e(item.hint)}</p>` : `<span id="${id}-hint"></span>`}</div>`;
+      ? `<select id="${id}" data-native-key="${item.key}"><option value="">${e(t("Use configuration value"))}</option>${item.choices.map((choice) => `<option value="${e(choice.value)}">${e(t(choice.label))}</option>`).join("")}</select>`
+      : `<input id="${id}" data-native-key="${item.key}" type="number" min="${item.min}" max="${item.max}" step="${item.type === "float" ? "any" : "1"}" placeholder="${e(t("Use configuration value"))}" aria-describedby="${id}-effective ${id}-hint"/>`;
+    return `<div class="field" id="${id}-field"><label for="${id}" data-i18n="${e(item.label)}">${e(t(item.label))}</label>${input}<small class="option-effective" id="${id}-effective"></small>${item.hint ? `<p class="field-hint" id="${id}-hint" data-i18n="${e(item.hint)}">${e(t(item.hint))}</p>` : `<span id="${id}-hint"></span>`}</div>`;
   }
 
   source() {
@@ -156,7 +156,7 @@ class SimulationOptions {
     this.sync();
   }
 
-  setChoices(id, choices, value, inherited = "沿用配置") {
+  setChoices(id, choices, value, inherited = t("Use configuration value")) {
     const e = this.escape,
       input = document.getElementById(id);
     let markup =
@@ -164,13 +164,14 @@ class SimulationOptions {
       choices
         .map(
           (item) =>
-            `<option value="${e(item.value)}">${e(item.label)}</option>`,
+            `<option value="${e(item.value)}">${e(t(item.label))}</option>`,
         )
         .join("");
     if (value && !choices.some((item) => item.value === value)) {
-      markup += `<option value="${e(value)}">${e(value)} · 请检查兼容性</option>`;
+      markup += `<option value="${e(value)}">${e(value)}${e(t(" · check compatibility"))}</option>`;
     }
     const signature = JSON.stringify([
+      I18n.language,
       choices,
       value && !choices.some((item) => item.value === value) ? value : null,
     ]);
@@ -363,13 +364,20 @@ class SimulationOptions {
       if (option.disabled !== disabled) option.disabled = disabled;
     }
     document.getElementById("physical-topology-hint").textContent =
-      topology?.hint || "选择实际物理连接方式；算法与拓扑分别设置。";
+      t(topology?.hint) ||
+      t(
+        "Choose the physical links between devices. Select the collective algorithm separately.",
+      );
     document.getElementById("operation-hint").textContent =
       operation.collective === "alltoall"
-        ? "非分层选项使用同一 AlltoAllInjector；CollNet 是该路径的别名。"
+        ? t(
+            "Non-hierarchical AllToAll choices share AlltoAllInjector. The CollNet names are aliases for that path.",
+          )
         : operation.algorithm === "hierarchical"
-          ? "按节点分组，分别执行节点内与节点间通信。"
-          : "NVLS / SHARP 需要单节点 NVSwitch；分层算法需要多节点或分组拓扑。";
+          ? t("Groups ranks by node and runs intra-node and inter-node phases.")
+          : t(
+              "NVLS / SHARP need single-node NVSwitch. Hierarchical algorithms need multiple nodes or grouped topologies.",
+            );
     const source = this.source();
     for (const [id, sourceValue] of [
       ["collective-select", source.op.collective],
@@ -378,7 +386,7 @@ class SimulationOptions {
     ]) {
       this.setDefaultLabel(
         document.getElementById(id),
-        `模板默认 · ${sourceValue || "stencil"}`,
+        t("Template default · {value0}", { value0: sourceValue || "stencil" }),
       );
     }
     const setting = (key) =>
@@ -420,37 +428,59 @@ class SimulationOptions {
       ? document.getElementById("inter-topology").selectedOptions[0]
           ?.textContent
       : topology?.label;
-    document.getElementById("topology-options-title").textContent =
-      `拓扑参数 · ${topologyName || "当前网络"}`;
+    document.getElementById("topology-options-title").textContent = t(
+      "Topology parameters · {value0}",
+      { value0: t(topologyName) || t("current network") },
+    );
     document.getElementById("topology-options-description").textContent = multi
-      ? "设置节点间网络的尺寸，例如 spine 数量或 torus 宽度。0 表示自动选择，通常可直接使用默认值。"
+      ? t(
+          "Set the inter-node network size, such as spine count or torus width. 0 selects it automatically. The defaults usually suffice.",
+        )
       : operation.topology === "leafspine"
-        ? "Leaf 连接 GPU，Spine 连接各个 Leaf。这里设置两层交换机的数量；GPU 数须能被 Leaf 数整除。已填入可运行的默认值。"
+        ? t(
+            "Leaf switches connect GPUs; spine switches connect the leaves. Set the switch count in each tier. GPU count must be divisible by leaf count. Valid defaults are provided.",
+          )
         : operation.topology === "mesh"
-          ? "设置网格的行数和列数。例如 2 行 × 4 列对应 8 个 GPU；修改维度后 GPU 总数会自动更新。"
+          ? t(
+              "Set mesh rows and columns. For example, 2 rows × 4 columns gives 8 GPUs. Changing the dimensions updates the GPU count.",
+            )
           : operation.topology === "torus"
-            ? "设置环绕网络的 X、Y、Z 维长度。例如 2 × 2 × 2 对应 8 个 GPU；修改维度后 GPU 总数会自动更新。"
+            ? t(
+                "Set torus dimensions X, Y, and Z. For example, 2 × 2 × 2 gives 8 GPUs. Changing the dimensions updates the GPU count.",
+              )
             : operation.topology === "hypercube"
-              ? "设置超立方体维数 d，GPU 总数为 2 的 d 次方。例如 3 维对应 8 个 GPU。"
-              : "设置当前物理网络的交换机数量或维度。已有默认值，可以直接运行；修改前请查看参数旁的约束说明。";
+              ? t(
+                  "Set hypercube dimension d. The GPU count is 2 to the power d; 3 dimensions gives 8 GPUs.",
+                )
+              : t(
+                  "Set switch counts or dimensions for this network. The defaults are ready to run. Check the constraints beside each field before changing them.",
+                );
     const algorithmDetail = ["broadcast", "reduce"].includes(
       operation.collective,
     )
       ? [
-          "Root rank",
-          "Root rank 从 0 开始编号：Broadcast 从这个 GPU 发出数据，Reduce 将归约结果交给这个 GPU。",
+          t("Root rank"),
+          t(
+            "Root ranks start at 0. Broadcast sends data from this GPU; Reduce delivers the result to this GPU.",
+          ),
         ]
       : operation.algorithm === "ncclring"
         ? [
-            "并行通道",
-            "通道数控制并行 ring 的数量。0 表示按每节点 GPU 数自动设置。",
+            t("Parallel channels"),
+            t(
+              "Channels set the number of parallel rings. 0 selects the count from GPUs per node.",
+            ),
           ]
         : [
-            "节点内算法",
-            "Hierarchical 分别执行节点内和节点间通信。这里选择节点内阶段使用 Ring 或 Full mesh，物理连接方式由上方拓扑选择决定。",
+            t("Intra-node algorithm"),
+            t(
+              "Hierarchical operations have intra-node and inter-node phases. Choose Ring or Full mesh for the intra-node phase here. The topology selectors above set the physical links.",
+            ),
           ];
-    document.getElementById("algorithm-options-title").textContent =
-      `算法参数 · ${algorithmDetail[0]}`;
+    document.getElementById("algorithm-options-title").textContent = t(
+      "Algorithm parameters · {value0}",
+      { value0: algorithmDetail[0] },
+    );
     document.getElementById("algorithm-options-description").textContent =
       algorithmDetail[1];
   }
@@ -522,10 +552,18 @@ class SimulationOptions {
         item.choices?.find((choice) => choice.value === String(value))?.label ??
         value;
       if (item.choices)
-        this.setDefaultLabel(input, `沿用 · ${label ?? "配置值"}`);
-      else input.placeholder = `当前 ${value ?? "配置值"}`;
+        this.setDefaultLabel(
+          input,
+          t("Inherit · {value0}", {
+            value0: t(label ?? "configuration value"),
+          }),
+        );
+      else
+        input.placeholder = t("Current {value0}", {
+          value0: value ?? t("configuration value"),
+        });
       document.getElementById(`opt-${item.key}-effective`).textContent =
-        value == null ? "" : `当前：${label}`;
+        value == null ? "" : t("Current: {value0}", { value0: t(label) });
     }
     this.sync();
     const s = summary.settings || {},
@@ -533,7 +571,7 @@ class SimulationOptions {
     const controller =
       [enabled("dcqcn") ? "DCQCN" : "", enabled("rttcc") ? "RTTCC" : ""]
         .filter(Boolean)
-        .join(" + ") || "关闭";
+        .join(" + ") || t("Disabled");
     const rates = [
       s.berIntraNodeElectrical,
       s.berIntraRackElectrical,
@@ -543,45 +581,79 @@ class SimulationOptions {
     const lossPercent = Number(
       (Number(s.packetLossRate || 0) * 100).toPrecision(6),
     );
-    const errors = `BER ${Number(s.ber) > 0 ? s.ber : rates.length ? "分层设置" : "0"} · 丢包 ${lossPercent}%${s.errorMode === "burst" ? " · 突发" : ""}`;
+    const errors = t("BER {value0} · loss {value1}%{value2}", {
+      value0:
+        Number(s.ber) > 0 ? s.ber : rates.length ? t("tiered rates") : "0",
+      value1: lossPercent,
+      value2: s.errorMode === "burst" ? t(" · burst") : "",
+    });
     const rows = [
       [
-        "发送控制",
-        `Credit · ${Number(s.effectiveVcCredits).toLocaleString("en-US")} 分片 / VC`,
+        t("Send control"),
+        t("Credits · {value0} chunks / VC", {
+          value0: Number(s.effectiveVcCredits).toLocaleString("en-US"),
+        }),
       ],
-      ["错误注入", errors],
+      [t("Error injection"), errors],
       [
         "FEC",
         enabled("fecEnabled")
           ? `RS(${s.fecN}, ${s.fecK}) · T=${s.fecT}`
-          : "关闭",
+          : t("Disabled"),
       ],
       [
-        "LLR 链路重传",
+        t("Link-level retry (LLR)"),
         enabled("llrEnabled")
-          ? `${s.llrMode === "sack" ? "SACK" : "Go-back-N"}${s.llrRequested !== s.llrEnabled ? " · Fabric 强制启用" : ""}`
-          : "关闭",
+          ? `${s.llrMode === "sack" ? "SACK" : "Go-back-N"}${s.llrRequested !== s.llrEnabled ? t(" · forced by fabric") : ""}`
+          : t("Disabled"),
       ],
     ];
     if (summary.num_nodes > 1)
       rows.push(
         [
-          "So 发送窗口",
-          Number(s.soTxWindow) ? `${s.soTxWindow} 个在途分片` : "不限在途分片",
+          t("So TX window"),
+          Number(s.soTxWindow)
+            ? t("{value0} in-flight chunks", { value0: s.soTxWindow })
+            : t("Unlimited in-flight chunks"),
         ],
         [
-          "拥塞控制 / PFC",
-          `${controller} / ${Number(s.switchPfcMode) ? `模式 ${s.switchPfcMode}` : "关闭"}`,
+          t("Congestion control / PFC"),
+          `${controller} / ${Number(s.switchPfcMode) ? t("Mode {value0}", { value0: s.switchPfcMode }) : t("Disabled")}`,
         ],
       );
     if (Number(s.failedOpticalLink) >= 0)
-      rows.push(["光链路故障", `移除链路 #${s.failedOpticalLink} · 重算路由`]);
+      rows.push([
+        t("Optical link failure"),
+        t("Remove link #{value0} · recompute routes", {
+          value0: s.failedOpticalLink,
+        }),
+      ]);
     document.getElementById("effective-options").innerHTML = rows
       .map(
         ([key, value]) =>
           `<div class="effective-option"><span>${this.escape(key)}</span><strong>${this.escape(value)}</strong></div>`,
       )
       .join("");
+  }
+
+  relocalize() {
+    for (const item of this.fields) {
+      const input = document.getElementById(`opt-${item.key}`);
+      for (const choice of item.choices || []) {
+        const option = [...input.options].find(
+          (option) => option.value === choice.value,
+        );
+        if (option) option.textContent = t(choice.label);
+      }
+    }
+    for (const [id, choices] of [
+      ["collective-select", this.schema.collectives],
+      ["physical-topology", this.schema.topologies],
+    ])
+      this.setChoices(id, choices, document.getElementById(id).value);
+    this.updateAlgorithms();
+    if (this.preview) this.update(this.preview);
+    else this.sync();
   }
 
   clearErrors() {

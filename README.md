@@ -208,7 +208,10 @@ Open **http://127.0.0.1:8080**. The lab includes a topology schematic, queued
 execution with cancellation/timeouts, native results and step-completion traces,
 persistent history, comparison of completed runs, and CSV/run-archive downloads.
 Inputs are copied per run; generated data stays outside the repository.
-See [webui/README.md](webui/README.md) for settings and usage.
+The interface defaults to English; **EN / 中文** in the header switches language
+without resetting inputs or results, and remembers the preference in the browser.
+See the [English guide](webui/README.md) or [中文使用说明](webui/README.zh-CN.md)
+for configuration, Docker/Mac SSH access, troubleshooting, and checks.
 
 ## Surrogate model
 

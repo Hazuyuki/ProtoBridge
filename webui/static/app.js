@@ -20,15 +20,15 @@ const terminal = new Set([
   "interrupted",
 ]);
 const statusLabels = {
-  queued: "排队中",
-  running: "运行中",
-  cancelling: "正在取消",
-  completed: "已完成",
-  incomplete: "未完成",
-  failed: "运行失败",
-  cancelled: "已取消",
-  timed_out: "已超时",
-  interrupted: "已中断",
+  queued: "Queued",
+  running: "Running",
+  cancelling: "Cancelling",
+  completed: "Completed",
+  incomplete: "Incomplete",
+  failed: "Failed",
+  cancelled: "Cancelled",
+  timed_out: "Timed out",
+  interrupted: "Interrupted",
 };
 const state = {
   catalog: null,
@@ -38,6 +38,7 @@ const state = {
   baseOp: {},
   controls: null,
   ready: false,
+  engine: null,
   preview: null,
   previewVersion: 0,
   selected: null,
@@ -49,11 +50,37 @@ const state = {
   historyKey: "",
   traceLoaded: null,
   submitting: false,
+  formMessage: "",
+  toastMessage: "",
+  connectionMessage: null,
 };
 let previewTimer,
   toastTimer,
   polling = false;
 
+class ApiError extends Error {
+  constructor(detail, status) {
+    super(typeof detail === "string" ? detail : `HTTP ${status}`);
+    this.detail = detail;
+    this.status = status;
+  }
+  localized() {
+    return Array.isArray(this.detail)
+      ? this.detail
+          .map(
+            (issue) =>
+              `${issue.loc.slice(1).join(".")}: ${validationMessage(issue)}`,
+          )
+          .join("; ")
+      : t(this.detail) ||
+          t("Request failed ({value0})", { value0: this.status });
+  }
+}
+function messageText(message) {
+  return message instanceof ApiError
+    ? message.localized()
+    : t(message instanceof Error ? message.message : message);
+}
 async function api(path, options = {}) {
   const response = await fetch(path, {
     cache: "no-store",
@@ -64,20 +91,45 @@ async function api(path, options = {}) {
   try {
     data = await response.json();
   } catch {
-    throw new Error("服务器响应无法读取，请检查服务是否仍在运行。");
+    throw new Error(
+      t("Cannot read the server response. Check that the service is running."),
+    );
   }
   if (!response.ok) {
-    const message = Array.isArray(data.detail)
-      ? data.detail
-          .map((x) => `${x.loc.slice(1).join(".")}: ${x.msg}`)
-          .join("；")
-      : data.detail;
-    throw new Error(message || `请求失败 (${response.status})`);
+    throw new ApiError(data.detail, response.status);
   }
   return data;
 }
+function displayRunName(run) {
+  return run.name_is_default ? t(run.name) : run.name;
+}
+function validationMessage(issue) {
+  const types = {
+    int_type: "Expected an integer.",
+    int_parsing: "Expected an integer.",
+    float_type: "Expected a number.",
+    float_parsing: "Expected a number.",
+    dict_type: "Expected an object.",
+    extra_forbidden: "Unknown field.",
+    missing: "This field is required.",
+    string_pattern_mismatch: "The value does not match the required format.",
+  };
+  if (types[issue.type]) return t(types[issue.type]);
+  const bounds = {
+    greater_than_equal: ["Must be at least {limit}.", "ge"],
+    less_than_equal: ["Must be at most {limit}.", "le"],
+    string_too_short: [
+      "Must contain at least {limit} characters.",
+      "min_length",
+    ],
+    string_too_long: ["Must contain at most {limit} characters.", "max_length"],
+  };
+  const bound = bounds[issue.type];
+  return bound ? t(bound[0], { limit: issue.ctx[bound[1]] }) : t(issue.msg);
+}
 function notify(message) {
-  $("toast").textContent = message;
+  state.toastMessage = message;
+  $("toast").textContent = messageText(message);
   $("toast").hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
@@ -85,7 +137,8 @@ function notify(message) {
   }, 3500);
 }
 function formError(message = "") {
-  $("form-error").textContent = message;
+  state.formMessage = message;
+  $("form-error").textContent = messageText(message);
   $("form-error").hidden = !message;
 }
 function bytesLabel(bytes) {
@@ -100,7 +153,7 @@ function durationLabel(ns) {
     : `${(Number(ns) / 1000).toLocaleString("en-US", { maximumFractionDigits: 3 })} µs`;
 }
 function badge(status) {
-  return `<span class="status-badge ${esc(status)}">${esc(statusLabels[status] || status)}</span>`;
+  return `<span class="status-badge ${esc(status)}">${esc(t(statusLabels[status] || status))}</span>`;
 }
 
 function setScene(scene, changeConfig = true) {
@@ -123,10 +176,12 @@ function setScene(scene, changeConfig = true) {
   $("config-select").innerHTML = configs
     .map(
       (config) =>
-        `<option value="${esc(config.id)}">${esc(config.title)}</option>`,
+        `<option value="${esc(config.id)}">${esc(t(config.title))}</option>`,
     )
     .join("");
-  $("config-count").textContent = `${configs.length} 个模板`;
+  $("config-count").textContent = t("{value0} templates", {
+    value0: configs.length,
+  });
   if (changeConfig && configs.length) loadConfig(configs[0].id);
 }
 function setSize(bytes) {
@@ -145,7 +200,7 @@ function loadConfig(id, request = null, copyName = true) {
   state.config = config;
   if (state.scene !== config.kind) setScene(config.kind, false);
   $("config-select").value = id;
-  $("config-description").textContent = config.description;
+  $("config-description").textContent = t(config.description);
   $("config-editor").value = request?.config_text ?? config.text;
   $("profile-editor").value = request?.profile_text ?? config.profile_text;
   const defaults = { ...config.defaults, ...request };
@@ -157,7 +212,10 @@ function loadConfig(id, request = null, copyName = true) {
   $("seed").value = defaults.seed ?? 1;
   $("timeout").value = defaults.timeout ?? 120;
   $("run-name").value = request
-    ? `${request.name || config.title}${copyName ? " · 副本" : ""}`.slice(0, 80)
+    ? `${request.name || t(config.title)}${copyName ? t(" · Copy") : ""}`.slice(
+        0,
+        80,
+      )
     : "";
   $("cli-json").value = JSON.stringify(defaults.cli_overrides || {}, null, 2);
   setSize(defaults.data_size ?? 1048576);
@@ -208,7 +266,7 @@ function updateLocalLabels() {
 function requestBody() {
   const cli = JSON.parse($("cli-json").value || "{}");
   if (!cli || typeof cli !== "object" || Array.isArray(cli))
-    throw new Error("附加 CLI 参数需为 JSON 对象。");
+    throw new Error(t("Extra CLI flags must be a JSON object."));
   const stack = { ...state.baseStack };
   for (const [id, key] of [
     ["bandwidth", "bandwidthGbps"],
@@ -260,8 +318,8 @@ async function refreshPreview() {
     }
     document.querySelector('label[for="data-size"]').textContent = result
       .summary.stencil
-      ? "dataSize 输入参数"
-      : "每 rank 应用数据量";
+      ? t("dataSize input")
+      : t("Application bytes per rank");
     updateLocalLabels();
     formError();
     renderTopology(result.summary);
@@ -273,11 +331,16 @@ async function refreshPreview() {
     $("latency").placeholder = result.summary.latency_ns;
     $("inter-bandwidth").placeholder = result.summary.inter_node_bandwidth_gbps;
     $("inter-latency").placeholder = result.summary.inter_node_latency_ns;
-    $("preview-notices").textContent = result.notices.join(" ");
+    $("preview-notices").textContent = result.notices
+      .map((message) => t(message))
+      .join(" ");
     $("preview-notices").hidden = !result.notices.length;
     $("stencil-hint").hidden = !result.summary.stencil;
     $("stencil-hint").textContent =
-      result.notices[0] || "实际传输量由配置中的 transfer.*.bytes 表达式决定。";
+      t(result.notices[0]) ||
+      t(
+        "The transfer.*.bytes expressions determine the actual transfer sizes.",
+      );
     $("run-button").disabled = !state.ready || state.submitting;
     return true;
   } catch (error) {
@@ -285,8 +348,8 @@ async function refreshPreview() {
       $("run-button").disabled = true;
       formError(
         error instanceof SyntaxError
-          ? "附加 CLI 参数的 JSON 格式无效。"
-          : error.message,
+          ? t("Invalid JSON in Extra CLI flags.")
+          : error,
       );
     }
     return false;
@@ -315,7 +378,7 @@ function renderTopology(summary) {
     for (let n = 0; n < shown; n++) {
       const x = start + n * (boxWidth + gap),
         center = x + boxWidth / 2;
-      svg += `<rect x="${x}" y="32" width="${boxWidth}" height="201" rx="10" fill="#ffffffeb" stroke="#dfe7f2"/><text x="${x + 16}" y="55" font-size="9" fill="#8597b1">NODE ${n}</text><text x="${center}" y="197" text-anchor="middle" font-size="9" fill="#8498b8">NVLink / ${summary.intra_node_topology === "fullmesh" ? "Full mesh" : "NVSwitch"}</text>`;
+      svg += `<rect x="${x}" y="32" width="${boxWidth}" height="201" rx="10" fill="#ffffffeb" stroke="#dfe7f2"/><text x="${x + 16}" y="55" font-size="9" fill="#8597b1">${esc(t("Node {value0}", { value0: n }))}</text><text x="${center}" y="197" text-anchor="middle" font-size="9" fill="#8498b8">NVLink / ${summary.intra_node_topology === "fullmesh" ? "Full mesh" : "NVSwitch"}</text>`;
       const visible = Math.min(summary.gpus_per_node, 4);
       for (let g = 0; g < visible; g++) {
         const gx = visible > 2 ? center + (g % 2 ? 32 : -32) : center;
@@ -326,7 +389,7 @@ function renderTopology(summary) {
         svg += `<text x="${center}" y="219" text-anchor="middle" font-size="8" fill="#8e9fb7">+ ${summary.gpus_per_node - 4} GPUs</text>`;
       svg += `<path d="M${center} 233v14" stroke="#df9c61" stroke-width="1.6"/>`;
     }
-    svg += `<path d="M${start + boxWidth / 2} 247H${start + (shown - 1) * (boxWidth + gap) + boxWidth / 2}" stroke="#df9c61" stroke-width="1.6"/><text x="350" y="266" text-anchor="middle" font-size="8" fill="#b28b66">${esc(summary.fabric)} fabric · ${esc(summary.inter_node_topology)}${summary.num_nodes > shown ? ` · 展示前 ${shown} 个节点，共 ${summary.num_nodes} 个` : ""}</text>`;
+    svg += `<path d="M${start + boxWidth / 2} 247H${start + (shown - 1) * (boxWidth + gap) + boxWidth / 2}" stroke="#df9c61" stroke-width="1.6"/><text x="350" y="266" text-anchor="middle" font-size="8" fill="#b28b66">${esc(summary.fabric)} fabric · ${esc(summary.inter_node_topology)}${summary.num_nodes > shown ? t(" · showing {value0} of {value1} nodes", { value0: shown, value1: summary.num_nodes }) : ""}</text>`;
   } else if (summary.stencil) {
     const x1 = 210,
       x2 = 490;
@@ -346,8 +409,8 @@ function renderTopology(summary) {
       rankLabel(summary.transfers[1].src) === rankLabel(first.dst) &&
       rankLabel(summary.transfers[1].dst) === rankLabel(first.src)
     )
-      svg += `<path d="M457 144H242" stroke="#7b9fee" stroke-width="1.7" marker-end="url(#network-arrow)"/><text x="350" y="168" text-anchor="middle" font-size="10" fill="#7291c5">${esc(summary.transfers[1]?.bytes)} bytes · 前一传输交付后</text>`;
-    svg += `<text x="350" y="221" text-anchor="middle" font-size="10" fill="#97a6bc">${count} ranks · ${esc(summary.transfers.length)} 个传输定义${summary.transfers.length > 2 ? " · 仅预览首组端点" : ""}</text>`;
+      svg += `<path d="M457 144H242" stroke="#7b9fee" stroke-width="1.7" marker-end="url(#network-arrow)"/><text x="350" y="168" text-anchor="middle" font-size="10" fill="#7291c5">${esc(summary.transfers[1]?.bytes)} bytes · ${esc(t("After the preceding transfer is delivered"))}</text>`;
+    svg += `<text x="350" y="221" text-anchor="middle" font-size="10" fill="#97a6bc">${count} ranks · ${esc(t("{value0} transfer definitions", { value0: summary.transfers.length }))}${summary.transfers.length > 2 ? t(" · first endpoint pair shown") : ""}</text>`;
   } else if (["ring", "switched", "fullmesh"].includes(summary.topology)) {
     const n = Math.min(count, 16),
       ring = summary.topology === "ring",
@@ -376,24 +439,30 @@ function renderTopology(summary) {
       svg += gpu(p.x, p.y, `G${i}`);
     });
     if (count > n)
-      svg += `<text x="350" y="263" text-anchor="middle" font-size="8" fill="#97a6bc">简化示意：展示前 ${n} 个 rank，共 ${count} 个</text>`;
+      svg += `<text x="350" y="263" text-anchor="middle" font-size="8" fill="#97a6bc">${esc(t("Schematic: showing {value0} of {value1} ranks", { value0: n, value1: count }))}</text>`;
   } else {
-    svg += `<rect x="190" y="74" width="320" height="124" rx="10" fill="#f8faff" stroke="#dbe5f4"/><text x="350" y="117" text-anchor="middle" font-size="20" fill="#536f99">${esc(summary.topology)}</text><text x="350" y="145" text-anchor="middle" font-size="11" fill="#8498b8">${count} ranks · ${esc(summary.algorithm)}</text><text x="350" y="176" text-anchor="middle" font-size="9" fill="#96a6bb">此拓扑暂无结构图，连接参数见配置快照。</text>`;
+    svg += `<rect x="190" y="74" width="320" height="124" rx="10" fill="#f8faff" stroke="#dbe5f4"/><text x="350" y="117" text-anchor="middle" font-size="20" fill="#536f99">${esc(summary.topology)}</text><text x="350" y="145" text-anchor="middle" font-size="11" fill="#8498b8">${count} ranks · ${esc(summary.algorithm)}</text><text x="350" y="176" text-anchor="middle" font-size="9" fill="#96a6bb">${esc(t("No structural diagram is available for this topology. See the input snapshot for link settings."))}</text>`;
   }
   $("topology-canvas").innerHTML = svg + "</svg>";
   $("topology-canvas").setAttribute(
     "aria-label",
-    `${summary.ranks} ranks，${summary.num_nodes} 个节点，${summary.topology} 拓扑示意`,
+    t("Topology schematic: {value0} ranks, {value1} nodes, {value2}", {
+      value0: summary.ranks,
+      value1: summary.num_nodes,
+      value2: summary.topology,
+    }),
   );
   $("topology-badge").textContent =
-    `${summary.num_nodes > 1 ? summary.inter_node_topology : summary.stencil ? "Transfer stencil" : summary.topology} · ${summary.fabric}`;
+    `${summary.num_nodes > 1 ? summary.inter_node_topology : summary.stencil ? t("Transfer stencil") : summary.topology} · ${summary.fabric}`;
   $("network-operation").textContent = summary.stencil
-    ? "Transfer stencil"
+    ? t("Transfer stencil")
     : `${summary.collective} / ${summary.algorithm}`;
   $("network-scale").textContent =
-    `${count} GPU / ${summary.num_nodes} ${summary.num_nodes > 1 ? "nodes" : "node"}${summary.num_nodes > 1 ? ` · So ${summary.inter_node_bandwidth_gbps} Gbps / ${summary.inter_node_latency_ns} ns` : ""}`;
+    `${count} GPUs / ${summary.num_nodes} ${t(summary.num_nodes > 1 ? "nodes" : "node")}${summary.num_nodes > 1 ? ` · So ${summary.inter_node_bandwidth_gbps} Gbps / ${summary.inter_node_latency_ns} ns` : ""}`;
   document.querySelector(".effective-strip>div>span").textContent =
-    summary.num_nodes > 1 ? "节点内带宽 / 链路" : "有效带宽 / 链路";
+    summary.num_nodes > 1
+      ? t("Intra-node bandwidth / link")
+      : t("Effective bandwidth / link");
   $("so-legend").hidden = summary.num_nodes < 2;
 }
 
@@ -426,7 +495,7 @@ async function selectRun(identifier, scroll = false, restoreInputs = false) {
       state.log = "";
       state.logCursor = 0;
       state.traceLoaded = null;
-      $("run-log").textContent = "等待程序输出…";
+      $("run-log").textContent = t("Waiting for simulator output…");
     }
     state.selected = run;
     if (restoreInputs)
@@ -441,7 +510,7 @@ async function selectRun(identifier, scroll = false, restoreInputs = false) {
         .querySelector(".results-panel")
         .scrollIntoView({ behavior: "smooth", block: "center" });
   } catch (error) {
-    notify(error.message);
+    notify(error);
   }
 }
 function renderSelected() {
@@ -453,21 +522,24 @@ function renderSelected() {
   $("result-empty").hidden = true;
   $("result-content").hidden = false;
   $("selected-run-description").textContent =
-    `${run.name} · ${run.summary.collective} / ${run.summary.algorithm} · ${run.summary.ranks} ranks · ${bytesLabel(run.summary.data_size)}${run.summary.stencil ? " dataSize" : " / rank"}`;
+    `${displayRunName(run)} · ${run.summary.collective} / ${run.summary.algorithm} · ${run.summary.ranks} ranks · ${bytesLabel(run.summary.data_size)}${run.summary.stencil ? " dataSize" : " / rank"}`;
   const status = $("selected-run-status");
   status.hidden = false;
   status.className = `status-badge ${run.status}`;
-  status.textContent = statusLabels[run.status] || run.status;
+  status.textContent = t(statusLabels[run.status] || run.status);
   $("run-progress").hidden = !active;
   const elapsed = run.started_at
     ? Math.max(0, (Date.now() - new Date(run.started_at).getTime()) / 1000)
     : 0;
   $("progress-text").textContent =
     run.status === "queued"
-      ? "已进入队列，等待前一任务结束。"
-      : `${statusLabels[run.status]} · 已运行 ${elapsed.toFixed(1)} s`;
+      ? t("Queued. Waiting for the preceding run to finish.")
+      : t("{value0} · elapsed {value1} s", {
+          value0: t(statusLabels[run.status]),
+          value1: elapsed.toFixed(1),
+        });
   $("run-error").hidden = !run.error;
-  $("run-error").textContent = run.error || "";
+  $("run-error").textContent = t(run.error);
   $("metric-duration").textContent = complete
     ? (result.simTimeNs / 1000).toLocaleString("en-US", {
         maximumFractionDigits: 3,
@@ -476,11 +548,12 @@ function renderSelected() {
   $("metric-exact").textContent = complete
     ? `${number(result.simTimeNs)} ns · status=complete`
     : active
-      ? "等待仿真完成"
-      : "未取得已完成操作的时长";
+      ? t("Waiting for the simulation to finish")
+      : t("No completed-operation time is available");
   $("metric-packets").textContent = number(result.endpointTxPackets);
-  $("metric-received").textContent =
-    `端点接收 ${number(result.endpointRxPackets)}`;
+  $("metric-received").textContent = t("Endpoint RX {value0}", {
+    value0: number(result.endpointRxPackets),
+  });
   $("metric-retries").textContent = number(result.retransmittedPackets);
   $("metric-drops").textContent = `/ ${number(result.switchDroppedPackets)}`;
   const settings = run.summary.settings || {};
@@ -494,22 +567,22 @@ function renderSelected() {
   }
   if (enabled("dcqcn") || result.ecnMarkedPackets > 0) {
     controlResults.push(
-      ["ECN 标记", result.ecnMarkedPackets],
-      ["CNP 反馈", result.cnpPacketsReceived],
+      [t("ECN marks"), result.ecnMarkedPackets],
+      [t("CNP feedback"), result.cnpPacketsReceived],
     );
   }
   if (enabled("rttcc") || result.rttccRttSamples > 0)
-    controlResults.push(["RTT 采样", result.rttccRttSamples]);
+    controlResults.push([t("RTT samples"), result.rttccRttSamples]);
   if (enabled("llrEnabled") || result.permanentLosses > 0)
-    controlResults.push(["永久丢失", result.permanentLosses]);
+    controlResults.push([t("Permanent losses"), result.permanentLosses]);
   if (enabled("fecEnabled") && !run.summary.stencil)
     controlResults.push(
-      ["FEC 可纠正", result.fecCorrectable],
-      ["FEC 不可纠正", result.fecUncorrectable],
+      [t("FEC correctable"), result.fecCorrectable],
+      [t("FEC uncorrectable"), result.fecUncorrectable],
     );
   if (result.opticalInterSwitchLinks > 0)
     controlResults.push([
-      "可用光链路",
+      t("Available optical links"),
       `${result.operationalOpticalInterSwitchLinks} / ${result.opticalInterSwitchLinks}`,
     ]);
   $("control-results").hidden = active || !controlResults.length || !run.result;
@@ -521,9 +594,13 @@ function renderSelected() {
     .join("");
   $("run-timing").textContent =
     run.wall_seconds != null
-      ? `程序运行 ${run.wall_seconds.toFixed(3)} s · RngRun=${run.request.seed}`
-      : "完成时记录程序运行时间";
-  $("run-identifier").textContent = `${run.name} · ${run.id.slice(0, 8)}`;
+      ? t("Wall time {value0} s · RngRun={value1}", {
+          value0: run.wall_seconds.toFixed(3),
+          value1: run.request.seed,
+        })
+      : t("Wall time is recorded when the run finishes");
+  $("run-identifier").textContent =
+    `${displayRunName(run)} · ${run.id.slice(0, 8)}`;
   $("cancel-button").hidden = !active;
   $("cancel-button").disabled = run.status === "cancelling";
   $("download-run").hidden = active;
@@ -536,9 +613,11 @@ function renderSelected() {
       ([key, value]) => `<tr><td>${esc(key)}</td><td>${esc(value)}</td></tr>`,
     )
     .join("");
-  $("result-field-count").textContent = `${entries.length} fields`;
+  $("result-field-count").textContent = t("{value0} fields", {
+    value0: entries.length,
+  });
   $("run-snapshot").textContent =
-    `# ${run.name}\n# branch: ${run.source.branch}\n# commit: ${run.source.commit}\n# binary SHA256: ${run.binary?.sha256 || "等待启动"}\n\n${run.config}\n# ---- profile.profile ----\n${run.profile}\n# ---- argv ----\n${JSON.stringify(run.command, null, 2)}`;
+    `# ${run.name}\n# branch: ${run.source.branch}\n# commit: ${run.source.commit}\n# binary SHA256: ${run.binary?.sha256 || t("Waiting to start")}\n\n${run.config}\n# ---- profile.profile ----\n${run.profile}\n# ---- argv ----\n${JSON.stringify(run.command, null, 2)}`;
 }
 async function loadLog() {
   const run = state.selected;
@@ -553,17 +632,20 @@ async function loadLog() {
     const pane = $("run-log"),
       atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 50;
     pane.textContent =
-      (truncated ? "[页面仅显示日志末尾，可下载完整日志]\n" : "") +
-      (state.log || "等待程序输出…");
+      (truncated
+        ? t(
+            "[Showing the end of the log. Download the complete log for all output.]\n",
+          )
+        : "") + (state.log || t("Waiting for simulator output…"));
     if (atBottom) pane.scrollTop = pane.scrollHeight;
   } catch (error) {
-    if (state.tab === "log") notify(error.message);
+    if (state.tab === "log") notify(error);
   }
 }
 async function loadTrace() {
   const run = state.selected;
   if (!run) return;
-  const key = run.id + ":" + run.status;
+  const key = run.id + ":" + run.status + ":" + I18n.language;
   if (state.traceLoaded === key && terminal.has(run.status)) return;
   try {
     const data = await api(`/api/runs/${run.id}/trace`);
@@ -571,7 +653,7 @@ async function loadTrace() {
     state.traceLoaded = key;
     if (!data.rows.length) {
       $("trace-content").innerHTML =
-        `<div class="small-empty">${terminal.has(run.status) ? "此场景未记录步骤数据。可在原始日志中查看运行结果。" : "等待 injector 写入步骤数据…"}</div>`;
+        `<div class="small-empty">${terminal.has(run.status) ? t("This scenario has no step trace. See the raw log for its results.") : t("Waiting for the injector to write step records…")}</div>`;
       return;
     }
     const ranks = [...new Set(data.rows.map((row) => row.gpu))]
@@ -584,7 +666,7 @@ async function loadTrace() {
       height = Math.max(160, ranks.length * 26 + 65);
     const max = Math.max(1, ...data.rows.map((row) => row.sinceStartNs)) / 1000;
     const x = (t) => left + (width - left - right) * (t / max);
-    let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg" aria-label="每个 rank 的步骤完成时刻">`;
+    let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg" aria-label="${esc(t("Step-completion timestamps for each rank"))}">`;
     for (let i = 0; i <= 4; i++) {
       const value = (max * i) / 4;
       svg += `<path d="M${x(value)} ${top - 8}V${height - 36}" stroke="#e8edf5" stroke-dasharray="3 4"/><text x="${x(value)}" y="${height - 16}" text-anchor="middle" font-size="9" fill="#8c9eb9">${+value.toFixed(2)}${i === 4 ? " µs" : ""}</text>`;
@@ -596,7 +678,7 @@ async function loadTrace() {
         .filter((row) => row.gpu === rank)
         .slice(0, 256)
         .forEach((row) => {
-          svg += `<circle cx="${x(row.sinceStartNs / 1000)}" cy="${y}" r="3" fill="#618bee" opacity=".85"><title>rank ${row.gpu}, step ${row.step}: ${row.sinceStartNs} ns</title></circle>`;
+          svg += `<circle cx="${x(row.sinceStartNs / 1000)}" cy="${y}" r="3" fill="#618bee" opacity=".85"><title>${esc(t("rank {value0}, step {value1}: {value2} ns", { value0: row.gpu, value1: row.step, value2: row.sinceStartNs }))}</title></circle>`;
         });
     });
     svg += "</svg>";
@@ -604,11 +686,10 @@ async function loadTrace() {
       data.truncated ||
       ranks.length < new Set(data.rows.map((r) => r.gpu)).size
     )
-      svg +=
-        '<p class="field-hint">为便于阅读，最多显示 16 个 rank；完整数据见下载包中的 steps.csv。</p>';
+      svg += `<p class="field-hint">${esc(t("The chart shows at most 16 ranks. Download steps.csv for the complete trace."))}</p>`;
     $("trace-content").innerHTML = svg;
   } catch (error) {
-    $("trace-content").textContent = error.message;
+    $("trace-content").textContent = messageText(error);
   }
 }
 
@@ -624,7 +705,7 @@ function renderHistory(force = false) {
   $("history-rows").innerHTML = state.runs
     .map(
       (run) =>
-        `<tr class="${run.id === state.selected?.id ? "current" : ""}"><td class="checkbox-cell"><input type="checkbox" data-compare="${run.id}" aria-label="选择 ${esc(run.name)} 进行比较" ${run.status !== "completed" ? "disabled" : ""} ${state.compared.has(run.id) ? "checked" : ""}></td><td><button class="run-link" data-run="${run.id}" type="button">${esc(run.name)}</button><small>${esc(run.id.slice(0, 8))} · ${esc(run.summary.algorithm)}</small></td><td class="numeric">${run.summary.ranks} ranks${run.summary.num_nodes > 1 ? `<small>${run.summary.num_nodes} × ${run.summary.gpus_per_node} GPUs</small>` : ""}</td><td class="numeric">${esc(bytesLabel(run.summary.data_size))}</td><td class="numeric duration">${run.status === "completed" ? durationLabel(run.result?.simTimeNs) : "—"}</td><td>${badge(run.status)}</td><td class="numeric">${new Date(run.created_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}<small>${run.wall_seconds != null ? run.wall_seconds.toFixed(3) + " s wall" : "等待完成"}</small></td><td><button type="button" class="icon-button" data-clone="${run.id}" title="载入此实验配置" aria-label="载入 ${esc(run.name)} 的配置"><svg><use href="#i-reset"/></svg></button></td></tr>`,
+        `<tr class="${run.id === state.selected?.id ? "current" : ""}"><td class="checkbox-cell"><input type="checkbox" data-compare="${run.id}" aria-label="${esc(t("Select {value0} for comparison", { value0: displayRunName(run) }))}" ${run.status !== "completed" ? "disabled" : ""} ${state.compared.has(run.id) ? "checked" : ""}></td><td><button class="run-link" data-run="${run.id}" type="button">${esc(displayRunName(run))}</button><small>${esc(run.id.slice(0, 8))} · ${esc(run.summary.algorithm)}</small></td><td class="numeric">${run.summary.ranks} ranks${run.summary.num_nodes > 1 ? `<small>${run.summary.num_nodes} × ${run.summary.gpus_per_node} GPUs</small>` : ""}</td><td class="numeric">${esc(bytesLabel(run.summary.data_size))}</td><td class="numeric duration">${run.status === "completed" ? durationLabel(run.result?.simTimeNs) : "—"}</td><td>${badge(run.status)}</td><td class="numeric">${new Date(run.created_at).toLocaleTimeString(I18n.language === "zh" ? "zh-CN" : "en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}<small>${run.wall_seconds != null ? t("{value0} s wall", { value0: run.wall_seconds.toFixed(3) }) : t("Waiting for completion")}</small></td><td><button type="button" class="icon-button" data-clone="${run.id}" title="${esc(t("Load this experiment's inputs"))}" aria-label="${esc(t("Load inputs for {value0}", { value0: displayRunName(run) }))}"><svg><use href="#i-reset"/></svg></button></td></tr>`,
     )
     .join("");
 }
@@ -641,10 +722,10 @@ function showComparison() {
   $("comparison-chart").innerHTML = runs
     .map(
       (run) =>
-        `<div class="comparison-item"><div class="comparison-label"><span>${esc(run.name)}</span><strong>${durationLabel(run.result.simTimeNs)}</strong></div><div class="comparison-track"><div class="comparison-bar" style="width:${(run.result.simTimeNs / max) * 100}%"></div></div><small>${esc(run.summary.collective)} / ${esc(run.summary.algorithm)} · ${run.summary.ranks} ranks · ${esc(bytesLabel(run.summary.data_size))}${run.summary.stencil ? " dataSize" : " / rank"} · ${run.id.slice(0, 8)}</small></div>`,
+        `<div class="comparison-item"><div class="comparison-label"><span>${esc(displayRunName(run))}</span><strong>${durationLabel(run.result.simTimeNs)}</strong></div><div class="comparison-track"><div class="comparison-bar" style="width:${(run.result.simTimeNs / max) * 100}%"></div></div><small>${esc(run.summary.collective)} / ${esc(run.summary.algorithm)} · ${run.summary.ranks} ranks · ${esc(bytesLabel(run.summary.data_size))}${run.summary.stencil ? " dataSize" : " / rank"} · ${run.id.slice(0, 8)}</small></div>`,
     )
     .join("");
-  $("compare-dialog").showModal();
+  if (!$("compare-dialog").open) $("compare-dialog").showModal();
 }
 async function poll() {
   if (polling || !state.catalog) return;
@@ -670,39 +751,51 @@ async function poll() {
     }
     $("connection-error").hidden = engine.ready;
   } catch (error) {
-    $("connection-error").textContent = `连接中断：${error.message}`;
+    state.connectionMessage = () =>
+      t("Connection lost: {value0}", { value0: messageText(error) });
+    $("connection-error").textContent = state.connectionMessage();
     $("connection-error").hidden = false;
     state.ready = false;
+    if (state.engine)
+      state.engine = { ...state.engine, ready: false, connected: false };
     $("run-button").disabled = true;
   } finally {
     polling = false;
   }
 }
 function renderEngine(engine) {
+  state.engine = engine;
   state.ready = engine.ready;
   $("engine-state").className =
     `engine-state ${engine.ready ? "ready" : "unready"}`;
   $("engine-state").innerHTML =
-    `<i></i>${engine.ready ? "仿真引擎就绪" : "需要构建仿真程序"}`;
+    `<i></i>${engine.connected === false ? t("Connection lost") : engine.ready ? t("Simulator ready") : t("Build the simulator first")}`;
   $("branch-label").textContent = engine.branch;
   $("branch-label").title = `${engine.branch} · ${engine.commit}`;
   $("queue-label").textContent =
     engine.running || engine.queued
-      ? `运行中 ${engine.running} · 排队 ${engine.queued}`
-      : "单任务执行队列";
+      ? t("Running {value0} · queued {value1}", {
+          value0: engine.running,
+          value1: engine.queued,
+        })
+      : t("One simulation at a time");
   $("run-button").disabled =
     !state.ready ||
     !state.preview ||
     state.submitting ||
     !$("form-error").hidden;
-  if (!engine.ready) {
-    $("connection-error").textContent =
-      "尚未找到仿真程序。请先在仓库根目录运行：./ns3 build gpu-cluster-sim";
+  if (!engine.ready && engine.connected !== false) {
+    state.connectionMessage = () =>
+      t(
+        "Simulator binary not found. Run ./ns3 build gpu-cluster-sim from the repository root.",
+      );
+    $("connection-error").textContent = state.connectionMessage();
     $("connection-error").hidden = false;
   }
 }
 
 async function initialize() {
+  await I18n.ready;
   try {
     const [catalog, engine, list] = await Promise.all([
       api("/api/catalog"),
@@ -713,6 +806,7 @@ async function initialize() {
     state.controls = new SimulationOptions(catalog.options, () => ({
       multi: state.scene === "multinode",
     }));
+    I18n.apply();
     state.runs = list.runs;
     renderEngine(engine);
     setScene("collective");
@@ -735,10 +829,12 @@ async function initialize() {
       const input = $(id);
       if (input.options.length <= 1) {
         input.disabled = true;
-        input.innerHTML = "<option>选项加载失败，请刷新页面</option>";
+        input.innerHTML = `<option>${esc(t("Unable to load choices. Reload the page."))}</option>`;
       }
     }
-    $("connection-error").textContent = `无法加载工作区：${error.message}`;
+    state.connectionMessage = () =>
+      t("Cannot load the workspace: {value0}", { value0: messageText(error) });
+    $("connection-error").textContent = state.connectionMessage();
     $("connection-error").hidden = false;
   }
 }
@@ -754,7 +850,7 @@ $("config-select").addEventListener("change", (event) =>
 $("reset-button").addEventListener("click", () => {
   if (state.config) {
     loadConfig(state.config.id);
-    notify("已恢复当前场景默认值");
+    notify(t("Template defaults restored"));
   }
 });
 document.querySelectorAll("[data-gpus]").forEach((button) =>
@@ -767,7 +863,7 @@ $("simulation-form").addEventListener("input", schedulePreview);
 $("simulation-form").addEventListener("change", schedulePreview);
 $("data-unit").addEventListener("change", updateLocalLabels);
 $("apply-source").addEventListener("click", async () => {
-  if (await refreshPreview()) notify("配置校验通过，预览已更新");
+  if (await refreshPreview()) notify(t("Inputs validated. Preview updated."));
 });
 $("simulation-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -788,12 +884,12 @@ $("simulation-form").addEventListener("submit", async (event) => {
     setTab("overview");
     await selectRun(run.id);
     await poll();
-    notify("已提交仿真任务");
+    notify(t("Simulation submitted"));
   } catch (error) {
     formError(
       error instanceof SyntaxError
-        ? "附加 CLI 参数的 JSON 格式无效。"
-        : error.message,
+        ? t("Invalid JSON in Extra CLI flags.")
+        : error,
     );
   } finally {
     state.submitting = false;
@@ -809,7 +905,7 @@ $("cancel-button").addEventListener("click", async () => {
     renderSelected();
     await poll();
   } catch (error) {
-    notify(error.message);
+    notify(error);
   }
 });
 document.querySelectorAll("[data-tab]").forEach((button) => {
@@ -837,9 +933,9 @@ $("history-rows").addEventListener("click", async (event) => {
       const run = await api(`/api/runs/${clone.dataset.clone}`);
       loadConfig(run.request.config_id, savedInputs(run));
       $("config-panel").scrollIntoView({ behavior: "smooth", block: "start" });
-      notify("已载入配置，可修改后重新运行");
+      notify(t("Inputs loaded. Edit them and run again."));
     } catch (error) {
-      notify(error.message);
+      notify(error);
     }
   }
 });
@@ -849,7 +945,7 @@ $("history-rows").addEventListener("change", (event) => {
   if (box.checked) {
     if (state.compared.size >= 6) {
       box.checked = false;
-      notify("一次最多对比 6 个实验");
+      notify(t("Compare at most 6 runs at a time."));
       return;
     }
     state.compared.add(box.dataset.compare);
@@ -886,14 +982,18 @@ document.querySelectorAll("dialog").forEach((dialog) =>
 );
 $("copy-config").addEventListener("click", async () => {
   if (!state.selected) {
-    notify("请先选择一次运行");
+    notify(t("Select a run first."));
     return;
   }
   try {
     await navigator.clipboard.writeText(state.selected.config);
-    notify("已复制运行配置");
+    notify(t("Run configuration copied"));
   } catch {
-    notify("浏览器未允许复制，请从完整运行记录中下载 config.cfg");
+    notify(
+      t(
+        "Clipboard access was denied. Download config.cfg from the run archive.",
+      ),
+    );
   }
 });
 for (const [input, editor] of [
@@ -904,12 +1004,12 @@ for (const [input, editor] of [
     const file = event.target.files[0];
     if (!file) return;
     if (file.size > 65536) {
-      notify("文件不能超过 64 KiB");
+      notify(t("Files must not exceed 64 KiB."));
       return;
     }
     $(editor).value = (await file.text()).replace(/^\uFEFF/, "");
     schedulePreview();
-    notify(`已载入 ${file.name}`);
+    notify(t("Loaded {value0}", { value0: file.name }));
     event.target.value = "";
   });
 document.addEventListener("keydown", (event) => {
@@ -925,5 +1025,47 @@ document.addEventListener("keydown", (event) => {
 window.addEventListener("hashchange", () => {
   const match = location.hash.match(/^#run=([0-9a-f]{32})$/);
   if (match && state.catalog) selectRun(match[1], false, true);
+});
+document.addEventListener("languagechange", () => {
+  formError(state.formMessage);
+  $("toast").textContent = messageText(state.toastMessage);
+  if (state.connectionMessage)
+    $("connection-error").textContent = state.connectionMessage();
+  if (!state.catalog) return;
+  const configSelect = $("config-select");
+  for (const option of configSelect.options) {
+    const config = state.catalog.configs.find(
+      (item) => item.id === option.value,
+    );
+    if (config) option.textContent = t(config.title);
+  }
+  $("config-count").textContent = t("{value0} templates", {
+    value0: configSelect.options.length,
+  });
+  $("config-description").textContent = t(state.config.description);
+  state.controls.relocalize();
+  updateLocalLabels();
+  if (state.preview) {
+    const preview = state.preview;
+    document.querySelector('label[for="data-size"]').textContent = t(
+      preview.summary.stencil ? "dataSize input" : "Application bytes per rank",
+    );
+    $("preview-notices").textContent = preview.notices
+      .map((message) => t(message))
+      .join(" ");
+    $("stencil-hint").textContent = t(
+      preview.notices[0] ||
+        "The transfer.*.bytes expressions determine the actual transfer sizes.",
+    );
+    renderTopology(preview.summary);
+  }
+  if (state.engine) renderEngine(state.engine);
+  renderSelected();
+  renderHistory(true);
+  if (state.selected) {
+    if (state.tab === "trace") loadTrace();
+    $("run-log").textContent = state.log || t("Waiting for simulator output…");
+  }
+  if ($("compare-dialog").open) showComparison();
 });
 initialize();
