@@ -82,6 +82,13 @@ groups. AllToAll's non-hierarchical choices share `AlltoAllInjector` (CollNet
 names are aliases). Invalid FEC tuples and PFC/ECN/drop-threshold orderings are
 rejected before a process starts.
 
+**Topology parameters** contains only structural settings for the selected
+network, such as leaf/spine counts or mesh rows/columns. **Algorithm parameters**
+contains operation-specific controls: Broadcast/Reduce root rank, NCCL ring
+channel count, or a hierarchical operation's intra-node algorithm. These panels
+are hidden when the selection needs no extra parameters. Multi-node physical
+topology selectors appear directly under communication/topology.
+
 Use **0.1% packet loss + SACK** in the error section for a small loss experiment.
 It sets 4 KiB bulk packets, selective retry, a 200 µs retransmission timeout,
 and sufficient credits; multi-node runs also receive a 64-chunk send window.

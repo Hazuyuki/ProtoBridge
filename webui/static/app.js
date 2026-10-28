@@ -727,6 +727,17 @@ async function initialize() {
     if (match) await selectRun(match[1], false, true);
     setInterval(poll, 1200);
   } catch (error) {
+    for (const id of [
+      "collective-select",
+      "algorithm-select",
+      "physical-topology",
+    ]) {
+      const input = $(id);
+      if (input.options.length <= 1) {
+        input.disabled = true;
+        input.innerHTML = "<option>选项加载失败，请刷新页面</option>";
+      }
+    }
     $("connection-error").textContent = `无法加载工作区：${error.message}`;
     $("connection-error").hidden = false;
   }

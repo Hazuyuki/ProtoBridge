@@ -373,6 +373,11 @@ main {
   column-gap: 12px;
   align-items: start;
 }
+.advanced summary > .options-title {
+  color: inherit;
+  font: inherit;
+  margin-left: 0;
+}
 .option-grid > [hidden] {
   display: none;
 }

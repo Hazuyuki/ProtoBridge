@@ -10,6 +10,18 @@ class SimulationOptions {
       ...schema.topology_fields,
       ...schema.groups.flatMap((group) => group.fields),
     ];
+    const algorithmKeys = new Set([
+      "intraNodeAlgorithm",
+      "rootRank",
+      "ringChannels",
+    ]);
+    this.algorithmFields = schema.topology_fields.filter((item) =>
+      algorithmKeys.has(item.key),
+    );
+    this.topologyFields = schema.topology_fields.filter(
+      (item) =>
+        !algorithmKeys.has(item.key) && item.key !== "intraNodeTopology",
+    );
     this.escape = (value) =>
       String(value ?? "").replace(
         /[&<>"']/g,
@@ -23,7 +35,13 @@ class SimulationOptions {
           })[c],
       );
     document.getElementById("topology-option-fields").innerHTML =
-      schema.topology_fields.map((item) => this.renderField(item)).join("");
+      this.topologyFields.map((item) => this.renderField(item)).join("");
+    document.getElementById("algorithm-option-fields").innerHTML =
+      this.algorithmFields.map((item) => this.renderField(item)).join("");
+    document.getElementById("intra-topology-control").innerHTML =
+      this.renderField(
+        schema.topology_fields.find((item) => item.key === "intraNodeTopology"),
+      );
     document.getElementById("native-options").innerHTML = schema.groups
       .map(
         (group) => `
@@ -42,6 +60,15 @@ class SimulationOptions {
     document
       .getElementById("physical-topology")
       .addEventListener("change", () => this.topologyChanged());
+    document
+      .getElementById("simulation-form")
+      .addEventListener("focusout", (event) => {
+        const input = event.target;
+        if (input.tagName === "SELECT" && input.dataset.pendingDefaultLabel) {
+          input.options[0].textContent = input.dataset.pendingDefaultLabel;
+          delete input.dataset.pendingDefaultLabel;
+        }
+      });
     document.getElementById("clear-errors").addEventListener("click", () => {
       this.clearErrors();
       this.changed();
@@ -132,7 +159,7 @@ class SimulationOptions {
   setChoices(id, choices, value, inherited = "沿用配置") {
     const e = this.escape,
       input = document.getElementById(id);
-    input.innerHTML =
+    let markup =
       `<option value="">${e(inherited)}</option>` +
       choices
         .map(
@@ -141,9 +168,31 @@ class SimulationOptions {
         )
         .join("");
     if (value && !choices.some((item) => item.value === value)) {
-      input.innerHTML += `<option value="${e(value)}">${e(value)} · 请检查兼容性</option>`;
+      markup += `<option value="${e(value)}">${e(value)} · 请检查兼容性</option>`;
     }
-    input.value = value;
+    const signature = JSON.stringify([
+      choices,
+      value && !choices.some((item) => item.value === value) ? value : null,
+    ]);
+    if (input.dataset.choicesSignature !== signature) {
+      input.innerHTML = markup;
+      input.dataset.choicesSignature = signature;
+    }
+    if (input.value !== value) input.value = value;
+  }
+
+  setDefaultLabel(input, label) {
+    if (input.options[0].textContent === label) {
+      delete input.dataset.pendingDefaultLabel;
+      return;
+    }
+    // Updating an open native select can dismiss its OS menu in Chrome.
+    // Leave focused selects alone and apply the label after focus leaves.
+    if (document.activeElement === input) {
+      input.dataset.pendingDefaultLabel = label;
+      return;
+    }
+    input.options[0].textContent = label;
   }
 
   operation() {
@@ -288,6 +337,7 @@ class SimulationOptions {
     document.getElementById("algorithm-select").disabled = operation.stencil;
     document.getElementById("physical-topology-field").hidden = multi;
     document.getElementById("physical-topology").disabled = multi;
+    document.getElementById("multi-topology-controls").hidden = !multi;
     document.getElementById("stencil-operation-hint").hidden =
       !operation.stencil;
     const topology = this.schema.topologies.find(
@@ -302,7 +352,7 @@ class SimulationOptions {
       button.disabled = dimensionRanks;
     });
     for (const option of document.getElementById("algorithm-select").options) {
-      option.disabled =
+      const disabled =
         (["nvls", "sharp", "collnetdirect", "collnetchain"].includes(
           option.value,
         ) &&
@@ -310,6 +360,7 @@ class SimulationOptions {
         (option.value === "hierarchical" &&
           !multi &&
           !["leafspine", "nvl72"].includes(operation.topology));
+      if (option.disabled !== disabled) option.disabled = disabled;
     }
     document.getElementById("physical-topology-hint").textContent =
       topology?.hint || "选择实际物理连接方式；算法与拓扑分别设置。";
@@ -325,8 +376,10 @@ class SimulationOptions {
       ["algorithm-select", source.op.algorithm || "ring"],
       ["physical-topology", source.op.topology || "ring"],
     ]) {
-      document.getElementById(id).options[0].textContent =
-        `沿用配置 · ${sourceValue || "stencil"}`;
+      this.setDefaultLabel(
+        document.getElementById(id),
+        `模板默认 · ${sourceValue || "stencil"}`,
+      );
     }
     const setting = (key) =>
       document.getElementById(`opt-${key}`)?.value ||
@@ -356,9 +409,50 @@ class SimulationOptions {
       document.getElementById(`options-${group.id}`).hidden =
         group.scope === "single" && multi;
     document.getElementById("topology-options").hidden =
-      !this.schema.topology_fields.some(
+      !this.topologyFields.some(
         (item) => !document.getElementById(`opt-${item.key}-field`).hidden,
       );
+    document.getElementById("algorithm-options").hidden =
+      !this.algorithmFields.some(
+        (item) => !document.getElementById(`opt-${item.key}-field`).hidden,
+      );
+    const topologyName = multi
+      ? document.getElementById("inter-topology").selectedOptions[0]
+          ?.textContent
+      : topology?.label;
+    document.getElementById("topology-options-title").textContent =
+      `拓扑参数 · ${topologyName || "当前网络"}`;
+    document.getElementById("topology-options-description").textContent = multi
+      ? "设置节点间网络的尺寸，例如 spine 数量或 torus 宽度。0 表示自动选择，通常可直接使用默认值。"
+      : operation.topology === "leafspine"
+        ? "Leaf 连接 GPU，Spine 连接各个 Leaf。这里设置两层交换机的数量；GPU 数须能被 Leaf 数整除。已填入可运行的默认值。"
+        : operation.topology === "mesh"
+          ? "设置网格的行数和列数。例如 2 行 × 4 列对应 8 个 GPU；修改维度后 GPU 总数会自动更新。"
+          : operation.topology === "torus"
+            ? "设置环绕网络的 X、Y、Z 维长度。例如 2 × 2 × 2 对应 8 个 GPU；修改维度后 GPU 总数会自动更新。"
+            : operation.topology === "hypercube"
+              ? "设置超立方体维数 d，GPU 总数为 2 的 d 次方。例如 3 维对应 8 个 GPU。"
+              : "设置当前物理网络的交换机数量或维度。已有默认值，可以直接运行；修改前请查看参数旁的约束说明。";
+    const algorithmDetail = ["broadcast", "reduce"].includes(
+      operation.collective,
+    )
+      ? [
+          "Root rank",
+          "Root rank 从 0 开始编号：Broadcast 从这个 GPU 发出数据，Reduce 将归约结果交给这个 GPU。",
+        ]
+      : operation.algorithm === "ncclring"
+        ? [
+            "并行通道",
+            "通道数控制并行 ring 的数量。0 表示按每节点 GPU 数自动设置。",
+          ]
+        : [
+            "节点内算法",
+            "Hierarchical 分别执行节点内和节点间通信。这里选择节点内阶段使用 Ring 或 Full mesh，物理连接方式由上方拓扑选择决定。",
+          ];
+    document.getElementById("algorithm-options-title").textContent =
+      `算法参数 · ${algorithmDetail[0]}`;
+    document.getElementById("algorithm-options-description").textContent =
+      algorithmDetail[1];
   }
 
   apply(request) {
@@ -428,7 +522,7 @@ class SimulationOptions {
         item.choices?.find((choice) => choice.value === String(value))?.label ??
         value;
       if (item.choices)
-        input.options[0].textContent = `沿用 · ${label ?? "配置值"}`;
+        this.setDefaultLabel(input, `沿用 · ${label ?? "配置值"}`);
       else input.placeholder = `当前 ${value ?? "配置值"}`;
       document.getElementById(`opt-${item.key}-effective`).textContent =
         value == null ? "" : `当前：${label}`;

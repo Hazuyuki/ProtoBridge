@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 import zipfile
 from contextlib import asynccontextmanager
@@ -10,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .catalog import RunRequest
@@ -49,6 +50,8 @@ def create_app(repo: Path | None = None, data_dir: Path | None = None, binary: P
         response.headers["Referrer-Policy"] = "same-origin"
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
+        elif request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
     def service() -> SimulationService:
@@ -149,7 +152,11 @@ def create_app(repo: Path | None = None, data_dir: Path | None = None, binary: P
 
     @application.get("/")
     async def index():
-        return FileResponse(STATIC/"index.html")
+        html = (STATIC/"index.html").read_text()
+        for token, filename in [("STYLES_VERSION", "styles.css"), ("OPTIONS_VERSION", "options.js"), ("APP_VERSION", "app.js")]:
+            version = hashlib.sha256((STATIC/filename).read_bytes()).hexdigest()[:12]
+            html = html.replace("__"+token+"__", version)
+        return HTMLResponse(html)
 
     application.mount("/static", StaticFiles(directory=STATIC), name="static")
     return application

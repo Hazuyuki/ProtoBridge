@@ -10,9 +10,9 @@
     />
     <title>ProtoBridge · 互联仿真实验室</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css" />
-    <script src="/static/options.js" defer></script>
-    <script src="/static/app.js" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=__STYLES_VERSION__" />
+    <script src="/static/options.js?v=__OPTIONS_VERSION__" defer></script>
+    <script src="/static/app.js?v=__APP_VERSION__" defer></script>
   </head>
   <body>
     <svg class="icon-defs" aria-hidden="true">
@@ -206,17 +206,49 @@
                 <div class="form-divider"><span>通信与拓扑</span></div>
                 <div class="field" id="collective-field">
                   <label for="collective-select">Collective 操作</label>
-                  <select id="collective-select"></select>
+                  <select id="collective-select" disabled>
+                    <option>正在加载可选操作…</option>
+                  </select>
                 </div>
                 <div class="field" id="algorithm-field">
                   <label for="algorithm-select">Collective 算法</label>
-                  <select id="algorithm-select"></select>
+                  <select id="algorithm-select" disabled>
+                    <option>正在加载可选算法…</option>
+                  </select>
                   <p class="field-hint" id="operation-hint"></p>
                 </div>
                 <div class="field" id="physical-topology-field">
                   <label for="physical-topology">物理拓扑</label>
-                  <select id="physical-topology"></select>
+                  <select id="physical-topology" disabled>
+                    <option>正在加载可选拓扑…</option>
+                  </select>
                   <p class="field-hint" id="physical-topology-hint"></p>
+                </div>
+                <div id="intra-topology-control"></div>
+                <div id="multi-topology-controls" hidden>
+                  <div class="form-row">
+                    <div class="field">
+                      <label for="inter-fabric">节点间 Fabric</label>
+                      <select id="inter-fabric">
+                        <option value="ETH">Ethernet</option>
+                        <option value="RoCE">RoCE</option>
+                        <option value="NVLink">NVLink</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label for="inter-topology">节点间拓扑</label>
+                      <select id="inter-topology">
+                        <option value="host">Host</option>
+                        <option value="tor">ToR</option>
+                        <option value="rail">Rail</option>
+                        <option value="leafspine">Leaf–spine</option>
+                        <option value="fullmesh">Full mesh</option>
+                        <option value="ring">Ring</option>
+                        <option value="torus2d">2D torus</option>
+                        <option value="dragonfly">Dragonfly</option>
+                      </select>
+                    </div>
+                  </div>
                 </div>
                 <p class="field-hint" id="stencil-operation-hint" hidden>
                   当前为自定义传输，操作由 transfer.* 决定。切换 collective
@@ -224,14 +256,32 @@
                 </p>
                 <details class="advanced" id="topology-options">
                   <summary>
-                    <svg><use href="#i-sliders" /></svg>拓扑与算法参数
+                    <svg><use href="#i-sliders" /></svg
+                    ><span id="topology-options-title" class="options-title"
+                      >拓扑参数（可选）</span
+                    >
                   </summary>
                   <div class="advanced-content">
-                    <p class="field-hint">
-                      留空沿用配置或原生默认值；按维度构建的拓扑会自动计算实际
-                      GPU 数。
+                    <p class="field-hint" id="topology-options-description">
+                      设置所选网络的结构，例如 Leaf / Spine 数量或 Mesh
+                      行列数。已有默认值，可以直接运行。
                     </p>
                     <div id="topology-option-fields" class="option-grid"></div>
+                  </div>
+                </details>
+                <details class="advanced" id="algorithm-options">
+                  <summary>
+                    <svg><use href="#i-sliders" /></svg
+                    ><span id="algorithm-options-title" class="options-title"
+                      >算法参数（可选）</span
+                    >
+                  </summary>
+                  <div class="advanced-content">
+                    <p
+                      class="field-hint"
+                      id="algorithm-options-description"
+                    ></p>
+                    <div id="algorithm-option-fields" class="option-grid"></div>
                   </div>
                 </details>
                 <div class="form-divider"><span>参与规模</span></div>
@@ -254,7 +304,7 @@
                     />
                   </div>
                   <p class="field-hint" id="dimension-ranks-hint" hidden>
-                    GPU 数由拓扑维度决定，请在“拓扑与算法参数”中调整。
+                    GPU 数由拓扑维度决定，请在“拓扑参数”中调整。
                   </p>
                 </div>
                 <div id="multi-node-fields" class="form-row" hidden>
@@ -331,29 +381,6 @@
                   </div>
                 </div>
                 <div id="inter-node-controls" hidden>
-                  <div class="form-row">
-                    <div class="field">
-                      <label for="inter-fabric">节点间 Fabric</label>
-                      <select id="inter-fabric">
-                        <option value="ETH">Ethernet</option>
-                        <option value="RoCE">RoCE</option>
-                        <option value="NVLink">NVLink</option>
-                      </select>
-                    </div>
-                    <div class="field">
-                      <label for="inter-topology">节点间拓扑</label>
-                      <select id="inter-topology">
-                        <option value="host">Host</option>
-                        <option value="tor">ToR</option>
-                        <option value="rail">Rail</option>
-                        <option value="leafspine">Leaf–spine</option>
-                        <option value="fullmesh">Full mesh</option>
-                        <option value="ring">Ring</option>
-                        <option value="torus2d">2D torus</option>
-                        <option value="dragonfly">Dragonfly</option>
-                      </select>
-                    </div>
-                  </div>
                   <div class="form-row">
                     <div class="field">
                       <label for="inter-bandwidth"

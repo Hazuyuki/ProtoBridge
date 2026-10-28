@@ -3,6 +3,8 @@
 import hashlib
 import io
 import json
+import re
+import shutil
 import sys
 import time
 import zipfile
@@ -12,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from webui.app import create_app
+import webui.app as web_app
 from webui.catalog import CLI_FIELDS
 from webui.simulation import parse_result
 
@@ -92,6 +95,33 @@ def test_form_catalog_only_lists_native_algorithms_and_topologies(client):
     assert "2dfullmeshclos" not in {item["value"] for item in options["topologies"]}
     allreduce = next(item for item in options["collectives"] if item["value"] == "allreduce")
     assert {"tree", "ncclring", "nvls", "hierarchical"} <= set(allreduce["algorithms"])
+
+
+def test_page_loads_versioned_scripts_with_revalidation(client):
+    response = client.get("/")
+    assert response.headers["cache-control"] == "no-cache"
+    assets = re.findall(r'(?:src|href)="(/static/[^" ]+\?v=[0-9a-f]{12})"', response.text)
+    assert len(assets) == 3
+    for asset in assets:
+        loaded = client.get(asset)
+        assert loaded.status_code == 200
+        assert loaded.headers["cache-control"] == "no-cache"
+    assert "正在加载可选操作" in response.text
+
+
+def test_asset_version_changes_when_script_content_changes(tmp_path, executable, monkeypatch):
+    static = tmp_path/"static"
+    shutil.copytree(REPO/"webui/static", static)
+    monkeypatch.setattr(web_app, "STATIC", static)
+    with TestClient(create_app(REPO, tmp_path/"runs", executable)) as client:
+        before = client.get("/").text
+        old_url = re.search(r'src="(/static/app.js\?v=[0-9a-f]{12})"', before).group(1)
+        with (static/"app.js").open("a") as stream:
+            stream.write("\n// browser cache regression\n")
+        after = client.get("/").text
+        new_url = re.search(r'src="(/static/app.js\?v=[0-9a-f]{12})"', after).group(1)
+        assert new_url != old_url
+        assert client.get(new_url).text.endswith("// browser cache regression\n")
 
 
 def test_operation_overrides_are_written_to_the_executed_snapshot(client):
