@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import Catalog, RunRequest
+from .i18n import canonical_message
 
 TERMINAL = {"completed", "incomplete", "failed", "cancelled", "timed_out", "interrupted"}
 MAX_PENDING = 16
@@ -148,7 +149,8 @@ class SimulationService:
         actual_config = prepared["config"].replace("profile = profile.profile", f"profile = {directory/'profile.profile'}", 1)
         (directory/"config.cfg").write_text(actual_config)
         (directory/"stdout.log").touch()
-        job = {"id": identifier, "name": prepared["title"], "status": "queued", "created_at": now(),
+        title = prepared["title"] if request.name.strip() else canonical_message(prepared["title"])
+        job = {"id": identifier, "name": title, "status": "queued", "created_at": now(),
                "started_at": None, "finished_at": None, "wall_seconds": None,
                "request": request.model_dump(), "summary": prepared["summary"],
                "notices": prepared["notices"], "config": actual_config, "profile": prepared["profile"], "cli": prepared["cli"],

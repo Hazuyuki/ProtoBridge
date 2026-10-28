@@ -100,28 +100,31 @@ def test_form_catalog_only_lists_native_algorithms_and_topologies(client):
 def test_page_loads_versioned_scripts_with_revalidation(client):
     response = client.get("/")
     assert response.headers["cache-control"] == "no-cache"
-    assets = re.findall(r'(?:src|href)="(/static/[^" ]+\?v=[0-9a-f]{12})"', response.text)
-    assert len(assets) == 3
+    assets = re.findall(r'(?:src|href|data-catalog)="(/static/[^" ]+\?v=[0-9a-f]{12})"', response.text)
+    assert len(assets) == 5
     for asset in assets:
         loaded = client.get(asset)
         assert loaded.status_code == 200
         assert loaded.headers["cache-control"] == "no-cache"
-    assert "正在加载可选操作" in response.text
+    assert 'lang="en"' in response.text
+    assert "Loading operation choices" in response.text
 
 
-def test_asset_version_changes_when_script_content_changes(tmp_path, executable, monkeypatch):
+@pytest.mark.parametrize("filename,attribute", [("app.js", "src"), ("i18n.js", "src"), ("locales.json", "data-catalog")])
+def test_asset_version_changes_when_content_changes(tmp_path, executable, monkeypatch, filename, attribute):
     static = tmp_path/"static"
     shutil.copytree(REPO/"webui/static", static)
     monkeypatch.setattr(web_app, "STATIC", static)
     with TestClient(create_app(REPO, tmp_path/"runs", executable)) as client:
         before = client.get("/").text
-        old_url = re.search(r'src="(/static/app.js\?v=[0-9a-f]{12})"', before).group(1)
-        with (static/"app.js").open("a") as stream:
-            stream.write("\n// browser cache regression\n")
+        pattern = rf'{attribute}="(/static/{re.escape(filename)}\?v=[0-9a-f]{{12}})"'
+        old_url = re.search(pattern, before).group(1)
+        content = (static/filename).read_text()+"\n"
+        (static/filename).write_text(content)
         after = client.get("/").text
-        new_url = re.search(r'src="(/static/app.js\?v=[0-9a-f]{12})"', after).group(1)
+        new_url = re.search(pattern, after).group(1)
         assert new_url != old_url
-        assert client.get(new_url).text.endswith("// browser cache regression\n")
+        assert client.get(new_url).text == content
 
 
 def test_operation_overrides_are_written_to_the_executed_snapshot(client):
@@ -160,7 +163,7 @@ def test_fabric_forced_llr_is_visible_in_preview(client):
     assert response.status_code == 200
     settings = response.json()["summary"]["settings"]
     assert settings["llrRequested"] == "0" and settings["llrEnabled"] == "1"
-    assert any("强制开启" in notice for notice in response.json()["notices"])
+    assert any("forces LLR on" in notice for notice in response.json()["notices"])
 
 
 def test_cli_only_controls_in_stack_do_not_claim_to_be_enabled(client):
@@ -168,7 +171,7 @@ def test_cli_only_controls_in_stack_do_not_claim_to_be_enabled(client):
     assert response.status_code == 200
     settings = response.json()["summary"]["settings"]
     assert settings["dcqcn"] == "0" and settings["packetLossRate"] == "0.01"
-    assert any("不会传给原生 CLI" in notice for notice in response.json()["notices"])
+    assert any("is not forwarded to the native CLI" in notice for notice in response.json()["notices"])
 
 
 def test_minimal_profile_has_native_bundle_and_inline_defaults(client):
