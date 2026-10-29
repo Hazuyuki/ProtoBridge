@@ -3724,14 +3724,19 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
     // deframe the ECN/CNP loop; conversely a non-RoCE So model still under
     // efficiency < 1.0 keeps the legacy framing. Receive dispatch routes by
     // the wire-level framed flag (round 11), so it adapts to either side.
-    // NOTE: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1) on the
-    // receive dispatch; the protocol-framed wire flag stamped only when a
-    // SoHeader is actually present keeps Su NVLink LL packets (framed by the
-    // Su builder but byte-1) out of the So extraction path, so the two
-    // byte-1 populations never cross-fire. Chunks too small to hold the
-    // 10-byte header (wireChunk <= soHeaderSize) stay raw + unframed — the
-    // receiver delivers them through the raw path instead of aborting on a
-    // header deserialize that cannot fit.
+    // NOTE: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1) on
+    // the receive dispatch, and the protocol-framed wire flag alone does
+    // NOT separate them — Su NCCL LL sends also stamp it (SendDataInternal
+    // sets SetProtocolFramed for every builder-framed chunk), so both
+    // byte-1 populations enter protocol processing. Their actual
+    // separation is builder-based: Su LL packets are framed by the
+    // NcclProtocolPayloadBuilder and extracted with
+    // GetPayloadBuilderForRank(sourceRank) (never a SoHeader), while the
+    // switch-side ECN-mark and receiver CNP-echo guards additionally key
+    // on fabric type == ROCE, which Su NVLink packets never carry. Chunks
+    // too small to hold the 10-byte header (wireChunk <= soHeaderSize)
+    // stay raw + unframed — the receiver delivers them through the raw
+    // path instead of aborting on a header deserialize that cannot fit.
     const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
     Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
     const bool destIsRoceModel = (destModel

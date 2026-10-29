@@ -135,8 +135,12 @@ same matched fabric parameters (40 Gbps, 1 µs links, 1000-B packets,
      instrumenting `QbbNetDevice::TransmitStart`, `txTimeNs=203`), and
      trace-side measurement confirms 203.0 ns/packet pacing at both the
      switch and the receiver (payload 900 → 183 ns, same −1 ns). The
-     FCT extraction (last switch rx) shaves the final packet's partial
-     serialization, giving the 1014.5 B/pkt constant implied by the FCTs.
+     amortized cost implied by the measured FCTs is 1014.5 B/pkt
+     (20.290 ms × 40 Gbps ÷ 8 ÷ 2 flows ÷ 50000 pkt/flow), within
+     0.05% of the 1015-B serial figure; the last-switch→receiver
+     observation gap (10–30 µs at 2:1–8:1) is queue-tail drainage, not
+     a per-packet term, so no extra per-packet constant is derived from
+     it.
 
    Bytes-on-wire per effective byte: PB = (1039/1000)/0.95 = **1.0937**,
    ns3-rdma = 1015/1000 = **1.015** (effective); predicted FCT ratio

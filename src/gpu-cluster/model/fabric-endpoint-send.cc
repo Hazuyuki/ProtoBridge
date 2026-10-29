@@ -7,6 +7,9 @@
 
 #include "fabric-endpoint.h"
 
+#include "roce-payload-builder.h"  // RocePayloadBuilder::GetTypeId (union gate below)
+#include "roce-protocol-model.h"   // RoceProtocolModel::GetTypeId
+
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/packet.h"
@@ -935,11 +938,38 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
 {
     NS_LOG_FUNCTION(this << destRank << size << static_cast<int>(protocolId) << flowId << vcId);
 
-    // Check if this protocol has no overhead (SIMPLE, NONE, or vendor single-protocol)
-    double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
-    if (efficiency >= 1.0)
+    // Check if this protocol has no overhead (SIMPLE, NONE, or vendor
+    // single-protocol). Union gate, same semantics as the bulk path's
+    // stampSoHeader (codex round 37, finding 1): efficiency alone is the
+    // wrong discriminator for the So fabric — the RoCE model's WireEfficiency
+    // is a header-accounting knob that is legitimately configured to 1.0
+    // (the ns3-rdma alignment setting), and an efficiency-only gate sent
+    // those non-bulk RoCE packets raw (no RocePayloadBuilder framing, no
+    // SoHeader): the switch ECN-mark guard (protocol==SIMPLE + fabric ROCE
+    // + SoHeader present) never fired, so congestion backoff stayed inert
+    // at exactly the aligned configuration. Route through the builder when
+    // the destination's model is RoCE OR the protocol has real framing
+    // overhead (Su NCCL LL/LL128); plain SIMPLE/NONE/Ethernet traffic
+    // (efficiency == 1.0, non-RoCE model) still takes the raw path.
+    Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
+    double efficiency = destModel->GetEfficiency(protocolId);
+    const bool destIsRoceModel = (destModel->GetInstanceTypeId()
+                                  == RoceProtocolModel::GetTypeId());
+    // NB: the builder check binds only the RoCE arm. The efficiency arm must
+    // NOT require RocePayloadBuilder — Su NCCL LL/LL128 traffic frames with
+    // NcclProtocolPayloadBuilder, and gating it on the RoCE builder broke
+    // EgressDisposeCancelsDeferredSendsTest (delivered 3 instead of 1: no
+    // per-flow pacing without the builder's chunked path).
+    const bool useBuilder = (efficiency < 1.0)
+        || (destIsRoceModel
+            && GetPayloadBuilderForRank(destRank)->GetInstanceTypeId()
+                == RocePayloadBuilder::GetTypeId());
+    if (!useBuilder)
     {
-        // No protocol overhead - use regular SendData
+        // No protocol overhead (or no RoCE builder mounted) - use regular
+        // SendData. NB: a RoCE dest without --dcqcn never mounts the So
+        // builder, so it takes this raw path exactly as before — the
+        // builder detour only lights up the ECN/CNP chain when it is armed.
         SendData(destRank, data, size, flowId, vcId);
         return;
     }

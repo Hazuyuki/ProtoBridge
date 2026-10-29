@@ -155,9 +155,11 @@ at this workload, same as ProtoBridge.)
    1000-B chunks). Both produce zero drops at 2:1 incast.
 4. **Interaction with rate control.** With DCQCN enabled, ns3-rdma emits
    zero PAUSEs — the rate controller keeps ingress occupancy under the
-   threshold. ProtoBridge has no DCQCN arm; its PFC is the only
-   congestion backpressure, and (as the controls show) it does not
-   change the transfer time.
+   threshold. These ProtoBridge runs mount no DCQCN arm (`--dcqcn` unset;
+   the RoCE rate machine exists — `--dcqcn=1` mounts `DcqcnRateMachine`
+   and the SoHeader/ECN/CNP chain — but is deliberately off here to
+   isolate PFC behavior); PFC is then the only congestion backpressure,
+   and (as the controls show) it does not change the transfer time.
 5. **XOFF in-flight absorption (headroom).** ns3-rdma's SwitchMmu keeps
    a dedicated ingress headroom (`m_pg_hdrm_limit` = 100 cells = 103 KB
    in the mix config) so the data still in flight when the XOFF leaves
