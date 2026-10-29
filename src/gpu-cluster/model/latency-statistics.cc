@@ -76,6 +76,21 @@ void
 LatencyStatistics::RecordFlowStart(uint16_t flowId)
 {
     NS_LOG_FUNCTION(this << flowId);
+    // Keep the EARLIEST unresolved start for the flow (codex round 40,
+    // finding 4): a second send reusing the flowId while the first is
+    // still in flight used to overwrite startTime, so the first
+    // completion was measured from the second start (two ~100-us
+    // deliveries on a 100-us link recorded P50 95 us). Overwrite only
+    // after the flow went quiet (RecordFlowComplete clears the start);
+    // overlapping same-flow sends then each measure from the first
+    // burst's head — an overestimate of the second message's latency,
+    // but never an underestimate, and identical to what the raw SendData
+    // path has always done.
+    auto it = m_flows.find(flowId);
+    if (it != m_flows.end() && !it->second.startTime.IsZero())
+    {
+        return;
+    }
     m_flows[flowId].startTime = Simulator::Now();
 }
 
@@ -93,6 +108,10 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
 
     Time latency = Simulator::Now() - it->second.startTime;
     RecordLatency(flowId, latency);
+    // Clear the start so a later send reusing the flowId records a fresh
+    // start instead of inheriting this flow's (see RecordFlowStart's
+    // earliest-unresolved-start guard).
+    it->second.startTime = Time(0);
 }
 
 void

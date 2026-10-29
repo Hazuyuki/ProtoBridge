@@ -954,7 +954,6 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
     const bool destIsRoce = (destModel->GetInstanceTypeId()
                              == RoceProtocolModel::GetTypeId());
-    const bool destIsRoceModel = destIsRoce;
     // When the So builder is mounted for a ROCE dest, normalize the protocol
     // id to the dest model's own — the same re-key the bulk path applies at
     // its builder seam (codex round 38, finding 1). A caller's NcclProtocol
@@ -972,13 +971,23 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         protocolId = destModel->GetProtocolId(size);
     }
     double efficiency = destModel->GetEfficiency(protocolId);
-    // NB: the builder check binds only the RoCE arm. The efficiency arm must
-    // NOT require RocePayloadBuilder — Su NCCL LL/LL128 traffic frames with
-    // NcclProtocolPayloadBuilder, and gating it on the RoCE builder broke
-    // EgressDisposeCancelsDeferredSendsTest (delivered 3 instead of 1: no
-    // per-flow pacing without the builder's chunked path).
-    const bool useBuilder = (efficiency < 1.0)
-        || (destIsRoceModel
+    // Builder selection is protocol-family-scoped (codex round 40, finding 1):
+    //   - Su (non-RoCE) dests with framing overhead (NCCL LL 64/128, LL128
+    //     120/128) frame with their NcclProtocolPayloadBuilder — the
+    //     efficiency arm must NOT require RocePayloadBuilder (gating it on
+    //     the RoCE builder broke EgressDisposeCancelsDeferredSendsTest:
+    //     delivered 3 instead of 1, no per-flow pacing).
+    //   - RoCE dests frame ONLY with the RoCE builder. Routing a RoCE dest
+    //     through a non-RoCE (e.g. NCCL) builder — reachable at
+    //     WireEfficiency < 1.0 via the old efficiency arm, with or without a
+    //     distinct So builder — puts NCCL-framed bytes on the ROCE fabric,
+    //     and the switch ECN-mark guard (fabric ROCE + protocol byte 1) then
+    //     rewrites the first 10 payload bytes as a SoHeader: silent
+    //     application-data corruption on every congestion mark. A RoCE dest
+    //     without the RoCE builder mounted takes the raw path instead — no
+    //     ECN feedback, but no corruption.
+    const bool useBuilder = (!destIsRoce && efficiency < 1.0)
+        || (destIsRoce
             && GetPayloadBuilderForRank(destRank)->GetInstanceTypeId()
                 == RocePayloadBuilder::GetTypeId());
     if (!useBuilder)
@@ -991,18 +1000,37 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         return;
     }
 
-    // For protocols with overhead (LL, LL128, etc.), use payload builder
-    uint64_t chunkSize = destModel->GetChunkSize(protocolId);
+    // For protocols with overhead (LL, LL128, etc.), use payload builder.
+    // RoCE chunk sizing (codex round 40, findings 2+3): the non-bulk RoCE
+    // arm must mirror the bulk path's knobs —
+    //   - the endpoint's bulk chunk size, not the model's default 512 KiB,
+    //     so alignment packet sizing (--bulkChunkSize=2690) carries over to
+    //     non-bulk pacing (with the 512-KiB default only the first packet
+    //     escaped a 1-Gbps ceiling, halving a paced 1-MiB transfer's time).
+    uint64_t chunkSize;
+    if (destIsRoce && m_bulkChunkSize > 0)
+    {
+        // Data per chunk; the wire-size expansion below pads each chunk's
+        // on-wire body to GetWireSize(chunk) so WireEfficiency is honored
+        // exactly as the bulk path honors it.
+        chunkSize = m_bulkChunkSize;
+    }
+    else
+    {
+        chunkSize = destModel->GetChunkSize(protocolId);
+    }
     // Bound idle parallel links the way raw SendData does (codex round 38,
-    // finding 2): the model chunk size (RoCE default 512 KiB) can exceed the
-    // size, putting the whole send on one device where the raw path would
-    // have fragmented across all of them. Cap the chunk at ceil(size /
-    // numDevices) — the same ceiling-division granularity as raw SendData's
-    // spray, so a size not divisible by the device count can still leave the
-    // last link idle (64 B over 12 devices -> 11 chunks); a perfect
-    // one-packet-per-link split would need remainder-aware chunk sizing that
-    // the raw path does not attempt either (codex round 39, finding 2).
-    // Cap-only: single-device and chunk-smaller-than-size sends unchanged.
+    // finding 2): the chunk size can exceed the size, putting the whole
+    // send on one device where the raw path would have fragmented across
+    // all of them. Cap the chunk at ceil(size / numDevices) — the same
+    // ceiling-division granularity as raw SendData's spray, so a size not
+    // divisible by the device count can still leave the last link idle
+    // (64 B over 12 devices -> 11 chunks); a perfect one-packet-per-link
+    // split would need remainder-aware chunk sizing that the raw path does
+    // not attempt either (codex round 39, finding 2). NB the cap can also
+    // re-split a multi-chunk send more evenly (768 KiB over two devices
+    // with a 512-KiB chunk: 512+256 becomes 384+384 — codex round 40,
+    // finding 5); single-device sends are unchanged.
     {
         std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
         if (devices.size() > 1 && chunkSize > 1)
@@ -1045,6 +1073,31 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         // and deliver nothing.
         std::vector<Ptr<Packet>> chunks = GetPayloadBuilderForRank(destRank)->BuildChunks(
             chunkData, thisChunkDataSize, protocolId, chunkSize);
+
+        // Wire-efficiency expansion for RoCE chunks (codex round 40, finding
+        // 2): the RoCE builder emits data + a fixed 10-B SoHeader per chunk,
+        // which never expresses the model's WireEfficiency — the bulk path
+        // sizes every chunk by GetWireSize instead. Pad each chunk body so
+        // its on-wire size is GetWireSize(thisChunkDataSize) amortized per
+        // chunk (chunk_data / WireEfficiency): serialization now matches the
+        // bulk path at any configured efficiency. Skip when the builder
+        // already produced a larger body (non-RoCE builders with their own
+        // framing units are untouched).
+        if (destIsRoce && efficiency < 1.0 && efficiency > 0.0)
+        {
+            uint64_t targetWire = static_cast<uint64_t>(
+                thisChunkDataSize / efficiency);
+            uint64_t perChunkTarget =
+                targetWire / std::max<uint64_t>(chunks.size(), 1);
+            for (auto& pkt : chunks)
+            {
+                if (pkt->GetSize() < perChunkTarget)
+                {
+                    pkt->AddAtEnd(
+                        Create<Packet>(perChunkTarget - pkt->GetSize()));
+                }
+            }
+        }
 
         // For protocols with overhead (LL/LL128), each sub-packet carries a
         // fixed amount of data (64B per LL line, 120B per LL128 chunk).
