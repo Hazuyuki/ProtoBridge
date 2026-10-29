@@ -5386,6 +5386,206 @@ class WireExpansionRepresentabilityTest : public TestCase
     }
 };
 
+// Round-46 finding 1 regression: fixed-width framing (LL/LL128) must NOT
+// be overpadded. Round 45's proportional-share distribution assigned each
+// sub-packet a share of the chunk's GetWireSize ledger that could EXCEED
+// the body the builder already emitted when a short tail padded the final
+// unit — LL 1000 B: 16 lines already total exactly the 2048-B ledger, but
+// the shares computed 15x131+128 = 2093 (45 excess); LL128 170 B: shares
+// 180/76 produced 308 over the 256-B ledger. The deficit-based padding
+// pads only chunkLedger - sum(bodies), which is ZERO for fixed-width
+// framing by construction.
+class LlFramingNoOverpadTest : public TestCase
+{
+  public:
+    LlFramingNoOverpadTest()
+        : TestCase("LL LL128 fixed-width framing is never overpadded")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        // LL 1000 B (15 full lines + 40-B tail) and LL128 170 B (120-B
+        // chunk + 50-B tail): the two exact inputs from the finding.
+        for (auto [proto, size] :
+             {std::pair{NcclProtocol::LL, 1000u},
+              std::pair{NcclProtocol::LL, 1010u},
+              std::pair{NcclProtocol::LL128, 170u}})
+        {
+            NodeContainer nodes;
+            nodes.Add(CreateObject<Node>());
+            nodes.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate",
+                                   DataRateValue(DataRate("200Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+            NetDeviceContainer devs = p2p.Install(nodes);
+
+            Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+            Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+            tx->SetRank(0);
+            rx->SetRank(1);
+            tx->SetLocalRankRange(0, 1);
+            rx->SetLocalRankRange(1, 1);
+            tx->AddNetDevice(devs.Get(0));
+            rx->AddNetDevice(devs.Get(1));
+            tx->SetRoutingEntry(1, 0);
+            rx->SetRoutingEntry(0, 0);
+            tx->SetBypassReorderBuffer(true);
+            rx->SetBypassReorderBuffer(true);
+
+            Ptr<NcclProtocolModel> nccl = CreateObject<NcclProtocolModel>();
+            tx->SetProtocolModel(nccl);
+            rx->SetProtocolModel(nccl);
+
+            static uint64_t deliveredBytes = 0;
+            static uint64_t wireBytes = 0;
+            deliveredBytes = 0;
+            wireBytes = 0;
+            rx->SetReceiveCallback(
+                [](uint16_t, Ptr<Packet>, FabricHeader hdr) {
+                    deliveredBytes += hdr.GetEffectiveDataSize();
+                });
+            tx->TraceConnectWithoutContext(
+                "Tx", MakeCallback(
+                          +[](uint32_t txSize, uint32_t) {
+                              wireBytes += txSize;
+                          }));
+
+            tx->Initialize();
+            rx->Initialize();
+
+            std::vector<uint8_t> buf(size, 0x77);
+            tx->SendDataWithProtocol(1, buf.data(), size,
+                                     static_cast<uint8_t>(proto), 6, 0);
+
+            Simulator::Stop(MicroSeconds(2000));
+            Simulator::Run();
+
+            // The ledger equals ceil-fraction fixed-width construction
+            // exactly (LL: ceil(1000/64)*128; LL128: ceil(170/120)*128),
+            // so the deficit is zero: NO padding may be added. Pre-fix:
+            // LL 1000 B traced 2093+41, LL128 170 B traced 308+41.
+            const uint64_t modelWire = nccl->GetWireSize(size,
+                                                         static_cast<uint8_t>(proto));
+            const uint32_t fabricHeaderSize =
+                FabricHeader().GetSerializedSize();
+            const uint64_t subPkts =
+                (proto == NcclProtocol::LL)
+                    ? (size + 63) / 64
+                    : (size + 119) / 120;
+            NS_TEST_ASSERT_MSG_EQ(
+                wireBytes,
+                modelWire + subPkts * (fabricHeaderSize + 2),
+                "fixed-width framing must not be overpadded: the builder "
+                "bodies already sum to the model ledger");
+            NS_TEST_ASSERT_MSG_EQ(deliveredBytes,
+                                  static_cast<uint64_t>(size),
+                                  "framed send delivers every data byte");
+
+            Simulator::Destroy();
+        }
+    }
+};
+
+// Round-46 finding 3 regression: a sub-0.01 wire efficiency (the UB
+// model's attribute checker allows (0.0, 1.0), unlike the other models'
+// 0.01 floor) rounded the representability data cap to ZERO, skipping
+// fragmentation entirely and leaving the uint32 truncation live —
+// efficiency 1/2^32 expands 1 data byte to a 4-GiB body whose
+// 4,294,967,296-B pad casts to zero. The cap now clamps up to 1 data
+// byte per chunk and the padding backstop skips unrepresentable pads
+// with a warning instead of truncating.
+class UbSubFloorEfficiencyTest : public TestCase
+{
+  public:
+    UbSubFloorEfficiencyTest()
+        : TestCase("sub-0.01 UB efficiency never truncates wire expansion")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(true);
+
+        Ptr<UbProtocolModel> ub = CreateObject<UbProtocolModel>();
+        // Just above the double-precision floor where floor(2^30*eff) == 0
+        // — the exact regime from the finding (1/2^32).
+        ub->SetAttribute("WireEfficiency",
+                         DoubleValue(1.0 / 4294967296.0));
+        tx->SetProtocolModel(ub);
+        rx->SetProtocolModel(ub);
+        Ptr<UbPayloadBuilder> ubBuilder = CreateObject<UbPayloadBuilder>();
+        tx->SetProtocolPayloadBuilder(ubBuilder);
+        rx->SetProtocolPayloadBuilder(ubBuilder);
+
+        static uint64_t deliveredBytes = 0;
+        deliveredBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader hdr) {
+            deliveredBytes += hdr.GetEffectiveDataSize();
+        });
+        static uint32_t maxTx = 0;
+        maxTx = 0;
+        tx->TraceConnectWithoutContext(
+            "Tx", MakeCallback(
+                      +[](uint32_t txSize, uint32_t) {
+                          if (txSize > maxTx)
+                          {
+                              maxTx = txSize;
+                          }
+                      }));
+
+        tx->Initialize();
+        rx->Initialize();
+
+        // One data byte: the ledger wants ~4 GiB of wire for it. The
+        // zero-rounded data cap now clamps to 1, so the send runs as a
+        // 1-data-byte chunk whose (unrepresentable) pad is SKIPPED with a
+        // warning — never a silently truncated 4 GiB.
+        const uint32_t size = 1;
+        std::vector<uint8_t> buf(size, 0x01);
+        tx->SendDataWithProtocol(1, buf.data(), size,
+                                 static_cast<uint8_t>(UbTransaction::MEM_SYNC), 6, 0);
+
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+
+        // The emitted body stays small (17-B builder body + headers): the
+        // alternative — a truncated 4-GiB pad — would either crash the
+        // allocation or wrap around; the backstop keeps it honest.
+        const uint32_t fabricHeaderSize = FabricHeader().GetSerializedSize();
+        NS_TEST_ASSERT_MSG_LT(maxTx, 0x80000000u + fabricHeaderSize + 2,
+            "an unrepresentable wire expansion is skipped, never truncated");
+        NS_TEST_ASSERT_MSG_EQ(deliveredBytes, static_cast<uint64_t>(size),
+            "the data byte is still delivered");
+
+        Simulator::Destroy();
+    }
+};
+
 // (1b-5) The WFQ backlog-decrement lambdas also capture raw `this`. Codex
 // round 14, finding 1: the three DecrementBacklog schedules in
 // SendPacketOnDevice were NOT tracked in m_deferredEgressEvents, so
@@ -15457,6 +15657,8 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new NcclSimpleWireExpansionOnSendTest, TestCase::Duration::QUICK);
     AddTestCase(new UbWireExpansionOnSendTest, TestCase::Duration::QUICK);
     AddTestCase(new WireExpansionRepresentabilityTest, TestCase::Duration::QUICK);
+    AddTestCase(new LlFramingNoOverpadTest, TestCase::Duration::QUICK);
+    AddTestCase(new UbSubFloorEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolHeaderTest, TestCase::Duration::QUICK);

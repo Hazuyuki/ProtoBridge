@@ -1077,9 +1077,23 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         if (efficiency < 1.0 && efficiency > 0.0)
         {
             constexpr uint64_t maxRepresentableBody = 1ull << 30;
-            const uint64_t dataCap = static_cast<uint64_t>(
+            uint64_t dataCap = static_cast<uint64_t>(
                 maxRepresentableBody * efficiency);
-            if (dataCap > 0 && chunkSize > dataCap)
+            // Zero-rounded cap guard (round 46, finding 3): a sub-0.01
+            // efficiency (the UB model's checker allows (0.0, 1.0), unlike
+            // the other models' 0.01 floor) can round the cap to zero —
+            // skipping the fragmention entirely and leaving the uint32
+            // truncation live (eff 1/2^32: 1 data byte "expands" to a
+            // 4-GiB body whose 4,294,967,296-B pad casts to zero). Clamp
+            // up to one data byte per chunk: the transfer fragments into
+            // one-byte chunks (slow, but the wire ledger is honest), and
+            // the padding backstop below skips any still-unrepresentable
+            // pad with a warning instead of truncating.
+            if (dataCap == 0)
+            {
+                dataCap = 1;
+            }
+            if (chunkSize > dataCap)
             {
                 chunkSize = dataCap;
             }
@@ -1208,39 +1222,62 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             }
             else
             {
-                // Non-RoCE arm (rounds 44-45): expand to the model's
-                // GetWireSize for this chunk's data, distributing the
-                // expansion across the sub-packets in proportion to their
-                // data counts. Fixed-width framing (LL 64/128, LL128
-                // 120/128) computes every share <= its existing body, so
-                // the loop below is a no-op there — their construction
-                // already equals the ledger.
+                // Non-RoCE arm (rounds 44-46): expand the chunk's bodies to
+                // the model's GetWireSize by padding the DEFICIT — the
+                // difference between the ledger and the sum of the bodies
+                // the builder already emitted. Fixed-width framing (LL
+                // 64/128, LL128 120/128) constructs bodies that sum to
+                // exactly the ledger (ceil(data/unit)*unitWire), so the
+                // deficit is zero and nothing is padded — round 45's
+                // proportional-share distribution instead assigned each
+                // sub-packet a share of the ledger that could EXCEED its
+                // existing body when a short tail padded the final unit
+                // (LL 1000 B: 15 lines at 131 B + tail at 128 B = 2093 B
+                // over the 2048-B ledger; codex round 46, finding 1).
+                // Distributing only the deficit can never overpad: every
+                // sub-packet grows by at most the total missing bytes. The
+                // split across sub-packets is even (last absorbs the
+                // remainder) — the LEDGER total is what pacing and queue
+                // accounting key on; per-sub-packet granularity only
+                // affects how the padding interleaves.
                 const uint64_t chunkLedger = destModel->GetWireSize(
                     thisChunkDataSize, protocolId);
-                // Sub-packet data counts, from the builder itself (same
-                // extraction the advertised-size computation below uses).
-                uint64_t ledgerAssigned = 0;
-                for (size_t i = 0; i < chunks.size(); ++i)
+                uint64_t bodySum = 0;
+                for (const auto& pkt : chunks)
                 {
-                    Ptr<Packet> pkt = chunks[i];
-                    std::vector<uint8_t> tmpBuf(pkt->GetSize());
-                    uint64_t extracted = (pkt->GetSize() > 0)
-                        ? builder->ExtractData(pkt, protocolId,
-                                               tmpBuf.data(), tmpBuf.size())
-                        : 0;
-                    // Last sub-packet absorbs the rounding remainder so the
-                    // chunk's padded bodies sum to exactly the ledger.
-                    uint64_t share = (i + 1 == chunks.size())
-                        ? (chunkLedger - std::min(ledgerAssigned, chunkLedger))
-                        : static_cast<uint64_t>(
-                            chunkLedger * static_cast<double>(extracted)
-                            / static_cast<double>(thisChunkDataSize));
-                    ledgerAssigned += share;
-                    if (share > 0 && pkt->GetSize() < share)
+                    bodySum += pkt->GetSize();
+                }
+                const uint64_t deficit =
+                    (chunkLedger > bodySum) ? chunkLedger - bodySum : 0;
+                if (deficit > 0 && !chunks.empty())
+                {
+                    uint64_t assigned = 0;
+                    for (size_t i = 0; i < chunks.size(); ++i)
                     {
-                        pkt->AddAtEnd(
-                            Create<Packet>(static_cast<uint32_t>(
-                                share - pkt->GetSize())));
+                        uint64_t pad = (i + 1 == chunks.size())
+                            ? deficit - assigned
+                            : deficit / chunks.size();
+                        assigned += pad;
+                        // Representability backstop (round 46, finding 3):
+                        // a pad that cannot fit a uint32-sized packet means
+                        // the efficiency is too small for the data chunk
+                        // (the data cap above should have fragmented it;
+                        // only a custom model below the 0.01 checker floor
+                        // can still get here). Warn and skip rather than
+                        // silently truncating 4 GiB of wire accounting.
+                        if (pad > 0x7FFFFFFFull)
+                        {
+                            NS_LOG_WARN("Wire-expansion pad " << pad
+                                        << " B exceeds a representable packet"
+                                           " body; skipping (fragment the"
+                                           " transfer or raise efficiency)");
+                            continue;
+                        }
+                        if (pad > 0)
+                        {
+                            chunks[i]->AddAtEnd(
+                                Create<Packet>(static_cast<uint32_t>(pad)));
+                        }
                     }
                 }
             }

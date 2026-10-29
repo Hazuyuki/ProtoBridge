@@ -97,22 +97,29 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
         return;
     }
 
-    // FIFO: consume the OLDEST unmatched start. Per-flow fabric ordering is
-    // FIFO (same vc, same path), so when each message completes in exactly
-    // one delivery, the k-th completion belongs to the k-th start and every
-    // sample is exact. With multi-fragment messages the pairing degrades
-    // gracefully: fragments complete in order, so the first fragment of a
-    // message consumes the correct start (the message's own); a later
-    // fragment consumes the NEXT message's start, which for FIFO-ordered
-    // delivery is always a LATER timestamp than the fragment's own
-    // message's start — the recorded duration is a true lower bound of
-    // that next message's latency, never an overestimate of either
-    // message's, and never simulation uptime. Round 44's LIFO popped the
-    // latest start instead and could OVERESTIMATE: two single-fragment
-    // messages at starts 200/250 us completing at 300/310 us recorded
-    // 50 and 110 us where the true latencies are 100 and 60 — the 110 us
-    // sample exceeds both messages' actual latencies (codex round 45,
-    // finding 1).
+    // FIFO: consume the OLDEST unmatched start. When per-flow delivery is
+    // sequence-ordered (the reorder-buffer path — the common case), the
+    // k-th completion belongs to the k-th start: single-delivery messages
+    // measure exactly their own latency even when overlapped (round 44's
+    // LIFO recorded 50 and 110 us for two messages whose true latencies
+    // were 100 and 60 — the 110 exceeded both; codex round 45, finding 1).
+    // With multi-fragment messages the pairing degrades gracefully: the
+    // first fragment of a message consumes the message's own start; a
+    // later fragment consumes the NEXT message's start, which under
+    // ordered delivery is a later timestamp than its own — a true lower
+    // bound of that next message's latency.
+    // HONEST LIMIT (codex round 46, finding 2): the guarantee does NOT
+    // hold unconditionally. Delivery can reorder — a receiver in bypass
+    // mode (SetBypassReorderBuffer(true)) delivers packets in ARRIVAL
+    // order, and spraying one flow across devices with different
+    // propagation delays can deliver a LATER message's fragment before
+    // an earlier one's (start 0 us via a 100-us link, start 10 us via a
+    // 0-us link: FIFO records 10.169/90.169 us where the true latencies
+    // are 0.169/100.169 us — the first sample overestimates by 10 us).
+    // The samples remain a bounded, monotone approximation; consumers
+    // needing per-message FCT exactness must not use overlapped flows on
+    // reordering paths. No in-tree consumer reads these samples at all
+    // (the harness measures durations from completion callbacks).
     Time startTime = it->second.pendingStarts.front();
     it->second.pendingStarts.pop_front();
     RecordLatency(flowId, Simulator::Now() - startTime);
