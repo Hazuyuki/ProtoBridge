@@ -1027,13 +1027,19 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     // Degenerate caps (rounding to 0, or smaller than the header) clamp
     // the data cap to 1 but ALSO clamp the padded body to the cap itself
     // in the loop — cap 11 at eff 0.01 otherwise emitted 100-B bodies
-    // (round 43, finding 5).
+    // (round 43, finding 5). Caps below the minimum framable body
+    // (SoHeaderSize + 1 data byte) are clamped UP to that minimum
+    // (codex round 44, finding 4): a RoCE-framed body cannot be smaller
+    // than its mandatory header plus one data byte, so the wire-cap
+    // guarantee is "body <= max(cap, SoHeaderSize + 1)" — the previous
+    // unconditional reading was false for caps 1-10, which emitted 11-B
+    // bodies over a 10-B cap.
     uint64_t chunkSize;
     uint64_t bodyHardCap = 0; // 0 = unbounded (non-RoCE or no bulk cap)
     if (destIsRoce && m_bulkChunkSize > 0)
     {
         const uint32_t soHdr = SoHeader().GetSerializedSize();
-        bodyHardCap = m_bulkChunkSize;
+        bodyHardCap = std::max<uint64_t>(m_bulkChunkSize, soHdr + 1);
         if (m_bulkChunkSize > soHdr)
         {
             const double roceEff = destModel->GetEfficiency(protocolId);
@@ -1113,29 +1119,64 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         std::vector<Ptr<Packet>> chunks = GetPayloadBuilderForRank(destRank)->BuildChunks(
             chunkData, thisChunkDataSize, protocolId, chunkSize);
 
-        // Wire-efficiency expansion for RoCE chunks (codex rounds 40-42):
-        // the RoCE builder emits data + a fixed 10-B SoHeader per chunk,
-        // which never expresses the model's WireEfficiency — the bulk path
-        // sizes every chunk by GetWireSize instead. Pad each chunk's TOTAL
-        // on-wire body to ceil(chunkData / WireEfficiency) with the SoHeader
-        // INSIDE the budget, exactly like the bulk path's
-        // Create(wireChunk-10) + AddHeader(SoHeader) == wireChunk
-        // construction. The chunkData cap above reserves the header bytes
-        // ((cap - soHdr) * eff), so padded bodies never exceed the cap. The
-        // chunk's actual data count comes from its own SoHeader
-        // (GetDataSize), so a spray-capped tail chunk pads to its own
-        // proportion. Padding sits after the SoHeader-framed body: RoCE
-        // ExtractData reads the data size from the SoHeader and never reads
-        // past it, and the switch ECN mark only rewrites the header itself.
-        if (destIsRoce && efficiency < 1.0 && efficiency > 0.0)
+        // Wire-efficiency expansion for builder-framed chunks (codex rounds
+        // 40-44): a builder that emits no per-chunk size expansion of its
+        // own — the RoCE builder (data + a fixed 10-B SoHeader) and, under
+        // a SIMPLE-style efficiency override, the raw NCCL/MCCL builders —
+        // never expresses the model's WireEfficiency on the wire, while the
+        // bulk path sizes every chunk by GetWireSize instead. Pad each
+        // chunk's TOTAL on-wire body to ceil(chunkData / eff) so the
+        // transmitted-byte count matches the model's GetWireSize ledger:
+        // byte-based pacing (DCQCN), serialization time, and switch queue
+        // accounting all key on the wire size, so an unpadded body silently
+        // understates every one of them (round 44, finding 3: NCCL SIMPLE
+        // at SimpleWireEfficiency 0.8 sent 1000 wire bytes where the model
+        // specifies 1250 — 20% understated pacing). The receiver is
+        // unaffected: every ExtractData implementation reads the true data
+        // count from the chunk's own header (RoCE SoHeader GetDataSize) or
+        // is capped by the header's EffectiveDataSize (NCCL/MCCL raw copy),
+        // so trailing padding bytes are never delivered.
+        // RoCE arm: the data cap above reserves the header bytes
+        // ((cap - soHdr) * eff) so padded bodies never exceed the cap, and
+        // targetWire is clamped by bodyHardCap (round 43, finding 5).
+        // Non-RoCE arm: pad ONLY unframed raw bodies — a sub-packet whose
+        // ExtractData returns exactly its size carries no per-chunk framing
+        // (NCCL/MCCL SIMPLE). Fixed-width framing (LL 64/128, LL128 120/128)
+        // already expands the body to GetWireSize by construction and is
+        // left untouched; UB's per-chunk 16-B transaction header is its own
+        // overhead representation (its builder test documents the build
+        // round-trip as byte-exact) and is likewise left untouched.
+        if (efficiency < 1.0 && efficiency > 0.0)
         {
+            Ptr<ProtocolPayloadBuilder> builder =
+                GetPayloadBuilderForRank(destRank);
+            const bool builderIsRoce =
+                (builder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
             for (auto& pkt : chunks)
             {
-                SoHeader soh;
-                pkt->PeekHeader(soh);
-                uint64_t chunkData = soh.GetDataSize();
-                uint64_t targetWire = static_cast<uint64_t>(
-                    std::ceil(chunkData / efficiency));
+                uint64_t targetWire = 0;
+                if (builderIsRoce)
+                {
+                    SoHeader soh;
+                    pkt->PeekHeader(soh);
+                    targetWire = static_cast<uint64_t>(
+                        std::ceil(soh.GetDataSize() / efficiency));
+                }
+                else
+                {
+                    // Unframed-raw detection: ExtractData returning the
+                    // full packet size means the whole body is data.
+                    std::vector<uint8_t> probe(pkt->GetSize());
+                    uint64_t extracted = (pkt->GetSize() > 0)
+                        ? builder->ExtractData(pkt, protocolId,
+                                               probe.data(), probe.size())
+                        : 0;
+                    if (extracted == pkt->GetSize() && extracted > 0)
+                    {
+                        targetWire = static_cast<uint64_t>(
+                            std::ceil(extracted / efficiency));
+                    }
+                }
                 // Degenerate-cap guard (round 43, finding 5): never let the
                 // padded body exceed the wire cap — ceil(data/eff) can
                 // overshoot when the data cap was clamped up from a

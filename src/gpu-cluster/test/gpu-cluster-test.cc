@@ -4962,6 +4962,219 @@ class RoceNonBulkSendDeliveryTest : public TestCase
 
 uint32_t RoceNonBulkSendDeliveryTest::g_maxWireBody = 0;
 
+// Round-44 regression coverage: LatencyStatistics start/complete pairing.
+// The sender records ONE start per message; the receiver records a
+// completion PER DELIVERED FRAGMENT. Round-42's pure FIFO and round-43's
+// size==1 heuristic each mispaired overlapped or multi-fragment flows
+// (stranded starts / first-fragment latencies). The LIFO semantics record
+// every completion from the LATEST unmatched start, so: a single-fragment
+// message measures exactly its own latency, a multi-fragment message
+// records its first fragment and later fragments warn-and-drop (lower
+// bound, never simulation uptime), and overlapped messages pair newest
+// with newest. This test drives all three shapes through the real
+// RecordFlowStart/RecordFlowComplete API.
+class LatencyStatisticsLifoPairingTest : public TestCase
+{
+  public:
+    LatencyStatisticsLifoPairingTest()
+        : TestCase("LatencyStatistics LIFO start-complete pairing")
+    {
+    }
+
+    // The FlowComplete TracedCallback connects only via a stateless
+    // function-pointer lambda (same constraint as the Tx trace), so the
+    // pairing record lives in static storage.
+    static std::vector<std::pair<uint16_t, int64_t>> g_samples;
+
+    void DoRun() override
+    {
+        g_samples.clear();
+        Ptr<LatencyStatistics> stats = CreateObject<LatencyStatistics>();
+        stats->SetWarmupFraction(0.0);
+
+        // LIFO pairing trace: (flowId, latencyNs) per completion.
+        stats->TraceConnectWithoutContext(
+            "FlowComplete",
+            MakeCallback(+[](uint16_t flowId, Time latency) {
+                g_samples.push_back({flowId, latency.GetNanoSeconds()});
+            }));
+
+        // (1) Single-fragment message: start at 10us, complete at 40us ->
+        // exactly 30us. A stranded-start or first-fragment mispair shows
+        // up as a missing sample.
+        Simulator::Schedule(MicroSeconds(10), [stats]() {
+            stats->RecordFlowStart(7);
+        });
+        Simulator::Schedule(MicroSeconds(40), [stats]() {
+            stats->RecordFlowComplete(7);
+        });
+
+        // (2) Multi-fragment message (one start, three completions at
+        // 110/120/130us): the first completion pairs with the start
+        // (60us sample); the later fragments have no unmatched start and
+        // must be dropped, not paired with a foreign start and not
+        // recorded as simulation uptime.
+        Simulator::Schedule(MicroSeconds(50), [stats]() {
+            stats->RecordFlowStart(8);
+        });
+        Simulator::Schedule(MicroSeconds(110), [stats]() {
+            stats->RecordFlowComplete(8);
+        });
+        Simulator::Schedule(MicroSeconds(120), [stats]() {
+            stats->RecordFlowComplete(8);
+        });
+        Simulator::Schedule(MicroSeconds(130), [stats]() {
+            stats->RecordFlowComplete(8);
+        });
+
+        // (3) Overlapped messages on one flow: starts at 200us and 250us,
+        // completions at 300us and 310us. LIFO pairs the 300us completion
+        // with the 250us start (50us), then the 310us completion with the
+        // 200us start (110us). FIFO would pair 300-200=100 and 310-250=60;
+        // the round-42 FIFO ordering and the round-44 LIFO ordering differ,
+        // so the values pin the semantics.
+        Simulator::Schedule(MicroSeconds(200), [stats]() {
+            stats->RecordFlowStart(9);
+        });
+        Simulator::Schedule(MicroSeconds(250), [stats]() {
+            stats->RecordFlowStart(9);
+        });
+        Simulator::Schedule(MicroSeconds(300), [stats]() {
+            stats->RecordFlowComplete(9);
+        });
+        Simulator::Schedule(MicroSeconds(310), [stats]() {
+            stats->RecordFlowComplete(9);
+        });
+
+        // (4) A completion with no start at all: warned and dropped, never
+        // a crash and never a fabricated sample.
+        Simulator::Schedule(MicroSeconds(400), [stats]() {
+            stats->RecordFlowComplete(123);
+        });
+
+        Simulator::Stop(MicroSeconds(500));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(g_samples.size(), 4u,
+            "exactly one sample per message-start: single-fragment, "
+            "first-of-multi-fragment, and the two overlapped messages");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[0].first, 7u, "flow 7 sampled first");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[0].second, 30000,
+            "single-fragment message measures exactly its own latency");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[1].first, 8u, "flow 8 first fragment");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[1].second, 60000,
+            "multi-fragment message records its first fragment from its start");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[2].first, 9u, "flow 9 newest-first");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[2].second, 50000,
+            "overlapped: 300us completion pairs with the 250us start (LIFO)");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[3].second, 110000,
+            "overlapped: 310us completion pairs with the 200us start");
+        NS_TEST_ASSERT_MSG_EQ(stats->GetSampleCount(123), 0u,
+            "a completion without a start records nothing");
+
+        Simulator::Destroy();
+    }
+};
+
+std::vector<std::pair<uint16_t, int64_t>> LatencyStatisticsLifoPairingTest::g_samples;
+
+// Round-44 finding 3 regression: a non-RoCE efficiency override
+// (SimpleWireEfficiency / WireEfficiency < 1.0) must expand the
+// transmitted bytes of a builder-framed SIMPLE send. Pre-fix, a 1000-B
+// NCCL SIMPLE send at 0.8 emitted a 1000-B body where the model's
+// GetWireSize specifies 1250 — understating DCQCN pacing, serialization
+// time, and switch queue accounting by 20%. Asserts the sender's Tx trace
+// totals ceil(data/eff) wire bytes per send AND that the receiver still
+// delivers exactly the sent data bytes (padding never delivered).
+class NcclSimpleWireExpansionOnSendTest : public TestCase
+{
+  public:
+    NcclSimpleWireExpansionOnSendTest()
+        : TestCase("NCCL SIMPLE send pads wire body to the model's wire size")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(true);
+
+        // NCCL model with SimpleWireEfficiency 0.8 — the Su (local-rank)
+        // configuration; no So builder, no RoCE model anywhere.
+        Ptr<NcclProtocolModel> nccl = CreateObject<NcclProtocolModel>();
+        nccl->SetAttribute("SimpleWireEfficiency", DoubleValue(0.8));
+        tx->SetProtocolModel(nccl);
+        rx->SetProtocolModel(nccl);
+
+        static uint64_t deliveredBytes = 0;
+        deliveredBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader hdr) {
+            deliveredBytes += hdr.GetEffectiveDataSize();
+        });
+        static uint64_t wireBytes = 0;
+        static std::vector<uint32_t> txSizes;
+        wireBytes = 0;
+        txSizes.clear();
+        tx->TraceConnectWithoutContext(
+            "Tx", MakeCallback(
+                      +[](uint32_t txSize, uint32_t) {
+                          wireBytes += txSize;
+                          txSizes.push_back(txSize);
+                      }));
+
+        tx->Initialize();
+        rx->Initialize();
+
+        const uint32_t size = 1000;
+        std::vector<uint8_t> buf(size, 0xCD);
+        tx->SendDataWithProtocol(1, buf.data(), size,
+                                 static_cast<uint8_t>(NcclProtocol::SIMPLE), 5, 0);
+
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+
+        // Model ledger: GetWireSize(1000, SIMPLE) == ceil(1000/0.8) == 1250.
+        // The Tx trace fires AFTER SendPacketOnDevice, and the
+        // PointToPointNetDevice synchronously prepends its 2-byte PPP
+        // link-layer header inside that call — so the traced size is
+        // body + 39-B FabricHeader + 2-B PPP (1291; pre-fix: 1041).
+        const uint32_t fabricHeaderSize = FabricHeader().GetSerializedSize();
+        const uint64_t modelWire = nccl->GetWireSize(size,
+                                                     static_cast<uint8_t>(NcclProtocol::SIMPLE));
+        NS_TEST_ASSERT_MSG_EQ(modelWire, 1250u,
+            "the model ledger itself must expand 1000 B at 0.8 to 1250");
+        NS_TEST_ASSERT_MSG_EQ(wireBytes, modelWire + fabricHeaderSize + 2,
+            "the transmitted wire bytes must match the model's GetWireSize "
+            "plus the FabricHeader and the 2-B PPP link header "
+            "(pre-fix: 1000 + 39 + 2)");
+        // Padding is never delivered: exactly the 1000 sent data bytes.
+        NS_TEST_ASSERT_MSG_EQ(deliveredBytes, static_cast<uint64_t>(size),
+            "wire-efficiency padding must not change the delivered data bytes");
+
+        Simulator::Destroy();
+    }
+};
+
 // (1b-5) The WFQ backlog-decrement lambdas also capture raw `this`. Codex
 // round 14, finding 1: the three DecrementBacklog schedules in
 // SendPacketOnDevice were NOT tracked in m_deferredEgressEvents, so
@@ -15029,6 +15242,8 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new EthernetProtocolModelTest, TestCase::Duration::QUICK);
     AddTestCase(new RocePayloadBuilderTest, TestCase::Duration::QUICK);
     AddTestCase(new RoceNonBulkSendDeliveryTest, TestCase::Duration::QUICK);
+    AddTestCase(new LatencyStatisticsLifoPairingTest, TestCase::Duration::QUICK);
+    AddTestCase(new NcclSimpleWireExpansionOnSendTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolHeaderTest, TestCase::Duration::QUICK);

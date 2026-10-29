@@ -76,18 +76,21 @@ void
 LatencyStatistics::RecordFlowStart(uint16_t flowId)
 {
     NS_LOG_FUNCTION(this << flowId);
-    // Message-oriented start bookkeeping (codex rounds 40-43): the sender
-    // records ONE start per message, the receiver records a completion PER
-    // DELIVERED FRAGMENT. A pure FIFO popped one start per completion, so
-    // a 3-fragment message recorded only the FIRST fragment's latency and
-    // dropped the rest — and could consume an overlapped message's start
-    // with its own second fragment. Instead, a start stays at the queue
-    // head until a completion arrives with the queue otherwise EMPTY
-    // (i.e. all fragments of the message since that start have landed):
-    // the recorded sample is then the message's head-to-last-fragment
-    // latency, the quantity FCT-style measurements actually want. A new
-    // start while the previous message is still draining queues behind it
-    // and is matched only after the head start expires.
+    // Per-message start bookkeeping (codex rounds 40-44): the sender records
+    // ONE start per message, the receiver records a completion PER DELIVERED
+    // FRAGMENT. Perfect message-tail matching is not reconstructible from
+    // the start/complete event stream alone — the receiver cannot know which
+    // completion is a message's last fragment (round-43's size==1 heuristic
+    // recorded the FIRST fragment without overlap and stranded every start
+    // when messages overlapped; round-42's pure FIFO misattributed overlapped
+    // starts). The semantics here are deliberately simple and monotone: each
+    // completion measures from the LATEST unmatched start (the message most
+    // likely to have produced this fragment) and consumes it. A single-
+    // fragment message measures exactly its own latency; a multi-fragment
+    // message records its first fragment from its own start and later
+    // fragments from whatever start is next (usually none — warned and
+    // dropped, keeping every recorded sample a true lower bound of some
+    // message's latency, never an overestimate and never simulation uptime).
     m_flows[flowId].pendingStarts.push_back(Simulator::Now());
 }
 
@@ -103,18 +106,13 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
         return;
     }
 
-    if (it->second.pendingStarts.size() == 1)
-    {
-        // Last fragment of the in-flight message (no newer start queued):
-        // this completion closes the message. Measure head-to-tail.
-        Time startTime = it->second.pendingStarts.front();
-        it->second.pendingStarts.pop_front();
-        RecordLatency(flowId, Simulator::Now() - startTime);
-        return;
-    }
-    // Intermediate fragment (or an earlier message's tail while a newer
-    // message has started): no sample — the message is still in flight.
-    // The head start remains for the closing completion.
+    // LIFO: the latest unmatched start is the one this fragment most likely
+    // belongs to (fragments of a message complete in order, and a newer
+    // message's fragments cannot complete before the older message's —
+    // same fabric, same FIFO ordering per flow).
+    Time startTime = it->second.pendingStarts.back();
+    it->second.pendingStarts.pop_back();
+    RecordLatency(flowId, Simulator::Now() - startTime);
 }
 
 void
