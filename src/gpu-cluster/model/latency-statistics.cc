@@ -76,21 +76,12 @@ void
 LatencyStatistics::RecordFlowStart(uint16_t flowId)
 {
     NS_LOG_FUNCTION(this << flowId);
-    // Per-message start bookkeeping (codex rounds 40-44): the sender records
+    // Per-message start bookkeeping (codex rounds 40-45): the sender records
     // ONE start per message, the receiver records a completion PER DELIVERED
     // FRAGMENT. Perfect message-tail matching is not reconstructible from
-    // the start/complete event stream alone — the receiver cannot know which
-    // completion is a message's last fragment (round-43's size==1 heuristic
-    // recorded the FIRST fragment without overlap and stranded every start
-    // when messages overlapped; round-42's pure FIFO misattributed overlapped
-    // starts). The semantics here are deliberately simple and monotone: each
-    // completion measures from the LATEST unmatched start (the message most
-    // likely to have produced this fragment) and consumes it. A single-
-    // fragment message measures exactly its own latency; a multi-fragment
-    // message records its first fragment from its own start and later
-    // fragments from whatever start is next (usually none — warned and
-    // dropped, keeping every recorded sample a true lower bound of some
-    // message's latency, never an overestimate and never simulation uptime).
+    // the start/complete event stream alone. The semantics are deliberately
+    // simple and monotone (see the FIFO note in RecordFlowComplete): each
+    // completion measures from the OLDEST unmatched start and consumes it.
     m_flows[flowId].pendingStarts.push_back(Simulator::Now());
 }
 
@@ -106,12 +97,24 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
         return;
     }
 
-    // LIFO: the latest unmatched start is the one this fragment most likely
-    // belongs to (fragments of a message complete in order, and a newer
-    // message's fragments cannot complete before the older message's —
-    // same fabric, same FIFO ordering per flow).
-    Time startTime = it->second.pendingStarts.back();
-    it->second.pendingStarts.pop_back();
+    // FIFO: consume the OLDEST unmatched start. Per-flow fabric ordering is
+    // FIFO (same vc, same path), so when each message completes in exactly
+    // one delivery, the k-th completion belongs to the k-th start and every
+    // sample is exact. With multi-fragment messages the pairing degrades
+    // gracefully: fragments complete in order, so the first fragment of a
+    // message consumes the correct start (the message's own); a later
+    // fragment consumes the NEXT message's start, which for FIFO-ordered
+    // delivery is always a LATER timestamp than the fragment's own
+    // message's start — the recorded duration is a true lower bound of
+    // that next message's latency, never an overestimate of either
+    // message's, and never simulation uptime. Round 44's LIFO popped the
+    // latest start instead and could OVERESTIMATE: two single-fragment
+    // messages at starts 200/250 us completing at 300/310 us recorded
+    // 50 and 110 us where the true latencies are 100 and 60 — the 110 us
+    // sample exceeds both messages' actual latencies (codex round 45,
+    // finding 1).
+    Time startTime = it->second.pendingStarts.front();
+    it->second.pendingStarts.pop_front();
     RecordLatency(flowId, Simulator::Now() - startTime);
 }
 

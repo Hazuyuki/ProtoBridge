@@ -4962,22 +4962,25 @@ class RoceNonBulkSendDeliveryTest : public TestCase
 
 uint32_t RoceNonBulkSendDeliveryTest::g_maxWireBody = 0;
 
-// Round-44 regression coverage: LatencyStatistics start/complete pairing.
-// The sender records ONE start per message; the receiver records a
-// completion PER DELIVERED FRAGMENT. Round-42's pure FIFO and round-43's
-// size==1 heuristic each mispaired overlapped or multi-fragment flows
-// (stranded starts / first-fragment latencies). The LIFO semantics record
-// every completion from the LATEST unmatched start, so: a single-fragment
-// message measures exactly its own latency, a multi-fragment message
-// records its first fragment and later fragments warn-and-drop (lower
-// bound, never simulation uptime), and overlapped messages pair newest
-// with newest. This test drives all three shapes through the real
-// RecordFlowStart/RecordFlowComplete API.
-class LatencyStatisticsLifoPairingTest : public TestCase
+// Round-44/45 regression coverage: LatencyStatistics start/complete
+// pairing. The sender records ONE start per message; the receiver records
+// a completion PER DELIVERED FRAGMENT. The pairing is FIFO (per-flow
+// fabric ordering is FIFO): the k-th completion consumes the k-th start,
+// so single-delivery messages measure EXACTLY their own latency even when
+// overlapped — round 44's LIFO popped the latest start and overestimated
+// (starts 200/250 us, completions 300/310 us recorded 50/110 us where the
+// true latencies are 100/60; the 110 exceeded BOTH messages' latencies,
+// codex round 45 finding 1). A multi-fragment message degrades
+// gracefully: its first fragment consumes the correct start; a later
+// fragment consumes the NEXT message's start, which for FIFO delivery is
+// later than its own — a true lower bound of that message's latency,
+// never an overestimate. This test drives all three shapes through the
+// real RecordFlowStart/RecordFlowComplete API.
+class LatencyStatisticsFifoPairingTest : public TestCase
 {
   public:
-    LatencyStatisticsLifoPairingTest()
-        : TestCase("LatencyStatistics LIFO start-complete pairing")
+    LatencyStatisticsFifoPairingTest()
+        : TestCase("LatencyStatistics FIFO start-complete pairing")
     {
     }
 
@@ -4992,7 +4995,7 @@ class LatencyStatisticsLifoPairingTest : public TestCase
         Ptr<LatencyStatistics> stats = CreateObject<LatencyStatistics>();
         stats->SetWarmupFraction(0.0);
 
-        // LIFO pairing trace: (flowId, latencyNs) per completion.
+        // Pairing trace: (flowId, latencyNs) per completion.
         stats->TraceConnectWithoutContext(
             "FlowComplete",
             MakeCallback(+[](uint16_t flowId, Time latency) {
@@ -5000,8 +5003,7 @@ class LatencyStatisticsLifoPairingTest : public TestCase
             }));
 
         // (1) Single-fragment message: start at 10us, complete at 40us ->
-        // exactly 30us. A stranded-start or first-fragment mispair shows
-        // up as a missing sample.
+        // exactly 30us.
         Simulator::Schedule(MicroSeconds(10), [stats]() {
             stats->RecordFlowStart(7);
         });
@@ -5009,11 +5011,10 @@ class LatencyStatisticsLifoPairingTest : public TestCase
             stats->RecordFlowComplete(7);
         });
 
-        // (2) Multi-fragment message (one start, three completions at
-        // 110/120/130us): the first completion pairs with the start
+        // (2) Multi-fragment message (one start at 50us, three completions
+        // at 110/120/130us): the first completion pairs with the start
         // (60us sample); the later fragments have no unmatched start and
-        // must be dropped, not paired with a foreign start and not
-        // recorded as simulation uptime.
+        // must be dropped, not fabricated.
         Simulator::Schedule(MicroSeconds(50), [stats]() {
             stats->RecordFlowStart(8);
         });
@@ -5027,12 +5028,12 @@ class LatencyStatisticsLifoPairingTest : public TestCase
             stats->RecordFlowComplete(8);
         });
 
-        // (3) Overlapped messages on one flow: starts at 200us and 250us,
-        // completions at 300us and 310us. LIFO pairs the 300us completion
-        // with the 250us start (50us), then the 310us completion with the
-        // 200us start (110us). FIFO would pair 300-200=100 and 310-250=60;
-        // the round-42 FIFO ordering and the round-44 LIFO ordering differ,
-        // so the values pin the semantics.
+        // (3) Overlapped single-fragment messages on one flow: starts at
+        // 200us and 250us, completions at 300us and 310us (FIFO fabric
+        // order). FIFO pairs 300-200=100 and 310-250=60 — the TRUE
+        // latencies of both messages. Round 44's LIFO recorded 50 and 110
+        // here; the 110 overestimated both messages. The values pin the
+        // exact-pairing guarantee.
         Simulator::Schedule(MicroSeconds(200), [stats]() {
             stats->RecordFlowStart(9);
         });
@@ -5064,11 +5065,13 @@ class LatencyStatisticsLifoPairingTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(g_samples[1].first, 8u, "flow 8 first fragment");
         NS_TEST_ASSERT_MSG_EQ(g_samples[1].second, 60000,
             "multi-fragment message records its first fragment from its start");
-        NS_TEST_ASSERT_MSG_EQ(g_samples[2].first, 9u, "flow 9 newest-first");
-        NS_TEST_ASSERT_MSG_EQ(g_samples[2].second, 50000,
-            "overlapped: 300us completion pairs with the 250us start (LIFO)");
-        NS_TEST_ASSERT_MSG_EQ(g_samples[3].second, 110000,
-            "overlapped: 310us completion pairs with the 200us start");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[2].first, 9u, "flow 9 oldest-first");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[2].second, 100000,
+            "overlapped: 300us completion pairs with the 200us start (FIFO "
+            "exact — the message's true latency)");
+        NS_TEST_ASSERT_MSG_EQ(g_samples[3].second, 60000,
+            "overlapped: 310us completion pairs with the 250us start (FIFO "
+            "exact — the message's true latency)");
         NS_TEST_ASSERT_MSG_EQ(stats->GetSampleCount(123), 0u,
             "a completion without a start records nothing");
 
@@ -5076,7 +5079,7 @@ class LatencyStatisticsLifoPairingTest : public TestCase
     }
 };
 
-std::vector<std::pair<uint16_t, int64_t>> LatencyStatisticsLifoPairingTest::g_samples;
+std::vector<std::pair<uint16_t, int64_t>> LatencyStatisticsFifoPairingTest::g_samples;
 
 // Round-44 finding 3 regression: a non-RoCE efficiency override
 // (SimpleWireEfficiency / WireEfficiency < 1.0) must expand the
@@ -5170,6 +5173,214 @@ class NcclSimpleWireExpansionOnSendTest : public TestCase
         // Padding is never delivered: exactly the 1000 sent data bytes.
         NS_TEST_ASSERT_MSG_EQ(deliveredBytes, static_cast<uint64_t>(size),
             "wire-efficiency padding must not change the delivered data bytes");
+
+        Simulator::Destroy();
+    }
+};
+
+// Round-45 finding 3 regression: UB's per-chunk 16-B transaction header is
+// additive overhead, NOT the wire-efficiency expansion — the builder emits
+// 16+data while the model's GetWireSize specifies 16+data/eff. Pre-fix
+// (the unframed-raw probe excluded framed sub-packets), a 1000-B MEM_SYNC
+// send at WireEfficiency 0.8 emitted a 1016-B body where the model
+// specifies 1266. The ledger-distributing padding must expand it.
+class UbWireExpansionOnSendTest : public TestCase
+{
+  public:
+    UbWireExpansionOnSendTest()
+        : TestCase("UB send pads wire body to the model's wire size")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(true);
+
+        Ptr<UbProtocolModel> ub = CreateObject<UbProtocolModel>();
+        ub->SetAttribute("WireEfficiency", DoubleValue(0.8));
+        tx->SetProtocolModel(ub);
+        rx->SetProtocolModel(ub);
+        Ptr<UbPayloadBuilder> ubBuilder = CreateObject<UbPayloadBuilder>();
+        tx->SetProtocolPayloadBuilder(ubBuilder);
+        rx->SetProtocolPayloadBuilder(ubBuilder);
+
+        static uint64_t deliveredBytes = 0;
+        deliveredBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader hdr) {
+            deliveredBytes += hdr.GetEffectiveDataSize();
+        });
+        static uint64_t wireBytes = 0;
+        wireBytes = 0;
+        tx->TraceConnectWithoutContext(
+            "Tx", MakeCallback(
+                      +[](uint32_t txSize, uint32_t) {
+                          wireBytes += txSize;
+                      }));
+
+        tx->Initialize();
+        rx->Initialize();
+
+        const uint32_t size = 1000;
+        std::vector<uint8_t> buf(size, 0xEE);
+        tx->SendDataWithProtocol(1, buf.data(), size,
+                                 static_cast<uint8_t>(UbTransaction::MEM_SYNC), 6, 0);
+
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+
+        // Model ledger: GetWireSize(1000, MEM_SYNC) == 16 + 1000/0.8 == 1266.
+        // Tx-traced total = ledger + FabricHeader + PPP (same accounting as
+        // the NCCL test above). Pre-fix: 1016 + 39 + 2.
+        const uint32_t fabricHeaderSize = FabricHeader().GetSerializedSize();
+        const uint64_t modelWire = ub->GetWireSize(
+            size, static_cast<uint8_t>(UbTransaction::MEM_SYNC));
+        NS_TEST_ASSERT_MSG_EQ(modelWire, 1266u,
+            "the UB model ledger must expand 1000 B at 0.8 to 1266");
+        NS_TEST_ASSERT_MSG_EQ(wireBytes, modelWire + fabricHeaderSize + 2,
+            "the transmitted wire bytes must match the UB model's GetWireSize "
+            "plus the FabricHeader and the 2-B PPP link header "
+            "(pre-fix: 1016 + 39 + 2)");
+        // The 16-B transaction header is framing, not data: exactly the
+        // 1000 sent data bytes are delivered.
+        NS_TEST_ASSERT_MSG_EQ(deliveredBytes, static_cast<uint64_t>(size),
+            "wire-efficiency padding must not change the delivered data bytes");
+
+        Simulator::Destroy();
+    }
+};
+
+// Round-45 finding 2 regression: the non-RoCE padding must never truncate
+// a wire expansion past what a uint32-sized packet can carry. Pre-fix, an
+// MCCL ChunkSize at WireEfficiency 0.01 expanded a ~43-MB chunk to a
+// ~4.34-GB wire body and the AddAtEnd cast truncated the 4,294,967,391-B
+// padding to 95 — silently dropping exactly 4 GiB of serialization. The
+// representability cap fragments the transfer instead: data chunks cap at
+// floor(2^30 * eff) so every padded body fits a uint32.
+class WireExpansionRepresentabilityTest : public TestCase
+{
+  public:
+    WireExpansionRepresentabilityTest()
+        : TestCase("non-RoCE wire expansion stays uint32-representable")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("400Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(true);
+
+        // MCCL with the extreme-efficiency attributes from the finding:
+        // eff 0.01 and a chunk size above 2^30 * eff (~10.7 MB at 0.01),
+        // so the data cap must bind. ChunkSize 43,383,509 was the exact
+        // truncating input (single chunk > 4 GiB after expansion).
+        Ptr<McclProtocolModel> mccl = CreateObject<McclProtocolModel>();
+        mccl->SetAttribute("WireEfficiency", DoubleValue(0.01));
+        mccl->SetAttribute("ChunkSize", UintegerValue(43383509));
+        tx->SetProtocolModel(mccl);
+        rx->SetProtocolModel(mccl);
+        Ptr<McclPayloadBuilder> mcclBuilder = CreateObject<McclPayloadBuilder>();
+        tx->SetProtocolPayloadBuilder(mcclBuilder);
+        rx->SetProtocolPayloadBuilder(mcclBuilder);
+
+        static uint64_t deliveredBytes = 0;
+        deliveredBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader hdr) {
+            deliveredBytes += hdr.GetEffectiveDataSize();
+        });
+        static uint64_t wireBytes = 0;
+        static uint32_t maxTx = 0;
+        wireBytes = 0;
+        maxTx = 0;
+        tx->TraceConnectWithoutContext(
+            "Tx", MakeCallback(
+                      +[](uint32_t txSize, uint32_t) {
+                          wireBytes += txSize;
+                          if (txSize > maxTx)
+                          {
+                              maxTx = txSize;
+                          }
+                      }));
+
+        tx->Initialize();
+        rx->Initialize();
+
+        // A multiple of the data cap (floor(2^30 * 0.01) = 10,737,418) so
+        // the send spans several max-size chunks plus a tail.
+        const uint32_t size = 10737418u * 3 + 12345u;
+        std::vector<uint8_t> buf(size, 0x5A);
+        tx->SendDataWithProtocol(1, buf.data(), size,
+                                 static_cast<uint8_t>(McclProtocol::SIMPLE), 6, 0);
+
+        Simulator::Stop(MilliSeconds(400));
+        Simulator::Run();
+
+        // (a) Every transmitted body fits a uint32 comfortably: the data
+        // cap keeps each padded body <= 2^30 + header slack. Pre-fix the
+        // single chunk's padding cast truncated to 95 B.
+        const uint32_t fabricHeaderSize = FabricHeader().GetSerializedSize();
+        NS_TEST_ASSERT_MSG_LT(maxTx, 0x80000000u + fabricHeaderSize + 2,
+            "every padded wire body must stay representable (pre-fix: the "
+            "AddAtEnd cast truncated 4,294,967,391 B of padding to 95)");
+        // (b) The wire-byte ledger still honors the model's expansion:
+        // total wire bytes == GetWireSize(size) + per-packet headers
+        // (FabricHeader + PPP per emitted packet). Count packets via the
+        // txSizes side channel of the other test's trace — simpler: assert
+        // the body total directly against the model ledger with headers
+        // subtracted by the known per-packet overhead times the chunk
+        // count (ceil(size/dataCap) chunks).
+        const uint64_t dataCap = static_cast<uint64_t>(1073741824ull * 0.01);
+        const uint64_t numChunks = (size + dataCap - 1) / dataCap;
+        const uint64_t modelWire = mccl->GetWireSize(
+            size, static_cast<uint8_t>(McclProtocol::SIMPLE));
+        NS_TEST_ASSERT_MSG_EQ(
+            wireBytes,
+            modelWire + numChunks * (fabricHeaderSize + 2),
+            "total wire bytes must equal the model ledger plus per-packet "
+            "FabricHeader+PPP overhead for every chunk");
+        // (c) Full delivery: every sent data byte arrives.
+        NS_TEST_ASSERT_MSG_EQ(deliveredBytes, static_cast<uint64_t>(size),
+            "the fragmented expansion must still deliver every data byte");
 
         Simulator::Destroy();
     }
@@ -15242,8 +15453,10 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new EthernetProtocolModelTest, TestCase::Duration::QUICK);
     AddTestCase(new RocePayloadBuilderTest, TestCase::Duration::QUICK);
     AddTestCase(new RoceNonBulkSendDeliveryTest, TestCase::Duration::QUICK);
-    AddTestCase(new LatencyStatisticsLifoPairingTest, TestCase::Duration::QUICK);
+    AddTestCase(new LatencyStatisticsFifoPairingTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireExpansionOnSendTest, TestCase::Duration::QUICK);
+    AddTestCase(new UbWireExpansionOnSendTest, TestCase::Duration::QUICK);
+    AddTestCase(new WireExpansionRepresentabilityTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolHeaderTest, TestCase::Duration::QUICK);

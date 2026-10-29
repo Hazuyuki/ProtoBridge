@@ -1063,6 +1063,27 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     else
     {
         chunkSize = destModel->GetChunkSize(protocolId);
+        // Representability cap (codex round 45, finding 2): the ledger
+        // padding below expands each chunk's body to the model's
+        // GetWireSize proportion; a body larger than any uint32-sized
+        // packet can carry truncates the AddAtEnd cast (ChunkSize=43383509
+        // at WireEfficiency 0.01 padded 4,294,967,391 B down to 95 —
+        // exactly 4 GiB missing from serialization and byte accounting).
+        // Cap the DATA chunk at floor(MAX_BODY * efficiency) so every
+        // padded body stays representable: the transfer just fragments
+        // into more chunks and the wire-byte ledger is preserved. Only
+        // the non-RoCE builder path needs this — the RoCE arm already
+        // clamps targetWire to bodyHardCap (a uint32).
+        if (efficiency < 1.0 && efficiency > 0.0)
+        {
+            constexpr uint64_t maxRepresentableBody = 1ull << 30;
+            const uint64_t dataCap = static_cast<uint64_t>(
+                maxRepresentableBody * efficiency);
+            if (dataCap > 0 && chunkSize > dataCap)
+            {
+                chunkSize = dataCap;
+            }
+        }
     }
     // Bound idle parallel links the way raw SendData does (codex round 38,
     // finding 2): the chunk size can exceed the size, putting the whole
@@ -1120,76 +1141,107 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             chunkData, thisChunkDataSize, protocolId, chunkSize);
 
         // Wire-efficiency expansion for builder-framed chunks (codex rounds
-        // 40-44): a builder that emits no per-chunk size expansion of its
+        // 40-45): a builder that emits no per-chunk size expansion of its
         // own — the RoCE builder (data + a fixed 10-B SoHeader) and, under
-        // a SIMPLE-style efficiency override, the raw NCCL/MCCL builders —
+        // an efficiency override, the raw NCCL/MCCL and UB builders —
         // never expresses the model's WireEfficiency on the wire, while the
         // bulk path sizes every chunk by GetWireSize instead. Pad each
-        // chunk's TOTAL on-wire body to ceil(chunkData / eff) so the
-        // transmitted-byte count matches the model's GetWireSize ledger:
-        // byte-based pacing (DCQCN), serialization time, and switch queue
-        // accounting all key on the wire size, so an unpadded body silently
-        // understates every one of them (round 44, finding 3: NCCL SIMPLE
-        // at SimpleWireEfficiency 0.8 sent 1000 wire bytes where the model
-        // specifies 1250 — 20% understated pacing). The receiver is
-        // unaffected: every ExtractData implementation reads the true data
-        // count from the chunk's own header (RoCE SoHeader GetDataSize) or
-        // is capped by the header's EffectiveDataSize (NCCL/MCCL raw copy),
+        // chunk's TOTAL on-wire body to its GetWireSize proportion so the
+        // transmitted-byte count matches the model's ledger: byte-based
+        // pacing (DCQCN), serialization time, and switch queue accounting
+        // all key on the wire size, so an unpadded body silently understates
+        // every one of them (round 44, finding 3: NCCL SIMPLE at
+        // SimpleWireEfficiency 0.8 sent 1000 wire bytes where the model
+        // specifies 1250; round 45, finding 3: UB at 0.8 sent 1016 where
+        // the model specifies 1266 — the 16-B transaction header is
+        // additive, it does not carry the /eff expansion either).
+        // The target is LEDGER-relative, not a naive ceil(data/eff) per
+        // sub-packet: this chunk's data bytes expand to
+        // GetWireSize(thisChunkDataSize) total wire bytes, and each
+        // sub-packet's share is proportional to its OWN data count. That
+        // is exact for fixed-width framing (LL/LL128: every sub-packet's
+        // body already equals its share, so nothing is padded) and for
+        // raw builders (single sub-packet per chunk: share == the whole
+        // expansion), and it fixes the sub-packet-attribution problem for
+        // framed builders whose per-chunk header is a fixed additive
+        // overhead (UB): the header's own wire bytes are part of the
+        // chunk's ledger share, not extra.
+        // The receiver is unaffected: every ExtractData implementation
+        // reads the true data count from the chunk's own header (RoCE
+        // SoHeader GetDataSize, LL128's size field, UB's size field) or is
+        // capped by the header's EffectiveDataSize (NCCL/MCCL raw copy),
         // so trailing padding bytes are never delivered.
-        // RoCE arm: the data cap above reserves the header bytes
-        // ((cap - soHdr) * eff) so padded bodies never exceed the cap, and
-        // targetWire is clamped by bodyHardCap (round 43, finding 5).
-        // Non-RoCE arm: pad ONLY unframed raw bodies — a sub-packet whose
-        // ExtractData returns exactly its size carries no per-chunk framing
-        // (NCCL/MCCL SIMPLE). Fixed-width framing (LL 64/128, LL128 120/128)
-        // already expands the body to GetWireSize by construction and is
-        // left untouched; UB's per-chunk 16-B transaction header is its own
-        // overhead representation (its builder test documents the build
-        // round-trip as byte-exact) and is likewise left untouched.
         if (efficiency < 1.0 && efficiency > 0.0)
         {
             Ptr<ProtocolPayloadBuilder> builder =
                 GetPayloadBuilderForRank(destRank);
             const bool builderIsRoce =
                 (builder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
-            for (auto& pkt : chunks)
+            // The chunk's total wire budget from the MODEL ledger. For the
+            // RoCE arm the round-40 formula is preserved exactly (per-chunk
+            // ceil(data/eff) with the SoHeader inside, clamped by
+            // bodyHardCap) — changing it would move the calibrated
+            // non-bulk RoCE anchor numbers.
+            if (builderIsRoce)
             {
-                uint64_t targetWire = 0;
-                if (builderIsRoce)
+                for (auto& pkt : chunks)
                 {
                     SoHeader soh;
                     pkt->PeekHeader(soh);
-                    targetWire = static_cast<uint64_t>(
+                    uint64_t targetWire = static_cast<uint64_t>(
                         std::ceil(soh.GetDataSize() / efficiency));
-                }
-                else
-                {
-                    // Unframed-raw detection: ExtractData returning the
-                    // full packet size means the whole body is data.
-                    std::vector<uint8_t> probe(pkt->GetSize());
-                    uint64_t extracted = (pkt->GetSize() > 0)
-                        ? builder->ExtractData(pkt, protocolId,
-                                               probe.data(), probe.size())
-                        : 0;
-                    if (extracted == pkt->GetSize() && extracted > 0)
+                    // Degenerate-cap guard (round 43, finding 5): never let
+                    // the padded body exceed the wire cap — ceil(data/eff)
+                    // can overshoot when the data cap was clamped up from a
+                    // floor-to-zero product (cap 11, eff 0.01).
+                    if (bodyHardCap > 0 && targetWire > bodyHardCap)
                     {
-                        targetWire = static_cast<uint64_t>(
-                            std::ceil(extracted / efficiency));
+                        targetWire = bodyHardCap;
+                    }
+                    if (pkt->GetSize() < targetWire)
+                    {
+                        pkt->AddAtEnd(
+                            Create<Packet>(static_cast<uint32_t>(
+                                targetWire - pkt->GetSize())));
                     }
                 }
-                // Degenerate-cap guard (round 43, finding 5): never let the
-                // padded body exceed the wire cap — ceil(data/eff) can
-                // overshoot when the data cap was clamped up from a
-                // floor-to-zero product (cap 11, eff 0.01).
-                if (bodyHardCap > 0 && targetWire > bodyHardCap)
+            }
+            else
+            {
+                // Non-RoCE arm (rounds 44-45): expand to the model's
+                // GetWireSize for this chunk's data, distributing the
+                // expansion across the sub-packets in proportion to their
+                // data counts. Fixed-width framing (LL 64/128, LL128
+                // 120/128) computes every share <= its existing body, so
+                // the loop below is a no-op there — their construction
+                // already equals the ledger.
+                const uint64_t chunkLedger = destModel->GetWireSize(
+                    thisChunkDataSize, protocolId);
+                // Sub-packet data counts, from the builder itself (same
+                // extraction the advertised-size computation below uses).
+                uint64_t ledgerAssigned = 0;
+                for (size_t i = 0; i < chunks.size(); ++i)
                 {
-                    targetWire = bodyHardCap;
-                }
-                if (pkt->GetSize() < targetWire)
-                {
-                    pkt->AddAtEnd(
-                        Create<Packet>(static_cast<uint32_t>(
-                            targetWire - pkt->GetSize())));
+                    Ptr<Packet> pkt = chunks[i];
+                    std::vector<uint8_t> tmpBuf(pkt->GetSize());
+                    uint64_t extracted = (pkt->GetSize() > 0)
+                        ? builder->ExtractData(pkt, protocolId,
+                                               tmpBuf.data(), tmpBuf.size())
+                        : 0;
+                    // Last sub-packet absorbs the rounding remainder so the
+                    // chunk's padded bodies sum to exactly the ledger.
+                    uint64_t share = (i + 1 == chunks.size())
+                        ? (chunkLedger - std::min(ledgerAssigned, chunkLedger))
+                        : static_cast<uint64_t>(
+                            chunkLedger * static_cast<double>(extracted)
+                            / static_cast<double>(thisChunkDataSize));
+                    ledgerAssigned += share;
+                    if (share > 0 && pkt->GetSize() < share)
+                    {
+                        pkt->AddAtEnd(
+                            Create<Packet>(static_cast<uint32_t>(
+                                share - pkt->GetSize())));
+                    }
                 }
             }
         }
