@@ -14,6 +14,7 @@
 
 #include <vector>
 #include <unordered_map>
+#include <deque>
 #include <cstdint>
 
 namespace ns3
@@ -146,8 +147,13 @@ class LatencyStatistics : public Object
 
     struct FlowRecord
     {
-        Time startTime;
-        bool hasStart = false;             ///< Sticky: first start per flowId wins
+        // FIFO of unmatched start times (codex rounds 40-42): completions are
+        // recorded per delivered packet, so a flow's lifecycle is a stream of
+        // (start, complete) events that can interleave across messages reusing
+        // the flowId. Matching completions to starts in order gives each
+        // message its own latency regardless of overlap; an empty queue means
+        // a completion without a start (warned and dropped).
+        std::deque<Time> pendingStarts;
         std::vector<int64_t> latenciesNs;  ///< Completed flow latencies in nanoseconds
     };
 

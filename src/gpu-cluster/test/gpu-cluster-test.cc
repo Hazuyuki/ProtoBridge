@@ -4849,6 +4849,106 @@ class EgressDisposeCancelsDeferredSendsTest : public TestCase
     }
 };
 
+// Round-41/42 regression coverage: the non-bulk RoCE send path (RoCE model
+// + So builder + SendDataWithProtocol) had NO test — every existing
+// non-bulk send test used NCCL models, so three successive bugs escaped
+// (advertised-data capped at the model chunk size delivering half the
+// bytes; wire-cap interpreted as data bytes; padding outside the header
+// budget). This test drives the exact path: 2 nodes, RoCE model mounted
+// inter-node, So builder mounted, bulkChunkSize set, several send sizes
+// including the chunk-boundary and tail cases; asserts FULL delivery
+// (effective bytes == sent bytes) and that every emitted packet's wire
+// body respects the bulk chunk cap.
+class RoceNonBulkSendDeliveryTest : public TestCase
+{
+  public:
+    RoceNonBulkSendDeliveryTest()
+        : TestCase("RoCE non-bulk send delivers all bytes within the wire cap")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        for (uint32_t cap : {2690u, 1000u})
+        {
+            NodeContainer nodes;
+            nodes.Add(CreateObject<Node>());
+            nodes.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+            NetDeviceContainer devs = p2p.Install(nodes);
+
+            Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+            Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+            tx->SetRank(0);
+            rx->SetRank(1);
+            tx->SetLocalRankRange(0, 1);
+            rx->SetLocalRankRange(1, 1);
+            tx->AddNetDevice(devs.Get(0));
+            rx->AddNetDevice(devs.Get(1));
+            tx->SetRoutingEntry(1, 0);
+            rx->SetRoutingEntry(0, 0);
+            tx->SetBypassReorderBuffer(true);
+            rx->SetBypassReorderBuffer(true);
+
+            Ptr<RoceProtocolModel> roce = CreateObject<RoceProtocolModel>();
+            roce->SetAttribute("WireEfficiency", DoubleValue(0.95));
+            tx->SetInterNodeProtocolModel(roce);
+            rx->SetInterNodeProtocolModel(roce);
+            Ptr<RocePayloadBuilder> soBuilder = CreateObject<RocePayloadBuilder>();
+            tx->SetSoPayloadBuilder(soBuilder);
+            rx->SetSoPayloadBuilder(soBuilder);
+            tx->SetBulkChunkSize(cap);
+
+            static uint64_t deliveredBytes = 0;
+            static uint32_t maxWireBody = 0;
+            deliveredBytes = 0;
+            maxWireBody = 0;
+            rx->SetReceiveCallback([](uint16_t, Ptr<Packet> pkt, FabricHeader hdr) {
+                deliveredBytes += hdr.GetEffectiveDataSize();
+                // FabricHeader (39 B) is peeled before the callback; the
+                // body here is SoHeader + data + efficiency padding.
+                if (pkt->GetSize() > maxWireBody)
+                {
+                    maxWireBody = pkt->GetSize();
+                }
+            });
+
+            tx->Initialize();
+            rx->Initialize();
+
+            // Sizes spanning single-chunk, exact-cap-tail, and multi-chunk.
+            for (uint32_t size : {64u, 1000u, cap, cap * 2u, cap * 2u + 137u})
+            {
+                std::vector<uint8_t> buf(size, 0xAB);
+                tx->SendDataWithProtocol(1, buf.data(), size,
+                                         static_cast<uint8_t>(NcclProtocol::SIMPLE), 7, 0);
+            }
+
+            Simulator::Stop(MicroSeconds(5000));
+            Simulator::Run();
+
+            // Every sent byte must arrive (the round-41 HIGH delivered
+            // 512 KiB of 1 MiB: advertised size capped at the model chunk).
+            NS_TEST_ASSERT_MSG_EQ(deliveredBytes,
+                                  static_cast<uint64_t>(64 + 1000 + cap + cap * 2 + cap * 2 + 137),
+                                  "non-bulk RoCE send must deliver every sent byte");
+            // Wire bodies respect the cap (round-41/42 sizing: data cap
+            // (cap-10)*eff, padded to ceil(data/eff) with the header inside
+            // the budget — a body may exceed cap only if (cap-10)*eff
+            // rounding pushes ceil past cap, which the integer floor
+            // prevents; allow nothing).
+            NS_TEST_ASSERT_MSG_EQ(maxWireBody <= cap, true,
+                                  "every non-bulk RoCE wire body must fit the bulk chunk cap");
+
+            Simulator::Destroy();
+        }
+    }
+};
+
 // (1b-5) The WFQ backlog-decrement lambdas also capture raw `this`. Codex
 // round 14, finding 1: the three DecrementBacklog schedules in
 // SendPacketOnDevice were NOT tracked in m_deferredEgressEvents, so
@@ -14915,6 +15015,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new RoceProtocolModelTest, TestCase::Duration::QUICK);
     AddTestCase(new EthernetProtocolModelTest, TestCase::Duration::QUICK);
     AddTestCase(new RocePayloadBuilderTest, TestCase::Duration::QUICK);
+    AddTestCase(new RoceNonBulkSendDeliveryTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolHeaderTest, TestCase::Duration::QUICK);

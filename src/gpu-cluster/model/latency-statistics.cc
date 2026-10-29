@@ -76,26 +76,18 @@ void
 LatencyStatistics::RecordFlowStart(uint16_t flowId)
 {
     NS_LOG_FUNCTION(this << flowId);
-    // Keep the FIRST start per flowId (codex round 40 finding 4, round 41
-    // finding 2): completions are recorded per delivered packet
-    // (FabricEndpoint fires one per fragment), so an overwrite-on-start /
-    // clear-on-complete pair mis-measures both interleavings —
-    //   overwrite-only: a second in-flight message retimes the first's
-    //     completion (two ~100-us deliveries recorded P50 95 us);
-    //   overwrite + clear-on-complete: a fragment completion cleared the
-    //     start, so the NEXT fragment's completion measured from zero
-    //     (simulation uptime, e.g. 10,110 us), and a legitimate start at
-    //     t=0 was indistinguishable from "no start".
-    // With a sticky first start, every fragment's completion measures from
-    // the message head — the same semantics the raw SendData path always
-    // had, and monotone per flowId.
-    auto it = m_flows.find(flowId);
-    if (it != m_flows.end() && it->second.hasStart)
-    {
-        return;
-    }
-    m_flows[flowId].startTime = Simulator::Now();
-    m_flows[flowId].hasStart = true;
+    // FIFO matching (codex rounds 40-42): completions are recorded per
+    // delivered packet, and messages can reuse the flowId. Queue each start;
+    // a completion pops the OLDEST unmatched start, so
+    //   - sequential messages each measure their own latency
+    //     (1.0/1.1 ms then 10.0/10.1 ms -> 100 us and 100 us, where the
+    //     round-41 sticky start recorded 100 us and 9100 us);
+    //   - an overlapped second message retimes only the completion that
+    //     lands after its own start is queued — never the first message's
+    //     in-flight completion;
+    //   - a legitimate start at t=0 works (Time(0) is a queued value, not
+    //     a sentinel).
+    m_flows[flowId].pendingStarts.push_back(Simulator::Now());
 }
 
 void
@@ -104,16 +96,16 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
     NS_LOG_FUNCTION(this << flowId);
 
     auto it = m_flows.find(flowId);
-    if (it == m_flows.end())
+    if (it == m_flows.end() || it->second.pendingStarts.empty())
     {
         NS_LOG_WARN("Flow complete without start: flowId=" << flowId);
         return;
     }
 
-    Time latency = Simulator::Now() - it->second.startTime;
+    Time startTime = it->second.pendingStarts.front();
+    it->second.pendingStarts.pop_front();
+    Time latency = Simulator::Now() - startTime;
     RecordLatency(flowId, latency);
-    // hasStart stays set: the next same-flow message's completions keep
-    // measuring from this flow's first start (see RecordFlowStart).
 }
 
 void
