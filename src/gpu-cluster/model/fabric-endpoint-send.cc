@@ -952,9 +952,20 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     // overhead (Su NCCL LL/LL128); plain SIMPLE/NONE/Ethernet traffic
     // (efficiency == 1.0, non-RoCE model) still takes the raw path.
     Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
-    double efficiency = destModel->GetEfficiency(protocolId);
     const bool destIsRoceModel = (destModel->GetInstanceTypeId()
                                   == RoceProtocolModel::GetTypeId());
+    // When the So builder is mounted, normalize the protocol id to the dest
+    // model's own — the same re-key the bulk path applies at its builder
+    // seam (codex round 38, finding 1). A caller's NcclProtocol byte
+    // (e.g. SIMPLE=3) is wrong on the wire for a RoCE dest: the switch
+    // ECN-mark and receiver CNP-echo guards key on RoceProtocol::SIMPLE=1,
+    // so the outer byte 3 would leave congested explicit-protocol sends
+    // without feedback even though the inner SoHeader carries SIMPLE.
+    if (GetPayloadBuilderForRank(destRank) != m_payloadBuilder)
+    {
+        protocolId = destModel->GetProtocolId(size);
+    }
+    double efficiency = destModel->GetEfficiency(protocolId);
     // NB: the builder check binds only the RoCE arm. The efficiency arm must
     // NOT require RocePayloadBuilder — Su NCCL LL/LL128 traffic frames with
     // NcclProtocolPayloadBuilder, and gating it on the RoCE builder broke
@@ -975,7 +986,32 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     }
 
     // For protocols with overhead (LL, LL128, etc.), use payload builder
-    uint64_t chunkSize = GetProtocolModelForDest(destRank)->GetChunkSize(protocolId);
+    uint64_t chunkSize = destModel->GetChunkSize(protocolId);
+    // Preserve raw SendData's one-chunk-per-link spray guarantee (codex
+    // round 38, finding 2): the model chunk size (RoCE default 512 KiB) can
+    // exceed the size, leaving parallel links idle where the raw path would
+    // have fragmented one chunk per device. Cap the chunk so numChunks >=
+    // number of usable devices (only ever a CAP — single-device and
+    // chunk-smaller-than-size sends are unchanged).
+    {
+        std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
+        if (devices.size() > 1 && chunkSize > 1)
+        {
+            uint64_t perLink = (size + devices.size() - 1) / devices.size();
+            if (perLink < chunkSize)
+            {
+                chunkSize = perLink;
+            }
+        }
+    }
+
+    // Raw SendData records the flow start for latency statistics; the builder
+    // detour must too, or delivery samples are discarded at
+    // RecordFlowComplete for lack of a start (codex round 38, finding 3).
+    if (m_latencyStatistics)
+    {
+        m_latencyStatistics->RecordFlowStart(flowId);
+    }
 
     NS_LOG_INFO("Sending " << size << " bytes with protocol "
                << static_cast<int>(protocolId) << " efficiency=" << efficiency
