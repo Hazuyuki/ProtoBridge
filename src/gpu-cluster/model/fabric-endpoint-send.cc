@@ -9,6 +9,7 @@
 
 #include "roce-payload-builder.h"  // RocePayloadBuilder::GetTypeId (union gate below)
 #include "roce-protocol-model.h"   // RoceProtocolModel::GetTypeId
+#include "so-header.h"             // SoHeader (wire-efficiency padding below)
 
 #include "ns3/log.h"
 #include "ns3/simulator.h"
@@ -1078,23 +1079,30 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         // 2): the RoCE builder emits data + a fixed 10-B SoHeader per chunk,
         // which never expresses the model's WireEfficiency — the bulk path
         // sizes every chunk by GetWireSize instead. Pad each chunk body so
-        // its on-wire size is GetWireSize(thisChunkDataSize) amortized per
-        // chunk (chunk_data / WireEfficiency): serialization now matches the
-        // bulk path at any configured efficiency. Skip when the builder
-        // already produced a larger body (non-RoCE builders with their own
-        // framing units are untouched).
+        // its on-wire size is ceil(chunkData / WireEfficiency), exactly the
+        // model's GetWireSize formula (round-40 follow-up: the first version
+        // divided the whole-chunk target by chunks.size(), losing up to a
+        // byte per chunk to floor rounding vs the bulk path's ceil). The
+        // chunk's actual data count comes from its own SoHeader
+        // (GetDataSize), so a spray-capped tail chunk pads to its own
+        // proportion, not the full chunk's. The padding sits AFTER the
+        // SoHeader-framed body: RoCE ExtractData reads the data size from
+        // the SoHeader and never reads past it, and the switch ECN mark
+        // only rewrites the header itself.
         if (destIsRoce && efficiency < 1.0 && efficiency > 0.0)
         {
-            uint64_t targetWire = static_cast<uint64_t>(
-                thisChunkDataSize / efficiency);
-            uint64_t perChunkTarget =
-                targetWire / std::max<uint64_t>(chunks.size(), 1);
             for (auto& pkt : chunks)
             {
-                if (pkt->GetSize() < perChunkTarget)
+                SoHeader soh;
+                pkt->PeekHeader(soh);
+                uint64_t chunkData = soh.GetDataSize();
+                uint64_t targetWire = static_cast<uint64_t>(
+                    std::ceil(chunkData / efficiency)) + soh.GetSerializedSize();
+                if (pkt->GetSize() < targetWire)
                 {
                     pkt->AddAtEnd(
-                        Create<Packet>(perChunkTarget - pkt->GetSize()));
+                        Create<Packet>(static_cast<uint32_t>(
+                            targetWire - pkt->GetSize())));
                 }
             }
         }
