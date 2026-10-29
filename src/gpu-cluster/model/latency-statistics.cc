@@ -76,22 +76,26 @@ void
 LatencyStatistics::RecordFlowStart(uint16_t flowId)
 {
     NS_LOG_FUNCTION(this << flowId);
-    // Keep the EARLIEST unresolved start for the flow (codex round 40,
-    // finding 4): a second send reusing the flowId while the first is
-    // still in flight used to overwrite startTime, so the first
-    // completion was measured from the second start (two ~100-us
-    // deliveries on a 100-us link recorded P50 95 us). Overwrite only
-    // after the flow went quiet (RecordFlowComplete clears the start);
-    // overlapping same-flow sends then each measure from the first
-    // burst's head — an overestimate of the second message's latency,
-    // but never an underestimate, and identical to what the raw SendData
-    // path has always done.
+    // Keep the FIRST start per flowId (codex round 40 finding 4, round 41
+    // finding 2): completions are recorded per delivered packet
+    // (FabricEndpoint fires one per fragment), so an overwrite-on-start /
+    // clear-on-complete pair mis-measures both interleavings —
+    //   overwrite-only: a second in-flight message retimes the first's
+    //     completion (two ~100-us deliveries recorded P50 95 us);
+    //   overwrite + clear-on-complete: a fragment completion cleared the
+    //     start, so the NEXT fragment's completion measured from zero
+    //     (simulation uptime, e.g. 10,110 us), and a legitimate start at
+    //     t=0 was indistinguishable from "no start".
+    // With a sticky first start, every fragment's completion measures from
+    // the message head — the same semantics the raw SendData path always
+    // had, and monotone per flowId.
     auto it = m_flows.find(flowId);
-    if (it != m_flows.end() && !it->second.startTime.IsZero())
+    if (it != m_flows.end() && it->second.hasStart)
     {
         return;
     }
     m_flows[flowId].startTime = Simulator::Now();
+    m_flows[flowId].hasStart = true;
 }
 
 void
@@ -108,10 +112,8 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
 
     Time latency = Simulator::Now() - it->second.startTime;
     RecordLatency(flowId, latency);
-    // Clear the start so a later send reusing the flowId records a fresh
-    // start instead of inheriting this flow's (see RecordFlowStart's
-    // earliest-unresolved-start guard).
-    it->second.startTime = Time(0);
+    // hasStart stays set: the next same-flow message's completions keep
+    // measuring from this flow's first start (see RecordFlowStart).
 }
 
 void

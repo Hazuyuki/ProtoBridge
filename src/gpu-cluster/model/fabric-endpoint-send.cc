@@ -994,27 +994,47 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     if (!useBuilder)
     {
         // No protocol overhead (or no RoCE builder mounted) - use regular
-        // SendData. NB: a RoCE dest without --dcqcn never mounts the So
-        // builder, so it takes this raw path exactly as before — the
-        // builder detour only lights up the ECN/CNP chain when it is armed.
+        // SendData. NB (codex round 41, finding 4): this is NOT the
+        // pre-round-37 behavior for a RoCE dest without the So builder —
+        // that path used to frame with the default NcclProtocolPayload-
+        // Builder at efficiency < 1.0 (LL lines on the RoCE fabric). The
+        // raw path is deliberate: NCCL-framed bytes on the ROCE fabric get
+        // their payload corrupted by the switch ECN-mark guard (round 40,
+        // finding 1), so unmounted-builder RoCE goes raw (protocol byte 0,
+        // no WireEfficiency expansion, no ECN feedback) rather than
+        // mis-framed. No production workload reaches this corner — the sim
+        // harness's collectives all use SendBulkWireTransferSize.
         SendData(destRank, data, size, flowId, vcId);
         return;
     }
 
     // For protocols with overhead (LL, LL128, etc.), use payload builder.
-    // RoCE chunk sizing (codex round 40, findings 2+3): the non-bulk RoCE
-    // arm must mirror the bulk path's knobs —
-    //   - the endpoint's bulk chunk size, not the model's default 512 KiB,
-    //     so alignment packet sizing (--bulkChunkSize=2690) carries over to
-    //     non-bulk pacing (with the 512-KiB default only the first packet
-    //     escaped a 1-Gbps ceiling, halving a paced 1-MiB transfer's time).
+    // RoCE chunk sizing (codex round 40 findings 2+3, round 41 finding 3):
+    // the non-bulk RoCE arm mirrors the bulk path's knobs. m_bulkChunkSize
+    // is a WIRE-BYTE cap on the bulk path (SendBulkWireTransferSize divides
+    // wireSize by it), so it must be converted to a data-byte cap here:
+    // chunkData = cap * efficiency, padded back up to
+    // ceil(chunkData/efficiency) + SoHeaderSize in the loop. Interpreting
+    // the cap as data bytes made 5380 B at eff 0.95 cap 2690 emit two
+    // 2831-B bodies where bulk emits three 1888-B ones — the larger first
+    // packet escaped the pacer (FCT 24.190 vs 31.986 us under a 1-Gbps
+    // ceiling).
     uint64_t chunkSize;
     if (destIsRoce && m_bulkChunkSize > 0)
     {
-        // Data per chunk; the wire-size expansion below pads each chunk's
-        // on-wire body to GetWireSize(chunk) so WireEfficiency is honored
-        // exactly as the bulk path honors it.
-        chunkSize = m_bulkChunkSize;
+        const double roceEff = destModel->GetEfficiency(protocolId);
+        if (roceEff > 0.0 && roceEff < 1.0)
+        {
+            chunkSize = static_cast<uint64_t>(m_bulkChunkSize * roceEff);
+        }
+        else
+        {
+            chunkSize = m_bulkChunkSize;
+        }
+        if (chunkSize == 0)
+        {
+            chunkSize = 1;
+        }
     }
     else
     {
@@ -1075,20 +1095,19 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         std::vector<Ptr<Packet>> chunks = GetPayloadBuilderForRank(destRank)->BuildChunks(
             chunkData, thisChunkDataSize, protocolId, chunkSize);
 
-        // Wire-efficiency expansion for RoCE chunks (codex round 40, finding
-        // 2): the RoCE builder emits data + a fixed 10-B SoHeader per chunk,
-        // which never expresses the model's WireEfficiency — the bulk path
-        // sizes every chunk by GetWireSize instead. Pad each chunk body so
-        // its on-wire size is ceil(chunkData / WireEfficiency), exactly the
-        // model's GetWireSize formula (round-40 follow-up: the first version
-        // divided the whole-chunk target by chunks.size(), losing up to a
-        // byte per chunk to floor rounding vs the bulk path's ceil). The
-        // chunk's actual data count comes from its own SoHeader
-        // (GetDataSize), so a spray-capped tail chunk pads to its own
-        // proportion, not the full chunk's. The padding sits AFTER the
-        // SoHeader-framed body: RoCE ExtractData reads the data size from
-        // the SoHeader and never reads past it, and the switch ECN mark
-        // only rewrites the header itself.
+        // Wire-efficiency expansion for RoCE chunks (codex round 40 finding
+        // 2, round 41 finding 5): the RoCE builder emits data + a fixed
+        // 10-B SoHeader per chunk, which never expresses the model's
+        // WireEfficiency — the bulk path sizes every chunk by GetWireSize
+        // instead. Pad each chunk's TOTAL on-wire body to
+        // ceil(chunkData / WireEfficiency) — SoHeader INSIDE the budget,
+        // exactly like the bulk path's Create(wireChunk-10) +
+        // AddHeader(SoHeader) == wireChunk construction. The chunk's actual
+        // data count comes from its own SoHeader (GetDataSize), so a
+        // spray-capped tail chunk pads to its own proportion. Padding sits
+        // after the SoHeader-framed body: RoCE ExtractData reads the data
+        // size from the SoHeader and never reads past it, and the switch
+        // ECN mark only rewrites the header itself.
         if (destIsRoce && efficiency < 1.0 && efficiency > 0.0)
         {
             for (auto& pkt : chunks)
@@ -1097,7 +1116,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                 pkt->PeekHeader(soh);
                 uint64_t chunkData = soh.GetDataSize();
                 uint64_t targetWire = static_cast<uint64_t>(
-                    std::ceil(chunkData / efficiency)) + soh.GetSerializedSize();
+                    std::ceil(chunkData / efficiency));
                 if (pkt->GetSize() < targetWire)
                 {
                     pkt->AddAtEnd(
@@ -1127,7 +1146,20 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             // tail otherwise advertises the full unit (64 B for a 50 B tail)
             // and over-counts the flow.
             uint32_t subPacketDataSize;
-            if (efficiency < 1.0)
+            if (destIsRoce)
+            {
+                // RoCE: the SoHeader declares this chunk's exact data count —
+                // no extraction round-trip needed, and NO model-chunk cap:
+                // chunk construction uses m_bulkChunkSize (8 MiB default), so
+                // capping the advertised size at the model's 512-KiB chunk
+                // truncated every larger chunk at the receiver (1 MiB in one
+                // chunk delivered 512 KiB, codex round 41, finding 1).
+                SoHeader soh;
+                pkt->PeekHeader(soh);
+                uint32_t dataStillNeeded = thisChunkDataSize - dataAssigned;
+                subPacketDataSize = std::min(soh.GetDataSize(), dataStillNeeded);
+            }
+            else if (efficiency < 1.0)
             {
                 uint32_t dataStillNeeded = thisChunkDataSize - dataAssigned;
                 std::vector<uint8_t> tmpBuf(pkt->GetSize());

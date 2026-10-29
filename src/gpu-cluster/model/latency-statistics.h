@@ -147,6 +147,7 @@ class LatencyStatistics : public Object
     struct FlowRecord
     {
         Time startTime;
+        bool hasStart = false;             ///< Sticky: first start per flowId wins
         std::vector<int64_t> latenciesNs;  ///< Completed flow latencies in nanoseconds
     };
 
