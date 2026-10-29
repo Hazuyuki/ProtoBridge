@@ -3215,8 +3215,19 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket()
             && hdr.GetSourceRank() == m_rank)
         {
-            double eff = GetProtocolModelForDest(hdr.GetDestRank())->GetEfficiency(hdr.GetProtocol());
-            if (eff < 1.0)
+            // RoCE-identity gate, not an efficiency-value gate (codex round 36,
+            // finding 1): the destination's model being the RoCE So model is
+            // what makes this inter-node RDMA traffic subject to DCQCN rate
+            // shaping. The old `eff < 1.0` test silently disabled shaping (and
+            // the SoHeader/ECN/CNP framing below) whenever WireEfficiency was
+            // configured to exactly 1.0 — e.g. the ns3-rdma alignment knob
+            // --soRoceWireEfficiency=1.0, which is about header accounting,
+            // not about turning congestion control off.
+            Ptr<ProtocolModel> destModel = GetProtocolModelForDest(hdr.GetDestRank());
+            bool destIsRoce = (destModel
+                               && destModel->GetInstanceTypeId()
+                                      == RoceProtocolModel::GetTypeId());
+            if (destIsRoce)
             {
                 uint64_t flowKey = MakeRateFlowKey(m_rank,
                                                   hdr.GetDestRank(),
@@ -3689,16 +3700,20 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                << " efficiency=" << efficiency << " protocol=" << static_cast<int>(protocolId));
 
     // Seam B (WU-SoH5): activate the dormant SoHeader/ECN/CNP loop on the So
-    // (RoCE) fabric. When efficiency < 1.0 (inter-node RoCE) and the mounted
-    // payload builder is RocePayloadBuilder, stamp a within-budget SoHeader +
-    // SetProtocol(SIMPLE) on each coalesced bulk packet. The 10-byte SoHeader
-    // sits WITHIN the wireSize budget (Create(wireChunk-10) + AddHeader(SoHeader)
-    // == wireChunk on-wire body), so chunk count and egress serialization are
-    // unchanged -> bit-identical at zero congestion (ECN never marks). Su
-    // (efficiency == 1.0) and non-RoCE builders stay on SetProtocol(0) with no
-    // SoHeader -> dormant, no breakage. This lights up
-    // EthernetSwitch::MarkEcnIfCongested (guard GetProtocol()==SIMPLE),
-    // SoHeader::PeekEcn, and SendCnpPacket on real So bulk traffic.
+    // (RoCE) fabric. When the destination's model is the RoCE So model and the
+    // mounted payload builder is RocePayloadBuilder, stamp a within-budget
+    // SoHeader + SetProtocol(SIMPLE) on each coalesced bulk packet. The
+    // 10-byte SoHeader sits WITHIN the wireSize budget
+    // (Create(wireChunk-10) + AddHeader(SoHeader) == wireChunk on-wire body),
+    // so chunk count and egress serialization are unchanged -> bit-identical
+    // at zero congestion (ECN never marks). Su models and non-RoCE builders
+    // stay on SetProtocol(0) with no SoHeader -> dormant, no breakage. This
+    // lights up EthernetSwitch::MarkEcnIfCongested (guard
+    // GetProtocol()==SIMPLE), SoHeader::PeekEcn, and SendCnpPacket on real
+    // So bulk traffic. The gate is RoCE IDENTITY, not `efficiency < 1.0`
+    // (codex round 36, finding 1): WireEfficiency=1.0 (the ns3-rdma
+    // alignment setting, a header-accounting choice) must not silently
+    // deframe the ECN/CNP loop.
     // NOTE: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1) on the
     // receive dispatch; the protocol-framed wire flag stamped only when a
     // SoHeader is actually present keeps Su NVLink LL packets (framed by the
@@ -3708,7 +3723,11 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
     // receiver delivers them through the raw path instead of aborting on a
     // header deserialize that cannot fit.
     const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
-    const bool stampSoHeader = (efficiency < 1.0) && payloadBuilder &&
+    Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
+    const bool destIsRoceModel = (destModel
+                                  && destModel->GetInstanceTypeId()
+                                         == RoceProtocolModel::GetTypeId());
+    const bool stampSoHeader = destIsRoceModel && payloadBuilder &&
         (payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
 
     std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);

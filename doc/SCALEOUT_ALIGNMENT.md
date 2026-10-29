@@ -127,13 +127,20 @@ same matched fabric parameters (40 Gbps, 1 µs links, 1000-B packets,
      serialized as 52632 chunks of 1000 B on the wire.
    - PB additionally serializes a **39-B FabricHeader per chunk**
      (chunk+39 B wire per 1000 B effective).
-   - ns3-rdma charges ~**14.5 B/packet** of headers
-     (UdpClient: `m_size−14−10` payload + SeqTs 14 B, wire adds UDP 8 +
-     IP 20 + PPP 2 ⇒ 1014.5 B wire per 1000 B effective).
+   - ns3-rdma's nominal wire size is **1020 B per 1000-B packet**
+     (UdpClient: `m_size−14−10` = 976 B payload + SeqTs 14 + UDP 8 +
+     IP 20 + PPP 2), but its *effective* serialized cost is **1015 B**:
+     the ns-3.18 `Time` Q64.64 conversion truncates the per-packet
+     tx time (1020 B at 40 Gbps = 204 ns → 203 ns; verified by
+     instrumenting `QbbNetDevice::TransmitStart`, `txTimeNs=203`), and
+     trace-side measurement confirms 203.0 ns/packet pacing at both the
+     switch and the receiver (payload 900 → 183 ns, same −1 ns). The
+     FCT extraction (last switch rx) shaves the final packet's partial
+     serialization, giving the 1014.5 B/pkt constant implied by the FCTs.
 
    Bytes-on-wire per effective byte: PB = (1039/1000)/0.95 = **1.0937**,
-   ns3-rdma = 1014.5/1000 = **1.0145**; predicted FCT ratio
-   1.0937/1.0145 = **1.078** vs measured 1.079. Neither term is a
+   ns3-rdma = 1015/1000 = **1.015** (effective); predicted FCT ratio
+   1.0937/1.015 = **1.0776** vs measured 1.079. Neither term is a
    congestion-behavior difference — both are header-accounting
    conventions. Neutralizing them aligns the simulators:
 
@@ -146,10 +153,10 @@ same matched fabric parameters (40 Gbps, 1 µs links, 1000-B packets,
 
    The aligned configuration sets `--soRoceWireEfficiency=1.0` (new knob;
    default −1 keeps the model's 0.95) and `--bulkChunkSize=2690` so that
-   (2690+39)/2690 = 1.0145 equals ns3-rdma's amortized header ratio.
-   Residual gap: +10–22 µs (0.03–0.05%), a fixed startup/RTT-scale
-   pipeline offset, not a per-packet term. After alignment the two
-   simulators agree at every convergence ratio.
+   (2690+39)/2690 = 1.0145 ≈ ns3-rdma's effective amortized ratio of
+   1015/1000 = 1.015. Residual gap: +10–22 µs (0.03–0.05%), a fixed
+   startup/RTT-scale pipeline offset, not a per-packet term. After
+   alignment the two simulators agree at every convergence ratio.
 
 ## Reproduction
 

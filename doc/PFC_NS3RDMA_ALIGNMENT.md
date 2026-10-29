@@ -18,11 +18,15 @@ Two senders → one receiver (2:1 incast):
   Flows start at t = 1.0 s; FCT measured as the time the seq-49999 packet
   of each flow is enqueued at the receiver.
 - **ProtoBridge**: `--topology=switched --collective=incast --numGpus=3
-  --numNodes=3 --gpusPerNode=1 --interNodeTopology=host
+  --numNodes=3 --gpusPerNode=1 --interNodeTopology=tor
   --interNodeBandwidth=40 --interNodeLatency=1000 --dataSize=50000000
   --bulkChunkSize=1000 --switchPfcMode=<mode> --pfcPauseThreshold=20
   --pfcPauseTime=5 --pfcResumeOffset=8 --soTxWindow=64` (mode 1 omits the
-  pause time). `--gpusPerNode=1 --interNodeTopology=host` are REQUIRED: the
+  pause time). `--gpusPerNode=1 --interNodeTopology=tor` are REQUIRED: the
+  defaults (8 GPUs/node, inter-node fullmesh) build a 24-rank fullmesh
+  fabric with no leaf switch, where PFC is inert; `tor` is the
+  shared-switch star (the ns3-rdma structural twin), `host` adds one
+  switch per node (results for both in the table). `--soTxWindow=64` is
   defaults (8 GPUs/node, inter-node fullmesh) build a 24-rank fullmesh
   fabric with no leaf switch, where PFC is inert. `--soTxWindow=64` is
   REQUIRED at 1000-B chunks: it bounds the in-flight bulk chunks (the
@@ -53,16 +57,25 @@ therefore compared per ingress/port, not as a global equivalence.
 | ns3-rdma, dynamic thr (α=16) | 19.51 ms | 24,936 | 2,078 | 0 |
 | ns3-rdma, PFC off (control) | 20.29 ms | 0 | 0 | 0 |
 | ns3-rdma, DCQCN on (control) | ~20.3 ms | 0 | 0 | 0 |
-| PB mode 1 (explicit RESUME) | 23.60 ms | 1,548 | 13,932 | 0 |
-| PB mode 3 (quanta 5 µs) | 24.38 ms | 13,932 | 13,932 | 0 |
-| PB, PFC off (control) | 21.90 ms | — | — | 0 |
-| PB mode 1, 9000-B chunks | 21.15 ms | 182 | 1,638 | 0 |
-| PB mode 3, 9000-B chunks | 21.15 ms | 16,871 | 18 | 0 |
-| PB, PFC off, 9000-B chunks | 21.15 ms | — | — | 0 |
+| PB mode 1 (explicit RESUME), tor | 21.90 ms | 1,584 | 14,253 | 0 |
+| PB mode 1 (explicit RESUME), host | 23.60 ms | 1,548 | 13,932 | 0 |
+| PB mode 3 (quanta 5 µs), tor | 22.35 ms | 13,932 | 13,928 | 0 |
+| PB mode 3 (quanta 5 µs), host | 24.38 ms | 13,932 | 13,932 | 0 |
+| PB, PFC off (control), tor/host | 21.90 ms | — | — | 0 |
+| PB mode 1, 9000-B chunks, tor | 21.15 ms | 2 | 18 | 0 |
+| PB mode 1, 9000-B chunks, host | 21.15 ms | 182 | 1,638 | 0 |
+| PB mode 3, 9000-B chunks, tor/host | 21.15 ms | 16,871 | 18 | 0 |
+| PB, PFC off, 9000-B chunks, tor/host | 21.15 ms | — | — | 0 |
 
 All PB 1000-B rows use `--soTxWindow=64`; the 9000-B rows are identical
 with or without it (21.153216 ms in every run), so the window is a no-op
-for a BDP-sized transfer that never approaches the VOQ cap.
+for a BDP-sized transfer that never approaches the VOQ cap. The `tor`
+rows use the shared-switch topology (the structural twin of the ns3-rdma
+star, and the topology used for the scale-out alignment); the previously
+published `host` rows are retained for reference — `host` gives each
+node its own switch (one extra hop), which adds PFC-drain time at
+1000-B chunks (mode 1: 23.60 vs 21.90 ms) and slightly different pause
+counts, but is byte-identical at 9000-B chunks where queues stay shallow.
 
 (PB FCT is `simTimeNs` for the same 2×50 MB incast. "PFC off" on the
 ns3-rdma side raises the SwitchMmu ingress limits coherently — PG shared
@@ -75,10 +88,12 @@ at this workload, same as ProtoBridge.)
 
 ### FCT
 
-- At matched 1000-B packets, ProtoBridge's FCT (21.90 ms, PFC off) is
+- At matched 1000-B packets, ProtoBridge's tor FCT (21.90 ms, PFC off) is
   1.08× ns3-rdma's 20.29 ms. **This is not a PFC difference**:
-  ProtoBridge's FCT is PFC-slightly-variant (21.90 ms off → 23.60 ms
-  mode 1 → 24.38 ms mode 3): the ACK-clocked window (soTxWindow=64)
+  on the shared-switch `tor` topology the FCT is near PFC-invariant
+  (21.90 ms off → 21.90 ms mode 1 → 22.35 ms mode 3); the `host`
+  topology's extra hop makes PFC-variant behavior visible (21.90 →
+  23.60 mode 1 → 24.38 mode 3): the ACK-clocked window (soTxWindow=64)
   paces injection, and each pause/resume episode parks the window,
   adding a bounded restart cost — the price of backpressure actually
   engaging, visible now that the unbounded window no longer masks it.
@@ -182,11 +197,13 @@ at this workload, same as ProtoBridge.)
   `build/scratch/third mix/config_static_small.txt` (and
   `config_dynamic_small.txt`, `config_nopfc.txt`, `config_qcn.txt`) from
   `/tmp/pfc_align/ns3rdma`.
-- ProtoBridge (base 1000-B reproduction; the single-switch `host`
+- ProtoBridge (base 1000-B reproduction; the single-switch `tor`
   inter-node topology with one GPU per node is the structural twin of the
-  ns3-rdma star):
+  ns3-rdma star — `tor` places all nodes on one shared switch, while
+  `host` creates one switch per node and adds a hop, so `host` FCTs run
+  ~8% higher at equal settings):
   `./build/scratch/ns3.47-gpu-cluster-sim-debug --topology=switched
-  --collective=incast --numNodes=3 --gpusPerNode=1 --interNodeTopology=host
+  --collective=incast --numNodes=3 --gpusPerNode=1 --interNodeTopology=tor
   --interNodeBandwidth=40 --interNodeLatency=1000 --dataSize=50000000
   --bulkChunkSize=1000 --soTxWindow=64 --switchPfcMode=3
   --pfcPauseThreshold=20 --pfcPauseTime=5 --pfcResumeOffset=8`
