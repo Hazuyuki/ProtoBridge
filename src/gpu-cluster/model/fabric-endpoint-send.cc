@@ -952,16 +952,22 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     // overhead (Su NCCL LL/LL128); plain SIMPLE/NONE/Ethernet traffic
     // (efficiency == 1.0, non-RoCE model) still takes the raw path.
     Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
-    const bool destIsRoceModel = (destModel->GetInstanceTypeId()
-                                  == RoceProtocolModel::GetTypeId());
-    // When the So builder is mounted, normalize the protocol id to the dest
-    // model's own — the same re-key the bulk path applies at its builder
-    // seam (codex round 38, finding 1). A caller's NcclProtocol byte
-    // (e.g. SIMPLE=3) is wrong on the wire for a RoCE dest: the switch
+    const bool destIsRoce = (destModel->GetInstanceTypeId()
+                             == RoceProtocolModel::GetTypeId());
+    const bool destIsRoceModel = destIsRoce;
+    // When the So builder is mounted for a ROCE dest, normalize the protocol
+    // id to the dest model's own — the same re-key the bulk path applies at
+    // its builder seam (codex round 38, finding 1). A caller's NcclProtocol
+    // byte (e.g. SIMPLE=3) is wrong on the wire for a RoCE dest: the switch
     // ECN-mark and receiver CNP-echo guards key on RoceProtocol::SIMPLE=1,
     // so the outer byte 3 would leave congested explicit-protocol sends
     // without feedback even though the inner SoHeader carries SIMPLE.
-    if (GetPayloadBuilderForRank(destRank) != m_payloadBuilder)
+    // RoCE-only (codex round 39, finding 1): a distinct So builder can also
+    // be an NCCL builder mounted for an NCCL-model remote dest — there the
+    // caller's explicit protocol choice must win (re-keying would flip an
+    // explicit SIMPLE=3 to size-based LL=1, padding 64 raw bytes into a
+    // 128-B LL line).
+    if (destIsRoce && GetPayloadBuilderForRank(destRank) != m_payloadBuilder)
     {
         protocolId = destModel->GetProtocolId(size);
     }
@@ -987,12 +993,16 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
 
     // For protocols with overhead (LL, LL128, etc.), use payload builder
     uint64_t chunkSize = destModel->GetChunkSize(protocolId);
-    // Preserve raw SendData's one-chunk-per-link spray guarantee (codex
-    // round 38, finding 2): the model chunk size (RoCE default 512 KiB) can
-    // exceed the size, leaving parallel links idle where the raw path would
-    // have fragmented one chunk per device. Cap the chunk so numChunks >=
-    // number of usable devices (only ever a CAP — single-device and
-    // chunk-smaller-than-size sends are unchanged).
+    // Bound idle parallel links the way raw SendData does (codex round 38,
+    // finding 2): the model chunk size (RoCE default 512 KiB) can exceed the
+    // size, putting the whole send on one device where the raw path would
+    // have fragmented across all of them. Cap the chunk at ceil(size /
+    // numDevices) — the same ceiling-division granularity as raw SendData's
+    // spray, so a size not divisible by the device count can still leave the
+    // last link idle (64 B over 12 devices -> 11 chunks); a perfect
+    // one-packet-per-link split would need remainder-aware chunk sizing that
+    // the raw path does not attempt either (codex round 39, finding 2).
+    // Cap-only: single-device and chunk-smaller-than-size sends unchanged.
     {
         std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
         if (devices.size() > 1 && chunkSize > 1)
