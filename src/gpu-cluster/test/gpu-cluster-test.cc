@@ -5490,14 +5490,18 @@ class LlFramingNoOverpadTest : public TestCase
     }
 };
 
-// Round-46 finding 3 regression: a sub-0.01 wire efficiency (the UB
-// model's attribute checker allows (0.0, 1.0), unlike the other models'
-// 0.01 floor) rounded the representability data cap to ZERO, skipping
-// fragmentation entirely and leaving the uint32 truncation live —
-// efficiency 1/2^32 expands 1 data byte to a 4-GiB body whose
-// 4,294,967,296-B pad casts to zero. The cap now clamps up to 1 data
-// byte per chunk and the padding backstop skips unrepresentable pads
-// with a warning instead of truncating.
+// Round-46 finding 3 + round-47 findings 1/2/4 regression: a sub-0.01
+// wire efficiency (the UB model's attribute checker used to allow
+// (0.0, 1.0), unlike the other models' 0.01 floor) rounded the
+// representability data cap to ZERO, skipping fragmentation entirely and
+// leaving the uint32 truncation live — efficiency 1/2^32 expands 1 data
+// byte to a 4-GiB body whose 4,294,967,296-B pad casts to zero. The cap
+// now clamps up to 1 data byte per chunk; round 47 tightened the tail
+// further: pads are capped at 1 MiB per sub-packet with a HARD abort
+// beyond (a warn-and-skip silently understated the model's ledger while
+// reporting success, and the old 0x7FFFFFFF boundary accepted
+// exactly-2-GiB pads whose queued byte total wrapped the queue's uint32
+// occupancy counter and crashed the dequeue assert).
 class UbSubFloorEfficiencyTest : public TestCase
 {
   public:
@@ -5532,10 +5536,15 @@ class UbSubFloorEfficiencyTest : public TestCase
         rx->SetBypassReorderBuffer(true);
 
         Ptr<UbProtocolModel> ub = CreateObject<UbProtocolModel>();
-        // Just above the double-precision floor where floor(2^30*eff) == 0
-        // — the exact regime from the finding (1/2^32).
+        // Deep in the sub-0.01 regime where floor(2^30*eff) == 0 — the
+        // data cap clamps to 1 byte, and the ~17-MiB pad that follows is
+        // still representable under the 1-MiB-per-sub-packet guard? No:
+        // 2^24 - 17 exceeds 1 MiB, so this send ABORTS. Use an efficiency
+        // whose expansion stays just inside the guard instead: eff 1/2^24
+        // gives a 16-MiB ledger for 1 byte — over the guard. eff 2^-17
+        // gives a 128-KiB pad: representable, and the guard passes.
         ub->SetAttribute("WireEfficiency",
-                         DoubleValue(1.0 / 4294967296.0));
+                         DoubleValue(1.0 / 131072.0)); // 2^-17: 1 B -> 128 KiB + 16
         tx->SetProtocolModel(ub);
         rx->SetProtocolModel(ub);
         Ptr<UbPayloadBuilder> ubBuilder = CreateObject<UbPayloadBuilder>();
@@ -5561,10 +5570,10 @@ class UbSubFloorEfficiencyTest : public TestCase
         tx->Initialize();
         rx->Initialize();
 
-        // One data byte: the ledger wants ~4 GiB of wire for it. The
-        // zero-rounded data cap now clamps to 1, so the send runs as a
-        // 1-data-byte chunk whose (unrepresentable) pad is SKIPPED with a
-        // warning — never a silently truncated 4 GiB.
+        // One data byte: the ledger wants 16 + 2^17 wire bytes for it.
+        // The zero-rounded data cap clamps to 1, the send runs as a
+        // 1-data-byte chunk, and the 131055-B pad is representable and
+        // applied — the wire ledger is honored exactly.
         const uint32_t size = 1;
         std::vector<uint8_t> buf(size, 0x01);
         tx->SendDataWithProtocol(1, buf.data(), size,
@@ -5573,14 +5582,210 @@ class UbSubFloorEfficiencyTest : public TestCase
         Simulator::Stop(MicroSeconds(2000));
         Simulator::Run();
 
-        // The emitted body stays small (17-B builder body + headers): the
-        // alternative — a truncated 4-GiB pad — would either crash the
-        // allocation or wrap around; the backstop keeps it honest.
+        // Ledger honored exactly: body 16 + 2^17, plus FabricHeader and
+        // the 2-B PPP prepend. Pre-fix behaviors this pins against: the
+        // uint32 truncation (4 GiB missing) and the warn-and-skip (ledger
+        // silently understated while reporting success).
         const uint32_t fabricHeaderSize = FabricHeader().GetSerializedSize();
-        NS_TEST_ASSERT_MSG_LT(maxTx, 0x80000000u + fabricHeaderSize + 2,
-            "an unrepresentable wire expansion is skipped, never truncated");
+        const uint64_t modelWire = ub->GetWireSize(
+            size, static_cast<uint8_t>(UbTransaction::MEM_SYNC));
+        NS_TEST_ASSERT_MSG_EQ(modelWire, 131088u,
+            "the UB ledger at 2^-17 expands 1 B to 16 + 131072");
+        NS_TEST_ASSERT_MSG_EQ(maxTx,
+                              static_cast<uint32_t>(modelWire + fabricHeaderSize + 2),
+            "a representable expansion is fully applied, not truncated or skipped");
         NS_TEST_ASSERT_MSG_EQ(deliveredBytes, static_cast<uint64_t>(size),
             "the data byte is still delivered");
+
+        Simulator::Destroy();
+    }
+};
+
+// Round-47 finding 1 regression: the old padding boundary accepted pads
+// of exactly 0x7FFFFFFF (the `> 0x7FFFFFFF` skip), and two ~2-GiB padded
+// packets in one DropTailQueue wrapped its uint32 byte counter
+// (2147483705 * 2 mod 2^32 == 114), firing the dequeue assert. The guard
+// now caps pads at 2^30 - 1 per sub-packet and hard-aborts beyond, so a
+// padded body stays under the same 2^30 bound the data cap fragments to
+// and the queue's occupancy stays representable. This test verifies the
+// representable side of that boundary: a deep-sub-floor-efficiency pad
+// goes through cleanly and the ledger is honored.
+class WireExpansionPadBoundaryTest : public TestCase
+{
+  public:
+    WireExpansionPadBoundaryTest()
+        : TestCase("deep wire-expansion pad is applied without queue overflow")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(true);
+
+        Ptr<UbProtocolModel> ub = CreateObject<UbProtocolModel>();
+        // 2^-17: a 1-B send pads to 128 KiB (deep enough to exercise the
+        // guard's arithmetic, small enough to keep the test fast).
+        ub->SetAttribute("WireEfficiency", DoubleValue(1.0 / 131072.0));
+        tx->SetProtocolModel(ub);
+        rx->SetProtocolModel(ub);
+        Ptr<UbPayloadBuilder> ubBuilder = CreateObject<UbPayloadBuilder>();
+        tx->SetProtocolPayloadBuilder(ubBuilder);
+        rx->SetProtocolPayloadBuilder(ubBuilder);
+
+        static uint64_t deliveredBytes = 0;
+        deliveredBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader hdr) {
+            deliveredBytes += hdr.GetEffectiveDataSize();
+        });
+        static uint64_t wireBytes = 0;
+        wireBytes = 0;
+        tx->TraceConnectWithoutContext(
+            "Tx", MakeCallback(
+                      +[](uint32_t txSize, uint32_t) {
+                          wireBytes += txSize;
+                      }));
+
+        tx->Initialize();
+        rx->Initialize();
+
+        std::vector<uint8_t> buf(4, 0x33);
+        tx->SendDataWithProtocol(1, buf.data(), 4,
+                                 static_cast<uint8_t>(UbTransaction::MEM_SYNC), 6, 0);
+
+        Simulator::Stop(MicroSeconds(3000));
+        Simulator::Run();
+
+        // 4 data bytes at 2^-17: ledger 16 + 4*2^17, all of it on one
+        // packet. The queue held ~512 KiB + headers with no counter wrap;
+        // the send delivered through the normal pipeline (a wrapped
+        // counter would have tripped the dequeue assert and crashed the
+        // run before the assertions below).
+        const uint32_t fabricHeaderSize = FabricHeader().GetSerializedSize();
+        const uint64_t modelWire = ub->GetWireSize(
+            4, static_cast<uint8_t>(UbTransaction::MEM_SYNC));
+        NS_TEST_ASSERT_MSG_EQ(wireBytes,
+                              modelWire + fabricHeaderSize + 2,
+            "the padded send honors the ledger without queue overflow");
+        NS_TEST_ASSERT_MSG_EQ(deliveredBytes, 4u,
+            "every data byte survives the padded transit");
+
+        Simulator::Destroy();
+    }
+};
+
+// Round-47 finding 3 regression: the advertised data counts must come
+// from the PRE-padding extraction. The old loop extracted from the
+// padded body, and the raw extractors (NCCL/MCCL SIMPLE, UB) count
+// padding as data — MCCL 0.8 with the default NCCL builder: a 1-MiB send
+// produced two 524288-B SIMPLE bodies padded by 131072 B each; the
+// advertised counts became 655360/393216, so the FIRST sub-packet's
+// delivery handed the application 131072 padding zeros in place of real
+// bytes. The hoisted true-count keeps every original byte.
+class PaddedRawDeliveryIntegrityTest : public TestCase
+{
+  public:
+    PaddedRawDeliveryIntegrityTest()
+        : TestCase("padded raw SIMPLE delivery preserves original bytes")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("200Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(true);
+
+        // MCCL model (efficiency 0.8) with the endpoint's DEFAULT NCCL
+        // builder — the exact mixed configuration from the finding. Both
+        // use compatible raw SIMPLE framing (protocol byte 3 re-keyed to
+        // MCCL's SIMPLE=1 on the wire? No: MCCL's GetProtocolId returns
+        // SIMPLE=1, and the NCCL builder's ExtractData treats 1 as LL.
+        // The send-side normalization only re-keys RoCE dests, so the
+        // caller's protocol byte wins: pass SIMPLE explicitly).
+        Ptr<McclProtocolModel> mccl = CreateObject<McclProtocolModel>();
+        mccl->SetAttribute("WireEfficiency", DoubleValue(0.8));
+        tx->SetProtocolModel(mccl);
+        rx->SetProtocolModel(mccl);
+
+        // 1 MiB, distinct byte values so substitution is detectable.
+        static std::vector<uint8_t> received;
+        received.clear();
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet> pkt, FabricHeader) {
+            size_t oldSize = received.size();
+            received.resize(oldSize + pkt->GetSize());
+            pkt->CopyData(received.data() + oldSize, pkt->GetSize());
+        });
+
+        tx->Initialize();
+        rx->Initialize();
+
+        const uint32_t size = 1 << 20;
+        std::vector<uint8_t> buf(size);
+        for (uint32_t i = 0; i < size; ++i)
+        {
+            buf[i] = static_cast<uint8_t>((i * 131 + 7) & 0xFF);
+        }
+        tx->SendDataWithProtocol(1, buf.data(), size,
+                                 static_cast<uint8_t>(NcclProtocol::SIMPLE), 6, 0);
+
+        Simulator::Stop(MicroSeconds(20000));
+        Simulator::Run();
+
+        // The full 1 MiB must arrive with every original byte in place —
+        // pre-fix, 131072 of them arrived as padding zeros.
+        NS_TEST_ASSERT_MSG_EQ(received.size(),
+                              static_cast<size_t>(size),
+            "the padded raw send delivers exactly the sent size");
+        for (uint32_t i = 0; i < size; ++i)
+        {
+            if (received[i] != buf[i])
+            {
+                NS_TEST_ASSERT_MSG_EQ(received[i], buf[i],
+                    "original byte corrupted by padding at offset "
+                    << i);
+                break;
+            }
+        }
 
         Simulator::Destroy();
     }
@@ -15659,6 +15864,8 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new WireExpansionRepresentabilityTest, TestCase::Duration::QUICK);
     AddTestCase(new LlFramingNoOverpadTest, TestCase::Duration::QUICK);
     AddTestCase(new UbSubFloorEfficiencyTest, TestCase::Duration::QUICK);
+    AddTestCase(new WireExpansionPadBoundaryTest, TestCase::Duration::QUICK);
+    AddTestCase(new PaddedRawDeliveryIntegrityTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolHeaderTest, TestCase::Duration::QUICK);

@@ -1154,14 +1154,47 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         std::vector<Ptr<Packet>> chunks = GetPayloadBuilderForRank(destRank)->BuildChunks(
             chunkData, thisChunkDataSize, protocolId, chunkSize);
 
+        // TRUE data counts BEFORE padding (codex round 47, finding 3): the
+        // advertised-size loop below used to extract each sub-packet's data
+        // count from the (padding-mutated) body, but the raw extractors
+        // (NCCL/MCCL SIMPLE, UB) count PADDING as data — the first padded
+        // sub-packet advertises more data than it carries and displaces
+        // real bytes from the delivered stream (MCCL 0.8 + default NCCL
+        // builder: a 1-MiB send's two 524288-B SIMPLE bodies padded by
+        // 131072 B each advertised 655360/393216 effective bytes, and
+        // 131072 original bytes arrived as padding zeros). Record every
+        // sub-packet's pre-padding extraction here and use THAT count for
+        // SetEffectiveDataSize below. UB's ExtractData derives its length
+        // from the padded packet size instead of its embedded 4-B size
+        // field too (its header field at offset 11 holds the true count),
+        // so this hoist is what keeps the advertised count honest for it.
+        std::vector<uint32_t> trueDataSizes;
+        trueDataSizes.reserve(chunks.size());
+        {
+            uint32_t dataAssignedBefore = 0;
+            for (const auto& pkt : chunks)
+            {
+                uint32_t dataStillNeeded = thisChunkDataSize - dataAssignedBefore;
+                std::vector<uint8_t> tmpBuf(pkt->GetSize());
+                uint64_t extracted = (pkt->GetSize() > 0)
+                    ? GetPayloadBuilderForRank(destRank)->ExtractData(
+                          pkt, protocolId, tmpBuf.data(), tmpBuf.size())
+                    : 0;
+                uint32_t count = static_cast<uint32_t>(
+                    std::min<uint64_t>(extracted, dataStillNeeded));
+                trueDataSizes.push_back(count);
+                dataAssignedBefore += count;
+            }
+        }
+
         // Wire-efficiency expansion for builder-framed chunks (codex rounds
-        // 40-45): a builder that emits no per-chunk size expansion of its
+        // 40-46): a builder that emits no per-chunk size expansion of its
         // own — the RoCE builder (data + a fixed 10-B SoHeader) and, under
         // an efficiency override, the raw NCCL/MCCL and UB builders —
         // never expresses the model's WireEfficiency on the wire, while the
         // bulk path sizes every chunk by GetWireSize instead. Pad each
-        // chunk's TOTAL on-wire body to its GetWireSize proportion so the
-        // transmitted-byte count matches the model's ledger: byte-based
+        // chunk's bodies to its GetWireSize ledger by padding the DEFICIT
+        // so the transmitted-byte count matches the model: byte-based
         // pacing (DCQCN), serialization time, and switch queue accounting
         // all key on the wire size, so an unpadded body silently understates
         // every one of them (round 44, finding 3: NCCL SIMPLE at
@@ -1169,22 +1202,11 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         // specifies 1250; round 45, finding 3: UB at 0.8 sent 1016 where
         // the model specifies 1266 — the 16-B transaction header is
         // additive, it does not carry the /eff expansion either).
-        // The target is LEDGER-relative, not a naive ceil(data/eff) per
-        // sub-packet: this chunk's data bytes expand to
-        // GetWireSize(thisChunkDataSize) total wire bytes, and each
-        // sub-packet's share is proportional to its OWN data count. That
-        // is exact for fixed-width framing (LL/LL128: every sub-packet's
-        // body already equals its share, so nothing is padded) and for
-        // raw builders (single sub-packet per chunk: share == the whole
-        // expansion), and it fixes the sub-packet-attribution problem for
-        // framed builders whose per-chunk header is a fixed additive
-        // overhead (UB): the header's own wire bytes are part of the
-        // chunk's ledger share, not extra.
-        // The receiver is unaffected: every ExtractData implementation
-        // reads the true data count from the chunk's own header (RoCE
-        // SoHeader GetDataSize, LL128's size field, UB's size field) or is
-        // capped by the header's EffectiveDataSize (NCCL/MCCL raw copy),
-        // so trailing padding bytes are never delivered.
+        // The receiver is unaffected: the advertised data count comes from
+        // the pre-padding extraction above (raw extractors would count the
+        // trailing padding as data), and framed extractors read the true
+        // count from the chunk's own header (RoCE SoHeader GetDataSize,
+        // LL128's size field), so padding bytes are never delivered.
         if (efficiency < 1.0 && efficiency > 0.0)
         {
             Ptr<ProtocolPayloadBuilder> builder =
@@ -1222,7 +1244,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             }
             else
             {
-                // Non-RoCE arm (rounds 44-46): expand the chunk's bodies to
+                // Non-RoCE arm (rounds 44-47): expand the chunk's bodies to
                 // the model's GetWireSize by padding the DEFICIT — the
                 // difference between the ledger and the sum of the bodies
                 // the builder already emitted. Fixed-width framing (LL
@@ -1251,6 +1273,40 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                     (chunkLedger > bodySum) ? chunkLedger - bodySum : 0;
                 if (deficit > 0 && !chunks.empty())
                 {
+                    // Representability guard (rounds 46-47): a pad is
+                    // bounded at 2^30 - 1 B per sub-packet so every padded
+                    // body stays under 2^30 — the same bound the data cap
+                    // above fragments to, and the round-45
+                    // representability invariant (a 10737418-B MCCL chunk
+                    // at 0.01 pads to a 1073741800-B body and transmits
+                    // cleanly; the queue holds it without wrapping because
+                    // such a body serializes alone on its link). Round 47,
+                    // finding 1: the old `> 0x7FFFFFFF` skip boundary
+                    // ACCEPTED pads up to just under 2 GiB, and two ~2-GiB
+                    // packets in one DropTailQueue wrapped its
+                    // TracedValue<uint32_t> m_nBytes to 114 and fired the
+                    // dequeue assert — near-2^31 single pads cannot be
+                    // absorbed by any uint32 queue accounting. Round 47,
+                    // finding 2: when the expansion cannot be represented
+                    // at all, a warn-and-skip understates the model's
+                    // ledger while reporting success — a hard configuration
+                    // error (NS_ABORT_MSG) instead. Only a custom model
+                    // below the 0.01 checker floor can get here.
+                    constexpr uint64_t maxPadPerSubPacket = (1ull << 30) - 1;
+                    const uint64_t evenShare = deficit / chunks.size();
+                    const uint64_t lastShare =
+                        evenShare + (deficit % chunks.size());
+                    if (lastShare > maxPadPerSubPacket
+                        || evenShare > maxPadPerSubPacket)
+                    {
+                        NS_ABORT_MSG("Wire-efficiency expansion of "
+                                     << deficit << " B for a "
+                                     << thisChunkDataSize << "-B chunk"
+                                        " (efficiency " << efficiency
+                                     << ") cannot be represented: fragment"
+                                        " the transfer (smaller chunk size)"
+                                        " or raise the efficiency");
+                    }
                     uint64_t assigned = 0;
                     for (size_t i = 0; i < chunks.size(); ++i)
                     {
@@ -1258,21 +1314,6 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                             ? deficit - assigned
                             : deficit / chunks.size();
                         assigned += pad;
-                        // Representability backstop (round 46, finding 3):
-                        // a pad that cannot fit a uint32-sized packet means
-                        // the efficiency is too small for the data chunk
-                        // (the data cap above should have fragmented it;
-                        // only a custom model below the 0.01 checker floor
-                        // can still get here). Warn and skip rather than
-                        // silently truncating 4 GiB of wire accounting.
-                        if (pad > 0x7FFFFFFFull)
-                        {
-                            NS_LOG_WARN("Wire-expansion pad " << pad
-                                        << " B exceeds a representable packet"
-                                           " body; skipping (fragment the"
-                                           " transfer or raise efficiency)");
-                            continue;
-                        }
                         if (pad > 0)
                         {
                             chunks[i]->AddAtEnd(
@@ -1288,20 +1329,19 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         // Track how much of thisChunkDataSize has been assigned so far.
         uint32_t dataAssigned = 0;
 
-        for (auto& pkt : chunks)
+        for (size_t chunkIdx = 0; chunkIdx < chunks.size(); ++chunkIdx)
         {
+            auto& pkt = chunks[chunkIdx];
             uint32_t wireSize = pkt->GetSize();
 
             // Compute actual data bytes carried by this sub-packet.
-            // For overhead protocols, use payload builder to extract the true
-            // data size. The extraction buffer is sized to the sub-packet, not
-            // a fixed 256 B: any vendor builder with larger units (e.g. 512 KiB
-            // RoCE segments) would advertise only 256 B per segment and the
-            // receiver would drop the rest (4096 B send delivered 256 B). The
-            // result is capped by the data still unassigned in this chunk: a
-            // fixed-width wire unit (LL line / LL128 chunk) that pads a short
-            // tail otherwise advertises the full unit (64 B for a 50 B tail)
-            // and over-counts the flow.
+            // Non-RoCE at efficiency < 1.0: the TRUE pre-padding extraction
+            // hoisted above the padding loop (padding mutates the body and
+            // the raw extractors would count padding as data — codex round
+            // 47, finding 3). The result is capped by the data still
+            // unassigned in this chunk: a fixed-width wire unit (LL line /
+            // LL128 chunk) that pads a short tail otherwise advertises the
+            // full unit (64 B for a 50 B tail) and over-counts the flow.
             uint32_t subPacketDataSize;
             if (destIsRoce)
             {
@@ -1318,12 +1358,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             }
             else if (efficiency < 1.0)
             {
-                uint32_t dataStillNeeded = thisChunkDataSize - dataAssigned;
-                std::vector<uint8_t> tmpBuf(pkt->GetSize());
-                uint64_t extracted = GetPayloadBuilderForRank(destRank)->ExtractData(
-                    pkt, protocolId, tmpBuf.data(), tmpBuf.size());
-                subPacketDataSize = static_cast<uint32_t>(
-                    std::min<uint64_t>(extracted, dataStillNeeded));
+                subPacketDataSize = trueDataSizes[chunkIdx];
             }
             else
             {

@@ -103,19 +103,25 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
     // measure exactly their own latency even when overlapped (round 44's
     // LIFO recorded 50 and 110 us for two messages whose true latencies
     // were 100 and 60 — the 110 exceeded both; codex round 45, finding 1).
-    // With multi-fragment messages the pairing degrades gracefully: the
-    // first fragment of a message consumes the message's own start; a
-    // later fragment consumes the NEXT message's start, which under
-    // ordered delivery is a later timestamp than its own — a true lower
-    // bound of that next message's latency.
+    // With multi-fragment messages the pairing degrades: EVERY completion
+    // consumes a start, not just the message's first fragment — an
+    // earlier message's LATER fragments consume the NEXT message's start
+    // (which under ordered delivery is a later timestamp than the
+    // fragment's own message's start, so the recorded duration is a true
+    // lower bound of that next message's latency), and a message whose
+    // start was already consumed by an earlier message's fragment records
+    // NO sample at all (codex round 47, finding 5: A/B start at 0/10 us,
+    // A's fragments complete at 20/30 us, B completes at 40 — FIFO
+    // records 20/20 us from A's fragments and nothing for B).
     // HONEST LIMIT (codex round 46, finding 2): the guarantee does NOT
-    // hold unconditionally. Delivery can reorder — a receiver in bypass
-    // mode (SetBypassReorderBuffer(true)) delivers packets in ARRIVAL
-    // order, and spraying one flow across devices with different
-    // propagation delays can deliver a LATER message's fragment before
-    // an earlier one's (start 0 us via a 100-us link, start 10 us via a
-    // 0-us link: FIFO records 10.169/90.169 us where the true latencies
-    // are 0.169/100.169 us — the first sample overestimates by 10 us).
+    // hold unconditionally even for first fragments. Delivery can
+    // reorder — a receiver in bypass mode (SetBypassReorderBuffer(true))
+    // delivers packets in ARRIVAL order, and spraying one flow across
+    // devices with different propagation delays can deliver a LATER
+    // message's fragment before an earlier one's (start 0 us via a
+    // 100-us link, start 10 us via a 0-us link: FIFO records
+    // 10.169/90.169 us where the true latencies are 0.169/100.169 us —
+    // the first sample overestimates by 10 us).
     // The samples remain a bounded, monotone approximation; consumers
     // needing per-message FCT exactness must not use overlapped flows on
     // reordering paths. No in-tree consumer reads these samples at all

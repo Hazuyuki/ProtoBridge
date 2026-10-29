@@ -11,6 +11,8 @@
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
 
+#include <limits>
+
 namespace ns3
 {
 
@@ -54,7 +56,18 @@ UbProtocolModel::GetTypeId()
                       "Wire efficiency (0.98 for Flit-level framing)",
                       DoubleValue(0.98),
                       MakeDoubleAccessor(&UbProtocolModel::m_wireEfficiency),
-                      MakeDoubleChecker<double>(0.0, 1.0))
+                      // Exclusive lower bound (codex round 47, finding 4):
+                      // this model's checker used to admit (0.0, 1.0], and
+                      // both edges are degenerate for the /eff expansion —
+                      // 0.0 divides by zero into inf, and sub-2^-62
+                      // quotients overflow the uint64 conversion in
+                      // GetWireSize (UB, saturating to the additive header
+                      // alone and silently disabling the expansion).
+                      // Match the other models' floor semantics (NCCL
+                      // SimpleWireEfficiency, MCCL, RoCE): (0.0, 1.0] was
+                      // the intent — efficiency 0 carries no data.
+                      MakeDoubleChecker<double>(std::numeric_limits<double>::min(),
+                                                1.0))
         .AddAttribute("MaxSyncTransactionSize",
                       "Maximum size for sync memory transactions in bytes",
                       UintegerValue(4096),
@@ -109,19 +122,30 @@ UbProtocolModel::GetWireSize(uint64_t dataSize, uint8_t protocolId) const
     {
         case UbTransaction::MEM_SYNC:
         case UbTransaction::MEM_ASYNC:
-            // Transaction header (16B) + data * overhead factor
-            return 16 + static_cast<uint64_t>(dataSize / m_wireEfficiency);
-
         case UbTransaction::MESSAGE:
-            // Message header (16B) + data * Flit overhead
-            return 16 + static_cast<uint64_t>(dataSize / m_wireEfficiency);
+        default: {
+            // Transaction header (16B) + data * overhead factor. The
+            // double quotient is converted through a saturation check
+            // (codex round 47, finding 4): a sub-2^-62 efficiency makes
+            // dataSize / m_wireEfficiency exceed UINT64_MAX, and the
+            // direct static_cast is undefined behavior (UBSan reports
+            // the out-of-range conversion; the current build silently
+            // saturates to 16 — the header alone — disabling the
+            // expansion). The attribute checker now floors the
+            // efficiency at DBL_MIN, but GetWireSize is also reachable
+            // through direct attribute sets on the object, so the
+            // conversion itself stays guarded.
+            const double quotient = static_cast<double>(dataSize) / m_wireEfficiency;
+            if (quotient >= 18446744073709551615.0) // >= 2^64 - 1
+            {
+                return std::numeric_limits<uint64_t>::max();
+            }
+            return 16 + static_cast<uint64_t>(quotient);
+        }
 
         case UbTransaction::MAINTENANCE:
             // Small fixed-format, ~128B wire for tiny payload
             return std::max(static_cast<uint64_t>(128), 16 + dataSize);
-
-        default:
-            return 16 + static_cast<uint64_t>(dataSize / m_wireEfficiency);
     }
 }
 
