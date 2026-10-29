@@ -319,6 +319,10 @@ main(int argc, char* argv[])
     uint16_t rootRank = 0;
     uint32_t forceProtocol = 0;  // 0=auto, 1=LL, 2=LL128, 3=SIMPLE
     double protocolWireEfficiency = 1.0;
+    // So (inter-node) RoCE wire efficiency: -1 means "leave the model default
+    // (0.95) untouched". Separate from --protocolWireEfficiency (the Su-model
+    // knob, default 1.0) so that overriding one never silently changes the other.
+    double soRoceWireEfficiency = -1.0;
     bool useTransactionModel = true;
     bool verbose = false;
 
@@ -454,6 +458,7 @@ main(int argc, char* argv[])
     cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain/hierarchical/ncclring", algorithm);
     cmd.AddValue("protocolModel", "Protocol model type: ns3::NcclProtocolModel/ns3::UbProtocolModel/ns3::McclProtocolModel", protocolModelType);
     cmd.AddValue("protocolWireEfficiency", "Protocol payload bytes divided by transmitted bytes", protocolWireEfficiency);
+    cmd.AddValue("soRoceWireEfficiency", "So (inter-node) RoCE wire efficiency; -1 keeps the model default 0.95", soRoceWireEfficiency);
     cmd.AddValue("fabricType", "Fabric type: NVLink/ETH/ICI/HCCS/xGMI/MetaXLink/RoCE/UB", fabricTypeStr);
     cmd.AddValue("deviceType", "Device type: GPU/CPU/TPU/NPU/Gaudi/UB_NPU", deviceTypeStr);
     cmd.AddValue("numGpus", "Number of GPUs", numGpus);
@@ -942,6 +947,12 @@ main(int argc, char* argv[])
             Config::SetDefault("ns3::McclProtocolModel::PerGpuStartupDelayNs", UintegerValue(startupPerGpuNs));
         }
     }
+    else if (protocolModelType == "ns3::RoceProtocolModel")
+    {
+        // handled at the So model creation site (Config::SetDefault before
+        // CreateObject<RoceProtocolModel>); --protocolModel itself still
+        // validates against the Su models below.
+    }
     else if (protocolModelType == "ns3::UbProtocolModel")
     {
         Config::SetDefault("ns3::UbProtocolModel::StartupDelayNs", UintegerValue(startupSIMPLENs));
@@ -1359,6 +1370,19 @@ main(int argc, char* argv[])
         Ptr<EthernetProtocolModel> ethModel;
         if (interNodeFabricType == FabricType::ROCE)
         {
+            // --soRoceWireEfficiency overrides the So (inter-node) RoCE model's
+            // wire efficiency. The default 0.95 (Eth+IP+UDP+BTH+aETH framing
+            // amortization) inflates every bulk transfer by 1/0.95 on the wire;
+            // matching studies against simulators that charge headers per packet
+            // (ns3-rdma) need a way to neutralize the double-count (the fabric
+            // headers are already serialized per chunk by the switch). The knob
+            // defaults to -1 = "leave the model default (0.95) alone" so that
+            // default PB behavior is unchanged unless explicitly overridden.
+            if (soRoceWireEfficiency > 0.0)
+            {
+                Config::SetDefault("ns3::RoceProtocolModel::WireEfficiency",
+                                   DoubleValue(soRoceWireEfficiency));
+            }
             roceModel = CreateObject<RoceProtocolModel>();
         }
         else if (interNodeFabricType == FabricType::ETHERNET)
