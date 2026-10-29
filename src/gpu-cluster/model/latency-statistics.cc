@@ -76,17 +76,18 @@ void
 LatencyStatistics::RecordFlowStart(uint16_t flowId)
 {
     NS_LOG_FUNCTION(this << flowId);
-    // FIFO matching (codex rounds 40-42): completions are recorded per
-    // delivered packet, and messages can reuse the flowId. Queue each start;
-    // a completion pops the OLDEST unmatched start, so
-    //   - sequential messages each measure their own latency
-    //     (1.0/1.1 ms then 10.0/10.1 ms -> 100 us and 100 us, where the
-    //     round-41 sticky start recorded 100 us and 9100 us);
-    //   - an overlapped second message retimes only the completion that
-    //     lands after its own start is queued — never the first message's
-    //     in-flight completion;
-    //   - a legitimate start at t=0 works (Time(0) is a queued value, not
-    //     a sentinel).
+    // Message-oriented start bookkeeping (codex rounds 40-43): the sender
+    // records ONE start per message, the receiver records a completion PER
+    // DELIVERED FRAGMENT. A pure FIFO popped one start per completion, so
+    // a 3-fragment message recorded only the FIRST fragment's latency and
+    // dropped the rest — and could consume an overlapped message's start
+    // with its own second fragment. Instead, a start stays at the queue
+    // head until a completion arrives with the queue otherwise EMPTY
+    // (i.e. all fragments of the message since that start have landed):
+    // the recorded sample is then the message's head-to-last-fragment
+    // latency, the quantity FCT-style measurements actually want. A new
+    // start while the previous message is still draining queues behind it
+    // and is matched only after the head start expires.
     m_flows[flowId].pendingStarts.push_back(Simulator::Now());
 }
 
@@ -102,10 +103,18 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
         return;
     }
 
-    Time startTime = it->second.pendingStarts.front();
-    it->second.pendingStarts.pop_front();
-    Time latency = Simulator::Now() - startTime;
-    RecordLatency(flowId, latency);
+    if (it->second.pendingStarts.size() == 1)
+    {
+        // Last fragment of the in-flight message (no newer start queued):
+        // this completion closes the message. Measure head-to-tail.
+        Time startTime = it->second.pendingStarts.front();
+        it->second.pendingStarts.pop_front();
+        RecordLatency(flowId, Simulator::Now() - startTime);
+        return;
+    }
+    // Intermediate fragment (or an earlier message's tail while a newer
+    // message has started): no sample — the message is still in flight.
+    // The head start remains for the closing completion.
 }
 
 void

@@ -958,19 +958,23 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
     const bool destIsRoce = (destModel->GetInstanceTypeId()
                              == RoceProtocolModel::GetTypeId());
-    // When the So builder is mounted for a ROCE dest, normalize the protocol
-    // id to the dest model's own — the same re-key the bulk path applies at
-    // its builder seam (codex round 38, finding 1). A caller's NcclProtocol
-    // byte (e.g. SIMPLE=3) is wrong on the wire for a RoCE dest: the switch
-    // ECN-mark and receiver CNP-echo guards key on RoceProtocol::SIMPLE=1,
-    // so the outer byte 3 would leave congested explicit-protocol sends
-    // without feedback even though the inner SoHeader carries SIMPLE.
-    // RoCE-only (codex round 39, finding 1): a distinct So builder can also
-    // be an NCCL builder mounted for an NCCL-model remote dest — there the
-    // caller's explicit protocol choice must win (re-keying would flip an
-    // explicit SIMPLE=3 to size-based LL=1, padding 64 raw bytes into a
-    // 128-B LL line).
-    if (destIsRoce && GetPayloadBuilderForRank(destRank) != m_payloadBuilder)
+    // When the RoCE builder will frame this send (So builder mounted, OR the
+    // primary builder itself is the RoCE builder — config-mode RoCE profiles
+    // mount it globally, codex round 43 finding 3), normalize the protocol id
+    // to the dest model's own — the same re-key the bulk path applies at its
+    // builder seam (round 38, finding 1). A caller's NcclProtocol byte (e.g.
+    // SIMPLE=3) is wrong on the wire for a RoCE dest: the switch ECN-mark and
+    // receiver CNP-echo guards key on RoceProtocol::SIMPLE=1, so the outer
+    // byte 3 leaves congested explicit-protocol sends without feedback even
+    // though the inner SoHeader carries SIMPLE.
+    // RoCE-only (round 39, finding 1): a distinct So builder can also be an
+    // NCCL builder mounted for an NCCL-model remote dest — there the caller's
+    // explicit protocol choice must win (re-keying would flip an explicit
+    // SIMPLE=3 to size-based LL=1, padding 64 raw bytes into a 128-B LL
+    // line).
+    if (destIsRoce
+        && GetPayloadBuilderForRank(destRank)->GetInstanceTypeId()
+               == RocePayloadBuilder::GetTypeId())
     {
         protocolId = destModel->GetProtocolId(size);
     }
@@ -1016,31 +1020,26 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     // the bulk path's wire-byte chunk cap. m_bulkChunkSize caps WIRE bytes
     // on the bulk path, and every RoCE chunk carries a mandatory 10-B
     // SoHeader inside that budget, so the data-byte cap is
-    // (cap - SoHeaderSize) * efficiency — computed in INTEGER arithmetic
-    // (cap-1 samples of eff/256, floor) because the binary64 round trip
-    // (cap*eff truncated, then ceil(data/eff)) can exceed the cap by one
-    // byte (cap 4050, eff 0.94: 4050*0.94 == 3807.0 but 3807/0.94 ==
-    // 4050.0000000000005 -> 4051). The loop pads each chunk's total body
-    // back to ceil(chunkData/eff) (header inside), so bodies never exceed
-    // the cap.
+    // floor((cap - SoHeaderSize) * efficiency) — a single floor, no
+    // ceil-side round trip (binary64 cap*eff then ceil(data/eff) can
+    // overshoot by one byte: cap 4050, eff 0.94 -> 4051). The loop pads
+    // each chunk's total body to ceil(chunkData/eff) (header inside).
+    // Degenerate caps (rounding to 0, or smaller than the header) clamp
+    // the data cap to 1 but ALSO clamp the padded body to the cap itself
+    // in the loop — cap 11 at eff 0.01 otherwise emitted 100-B bodies
+    // (round 43, finding 5).
     uint64_t chunkSize;
+    uint64_t bodyHardCap = 0; // 0 = unbounded (non-RoCE or no bulk cap)
     if (destIsRoce && m_bulkChunkSize > 0)
     {
         const uint32_t soHdr = SoHeader().GetSerializedSize();
+        bodyHardCap = m_bulkChunkSize;
         if (m_bulkChunkSize > soHdr)
         {
-            // eff scaled to a per-256 integer to stay exact: dataCap is the
-            // largest data count with ceil(dataCap/eff) + 0 <= cap - soHdr
-            // ... conservatively floor((cap - soHdr) * eff).
             const double roceEff = destModel->GetEfficiency(protocolId);
             uint64_t dataCap;
             if (roceEff > 0.0 && roceEff < 1.0)
             {
-                // Rational form: dataCap = floor((cap - soHdr) * eff)
-                // computed as ((cap - soHdr) * effNum) / effDen with
-                // effNum/effDen == eff exactly enough: use llround on the
-                // product minus a half to implement floor without a
-                // ceil-side round trip.
                 dataCap = static_cast<uint64_t>(
                     std::floor((m_bulkChunkSize - soHdr) * roceEff));
             }
@@ -1137,6 +1136,14 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                 uint64_t chunkData = soh.GetDataSize();
                 uint64_t targetWire = static_cast<uint64_t>(
                     std::ceil(chunkData / efficiency));
+                // Degenerate-cap guard (round 43, finding 5): never let the
+                // padded body exceed the wire cap — ceil(data/eff) can
+                // overshoot when the data cap was clamped up from a
+                // floor-to-zero product (cap 11, eff 0.01).
+                if (bodyHardCap > 0 && targetWire > bodyHardCap)
+                {
+                    targetWire = bodyHardCap;
+                }
                 if (pkt->GetSize() < targetWire)
                 {
                     pkt->AddAtEnd(
@@ -1225,24 +1232,12 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             // back). The gate performs the HasCredits/ConsumeCredit pair
             // for the CREDIT policy, so a subclass override is no longer
             // bypassed on this path (codex round 29, finding 3).
-            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
-            {
-                NS_LOG_DEBUG("No credits for DATA_INTERNAL chunk on VC " << static_cast<int>(vcId)
-                             << ", queuing packet");
-                SendQueueEntry entry;
-                entry.packet = pkt;
-                entry.header = header;
-                entry.vcId = vcId;
-                entry.seqNum = seqNum;
-                m_sendQueue.push_back(entry);
-                TrySendQueuedPackets();
-                // Skip device selection for queued packets — TrySendQueuedPackets handles it
-                chunkIndex++;
-                continue;
-            }
-
-            pkt->AddHeader(header);
-
+            // Spray-lane selection happens BEFORE the admission gate (codex
+            // round 43, finding 4): a gate-denied packet parked on the send
+            // queue must keep its round-robin lane — the drain otherwise
+            // fell back to ResolveDeviceIndex (the static routing entry,
+            // lane 0), so backpressure silently collapsed a multi-lane
+            // transfer onto one link.
             std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
             uint32_t deviceIdx;
             if (devices.size() > 1)
@@ -1257,6 +1252,24 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             {
                 deviceIdx = ResolveDeviceIndex(destRank);
             }
+
+            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
+            {
+                NS_LOG_DEBUG("No credits for DATA_INTERNAL chunk on VC " << static_cast<int>(vcId)
+                             << ", queuing packet");
+                SendQueueEntry entry;
+                entry.packet = pkt;
+                entry.header = header;
+                entry.vcId = vcId;
+                entry.seqNum = seqNum;
+                entry.deviceIndex = deviceIdx;
+                m_sendQueue.push_back(entry);
+                TrySendQueuedPackets();
+                chunkIndex++;
+                continue;
+            }
+
+            pkt->AddHeader(header);
 
             Mac48Address destMac = ResolveDestMac(destRank);
             if (!SendPacketOnDevice(pkt, deviceIdx, destMac))

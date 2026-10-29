@@ -4867,6 +4867,10 @@ class RoceNonBulkSendDeliveryTest : public TestCase
     {
     }
 
+    // Tx trace sink state (the trace connects a stateless +[] function
+    // pointer, so the accumulator lives here).
+    static uint32_t g_maxWireBody;
+
     void DoRun() override
     {
         Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
@@ -4903,19 +4907,27 @@ class RoceNonBulkSendDeliveryTest : public TestCase
             rx->SetSoPayloadBuilder(soBuilder);
             tx->SetBulkChunkSize(cap);
 
+            // The receive callback sees a FRESH packet of extracted data
+            // (SoHeader and efficiency padding already stripped), so the
+            // wire-body cap is asserted at the sender's Tx trace instead —
+            // it fires per transmitted packet with the full on-wire size
+            // including the FabricHeader. A plain function (not a capturing
+            // lambda) because the TracedCallback signature is a two-arg
+            // function type, not Callback.
             static uint64_t deliveredBytes = 0;
-            static uint32_t maxWireBody = 0;
             deliveredBytes = 0;
-            maxWireBody = 0;
-            rx->SetReceiveCallback([](uint16_t, Ptr<Packet> pkt, FabricHeader hdr) {
+            g_maxWireBody = 0;
+            rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader hdr) {
                 deliveredBytes += hdr.GetEffectiveDataSize();
-                // FabricHeader (39 B) is peeled before the callback; the
-                // body here is SoHeader + data + efficiency padding.
-                if (pkt->GetSize() > maxWireBody)
-                {
-                    maxWireBody = pkt->GetSize();
-                }
             });
+            tx->TraceConnectWithoutContext(
+                "Tx", MakeCallback(
+                          +[](uint32_t wireSize, uint32_t) {
+                              if (wireSize > g_maxWireBody)
+                              {
+                                  g_maxWireBody = wireSize;
+                              }
+                          }));
 
             tx->Initialize();
             rx->Initialize();
@@ -4936,18 +4948,19 @@ class RoceNonBulkSendDeliveryTest : public TestCase
             NS_TEST_ASSERT_MSG_EQ(deliveredBytes,
                                   static_cast<uint64_t>(64 + 1000 + cap + cap * 2 + cap * 2 + 137),
                                   "non-bulk RoCE send must deliver every sent byte");
-            // Wire bodies respect the cap (round-41/42 sizing: data cap
-            // (cap-10)*eff, padded to ceil(data/eff) with the header inside
-            // the budget — a body may exceed cap only if (cap-10)*eff
-            // rounding pushes ceil past cap, which the integer floor
-            // prevents; allow nothing).
-            NS_TEST_ASSERT_MSG_EQ(maxWireBody <= cap, true,
+            // Wire bodies (body + 39-B FabricHeader at the Tx trace) respect
+            // cap + FabricHeader size — the body budget matches the bulk
+            // path's wireChunk (both exclude the FabricHeader).
+            const uint32_t fabricHeaderSize = FabricHeader().GetSerializedSize();
+            NS_TEST_ASSERT_MSG_EQ(g_maxWireBody <= cap + fabricHeaderSize, true,
                                   "every non-bulk RoCE wire body must fit the bulk chunk cap");
 
             Simulator::Destroy();
         }
     }
 };
+
+uint32_t RoceNonBulkSendDeliveryTest::g_maxWireBody = 0;
 
 // (1b-5) The WFQ backlog-decrement lambdas also capture raw `this`. Codex
 // round 14, finding 1: the three DecrementBacklog schedules in
