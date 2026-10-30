@@ -218,7 +218,10 @@ QueueBase::WouldOverflow(uint32_t nPackets, uint32_t nBytes) const
 {
     if (m_maxSize.GetUnit() == QueueSizeUnit::PACKETS)
     {
-        return (m_nPackets + nPackets > m_maxSize.GetValue());
+        // 64-bit promotion (codex round 50, finding 7): the uint32 sum
+        // wrapped at UINT32_MAX packets and admitted one extra.
+        return (static_cast<uint64_t>(m_nPackets) + nPackets
+                > m_maxSize.GetValue());
     }
     else
     {
@@ -231,7 +234,8 @@ QueueBase::WouldOverflow(uint32_t bytes) const
 {
     if (m_maxSize.GetUnit() == QueueSizeUnit::PACKETS)
     {
-        return (m_nPackets + 1 > m_maxSize.GetValue());
+        return (static_cast<uint64_t>(m_nPackets) + 1
+                > m_maxSize.GetValue());
     }
     // 64-bit on both sides: m_nBytes is uint64 and the uint32 limit
     // promotes, so a >4 GiB backlog compares correctly (no truncation

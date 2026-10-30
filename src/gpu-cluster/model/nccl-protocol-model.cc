@@ -7,6 +7,7 @@
 #include "ns3/log.h"
 
 #include <cmath>
+#include <limits>
 
 namespace ns3
 {
@@ -182,9 +183,24 @@ NcclProtocolModel::GetWireSize(uint64_t dataSize, NcclProtocol protocol)
     switch (protocol)
     {
         case NcclProtocol::LL:
-            return ((dataSize + LL_DATA_PER_LINE - 1) / LL_DATA_PER_LINE) * LL_LINE_SIZE;
-        case NcclProtocol::LL128:
-            return ((dataSize + LL128_DATA_PER_LINE - 1) / LL128_DATA_PER_LINE) * LL128_LINE_SIZE;
+        case NcclProtocol::LL128: {
+            // Checked framing (codex round 50, finding 2): the line count
+            // times the line size wraps in uint64 for dataSize near 2^63
+            // (LL: 2^63 data -> true 2^64 wire, returned 0), and a wrapped
+            // zero ledger emitted a header-only "successful" transfer.
+            // Saturate instead: the send paths abort on ledgers above the
+            // serviceable bound, which a saturated value always exceeds.
+            const uint64_t dataPerLine = (protocol == NcclProtocol::LL)
+                ? LL_DATA_PER_LINE : LL128_DATA_PER_LINE;
+            const uint64_t lineSize = (protocol == NcclProtocol::LL)
+                ? LL_LINE_SIZE : LL128_LINE_SIZE;
+            const uint64_t lines = (dataSize + dataPerLine - 1) / dataPerLine;
+            if (lines > std::numeric_limits<uint64_t>::max() / lineSize)
+            {
+                return std::numeric_limits<uint64_t>::max();
+            }
+            return lines * lineSize;
+        }
         case NcclProtocol::SIMPLE:
         case NcclProtocol::NONE:
         default:

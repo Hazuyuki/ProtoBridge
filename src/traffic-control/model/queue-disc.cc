@@ -437,7 +437,9 @@ QueueDisc::WouldOverflow(uint32_t bytes) const
     NS_LOG_FUNCTION(this << bytes);
     if (GetMaxSize().GetUnit() == QueueSizeUnit::PACKETS)
     {
-        return (m_nPackets + 1 > GetMaxSize().GetValue());
+        // 64-bit promotion (codex round 50, finding 7).
+        return (static_cast<uint64_t>(m_nPackets) + 1
+                > GetMaxSize().GetValue());
     }
     // 64-bit both sides (same reasoning as QueueBase::WouldOverflow).
     return (m_nBytes + bytes > GetMaxSize().GetValue());

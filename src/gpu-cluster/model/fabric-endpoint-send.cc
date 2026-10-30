@@ -350,6 +350,21 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             numChunks = std::max(minChunks, std::min(sizeBasedChunks, pathBalancedChunks));
         }
         uint64_t chunkSize = (wireSize + numChunks - 1) / numChunks;
+        // Header headroom (codex round 50, finding 1): a fragment body plus
+        // the 39-B FabricHeader and the 2-B PPP prepend must stay inside the
+        // uint32 the packet pipeline serializes. The SprayChunkSize
+        // attribute can still be set near UINT32_MAX directly (the setter
+        // caps, the raw attribute path bypasses it), so clamp here too: the
+        // transfer just fragments into more chunks.
+        constexpr uint64_t maxFragmentBody =
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - (39 + 2);
+        if (chunkSize > maxFragmentBody)
+        {
+            const uint64_t minChunksForBody =
+                (wireSize + maxFragmentBody - 1) / maxFragmentBody;
+            numChunks = std::max(numChunks, minChunksForBody);
+            chunkSize = (wireSize + numChunks - 1) / numChunks;
+        }
 
         NS_LOG_INFO("Fragmenting collective " << effectiveSize << " effective bytes ("
                     << wireSize << " wire bytes) to dest " << destRank

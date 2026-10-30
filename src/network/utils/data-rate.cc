@@ -126,6 +126,15 @@ DataRate::DataRate(uint64_t bps)
     : m_bps(bps)
 {
     NS_LOG_FUNCTION(this << bps);
+    // Signed-construction guard (codex round 50, finding 4): every
+    // fixed-point computation in CalculateBitsTxTime constructs
+    // int64x64_t from m_bps, and a rate >= 2^63 converts negative (2^62
+    // bits at 2^63 bps returned -500 ms instead of +500 ms). Rates that
+    // large (an exabit per second) are beyond any modeled link; reject
+    // at construction so the failure is at the configuration site.
+    NS_ABORT_MSG_IF(bps >= (1ull << 63),
+                    "DataRate of " << bps << " bps exceeds the supported "
+                    "range (>= 2^63 bps)");
 }
 
 DataRate
@@ -230,6 +239,11 @@ DataRate::DataRate(std::string rate)
     {
         NS_FATAL_ERROR("Could not parse rate: " << rate);
     }
+    // Same signed-construction guard as the uint64_t constructor (codex
+    // round 50, finding 4): the string parser accepts >= 2^63 bps.
+    NS_ABORT_MSG_IF(m_bps >= (1ull << 63),
+                    "DataRate of " << rate << " (" << m_bps
+                    << " bps) exceeds the supported range (>= 2^63 bps)");
 }
 
 /* For printing of data rate */

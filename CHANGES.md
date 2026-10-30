@@ -6,6 +6,58 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 50: configuration-boundary robustness at the fragment/ledger edge — header headroom, wrapped LL ledgers, zero spray size, negative DataRates, and tiny BERs
+
+**What.** Round 50 pushed the send paths' configurable knobs to their
+uint32/uint64 boundaries and found the fragmentation pipeline accepting
+nonsensical-but-representable configurations:
+
+1. **[P2] No header headroom in the fragment cap.** A
+   `BulkChunkSize`/`SprayChunkSize` near `UINT32_MAX` produces a body
+   whose +39-B FabricHeader +2-B PPP wraps the packet size to 38 B —
+   "successfully" sent garbage. Both setters now cap at
+   `UINT32_MAX - 41`, and both fragmentation paths clamp the computed
+   fragment body against the same bound independently of the configured
+   chunk sizes (the raw attribute path bypasses the setters). The
+   transfer just fragments into more chunks.
+2. **[P2] NCCL LL's framing wrapped inside `GetWireSize`.** `dataSize`
+   near 2^63 makes `lines × 128` wrap to 0 (or a small value) in uint64,
+   which passed the 2^62 ledger bound and emitted a header-only
+   "successful" transfer. The LL/LL128 arm now saturates to `UINT64_MAX`
+   when the line count times the line size would overflow (the send
+   paths' existing bound then aborts), and the bulk path additionally
+   rejects a zero wire ledger for nonzero data.
+3. **[P2] `SprayChunkSize = 0` divided by zero.** The setter and the
+   attribute checker both accept it; a 16-MiB bulk send then SIGFPEs in
+   the chunk-count division. The checker now requires ≥1, the setter
+   aborts on zero, and the (unused, also-dividing) `sizeBasedChunks`
+   computation in the bulk path is removed.
+4. **[P2] `DataRate` rates ≥ 2^63 constructed negative fixed-points.**
+   Both the uint64 and string constructors accept them;
+   `int64x64_t(m_bps)` then goes negative and `CalculateBitsTxTime`
+   returns inverted times (2^62 bits at 2^63 bps → −500 ms). Both
+   constructors now abort at the configuration site.
+5. **[P2] Tiny BERs collapsed to zero.** `1.0 - m_rate` rounds to
+   exactly 1.0 for `m_rate = 1e-17`, making every packet clean.
+   `DoCorruptBit` now computes `-expm1(n · log1p(-rate))`, preserving
+   the leading term.
+6. **[P3] PIE kept the truncating admission.** The wrapped comparison
+   pushed rejections into the internal queue's drop path, skipping the
+   `m_accuProb` reset and recording `INTERNAL_QUEUE_DROP` instead of
+   `FORCED_DROP`. It compares through `WouldOverflow` now.
+7. **[P3] Packet-mode `WouldOverflow` still wrapped at `UINT32_MAX`
+   packets.** The count is promoted to uint64 before the addition in
+   both `QueueBase` overloads and `QueueDisc`'s.
+
+**Verified.** Clean `-Werror` build; gpu-cluster suite 183/183 PASS
+(test-runner + test.py); three parity scripts PASS; the three calibrated
+scenarios byte-stable (ceiling 8306.3 µs; DCQCN congested 20802.4 µs /
+99985 ECN / 99974 CNP rx; aligned 20300.2 µs, zero ECN); every
+touched-core suite PASS (data-rate, error-model, pie, drop-tail,
+codel/cobalt/fifo/prio, fq-codel/fq-pie/fq-cobalt, queue-disc-traces,
+wifi-mac-queue, lr-wpan-error-model) plus a traffic-control example
+smoke run.
+
 ### Fixed — codex round 49: the round-48 64-bit widening completed across the whole blast radius — admission comparisons, near-saturated ledgers, FQ byte locals, and the error model
 
 **What.** Round 48 widened the queue byte counters and the

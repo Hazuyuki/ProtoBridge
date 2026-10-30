@@ -270,8 +270,11 @@ RateErrorModel::DoCorruptBit(Ptr<Packet> p)
     // in 32 bits for packets above 512 MiB — a 1073741881-B boundary
     // packet counted 456 bits instead of 8589935048, so a 1e-9 BER
     // modeled a ~4.6e-7 corruption probability instead of ~0.9998.
-    double per = 1 - std::pow(1.0 - m_rate,
-                              static_cast<double>(8.0 * p->GetSize()));
+    // expm1/log1p (codex round 50, finding 5): 1.0 - m_rate rounds to
+    // exactly 1.0 for a tiny BER (m_rate = 1e-17), making every packet
+    // clean. -expm1(n * log1p(-rate)) keeps the leading term.
+    const double exponent = static_cast<double>(8.0 * p->GetSize());
+    const double per = -std::expm1(exponent * std::log1p(-m_rate));
     return (m_ranvar->GetValue() < per);
 }
 

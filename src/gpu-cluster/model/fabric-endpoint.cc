@@ -72,7 +72,9 @@ FabricEndpoint::GetTypeId()
                       "Chunk size for spraying in bytes (default 4KB)",
                       UintegerValue(4*1024),  // 4KB default
                       MakeUintegerAccessor(&FabricEndpoint::m_sprayChunkSize),
-                      MakeUintegerChecker<uint32_t>())
+                      // min 1: zero divides by zero in every spray chunk
+                      // count (codex round 50, finding 3)
+                      MakeUintegerChecker<uint32_t>(1))
         .AddAttribute("CreditManager",
                       "Credit manager for flow control",
                       PointerValue(),
@@ -656,6 +658,19 @@ FabricEndpoint::GetSprayingEnabled() const
 void
 FabricEndpoint::SetSprayChunkSize(uint32_t chunkSize)
 {
+    // Zero is a division-by-zero in every spray chunk count (codex round
+    // 50, finding 3); the header-headroom cap mirrors SetBulkChunkSize
+    // (finding 1).
+    NS_ABORT_MSG_IF(chunkSize == 0, "Spray chunk size must be greater than zero");
+    constexpr uint32_t packetOverhead = 39 + 2;
+    constexpr uint32_t maxChunk =
+        std::numeric_limits<uint32_t>::max() - packetOverhead;
+    if (chunkSize > maxChunk)
+    {
+        NS_LOG_WARN("SprayChunkSize " << chunkSize << " capped to " << maxChunk
+                    << " to keep the packet inside uint32 after headers");
+        chunkSize = maxChunk;
+    }
     m_sprayChunkSize = chunkSize;
 }
 
@@ -1032,6 +1047,21 @@ void
 FabricEndpoint::SetBulkChunkSize(uint32_t bytes)
 {
     NS_ABORT_MSG_IF(bytes == 0, "Bulk chunk size must be greater than zero");
+    // Header headroom (codex round 50, finding 1): a chunk-sized body plus
+    // the 39-B FabricHeader and the 2-B PPP prepend must stay inside the
+    // uint32 the packet pipeline serializes — a UINT32_MAX-sized body wraps
+    // the total to 38 B and every downstream size consumer misbehaves.
+    // Cap at the largest body that keeps the FULL packet representable;
+    // transfers just fragment into more chunks.
+    constexpr uint32_t packetOverhead = 39 + 2;
+    constexpr uint32_t maxChunk =
+        std::numeric_limits<uint32_t>::max() - packetOverhead;
+    if (bytes > maxChunk)
+    {
+        NS_LOG_WARN("BulkChunkSize " << bytes << " capped to " << maxChunk
+                    << " to keep the packet inside uint32 after headers");
+        bytes = maxChunk;
+    }
     m_bulkChunkSize = bytes;
 }
 
@@ -3726,6 +3756,15 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     << " (efficiency " << efficiency << ", wire ledger "
                     << wireSize << " B) cannot be serviced: raise the "
                        "efficiency or reduce the transfer size");
+    // Wrapped-inside-GetWireSize ledger (codex round 50, finding 2): the
+    // NCCL LL framing multiplies in uint64, so dataSize = 2^63 wraps its
+    // true 2^64 ledger to ZERO — which passes the bound above and emits a
+    // header-only "successful" transfer (or divides by zero through
+    // wireChunkSize). Zero wire bytes for nonzero data is never legitimate.
+    NS_ABORT_MSG_IF(wireSize == 0,
+                    "Bulk transfer of " << dataSize << " B to rank " << destRank
+                    << " computed a ZERO wire ledger (model arithmetic "
+                       "overflowed): reduce the transfer size");
 
     NS_LOG_INFO("Bulk wire transfer: dataSize=" << dataSize << " wireSize=" << wireSize
                << " efficiency=" << efficiency << " protocol=" << static_cast<int>(protocolId));
@@ -3786,7 +3825,6 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         }
 
         uint64_t minChunks = sendDevices.size();
-        uint64_t sizeBasedChunks = (wireSize + m_sprayChunkSize - 1) / m_sprayChunkSize;
         // Coalesce bulk transfers while retaining at least one chunk per path.
         // Total wire bytes and path striping are unchanged. Queue and credit
         // events occur at this coarser granularity, so this API is reserved for
@@ -3802,7 +3840,22 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         // (wireSize - offset underflows) and emit zero/phantom data bytes.
         uint64_t memCapChunks = (wireSize + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
         uint64_t numChunks = std::max(minChunks, memCapChunks);
-        (void)sizeBasedChunks;
+        // Header headroom (codex round 50, findings 1+3): the fragment body
+        // plus the 39-B FabricHeader and 2-B PPP prepend must stay inside a
+        // uint32 — and m_bulkChunkSize/m_sprayChunkSize set through the raw
+        // attributes can sit near UINT32_MAX (the setters cap; the attribute
+        // path bypasses them). Clamp the fragment body; the transfer just
+        // fragments into more chunks. This also subsumes the unused
+        // sizeBasedChunks division (removed: it divided by a possibly-zero
+        // spray size and its result was never consumed).
+        constexpr uint64_t maxFragmentBody =
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - (39 + 2);
+        if (MAX_CHUNK_BYTES > maxFragmentBody)
+        {
+            const uint64_t bodyCapChunks =
+                (wireSize + maxFragmentBody - 1) / maxFragmentBody;
+            numChunks = std::max(numChunks, bodyCapChunks);
+        }
         numChunks = std::min(numChunks, std::max<uint64_t>(wireSize, 1));
         uint64_t wireChunkSize = (wireSize + numChunks - 1) / numChunks;
         // Only the first sentChunks fragments are actually emitted (the loops
