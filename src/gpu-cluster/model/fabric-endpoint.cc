@@ -22,6 +22,7 @@
 #include "ns3/enum.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace ns3
 {
@@ -3703,6 +3704,21 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
 
     const double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
     const uint64_t wireSize = GetProtocolModelForDest(destRank)->GetWireSize(dataSize, protocolId);
+
+    // Saturated ledger guard (codex round 48, finding 1): a sub-2^-62
+    // efficiency makes GetWireSize return UINT64_MAX, and the
+    // fragmentation math below would overflow — wireSize +
+    // MAX_CHUNK_BYTES - 1 wraps to a small memCapChunks, wireChunkSize
+    // underflow-divides, and the dataChunkSize line SIGFPEs. A wire
+    // ledger that cannot be represented in uint64 is a configuration
+    // error (the UB model's attribute checker floors the efficiency at
+    // DBL_MIN, but GetWireSize is also reachable through direct object
+    // attribute sets). Fail loudly with an actionable message instead.
+    NS_ABORT_MSG_IF(wireSize == std::numeric_limits<uint64_t>::max(),
+                    "Bulk transfer of " << dataSize << " B to rank " << destRank
+                    << " (efficiency " << efficiency
+                    << ") needs a wire ledger no uint64 can represent: "
+                       "raise the efficiency");
 
     NS_LOG_INFO("Bulk wire transfer: dataSize=" << dataSize << " wireSize=" << wireSize
                << " efficiency=" << efficiency << " protocol=" << static_cast<int>(protocolId));

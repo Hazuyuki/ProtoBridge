@@ -86,7 +86,7 @@ class QueueBase : public Object
     /**
      * @return The number of bytes currently occupied by the packets in the Queue
      */
-    uint32_t GetNBytes() const;
+    uint64_t GetNBytes() const;
 
     /**
      * @return The current size of the Queue in terms of packets, if the maximum
@@ -99,7 +99,7 @@ class QueueBase : public Object
      * simulation began, or since ResetStatistics was called, according to
      * whichever happened more recently
      */
-    uint32_t GetTotalReceivedBytes() const;
+    uint64_t GetTotalReceivedBytes() const;
 
     /**
      * @return The total number of packets received by this Queue since the
@@ -113,21 +113,21 @@ class QueueBase : public Object
      * simulation began, or since ResetStatistics was called, according to
      * whichever happened more recently
      */
-    uint32_t GetTotalDroppedBytes() const;
+    uint64_t GetTotalDroppedBytes() const;
 
     /**
      * @return The total number of bytes dropped before enqueue by this Queue
      * since the simulation began, or since ResetStatistics was called, according
      * to whichever happened more recently
      */
-    uint32_t GetTotalDroppedBytesBeforeEnqueue() const;
+    uint64_t GetTotalDroppedBytesBeforeEnqueue() const;
 
     /**
      * @return The total number of bytes dropped after dequeue by this Queue
      * since the simulation began, or since ResetStatistics was called, according
      * to whichever happened more recently
      */
-    uint32_t GetTotalDroppedBytesAfterDequeue() const;
+    uint64_t GetTotalDroppedBytesAfterDequeue() const;
 
     /**
      * @return The total number of packets dropped by this Queue since the
@@ -204,13 +204,17 @@ class QueueBase : public Object
 #endif
 
   protected:
-    TracedValue<uint32_t> m_nBytes;               //!< Number of bytes in the queue
-    uint32_t m_nTotalReceivedBytes;               //!< Total received bytes
+    // Byte counters are 64-bit (codex round 48, finding 2): wire-efficiency
+    // padding can put four ~1-GiB packets in one packet-count-limited
+    // DropTailQueue, and the old uint32 accounting wrapped (4 * (2^30 + 57)
+    // mod 2^32 == 228) and fired the dequeue underflow assert.
+    TracedValue<uint64_t> m_nBytes;               //!< Number of bytes in the queue
+    uint64_t m_nTotalReceivedBytes;               //!< Total received bytes
     TracedValue<uint32_t> m_nPackets;             //!< Number of packets in the queue
     uint32_t m_nTotalReceivedPackets;             //!< Total received packets
-    uint32_t m_nTotalDroppedBytes;                //!< Total dropped bytes
-    uint32_t m_nTotalDroppedBytesBeforeEnqueue;   //!< Total dropped bytes before enqueue
-    uint32_t m_nTotalDroppedBytesAfterDequeue;    //!< Total dropped bytes after dequeue
+    uint64_t m_nTotalDroppedBytes;                //!< Total dropped bytes
+    uint64_t m_nTotalDroppedBytesBeforeEnqueue;   //!< Total dropped bytes before enqueue
+    uint64_t m_nTotalDroppedBytesAfterDequeue;    //!< Total dropped bytes after dequeue
     uint32_t m_nTotalDroppedPackets;              //!< Total dropped packets
     uint32_t m_nTotalDroppedPacketsBeforeEnqueue; //!< Total dropped packets before enqueue
     uint32_t m_nTotalDroppedPacketsAfterDequeue;  //!< Total dropped packets after dequeue

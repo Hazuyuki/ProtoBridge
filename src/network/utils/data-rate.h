@@ -203,6 +203,17 @@ class DataRate
     Time CalculateBitsTxTime(uint32_t bits) const;
 
     /**
+     * @brief Calculate transmission time
+     *
+     * Calculates the transmission time at this data rate. The 64-bit
+     * overload exists because byte counts above 512 MiB widen to bit
+     * counts above 2^32 (see CalculateBytesTxTime).
+     * @param bits The number of bits (not bytes) for which to calculate
+     * @return The transmission time for the number of bits specified
+     */
+    Time CalculateBitsTxTime(uint64_t bits) const;
+
+    /**
      * Get the underlying bitrate
      * @return The underlying bitrate in bits per second
      */

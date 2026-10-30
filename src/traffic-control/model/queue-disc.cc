@@ -296,7 +296,7 @@ QueueDisc::GetTypeId()
             .AddTraceSource("BytesInQueue",
                             "Number of bytes currently stored in the queue disc",
                             MakeTraceSourceAccessor(&QueueDisc::m_nBytes),
-                            "ns3::TracedValueCallback::Uint32")
+                            "ns3::TracedValueCallback::Uint64")
             .AddTraceSource("SojournTime",
                             "Sojourn time of the last packet dequeued from the queue disc",
                             MakeTraceSourceAccessor(&QueueDisc::m_sojourn),
@@ -424,7 +424,7 @@ QueueDisc::GetNPackets() const
     return m_nPackets;
 }
 
-uint32_t
+uint64_t
 QueueDisc::GetNBytes() const
 {
     NS_LOG_FUNCTION(this);
@@ -511,7 +511,10 @@ QueueDisc::GetCurrentSize() const
     }
     if (GetMaxSize().GetUnit() == QueueSizeUnit::BYTES)
     {
-        return QueueSize(QueueSizeUnit::BYTES, m_nBytes);
+        // Truncating cast, bounded by the uint32 QueueSize value range
+        // (same note as QueueBase::GetCurrentSize).
+        return QueueSize(QueueSizeUnit::BYTES,
+                         static_cast<uint32_t>(m_nBytes));
     }
     NS_ABORT_MSG("Unknown queue size unit");
 }

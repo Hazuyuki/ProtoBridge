@@ -6,6 +6,51 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 48: four P2s downstream of the round-47 pad bound — saturated-ledger SIGFPE, uint32 queue byte accounting, 32-bit serialization, and a 12× RoCE send regression
+
+**What.** Round 47's hard pad guard made the wire-expansion path safe per
+sub-packet, but the probes this round pushed past every consumer of those
+bodies found the surrounding infrastructure still 32-bit-shaped:
+
+1. **[P2] Saturated `GetWireSize` SIGFPEs the bulk path.** With a UB
+   efficiency below 2^-62, `GetWireSize` returns `UINT64_MAX`; the bulk
+   fragmentation's ceiling division overflows to
+   `memCapChunks == 0`, `wireChunkSize` divides through zero, and the
+   `dataChunkSize` line crashes with SIGFPE. Both entry points now abort
+   loudly with an actionable message instead (`SendBulkWireTransferSize`
+   and the 4-arg `SendCollectiveBulk`, which the SHARP transaction path
+   feeds `action.wireBytes` into).
+2. **[P2] Queue byte accounting wrapped.** A packet-count-limited
+   `DropTailQueue` holding four ~1-GiB padded packets wrapped its
+   `TracedValue<uint32_t> m_nBytes` (4 × (2^30 + 57) mod 2^32 == 228) and
+   fired the dequeue underflow assert. `QueueBase`'s byte counters and
+   getters are now 64-bit (`m_nBytes`, total received/dropped bytes;
+   `BytesInQueue` trace callback becomes `Uint64`), mirrored in
+   `QueueDisc`, and `QueueSize`'s BYTES `operator+` computes in 64-bit
+   before the admission comparison.
+3. **[P2] Serialization wrapped.** `DataRate::CalculateBytesTxTime`
+   computed `bytes * 8` in 32 bits — a 536,870,969-B padded packet
+   serialized in 2 ns instead of ~21.5 ms at 200 Gbps. The
+   multiplication is 64-bit now, with a `uint64_t` overload of
+   `CalculateBitsTxTime`.
+4. **[P2] The round-47 hoisted extraction ran for RoCE sends.**
+   `trueDataSizes` was computed unconditionally although only the
+   non-RoCE efficiency<1.0 arm reads it — RoCE sends (which take their
+   advertised count from the SoHeader) paid a full body copy per chunk:
+   12× slower 16-MiB bulk sends, +45 % peak RSS. The hoist is now gated
+   on exactly its consumers.
+5. **[P3] Test coverage.** The pad-boundary tests gain the accepted
+   multi-packet boundary (five 1-B chunks at 2^-30, each padded to the
+   full 2^30 − 1: queue accounting and serialization stay exact) and the
+   reject side (an unrepresentable pad aborts; forked-child check).
+   Two stale comments corrected (the 1-B test's pad is 131071 B, and the
+   guard is 1 GiB − 1 per sub-packet, not 1 MiB).
+
+**Verified.** Clean `-Werror` build; gpu-cluster suite 183/183 PASS
+(test-runner + test.py); three parity scripts PASS; the three calibrated
+scenarios byte-stable (ceiling 8306.3 µs; DCQCN congested 20802.4 µs /
+99985 ECN / 99974 CNP rx; aligned 20300.2 µs, zero ECN).
+
 ### Added — PFC headroom (XOFF in-flight absorption, the ns3-rdma m_pg_hdrm_limit analog): `--pfcHeadroomChunks`
 
 **What.** 802.1Qbb PFC's no-drop contract requires the switch to buffer

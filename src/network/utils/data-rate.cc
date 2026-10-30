@@ -184,11 +184,22 @@ Time
 DataRate::CalculateBytesTxTime(uint32_t bytes) const
 {
     NS_LOG_FUNCTION(this << bytes);
-    return CalculateBitsTxTime(bytes * 8);
+    // 64-bit multiplication (codex round 48, finding 3): a packet larger
+    // than 512 MiB wraps the old 32-bit bytes*8 (a 536,870,969-B padded
+    // packet serialized in 2 ns instead of ~21.5 ms at 200 Gbps). Wire-
+    // efficiency padding can legitimately produce such bodies.
+    return CalculateBitsTxTime(static_cast<uint64_t>(bytes) * 8);
 }
 
 Time
 DataRate::CalculateBitsTxTime(uint32_t bits) const
+{
+    NS_LOG_FUNCTION(this << bits);
+    return Seconds(int64x64_t(bits) / m_bps);
+}
+
+Time
+DataRate::CalculateBitsTxTime(uint64_t bits) const
 {
     NS_LOG_FUNCTION(this << bits);
     return Seconds(int64x64_t(bits) / m_bps);

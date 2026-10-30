@@ -82,6 +82,8 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace ns3;
 
@@ -5538,11 +5540,11 @@ class UbSubFloorEfficiencyTest : public TestCase
         Ptr<UbProtocolModel> ub = CreateObject<UbProtocolModel>();
         // Deep in the sub-0.01 regime where floor(2^30*eff) == 0 — the
         // data cap clamps to 1 byte, and the ~17-MiB pad that follows is
-        // still representable under the 1-MiB-per-sub-packet guard? No:
-        // 2^24 - 17 exceeds 1 MiB, so this send ABORTS. Use an efficiency
-        // whose expansion stays just inside the guard instead: eff 1/2^24
-        // gives a 16-MiB ledger for 1 byte — over the guard. eff 2^-17
-        // gives a 128-KiB pad: representable, and the guard passes.
+        // still representable under the 1-GiB-minus-1 per-sub-packet pad
+        // guard? eff 2^-17 gives a 128-KiB pad for 1 B: representable,
+        // and the guard passes. (An efficiency whose expansion exceeds
+        // 2^30 - 1 B of pad per sub-packet aborts — covered by
+        // WireExpansionPadAbortTest below.)
         ub->SetAttribute("WireEfficiency",
                          DoubleValue(1.0 / 131072.0)); // 2^-17: 1 B -> 128 KiB + 16
         tx->SetProtocolModel(ub);
@@ -5572,8 +5574,9 @@ class UbSubFloorEfficiencyTest : public TestCase
 
         // One data byte: the ledger wants 16 + 2^17 wire bytes for it.
         // The zero-rounded data cap clamps to 1, the send runs as a
-        // 1-data-byte chunk, and the 131055-B pad is representable and
-        // applied — the wire ledger is honored exactly.
+        // 1-data-byte chunk (a 17-B body), and the 131071-B pad
+        // (131088 - 17) is representable and applied — the wire ledger
+        // is honored exactly.
         const uint32_t size = 1;
         std::vector<uint8_t> buf(size, 0x01);
         tx->SendDataWithProtocol(1, buf.data(), size,
@@ -5691,6 +5694,193 @@ class WireExpansionPadBoundaryTest : public TestCase
             "every data byte survives the padded transit");
 
         Simulator::Destroy();
+    }
+};
+
+// Round-48 findings 2/3 regression: the pad guard's ACCEPTED boundary
+// must survive the whole downstream pipeline, not just the per-sub-
+// packet arithmetic. Four packets of ~1 GiB each (body + pad + headers)
+// in one packet-count-limited DropTailQueue wrapped the queue's old
+// uint32 byte counter (4 * (2^30 + 57) mod 2^32 == 228) and fired the
+// dequeue underflow assert, while the p2p device's old 32-bit
+// bytes*8 serialized a >512-MiB packet in nanoseconds instead of
+// milliseconds. This test drives the accepted boundary — five 1-B data
+// chunks at efficiency 2^-30, each padded to the full 2^30 - 1 — and
+// verifies the queue's byte accounting and the serialization time both
+// stay exact. The guard itself (an unrepresentable pad aborts) is
+// pinned by WireExpansionPadAbortTest below.
+class WireExpansionPadAcceptBoundaryTest : public TestCase
+{
+  public:
+    WireExpansionPadAcceptBoundaryTest()
+        : TestCase("four max-boundary padded packets keep queue and "
+                   "serialization exact")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                           StringValue("1000000p"));
+        NodeContainer nodes;
+        nodes.Add(CreateObject<Node>());
+        nodes.Add(CreateObject<Node>());
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("1000Gbps")));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+        NetDeviceContainer devs = p2p.Install(nodes);
+
+        Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+        Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+        tx->SetRank(0);
+        rx->SetRank(1);
+        tx->SetLocalRankRange(0, 1);
+        rx->SetLocalRankRange(1, 1);
+        tx->AddNetDevice(devs.Get(0));
+        rx->AddNetDevice(devs.Get(1));
+        tx->SetRoutingEntry(1, 0);
+        rx->SetRoutingEntry(0, 0);
+        tx->SetBypassReorderBuffer(true);
+        rx->SetBypassReorderBuffer(true);
+
+        Ptr<UbProtocolModel> ub = CreateObject<UbProtocolModel>();
+        // 2^-30 with 5 data bytes: the data cap clamps each chunk to
+        // 1 data byte, five chunks total, each expanding to the full
+        // 2^30 - 1 pad — the exact accepted boundary of the guard. A
+        // sixth byte would exceed it (round 47's guard fires only when
+        // even the last share cannot fit).
+        ub->SetAttribute("WireEfficiency", DoubleValue(1.0 / 1073741824.0));
+        tx->SetProtocolModel(ub);
+        rx->SetProtocolModel(ub);
+        Ptr<UbPayloadBuilder> ubBuilder = CreateObject<UbPayloadBuilder>();
+        tx->SetProtocolPayloadBuilder(ubBuilder);
+        rx->SetProtocolPayloadBuilder(ubBuilder);
+
+        static uint64_t deliveredBytes = 0;
+        deliveredBytes = 0;
+        rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader hdr) {
+            deliveredBytes += hdr.GetEffectiveDataSize();
+        });
+        static uint64_t wireBytes = 0;
+        wireBytes = 0;
+        static uint64_t maxTx = 0;
+        maxTx = 0;
+        tx->TraceConnectWithoutContext(
+            "Tx", MakeCallback(
+                      +[](uint32_t txSize, uint32_t) {
+                          wireBytes += txSize;
+                          if (txSize > maxTx)
+                          {
+                              maxTx = txSize;
+                          }
+                      }));
+
+        tx->Initialize();
+        rx->Initialize();
+
+        std::vector<uint8_t> buf(5, 0x5A);
+        tx->SendDataWithProtocol(1, buf.data(), 5,
+                                 static_cast<uint8_t>(UbTransaction::MEM_SYNC), 6, 0);
+
+        // 5 packets x (2^30 + 57) B at 1 Tbps: the 5th finishes around
+        // 21.5 ms; four sit in the queue at once (the counter-wrap
+        // scenario). Generous stop so serialization completes.
+        Simulator::Stop(MilliSeconds(60));
+        Simulator::Run();
+
+        const uint32_t fabricHeaderSize = FabricHeader().GetSerializedSize();
+        // Each 1-B chunk carries its OWN 16-B UB header (the single-transfer
+        // model ledger counts only one), so the expected total is five
+        // per-chunk ledgers — GetWireSize(1) each — plus per-packet framing.
+        const uint64_t chunkLedger = ub->GetWireSize(
+            1, static_cast<uint8_t>(UbTransaction::MEM_SYNC));
+        NS_TEST_ASSERT_MSG_EQ(wireBytes, 5ull * (chunkLedger + fabricHeaderSize + 2),
+            "five boundary pads transmit exactly, queue accounting intact");
+        NS_TEST_ASSERT_MSG_EQ(maxTx, chunkLedger + fabricHeaderSize + 2,
+            "each padded packet carries its full 2^30-1 pad");
+        NS_TEST_ASSERT_MSG_EQ(deliveredBytes, 5u,
+            "all five data bytes survive the boundary transit");
+
+        Simulator::Destroy();
+    }
+};
+
+// Round-48 finding 5 companion: the pad guard's REJECT side. A pad
+// that exceeds 2^30 - 1 per sub-packet is a configuration error and
+// must abort the send loudly (round 47 replaced the silent warn-and-
+// skip). NS_ABORT_MSG exits the process, so the test forks and checks
+// the child's exit status — the same pattern the ns-3 suite uses for
+// fatal-path tests.
+class WireExpansionPadAbortTest : public TestCase
+{
+  public:
+    WireExpansionPadAbortTest()
+        : TestCase("unrepresentable wire-expansion pad aborts the send")
+    {
+    }
+
+    void DoRun() override
+    {
+        // 2^-31 with 5 data bytes: the data cap clamps to 1 B per chunk,
+        // and the ledger per chunk (16 + 2^31) demands a 2^31 - 17 pad —
+        // over the 2^30 - 1 guard. The child process must die from the
+        // NS_ABORT (nonzero exit), not complete the transfer.
+        pid_t pid = fork();
+        NS_TEST_ASSERT_MSG_EQ(pid >= 0, true, "fork must succeed");
+        if (pid == 0)
+        {
+            // Child: any failure to abort still exits nonzero below; the
+            // SUCCESS path is the abort, which exits with a failure code.
+            Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize",
+                               StringValue("1000000p"));
+            NodeContainer nodes;
+            nodes.Add(CreateObject<Node>());
+            nodes.Add(CreateObject<Node>());
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate("1000Gbps")));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(0)));
+            NetDeviceContainer devs = p2p.Install(nodes);
+
+            Ptr<FabricEndpoint> tx = CreateObject<FabricEndpoint>();
+            Ptr<FabricEndpoint> rx = CreateObject<FabricEndpoint>();
+            tx->SetRank(0);
+            rx->SetRank(1);
+            tx->SetLocalRankRange(0, 1);
+            rx->SetLocalRankRange(1, 1);
+            tx->AddNetDevice(devs.Get(0));
+            rx->AddNetDevice(devs.Get(1));
+            tx->SetRoutingEntry(1, 0);
+            rx->SetRoutingEntry(0, 0);
+            tx->SetBypassReorderBuffer(true);
+            rx->SetBypassReorderBuffer(true);
+
+            Ptr<UbProtocolModel> ub = CreateObject<UbProtocolModel>();
+            ub->SetAttribute("WireEfficiency", DoubleValue(1.0 / 2147483648.0));
+            tx->SetProtocolModel(ub);
+            rx->SetProtocolModel(ub);
+            Ptr<UbPayloadBuilder> ubBuilder = CreateObject<UbPayloadBuilder>();
+            tx->SetProtocolPayloadBuilder(ubBuilder);
+            rx->SetProtocolPayloadBuilder(ubBuilder);
+
+            tx->Initialize();
+            rx->Initialize();
+
+            std::vector<uint8_t> buf(5, 0x77);
+            tx->SendDataWithProtocol(1, buf.data(), 5,
+                                     static_cast<uint8_t>(UbTransaction::MEM_SYNC), 6, 0);
+            // If the guard somehow let it through, fail the child so the
+            // parent sees a completed-but-unaborted run as an error too.
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        // NS_ABORT raises SIGABRT (a signal death); a completed transfer
+        // instead exits 0 through the _exit(0) at the child's end. Either
+        // a nonzero exit OR SIGABRT is the loud failure we want.
+        const bool aborted = (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT)
+            || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+        NS_TEST_ASSERT_MSG_EQ(aborted, true,
+            "an unrepresentable pad aborts loudly instead of completing");
     }
 };
 
@@ -15865,6 +16055,8 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new LlFramingNoOverpadTest, TestCase::Duration::QUICK);
     AddTestCase(new UbSubFloorEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new WireExpansionPadBoundaryTest, TestCase::Duration::QUICK);
+    AddTestCase(new WireExpansionPadAcceptBoundaryTest, TestCase::Duration::QUICK);
+    AddTestCase(new WireExpansionPadAbortTest, TestCase::Duration::QUICK);
     AddTestCase(new PaddedRawDeliveryIntegrityTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclSimpleWireEfficiencyTest, TestCase::Duration::QUICK);
     AddTestCase(new NcclProtocolPayloadTest, TestCase::Duration::QUICK);

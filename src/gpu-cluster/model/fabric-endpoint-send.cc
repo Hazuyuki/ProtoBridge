@@ -16,6 +16,7 @@
 #include "ns3/packet.h"
 
 #include <algorithm>
+#include <limits>
 #include <cmath>
 
 namespace ns3
@@ -271,6 +272,14 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
 
     NS_ABORT_MSG_IF(effectiveSize == 0 || wireSize == 0,
                     "Collective transfers require nonzero effective and wire sizes");
+    // Saturated ledger guard (codex round 48, finding 1): the transaction
+    // path passes GetWireSize's UINT64_MAX sentinel here unchanged (a
+    // sub-2^-62 efficiency), and the spray/fragmentation math below would
+    // overflow exactly like the bulk path's. Same loud failure.
+    NS_ABORT_MSG_IF(wireSize == std::numeric_limits<uint64_t>::max(),
+                    "Collective transfer of " << effectiveSize
+                    << " B (wireSize saturated) cannot be represented: "
+                       "raise the efficiency");
 
     // Record flow start for latency statistics (use destRank as flowId)
     if (m_latencyStatistics)
@@ -1168,9 +1177,16 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         // from the padded packet size instead of its embedded 4-B size
         // field too (its header field at offset 11 holds the true count),
         // so this hoist is what keeps the advertised count honest for it.
+        // Gated on its consumers (codex round 48, finding 4): only the
+        // non-RoCE efficiency<1.0 advertised-size arm reads the vector —
+        // RoCE takes its count from the SoHeader and efficiency==1.0 takes
+        // it from the chunk-size min. The unconditional hoist cost a full
+        // body copy per chunk on every RoCE send (12x slowdown on 16-MiB
+        // bulk sends) for a result nobody consumed.
         std::vector<uint32_t> trueDataSizes;
-        trueDataSizes.reserve(chunks.size());
+        if (!destIsRoce && efficiency < 1.0)
         {
+            trueDataSizes.reserve(chunks.size());
             uint32_t dataAssignedBefore = 0;
             for (const auto& pkt : chunks)
             {
