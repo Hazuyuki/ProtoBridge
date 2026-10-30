@@ -177,3 +177,7 @@ same matched fabric parameters (40 Gbps, 1 µs links, 1000-B packets,
   3:1/6:1 points use `--numNodes` ∈ {4,7} (tor's shared switch is not
   counted) and ns3-rdma `topo_3to1.txt`/`topo_6to1.txt` in
   `/tmp/scaleout/matrix`.
+- Further ProtoBridge-side characterization on this same matched fabric
+  (data-size linearity, random-traffic injection-rate saturation, message
+  size, node scaling, chunk size — all with DCQCN):
+  `examples/gpu-cluster/datasize_injection_sweeps/`.
