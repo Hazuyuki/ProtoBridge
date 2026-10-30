@@ -265,8 +265,13 @@ bool
 RateErrorModel::DoCorruptBit(Ptr<Packet> p)
 {
     NS_LOG_FUNCTION(this << p);
-    // compute pkt error rate, assume uniformly distributed bit error
-    double per = 1 - std::pow(1.0 - m_rate, static_cast<double>(8 * p->GetSize()));
+    // compute pkt error rate, assume uniformly distributed bit error.
+    // 64-bit exponent (codex round 49, finding 7): 8 * p->GetSize() wraps
+    // in 32 bits for packets above 512 MiB — a 1073741881-B boundary
+    // packet counted 456 bits instead of 8589935048, so a 1e-9 BER
+    // modeled a ~4.6e-7 corruption probability instead of ~0.9998.
+    double per = 1 - std::pow(1.0 - m_rate,
+                              static_cast<double>(8.0 * p->GetSize()));
     return (m_ranvar->GetValue() < per);
 }
 

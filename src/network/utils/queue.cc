@@ -226,4 +226,17 @@ QueueBase::WouldOverflow(uint32_t nPackets, uint32_t nBytes) const
     }
 }
 
+bool
+QueueBase::WouldOverflow(uint32_t bytes) const
+{
+    if (m_maxSize.GetUnit() == QueueSizeUnit::PACKETS)
+    {
+        return (m_nPackets + 1 > m_maxSize.GetValue());
+    }
+    // 64-bit on both sides: m_nBytes is uint64 and the uint32 limit
+    // promotes, so a >4 GiB backlog compares correctly (no truncation
+    // through the uint32 QueueSize value like the operator+ path).
+    return (m_nBytes + bytes > m_maxSize.GetValue());
+}
+
 } // namespace ns3

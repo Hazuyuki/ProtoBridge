@@ -5758,8 +5758,11 @@ class WireExpansionPadAcceptBoundaryTest : public TestCase
 
         static uint64_t deliveredBytes = 0;
         deliveredBytes = 0;
+        static Time lastRxTime;
+        lastRxTime = Time(0);
         rx->SetReceiveCallback([](uint16_t, Ptr<Packet>, FabricHeader hdr) {
             deliveredBytes += hdr.GetEffectiveDataSize();
+            lastRxTime = Simulator::Now();
         });
         static uint64_t wireBytes = 0;
         wireBytes = 0;
@@ -5782,9 +5785,10 @@ class WireExpansionPadAcceptBoundaryTest : public TestCase
         tx->SendDataWithProtocol(1, buf.data(), 5,
                                  static_cast<uint8_t>(UbTransaction::MEM_SYNC), 6, 0);
 
-        // 5 packets x (2^30 + 57) B at 1 Tbps: the 5th finishes around
-        // 21.5 ms; four sit in the queue at once (the counter-wrap
-        // scenario). Generous stop so serialization completes.
+        // 5 packets x (2^30 + 57) B serialized back-to-back at 1 Tbps: the
+        // last one finishes around 42.95 ms; four sit in the queue at once
+        // (the counter-wrap scenario). Generous stop so serialization
+        // completes.
         Simulator::Stop(MilliSeconds(60));
         Simulator::Run();
 
@@ -5798,6 +5802,20 @@ class WireExpansionPadAcceptBoundaryTest : public TestCase
             "five boundary pads transmit exactly, queue accounting intact");
         NS_TEST_ASSERT_MSG_EQ(maxTx, chunkLedger + fabricHeaderSize + 2,
             "each padded packet carries its full 2^30-1 pad");
+        // Serialization duration (codex round 49, finding 8): with the old
+        // 32-bit bytes*8 the five packets "serialized" in nanoseconds and
+        // this test still passed. The last receive must land at the true
+        // serialized duration: 5 * (2^30 + 57) * 8 bits / 1 Tbps, within a
+        // small tolerance for scheduling granularity.
+        const uint64_t expectedBits = 5ull * (chunkLedger + fabricHeaderSize + 2) * 8;
+        const uint64_t bps = 1000000000000ull; // the 1000Gbps line above
+        // __int128 intermediate: expectedBits * 1e9 overflows uint64
+        // (4.29e22 > 2^64) — the codebase's established wide type.
+        const int64_t expectedNs = static_cast<int64_t>(
+            (static_cast<__int128_t>(expectedBits) * 1000000000 + bps - 1) / bps);
+        const int64_t actualNs = lastRxTime.GetNanoSeconds();
+        NS_TEST_ASSERT_MSG_EQ_TOL(actualNs, expectedNs, 1000,
+            "the padded packets serialize at their true wire duration");
         NS_TEST_ASSERT_MSG_EQ(deliveredBytes, 5u,
             "all five data bytes survive the boundary transit");
 

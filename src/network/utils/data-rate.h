@@ -196,18 +196,12 @@ class DataRate
     /**
      * @brief Calculate transmission time
      *
-     * Calculates the transmission time at this data rate
-     * @param bits The number of bits (not bytes) for which to calculate
-     * @return The transmission time for the number of bits specified
-     */
-    Time CalculateBitsTxTime(uint32_t bits) const;
-
-    /**
-     * @brief Calculate transmission time
-     *
-     * Calculates the transmission time at this data rate. The 64-bit
-     * overload exists because byte counts above 512 MiB widen to bit
-     * counts above 2^32 (see CalculateBytesTxTime).
+     * Calculates the transmission time at this data rate. The single
+     * 64-bit parameter replaces the former uint32_t signature (byte
+     * counts above 512 MiB widen to bit counts above 2^32 — a second
+     * overload made plain integer calls ambiguous, codex round 49,
+     * finding 5); uint32_t arguments convert implicitly with no change
+     * in behavior.
      * @param bits The number of bits (not bytes) for which to calculate
      * @return The transmission time for the number of bits specified
      */

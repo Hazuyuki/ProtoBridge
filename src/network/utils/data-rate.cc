@@ -12,6 +12,8 @@
 #include "ns3/log.h"
 #include "ns3/nstime.h"
 
+#include <limits>
+
 namespace ns3
 {
 
@@ -192,17 +194,25 @@ DataRate::CalculateBytesTxTime(uint32_t bytes) const
 }
 
 Time
-DataRate::CalculateBitsTxTime(uint32_t bits) const
-{
-    NS_LOG_FUNCTION(this << bits);
-    return Seconds(int64x64_t(bits) / m_bps);
-}
-
-Time
 DataRate::CalculateBitsTxTime(uint64_t bits) const
 {
     NS_LOG_FUNCTION(this << bits);
-    return Seconds(int64x64_t(bits) / m_bps);
+    // Unsigned-safe quotient (codex round 49, finding 6): constructing
+    // int64x64_t directly from a uint64 >= 2^63 converts to a NEGATIVE
+    // int64 (2^63 bits at 1 Tbps returned -9.2e15 ns). Split into an
+    // unsigned whole-seconds quotient and a fractional remainder, both
+    // well inside int64 range, and reassemble. bits beyond ~292 Gs
+    // (2^64 / 64e9... i.e. durations beyond Time's own range) abort
+    // inside Seconds anyway.
+    const uint64_t wholeSec = bits / m_bps;
+    const uint64_t remBits = bits % m_bps;
+    if (wholeSec > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    {
+        NS_ABORT_MSG("CalculateBitsTxTime: " << bits << " bits at "
+                     << m_bps << " bps exceeds Time's representable range");
+    }
+    const int64x64_t fractional = int64x64_t(remBits) / int64x64_t(m_bps);
+    return Seconds(int64x64_t(wholeSec) + fractional);
 }
 
 uint64_t

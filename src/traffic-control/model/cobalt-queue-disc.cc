@@ -322,7 +322,7 @@ CobaltQueueDisc::DoEnqueue(Ptr<QueueDiscItem> item)
 {
     NS_LOG_FUNCTION(this << item);
     Ptr<Packet> p = item->GetPacket();
-    if (GetCurrentSize() + item > GetMaxSize())
+    if (WouldOverflow(item->GetSize()))
     {
         NS_LOG_LOGIC("Queue full -- dropping pkt");
         int64_t now = CoDelGetTime();

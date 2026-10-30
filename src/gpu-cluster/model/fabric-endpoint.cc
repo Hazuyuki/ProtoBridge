@@ -3705,20 +3705,27 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
     const double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
     const uint64_t wireSize = GetProtocolModelForDest(destRank)->GetWireSize(dataSize, protocolId);
 
-    // Saturated ledger guard (codex round 48, finding 1): a sub-2^-62
-    // efficiency makes GetWireSize return UINT64_MAX, and the
-    // fragmentation math below would overflow — wireSize +
-    // MAX_CHUNK_BYTES - 1 wraps to a small memCapChunks, wireChunkSize
-    // underflow-divides, and the dataChunkSize line SIGFPEs. A wire
-    // ledger that cannot be represented in uint64 is a configuration
-    // error (the UB model's attribute checker floors the efficiency at
-    // DBL_MIN, but GetWireSize is also reachable through direct object
-    // attribute sets). Fail loudly with an actionable message instead.
-    NS_ABORT_MSG_IF(wireSize == std::numeric_limits<uint64_t>::max(),
+    // Unsizable-ledger guard (codex rounds 48-49): a sub-2^-62 efficiency
+    // saturates GetWireSize to UINT64_MAX, and a near-saturated ledger
+    // (e.g. efficiency just above 2^-64: 1 B -> 18446744073709547536)
+    // passes a bare sentinel test but still wraps the fragmentation
+    // arithmetic below — wireSize + MAX_CHUNK_BYTES - 1 overflows to a
+    // small memCapChunks, wireChunkSize underflow-divides, and the
+    // dataChunkSize line SIGFPEs. Every ceiling division and offset in
+    // the fragmentation stays representable only when the ledger is far
+    // from 2^64; 2^62 bounds it with 4 exabits of headroom (the largest
+    // transfer the packet pipeline can physically service is bounded by
+    // the data cap at ~2^30 anyway — a bigger ledger is a configuration
+    // error like the saturation, not a queueable transfer). The UB
+    // model's attribute checker floors the efficiency at DBL_MIN, but
+    // GetWireSize is also reachable through direct object attribute
+    // sets. Fail loudly with an actionable message instead.
+    constexpr uint64_t maxServicableWireLedger = 1ull << 62;
+    NS_ABORT_MSG_IF(wireSize > maxServicableWireLedger,
                     "Bulk transfer of " << dataSize << " B to rank " << destRank
-                    << " (efficiency " << efficiency
-                    << ") needs a wire ledger no uint64 can represent: "
-                       "raise the efficiency");
+                    << " (efficiency " << efficiency << ", wire ledger "
+                    << wireSize << " B) cannot be serviced: raise the "
+                       "efficiency or reduce the transfer size");
 
     NS_LOG_INFO("Bulk wire transfer: dataSize=" << dataSize << " wireSize=" << wireSize
                << " efficiency=" << efficiency << " protocol=" << static_cast<int>(protocolId));

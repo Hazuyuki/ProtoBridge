@@ -272,14 +272,17 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
 
     NS_ABORT_MSG_IF(effectiveSize == 0 || wireSize == 0,
                     "Collective transfers require nonzero effective and wire sizes");
-    // Saturated ledger guard (codex round 48, finding 1): the transaction
-    // path passes GetWireSize's UINT64_MAX sentinel here unchanged (a
-    // sub-2^-62 efficiency), and the spray/fragmentation math below would
-    // overflow exactly like the bulk path's. Same loud failure.
-    NS_ABORT_MSG_IF(wireSize == std::numeric_limits<uint64_t>::max(),
+    // Unsizable-ledger guard (codex rounds 48-49): the transaction path
+    // passes GetWireSize's saturation through here unchanged, and a
+    // NEAR-saturated ledger (not just the UINT64_MAX sentinel — e.g.
+    // efficiency just above 2^-64) wraps the spray/fragmentation
+    // arithmetic below exactly like the bulk path's, or truncates a
+    // fragment's uint32 chunk size. Same bound, same loud failure.
+    constexpr uint64_t maxServicableWireLedger = 1ull << 62;
+    NS_ABORT_MSG_IF(wireSize > maxServicableWireLedger,
                     "Collective transfer of " << effectiveSize
-                    << " B (wireSize saturated) cannot be represented: "
-                       "raise the efficiency");
+                    << " B (wire ledger " << wireSize
+                    << " B) cannot be serviced: raise the efficiency");
 
     // Record flow start for latency statistics (use destRank as flowId)
     if (m_latencyStatistics)

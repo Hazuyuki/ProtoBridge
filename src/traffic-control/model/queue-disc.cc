@@ -431,6 +431,18 @@ QueueDisc::GetNBytes() const
     return m_nBytes;
 }
 
+bool
+QueueDisc::WouldOverflow(uint32_t bytes) const
+{
+    NS_LOG_FUNCTION(this << bytes);
+    if (GetMaxSize().GetUnit() == QueueSizeUnit::PACKETS)
+    {
+        return (m_nPackets + 1 > GetMaxSize().GetValue());
+    }
+    // 64-bit both sides (same reasoning as QueueBase::WouldOverflow).
+    return (m_nBytes + bytes > GetMaxSize().GetValue());
+}
+
 QueueSize
 QueueDisc::GetMaxSize() const
 {

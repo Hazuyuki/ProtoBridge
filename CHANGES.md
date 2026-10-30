@@ -6,6 +6,61 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 49: the round-48 64-bit widening completed across the whole blast radius — admission comparisons, near-saturated ledgers, FQ byte locals, and the error model
+
+**What.** Round 48 widened the queue byte counters and the
+`CalculateBytesTxTime` multiplication; round 49 probed every remaining
+consumer of those values and found the widening incomplete:
+
+1. **[P2] Byte-queue admission still compared a truncated sum.** The
+   `QueueSize operator+` path truncated the widened running byte count
+   back to uint32 before `DoEnqueue`'s comparison, so a byte-mode queue
+   holding >4 GiB admitted packets forever (four ~1-GiB boundary packets:
+   the wrapped sum `228B` passed every check). `QueueBase` and
+   `QueueDisc` gain a `WouldOverflow(uint32_t bytes)` overload computed
+   entirely in 64-bit, and `Queue::DoEnqueue` plus the codel/fifo/cobalt
+   queue discs compare through it. Three `BytesInQueue` trace callbacks
+   that still took uint32 parameters (and aborted on connect at runtime)
+   are widened: tcp-validation, fqcodel-l4s-example,
+   codel-vs-pfifo-asymmetric.
+2. **[P2] A near-saturated ledger bypassed the sentinel guard.** A UB
+   efficiency just above 2^-64 yields a representable ledger
+   (1 B → 18446744073709547536) that passes `wireSize == UINT64_MAX`
+   but still wraps the fragmentation ceiling divisions into the round-48
+   SIGFPE, or truncates a fragment's uint32 chunk size. Both guards now
+   bound the ledger at 2^62 (four exabits of arithmetic headroom; the
+   packet pipeline's data cap sits at ~2^30 anyway) instead of testing
+   one sentinel value.
+3. **[P2] FQ queue disciplines still narrowed the backlog.** The
+   fat-flow selection in fq-codel/fq-pie/fq-cobalt kept uint32
+   `maxBacklog`/`bytes`/`len`/`threshold` locals — a wrapped backlog
+   made the drop target the WRONG flow. All widened to uint64.
+4. **[P2] The double `CalculateBitsTxTime` overload broke integer
+   callers** (`rate.CalculateBitsTxTime(8)` — ambiguous between uint32
+   and uint64). Collapsed to the single uint64 signature (uint32
+   arguments convert implicitly, no behavior change), and the fixed-point
+   construction is now unsigned-safe: `int64x64_t(uint64 >= 2^63)`
+   produced NEGATIVE times (2^63 bits at 1 Tbps → −9.2e15 ns); the
+   quotient now splits into an unsigned whole-seconds part and a
+   fractional remainder with a range abort.
+5. **[P2] `RateErrorModel`'s bit corruption still wrapped** —
+   `8 * p->GetSize()` in 32 bits gave a 1-GiB packet 456 bits instead
+   of 8.6e9, turning a 1e-9 BER into a 4.6e-7 corruption probability.
+   The exponent is computed in double now.
+6. **[P3] The boundary test gained a serialization-duration assert** —
+   with the old 32-bit wrap it passed in nanoseconds; the last receive
+   must now land at the true 5 × (2^30 + 57) × 8 / 1 Tbps ≈ 42.95 ms
+   (±1 µs), computed with a `__int128` intermediate (the naive
+   bits × 1e9 overflows uint64).
+
+**Verified.** Clean `-Werror` build; gpu-cluster suite 183/183 PASS
+(test-runner + test.py); three parity scripts PASS; the three calibrated
+scenarios byte-stable (ceiling 8306.3 µs; DCQCN congested 20802.4 µs /
+99985 ECN / 99974 CNP rx; aligned 20300.2 µs, zero ECN); every
+touched-core suite PASS (drop-tail, codel/cobalt/fifo/pie/prio
+queue-discs, fq-codel/fq-pie/fq-cobalt, queue-disc-traces,
+wifi-mac-queue, error-model, data-rate).
+
 ### Fixed — codex round 48: four P2s downstream of the round-47 pad bound — saturated-ledger SIGFPE, uint32 queue byte accounting, 32-bit serialization, and a 12× RoCE send regression
 
 **What.** Round 47's hard pad guard made the wire-expansion path safe per

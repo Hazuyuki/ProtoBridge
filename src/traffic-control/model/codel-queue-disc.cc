@@ -165,7 +165,7 @@ CoDelQueueDisc::DoEnqueue(Ptr<QueueDiscItem> item)
 {
     NS_LOG_FUNCTION(this << item);
 
-    if (GetCurrentSize() + item > GetMaxSize())
+    if (WouldOverflow(item->GetSize()))
     {
         NS_LOG_LOGIC("Queue full -- dropping pkt");
         DropBeforeEnqueue(item, OVERLIMIT_DROP);

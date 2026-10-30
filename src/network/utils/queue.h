@@ -179,6 +179,20 @@ class QueueBase : public Object
      */
     bool WouldOverflow(uint32_t nPackets, uint32_t nBytes) const;
 
+    /**
+     * @brief Check if enqueueing one more item would overflow the queue.
+     *
+     * The admission check for a single incoming item, computed entirely in
+     * 64-bit arithmetic. Unlike the QueueSize operator+ path, this does not
+     * truncate the running byte count to the uint32 QueueSize value range
+     * before comparing, so a byte-mode queue holding more than 4 GiB still
+     * admits correctly against its limit (codex round 49, finding 2).
+     *
+     * @param bytes size in bytes of the item about to be enqueued
+     * @return true if the item should be dropped instead, false otherwise.
+     */
+    bool WouldOverflow(uint32_t bytes) const;
+
 #if 0
   // average calculation requires keeping around
   // a buffer with the date of arrival of past received packets
@@ -513,7 +527,7 @@ Queue<Item, Container>::DoEnqueue(ConstIterator pos, Ptr<Item> item, Iterator& r
 {
     NS_LOG_FUNCTION(this << item);
 
-    if (GetCurrentSize() + item > GetMaxSize())
+    if (WouldOverflow(item->GetSize()))
     {
         NS_LOG_LOGIC("Queue full -- dropping pkt");
         DropBeforeEnqueue(item);

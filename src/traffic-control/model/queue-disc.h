@@ -300,6 +300,19 @@ class QueueDisc : public Object
     uint64_t GetNBytes() const;
 
     /**
+     * @brief Check if enqueueing one more item would overflow the queue disc.
+     *
+     * Computed entirely in 64-bit arithmetic — unlike the QueueSize
+     * operator+ path this does not truncate the running byte count to the
+     * uint32 QueueSize value range before comparing (codex round 49,
+     * finding 2).
+     *
+     * @param bytes size in bytes of the item about to be enqueued
+     * @return true if the item should be dropped instead, false otherwise.
+     */
+    bool WouldOverflow(uint32_t bytes) const;
+
+    /**
      * @brief Get the maximum size of the queue disc.
      *
      * @returns the maximum size of the queue disc.
