@@ -348,11 +348,31 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
     // flow into uint32 packet/header fields (codex finding 17) — an
     // effective size that wraps the cast advertises 0 delivered bytes
     // for a nonzero transfer. The fragmented arms split everything
-    // under the spray/coalesce caps (<= 8 MiB per chunk), so only this
-    // arm can see the wide values; abort loud rather than narrow.
+    // under the spray/coalesce caps (<= 8 MiB per chunk WIRE), so only
+    // that arm can see the wide values; abort loud rather than narrow.
     // SendCollective's per-chunk effective split (round 25, finding 2)
     // feeds fragments under that cap, so the wide-volume test (4 GiB
     // in 8-MiB chunks) still passes.
+    //
+    // Round 63 (codex finding 9): the per-chunk effective SHARE can
+    // still exceed 2^32 when a caller passes effectiveSize > wireSize
+    // (the four-argument overload does not require effective <= wire;
+    // probe: effectiveSize=2^33, wireSize=2 over two lanes gives each
+    // chunk an effective share of exactly 2^32, wrapping the header
+    // field to 0). The fragment stream pads any wireSize up to the
+    // 2^62 servicable ledger with at most wireSize chunks, so the
+    // minimum chunk wire size is 1 B and the per-chunk effective share
+    // is bounded by effectiveSize / wireSize. Abort when that ratio
+    // exceeds 2^32 - 1 so every per-chunk share survives the header
+    // field; equality is allowed (share == 2^32 - 1 fits).
+    constexpr uint64_t maxServicableEffectiveShare = std::numeric_limits<uint32_t>::max();
+    NS_ABORT_MSG_IF(effectiveSize / std::max<uint64_t>(wireSize, 1) >
+                        maxServicableEffectiveShare,
+                    "Collective transfer effective size " << effectiveSize
+                    << " B over a " << wireSize
+                    << " B wire ledger exceeds " << maxServicableEffectiveShare
+                    << " B of effective data per wire byte (the uint32 header"
+                       " field's limit): raise the efficiency");
     if (!needFragmentColl)
     {
         NS_ABORT_MSG_IF(effectiveSize > std::numeric_limits<uint32_t>::max(),

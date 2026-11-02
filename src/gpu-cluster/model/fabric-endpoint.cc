@@ -70,10 +70,16 @@ FabricEndpoint::GetTypeId()
                       BooleanValue(false),
                       MakeBooleanAccessor(&FabricEndpoint::m_sprayingEnabled),
                       MakeBooleanChecker())
+        // Round 63 (codex finding 16): route through the setter, not the raw
+        // member. The setter caps at 2^30 (keeping every fragment body
+        // representable in the packet pipeline) and aborts on zero; the
+        // old direct binding accepted UINT32_MAX, and the spray paths then
+        // built a fragment body larger than the packet pipeline can hold.
         .AddAttribute("SprayChunkSize",
                       "Chunk size for spraying in bytes (default 4KB)",
                       UintegerValue(4*1024),  // 4KB default
-                      MakeUintegerAccessor(&FabricEndpoint::m_sprayChunkSize),
+                      MakeUintegerAccessor(&FabricEndpoint::SetSprayChunkSize,
+                                           &FabricEndpoint::GetSprayChunkSize),
                       // min 1: zero divides by zero in every spray chunk
                       // count (codex round 50, finding 3)
                       MakeUintegerChecker<uint32_t>(1))
@@ -677,6 +683,12 @@ FabricEndpoint::SetSprayChunkSize(uint32_t chunkSize)
         chunkSize = maxChunk;
     }
     m_sprayChunkSize = chunkSize;
+}
+
+uint32_t
+FabricEndpoint::GetSprayChunkSize() const
+{
+    return m_sprayChunkSize;
 }
 
 void

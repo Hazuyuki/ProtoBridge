@@ -28,10 +28,16 @@ LatencyStatistics::GetTypeId()
         .SetParent<Object>()
         .SetGroupName("GpuCluster")
         .AddConstructor<LatencyStatistics>()
+        // Round 63 (codex finding 16): bind through the setter, not the raw
+        // member. The setter asserts [0, 1); the old direct member binding
+        // accepted 1.0 via the attribute (checker admits the inclusive
+        // bound), and RecordFlowCompletion then treats every sample as
+        // warmup and discards the entire run.
         .AddAttribute("WarmupFraction",
                       "Fraction of simulation time to exclude as warmup (0.0 to 1.0)",
                       DoubleValue(0.2),
-                      MakeDoubleAccessor(&LatencyStatistics::m_warmupFraction),
+                      MakeDoubleAccessor(&LatencyStatistics::SetWarmupFraction,
+                                         &LatencyStatistics::GetWarmupFraction),
                       MakeDoubleChecker<double>(0.0, 1.0))
         .AddAttribute("SimulationDuration",
                       "Configured simulation stop time for warmup calculation",

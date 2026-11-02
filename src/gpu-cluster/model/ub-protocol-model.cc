@@ -181,14 +181,47 @@ UbProtocolModel::GetDataSize(uint64_t wireSize, uint8_t protocolId) const
         case UbTransaction::MEM_SYNC:
         case UbTransaction::MEM_ASYNC:
         case UbTransaction::MESSAGE:
-            // Reverse: wireSize - header = data portion, then divide by overhead
-            return static_cast<uint64_t>((wireSize - 16) * m_wireEfficiency);
+            // Round 63: saturation guard on the inverse conversion (codex
+            // finding 5). At efficiency 1.0 the body (wireSize - 16) is an
+            // exact integer, but double(UINT64_MAX - 16) rounds up to 2^64
+            // and the static_cast is out of range (floating-point
+            // diagnostics halt the process under -fsanitize=
+            // float-cast-overflow); the first wire size hitting the
+            // rounding boundary is 2^64 - 1008. Efficiency 1.0 is exact —
+            // return the integer body; otherwise saturate.
+            if (m_wireEfficiency == 1.0)
+            {
+                return wireSize - 16;
+            }
+            else
+            {
+                const double product =
+                    static_cast<double>(wireSize - 16) * m_wireEfficiency;
+                if (!(product < 18446744073709551616.0)) // >= 2^64
+                {
+                    return std::numeric_limits<uint64_t>::max();
+                }
+                return static_cast<uint64_t>(product);
+            }
 
         case UbTransaction::MAINTENANCE:
             return wireSize - 16;
 
         default:
-            return static_cast<uint64_t>((wireSize - 16) * m_wireEfficiency);
+            if (m_wireEfficiency == 1.0)
+            {
+                return wireSize - 16;
+            }
+            else
+            {
+                const double product =
+                    static_cast<double>(wireSize - 16) * m_wireEfficiency;
+                if (!(product < 18446744073709551616.0)) // >= 2^64
+                {
+                    return std::numeric_limits<uint64_t>::max();
+                }
+                return static_cast<uint64_t>(product);
+            }
     }
 }
 

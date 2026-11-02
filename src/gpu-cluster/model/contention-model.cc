@@ -80,11 +80,25 @@ ContentionModel::DoDispose()
 }
 
 void
-ContentionModel::SetCollectiveWeight(double w) { m_weights[0] = w; }
+ContentionModel::SetCollectiveWeight(double w)
+{
+    // Round 63: clamp to the attribute checker's [0,1] bounds (codex
+    // finding 14). The attribute routes through this setter, but direct
+    // callers could pass -1 and later drive the uint64 cast in
+    // GetEffectiveBandwidth out of range from below (product < 0 passes
+    // the upper saturation guard).
+    m_weights[0] = std::max(0.0, std::min(1.0, w));
+}
 void
-ContentionModel::SetMemoryWeight(double w) { m_weights[1] = w; }
+ContentionModel::SetMemoryWeight(double w)
+{
+    m_weights[1] = std::max(0.0, std::min(1.0, w));
+}
 void
-ContentionModel::SetP2pWeight(double w) { m_weights[2] = w; }
+ContentionModel::SetP2pWeight(double w)
+{
+    m_weights[2] = std::max(0.0, std::min(1.0, w));
+}
 double
 ContentionModel::GetCollectiveWeight() const { return m_weights[0]; }
 double
@@ -250,8 +264,14 @@ ContentionModel::GetEffectiveBandwidth(TrafficClass trafficClass) const
     // 2^64 in double precision and the static_cast is out of range
     // (floating-point diagnostics halt the process under
     // -fsanitize=float-cast-overflow). Saturate like the protocol-model
-    // helpers (round 51, finding 8).
+    // helpers (round 51, finding 8). Round 63: a weight below 0 (now
+    // clamped in the setters, but belt-and-braces) or any negative
+    // product also cannot reach the cast — floor at zero.
     const double product = weight * static_cast<double>(m_bandwidth);
+    if (product <= 0.0)
+    {
+        return 0;
+    }
     if (!(product < 18446744073709551616.0)) // >= 2^64
     {
         return std::numeric_limits<uint64_t>::max();

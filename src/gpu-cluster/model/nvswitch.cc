@@ -1599,7 +1599,13 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
                 ((coalescedChunks + minChunks - 1) / minChunks) * minChunks;
             numChunks = std::max(minChunks, std::min(sizeBasedChunks, pathBalancedChunks));
         }
-        uint64_t chunkSize = (wirePartitionSize + numChunks - 1) / numChunks;
+        // Round 63 (codex finding 18): wrap-free ceiling. The old
+        // (wirePartitionSize + numChunks - 1) addition wrapped for large
+        // partitions — W = 2^32 * (2^32 - 128) with numChunks =
+        // 2,199,023,190,016 wrapped the numerator to 1,649,267,376,127 and
+        // yielded chunkSize 0 instead of 8,388,608. Divide first, then bump.
+        uint64_t chunkSize = wirePartitionSize / numChunks +
+                             (wirePartitionSize % numChunks != 0 ? 1 : 0);
 
         uint64_t bytesRemaining = wirePartitionSize;
         uint64_t offset = 0;

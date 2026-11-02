@@ -54,11 +54,16 @@ UbPayloadBuilder::BuildChunks(const uint8_t* data, uint64_t dataSize,
         // for dataSize > UINT64_MAX - 16 (codex probe: 2^64 - 16 + 16
         // wraps the framed size to 0 and payload[0] writes into an empty
         // vector), and the TransactionHeader size field is a uint32, so
-        // dataSize must fit uint32 anyway. The in-tree endpoint paths cap
-        // transfers well below this; fail loudly for direct callers.
-        NS_ABORT_MSG_IF(dataSize > std::numeric_limits<uint32_t>::max(),
+        // dataSize must fit uint32 anyway. Round 63: the framed length
+        // (header + data) also narrows into the uint32-taking
+        // Create<Packet> — dataSize = UINT32_MAX - 15 passes this
+        // comparison but frames to exactly 2^32 and narrows to 0.
+        // Reserve the header's 16 bytes like the chunked branches.
+        NS_ABORT_MSG_IF(dataSize >
+                            std::numeric_limits<uint32_t>::max() - UB_TRANSACTION_HEADER_SIZE,
                         "UbPayloadBuilder::BuildChunks MAINTENANCE payload of "
-                            << dataSize << " B exceeds the uint32 transaction size");
+                            << dataSize << " B leaves no uint32 room for the "
+                            << UB_TRANSACTION_HEADER_SIZE << "-B transaction header");
         std::vector<uint8_t> payload(UB_TRANSACTION_HEADER_SIZE + dataSize, 0);
 
         // Transaction header: type(1) + srcEID(2) + dstEID(2) + address(4) + size(4) + reserved(3)

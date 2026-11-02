@@ -8,6 +8,7 @@
  */
 
 #include "ring-allgather.h"
+#include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "nccl-protocol.h"
@@ -78,6 +79,8 @@ void
 RingAllGather::Initialize(uint16_t numGpus, uint64_t dataSize,
                           const std::vector<Ptr<FabricEndpoint>>& endpoints)
 {
+    // Round 63 (codex finding 17): zero GPUs divides by zero in the step/segment math below. Fail loudly instead.
+    NS_ABORT_MSG_IF(numGpus == 0, "RingAllGather::Initialize requires at least one GPU");
     m_numGpus = numGpus;
     m_dataSize = dataSize;
     m_endpoints = endpoints;

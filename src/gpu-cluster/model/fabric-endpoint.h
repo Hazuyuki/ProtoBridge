@@ -140,6 +140,7 @@ class FabricEndpoint : public Application
     void SetSprayingEnabled(bool enable);
     bool GetSprayingEnabled() const;
     void SetSprayChunkSize(uint32_t chunkSize);  // Chunk size for spraying (bytes)
+    uint32_t GetSprayChunkSize() const;          // Chunk size for spraying (bytes)
 
     // Neighbor MAC table
     void SetNeighborMac(uint16_t rank, Mac48Address addr);

@@ -68,6 +68,10 @@ RdmaOperationTraffic::Initialize(Ptr<FabricEndpoint> source,
     }
     if (RdmaNeedsReceive(m_opcode))
     {
+        // Round 63 (codex finding 17): a zero staging chunk divides by zero
+        // in the staged chunk count below.
+        NS_ABORT_MSG_IF(config.dataPath == "staged" && config.stagingChunkBytes == 0,
+                        "RDMA staged data path requires a nonzero staging chunk size");
         uint64_t chunks =
             config.dataPath == "staged" ? 1 + (m_bytes - 1) / config.stagingChunkBytes : 1;
         NS_ABORT_MSG_IF(chunks > UINT64_MAX / iterations, "RDMA receive count overflows");

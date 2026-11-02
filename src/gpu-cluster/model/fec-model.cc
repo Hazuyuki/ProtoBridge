@@ -617,7 +617,14 @@ FecModel::GetEncodedSize(uint32_t payloadSize) const
     // ~4-GB payload crosses UINT32_MAX; the old uint32 return narrowed it
     // below the payload size, and the padding site's `encoded > payload`
     // test silently skipped the parity expansion entirely.
-    return (encodedBits + 7) / 8;
+    // Round 63: wrap-free byte ceiling (codex finding 12). The old
+    // (encodedBits + 7) / 8 addition wrapped for encodedBits in the top
+    // 7 bits of uint64 — SetFecParams(1504703107, 1, 0) with a
+    // 1,532,423,903-B payload yields encodedBits = 2^64 - 6, +7 wraps the
+    // numerator to 1, and the function returned 0 instead of
+    // 2^61 = 2,305,843,009,213,693,952. Divide first, then bump on a
+    // nonzero remainder.
+    return encodedBits / 8 + (encodedBits % 8 != 0 ? 1 : 0);
 }
 
 uint32_t

@@ -122,6 +122,10 @@ void
 RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
                           const std::vector<Ptr<FabricEndpoint>>& endpoints)
 {
+    // Round 63 (codex finding 17): zero GPUs divides by zero at the segment
+    // grid below (and in every ring step count). Fail loudly instead of
+    // executing an integer division by zero.
+    NS_ABORT_MSG_IF(numGpus == 0, "RingAllReduce::Initialize requires at least one GPU");
     m_numGpus = numGpus;
     m_dataSize = dataSize;
     m_endpoints = endpoints;

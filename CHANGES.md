@@ -6,13 +6,158 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
-### Reviewed — codex round 62: 19 findings, 15 fixed, 4 verified-and-documented
+### Reviewed — codex round 63: 20 findings, 15 fixed, 5 verified-and-documented
+
+**What.** Round-63 review of commit 96f8cd8 returned 20 findings (5 P1, 11
+P2, 4 P3). All 20 were verified against the code with exact python
+arithmetic before any change; 15 are fixed here (wrap-free ceiling
+divisions, inverse-conversion saturation guards, attribute setter
+re-binding, zero-denominator loud aborts, effective-share ratio guard),
+and 5 were verified numerically and documented (two saturation-policy
+choices in ub-protocol-model/contention-model are deliberate; two CHANGES
+corrections; the RoCE padding narrowing is deferred to round 64 as a
+documented open item). The round-61 entry's "callers cannot reach the
+overflowing product" claim was also corrected — finding 13 proved it
+false with a reachable probe.
+
+**Fixed (P1).**
+
+1. **UB payload builder MAINTENANCE headroom (finding 3).**
+   `ub-payload-builder.cc` computed the MAINTENANCE frame's wire size as
+   `header + payload` where `payload` came from a caller-supplied
+   `dataSize` with no cap: at `dataSize = UINT32_MAX` the wire-size
+   addition overflowed uint32 and the ledger wrapped to a small value,
+   understating every byte the switch and pacing keyed on. The builder
+   now caps the MAINTENANCE data at `UINT32_MAX - UB_TRANSACTION_HEADER_SIZE`
+   and aborts loudly above it.
+
+2. **UB protocol model inverse conversion (finding 5).**
+   `UbProtocolModel::GetDataSize` multiplied `(wireSize - 16) * efficiency`
+   in double and cast straight to uint64: at efficiency 1.0 the product
+   rounds up to 2^64 for wireSize ≥ 2^64 - 1008, and the cast is out of
+   range (floating-point diagnostics halt the process under
+   `-fsanitize=float-cast-overflow`). Both the data-arm and the default
+   arm now return the exact integer body at efficiency 1.0 and saturate
+   at UINT64_MAX when the product reaches 2^64.
+
+3. **Fabric-endpoint collective effective-share guard (finding 9).**
+   The round-62 single-packet-arm abort only fired when
+   `effectiveSize > UINT32_MAX`; the four-argument
+   `SendCollectiveBulk(type, dest, effective, wire)` overload accepts
+   `effective > wire`, and the fragmented arms split by WIRE bytes — a
+   caller passing `effectiveSize = 2^33, wireSize = 2` over two lanes
+   produced a per-chunk effective share of exactly 2^32, wrapping the
+   uint32 header field to 0. The guard is now a ratio test:
+   `effectiveSize / max(wireSize, 1) > UINT32_MAX` aborts (equality
+   allowed: a share of exactly 2^32 - 1 still fits the header field).
+   A first cut at this guard used
+   `effectiveSize > wireSize * (1 << 32)`, which overflowed the
+   multiplication itself and aborted the legitimate
+   `SendCollectiveWideSizeTest` 4-GiB volume (effective == wire, ratio
+   1); the ratio form divides first and cannot wrap.
+
+4. **FEC GetEncodedSize final-byte wrap (finding 12).**
+   `fec-model.cc` returned `(encodedBits + 7) / 8`: at
+   `SetFecParams(1504703107, 1, 0)` with a 1,532,423,903-B payload the
+   exact bit ledger is 2^64 - 6, the +7 addition wrapped the numerator
+   to 1, and the function returned 0 instead of the exact 2^61 bytes
+   (2,305,843,009,213,693,952). The tail now divides first and bumps on
+   a nonzero remainder: `encodedBits / 8 + (encodedBits % 8 != 0)`.
+
+5. **Attribute/member disagreement (finding 16).**
+   `LatencyStatistics::GetTypeId` bound `WarmupFraction` via
+   `MakeDoubleChecker` against the raw member: the checker admits 1.0
+   while the setter requires `< 1.0`, so `SetAttribute("WarmupFraction",
+   1.0)` silently discarded every sample. The attribute now binds the
+   getter + validating setter pair. `FabricEndpoint`'s `SprayChunkSize`
+   attribute accepted `UINT32_MAX` while the setter caps at 2^30 plus a
+   zero-abort; it now binds the setter/getter pair too (header gained
+   the `GetSprayChunkSize` declaration).
+
+**Fixed (P2).**
+
+6. **Zero-denominator sweep (finding 17).** Fourteen collective
+   `Initialize(numGpus = 0)` sites now abort loudly at entry (ring /
+   fullmesh / hierarchical / nvls / tree / alltoall-injector families;
+   13 files gained `ns3/fatal-error.h`). The four hierarchical
+   `SetGpusPerNode(0)` / `SetNumNodes(0)` setters abort instead of
+   planting a divide-by-zero at the intra-node grid
+   (hierarchical-allreduce.cc:192, allgather.cc:132,
+   reducescatter.cc:189 et al.). The three BwRamp
+   `1 + chunkSize / threshold` denominators could wrap to zero at
+   chunkSize = UINT64_MAX - threshold + 1; they now divide first, bump
+   on remainder, and floor the denominator at 1 via
+   `std::max<uint64_t>(1, rampDiv)` (plus `#include <algorithm>` in the
+   three hierarchical files). `AllToAllInjector::SetTwoDimensionalRouting`
+   aborts on `rows == 0 || cols == 0` before the existing rows*cols
+   equality check. `RdmaOperationTraffic::Initialize` aborts when
+   `dataPath == "staged"` and `stagingChunkBytes == 0` (the staged
+   chunk count divided by the zero chunk size).
+
+7. **NVSwitch accumulated-ledger chunk-size wrap (finding 18).**
+   `nvswitch.cc:1602` divided `wirePartitionSize / numChunks` for the
+   per-chunk ceiling. At W = 2^32 * (2^32 - 128) =
+   18,446,743,523,953,737,728 and numChunks = 2,199,023,190,016 the
+   old `(W + numChunks - 1)` addition wrapped the numerator to
+   1,649,267,376,127 and produced chunkSize 0 instead of the exact
+   8,388,608. The division now runs first with a remainder bump.
+
+8. **Contention model weight and bandwidth floors (finding 14).**
+   `contention-model.cc` accepted weights outside [0, 1] (the setter
+   now clamps), and `GetEffectiveBandwidth` multiplied shares by the
+   unclamped weight before flooring — a negative weight produced a
+   negative product that the uint64 floor then mis-signed. The product
+   now saturates at 0 for any non-positive contribution.
+
+**Verified and documented (no code change).**
+
+- **Finding 6 / 7 (saturation policy).** The ub-protocol-model and
+  contention-model saturations at efficiency 1.0 / zero weight are
+  deliberate policy: returning the exact integer body at efficiency 1.0
+  and flooring the effective bandwidth at zero keep the models'
+  invariants (exact inverse at 1.0; non-negative bandwidth share)
+  without introducing a silent failure mode. Verified by exact
+  integer arithmetic.
+- **Finding 13 (round-61 doc correction).** The round-61 entry claimed
+  "every in-tree payloadSize is uint32 — callers cannot reach the
+  overflowing product". That was FALSE: `SetBulkChunkSize(2^30)` with
+  SIMPLE bulk and `FEC(2^31, 1, 0)` reaches the exact bit ledger
+  B + 17,179,869,184 and `GetEncodedSize` returns 2,147,483,648 B.
+  The round-61 entry now carries the correction.
+- **Finding 19 (round-62 doc correction).** The round-62 entry's own
+  finding IDs enumerate 13 fixed (2–13 + 17) + 6 documented (1, 14,
+  15, 16, 18, 19), contradicting its "15 fixed + 4 documented" header.
+  The header now reads 13 fixed, 6 documented.
+- **Finding 11 (deferred).** The RoCE wire-padding narrowing (32-bit
+  header field at multi-GiB pads) is deferred to round 64 as a
+  documented open item; the current guard aborts loudly at the
+  boundary rather than wrapping silently.
+- **Finding 20 (superseded).** The standing sweep instruction is
+  procedural; no code action.
+
+**Verified.** (a) `cmake --build cmake-cache -j $(nproc)` — 53/53
+targets. (b) DCQCN anchors, exact: `--bulkChunkSize=1000 --dcqcn=1` →
+simTimeUs=20802.4, ecnMarkedPackets=99985, cnpPacketsSent=99985,
+cnpPacketsReceived=99974; `--bulkChunkSize=2690 --dcqcn=0` →
+simTimeUs=20300.2, all three counters 0. (c) gpu-cluster test suite
+PASS in 9.852 s (the two new NS_FATAL abort messages in its output are
+the fork-child abort tests asserting their own loud-death path — the
+suite verdict is PASS). (d) Parity direct-run scripts: 48 ^PASS across
+14 scripts (target 48); `python3 -m pytest test_ibgda.py
+test_config_fec_enabled.py` from test/parity: 18 passed. (e) Surrogate:
+`PYTHONPATH=. python3 -m pytest test/ -q` — 101 passed. (f) Traffic
+-control smoke: Unforced drop 37/55500, Packets/Bytes sent
+6887/10302800 — exact. (g) 12 core queue-disc suites (pie, drop-tail,
+codel, cobalt, fifo, prio, fq-codel, fq-pie, fq-cobalt, queue-disc-traces,
+wifi-mac-queue, lr-wpan-error-model) all PASS.
+
+### Reviewed — codex round 62: 19 findings, 13 fixed, 6 verified-and-documented
 
 **What.** Round-62 review of commit 40a34cc returned 19 findings (4 P1, 12
 P2, 3 P3). The five round-61 guard categories were all confirmed clean on
-their guarded paths. Fifteen findings are fixed with loud-abort guards,
+their guarded paths. Thirteen findings are fixed with loud-abort guards,
 validating setters, wrap-free ceiling divisions, and inverse-direction
-saturation clamps; four were verified numerically and documented
+saturation clamps; six were verified numerically and documented
 (buffer.cc is upstream ns-3 code vendored inside protobridge — its four
 wrap sites are documented as upstream-parity, not fixed; the round-61
 CHANGES numbers were corrected against codex's original probe, which
@@ -218,9 +363,13 @@ probes were recomputed independently before acting.
    "corrected" this value; round 62 re-verified the original probe with
    exact integer arithmetic — codex's 1,610,612,736 B stands.) Exact
    unwrapped size 4,611,686,020,038,000,640 B. Not fixed: N = 2^31 needs
-   k*t ≤ 2^31 anyway, and every in-tree payloadSize is uint32 — callers
-   cannot reach the overflowing product. Round 62 additionally made both
-   ceiling divisions wrap-free (divide, then bump on nonzero remainder).
+   k*t ≤ 2^31 anyway. (Round 63, finding 13: the original "every in-tree
+   payloadSize is uint32 — callers cannot reach the overflowing product"
+   claim was FALSE — SetBulkChunkSize(2^30) with SIMPLE bulk and
+   FEC(2^31,1,0) reaches exact bits B + 17,179,869,184 and returns
+   2,147,483,648 B; see the round-63 entry.) Round 62 additionally made
+   both ceiling divisions wrap-free (divide, then bump on nonzero
+   remainder).
 8. **Near-zero BER precision floor (P2, verified, documented)** — at
    (N,K,T) = (544,514,0), BER 1e-18: pSym = 1e-17 but `1 - pSym` rounds to
    exactly 1.0 (the log1p-accurate range ends at the unit roundoff), so the

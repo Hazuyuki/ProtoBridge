@@ -6,6 +6,7 @@
  */
 
 #include "hierarchical-alltoall.h"
+#include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/nccl-protocol.h"
@@ -63,8 +64,20 @@ HierarchicalAlltoAll::HierarchicalAlltoAll()
 HierarchicalAlltoAll::~HierarchicalAlltoAll()
 {}
 
-void HierarchicalAlltoAll::SetGpusPerNode(uint32_t gpusPerNode) { m_gpusPerNode = gpusPerNode; }
-void HierarchicalAlltoAll::SetNumNodes(uint32_t numNodes) { m_numNodes = numNodes; }
+void HierarchicalAlltoAll::SetGpusPerNode(uint32_t gpusPerNode)
+{
+    // Round 63 (codex finding 17): zero divides by zero at the intra-node
+    // grid. Fail loudly at the setter.
+    NS_ABORT_MSG_IF(gpusPerNode == 0, "HierarchicalAlltoAll::SetGpusPerNode requires at least one GPU per node");
+    m_gpusPerNode = gpusPerNode;
+}
+void HierarchicalAlltoAll::SetNumNodes(uint32_t numNodes)
+{
+    // Round 63 (codex finding 17): zero divides by zero at the inter-node
+    // step count. Fail loudly at the setter.
+    NS_ABORT_MSG_IF(numNodes == 0, "HierarchicalAlltoAll::SetNumNodes requires at least one node");
+    m_numNodes = numNodes;
+}
 void HierarchicalAlltoAll::SetIntraNodeAlgorithm(const std::string& algo) { m_intraNodeAlgorithm = algo; }
 void HierarchicalAlltoAll::SetInterNodeStartupDelay(Time delay) { m_interNodeStartupDelayNs = delay.GetNanoSeconds(); }
 void HierarchicalAlltoAll::SetStartupDelays(Time ll, Time ll128, Time simple)
@@ -168,6 +181,8 @@ void
 HierarchicalAlltoAll::Initialize(uint16_t numGpus, uint64_t dataSize,
                                    const std::vector<Ptr<FabricEndpoint>>& endpoints)
 {
+    // Round 63 (codex finding 17): zero GPUs divides by zero in the chunk/step math below. Fail loudly instead.
+    NS_ABORT_MSG_IF(numGpus == 0, "HierarchicalAlltoAll::Initialize requires at least one GPU");
     NS_LOG_FUNCTION(this << numGpus << dataSize);
     m_numGpus = numGpus;
     m_dataSize = dataSize;
