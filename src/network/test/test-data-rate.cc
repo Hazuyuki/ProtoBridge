@@ -337,6 +337,15 @@ DataRateTestCase2::DoRun()
         DataRate c(1);
         c += DataRate(kMax - 1);
         NS_TEST_EXPECT_MSG_EQ(c.GetBitRate(), kMax, "1 += MAX-1 must not abort");
+
+        // Boundary (codex round 53): the double-precision product guard
+        // is exclusive — 1.0 == 2^63 - 1 in double, so an inclusive >=
+        // bound spuriously aborted the identity product MAX * 1.0.
+        const DataRate prodMax = DataRate(kMax) * 1.0;
+        NS_TEST_EXPECT_MSG_EQ(prodMax.GetBitRate(), kMax, "MAX * 1.0 must not abort");
+        DataRate d(kMax);
+        d *= 1.0;
+        NS_TEST_EXPECT_MSG_EQ(d.GetBitRate(), kMax, "MAX *= 1.0 must not abort");
     }
 #endif
 }

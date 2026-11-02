@@ -176,6 +176,10 @@ FecModel::GetEffectiveRateMultiplier() const
 double
 FecModel::ComputeSymbolErrorProbability(double ber) const
 {
+    if (ber >= 1.0)
+    {
+        return 1.0;
+    }
     // RS symbol = 10 bits (GF(2^10)), matching Python surrogate
     // P(symbol error) = 1 - (1 - BER)^10
     return 1.0 - std::pow(1.0 - ber, 10.0);
@@ -189,6 +193,19 @@ FecModel::ComputePostFecBer(double preFecBer) const
     if (preFecBer <= 0.0)
     {
         return 0.0;
+    }
+
+    // BER at or above 1.0: every codeword is certainly corrupted and
+    // certainly uncorrectable (round 53). Return 1.0 directly instead of
+    // evaluating the log-space sum below: at BER = 1.0 the symbol-error
+    // probability is exactly 1, and std::log(1.0 - pSym) raises
+    // FE_DIVBYZERO under fenv traps or IEEE diagnostics; a BER > 1.0
+    // (reachable via LinkDegradationModel's severity scaling, which only
+    // bounds the attribute input at [0,1]) would further raise
+    // FE_INVALID from std::log of a negative number.
+    if (preFecBer >= 1.0)
+    {
+        return 1.0;
     }
 
     double pSym = ComputeSymbolErrorProbability(preFecBer);
@@ -247,6 +264,17 @@ FecModel::DecodeCodeword(double preFecBer) const
     if (preFecBer <= 0.0)
     {
         return FecResult::NO_ERROR;
+    }
+
+    // Same BER >= 1.0 early-out as ComputePostFecBer (round 53): the
+    // log-space sum below would raise FE_DIVBYZERO (BER == 1.0) or
+    // FE_INVALID (BER > 1.0) and then deterministically conclude
+    // UNCORRECTABLE anyway, so skip the numerically invalid evaluation.
+    if (preFecBer >= 1.0)
+    {
+        m_fecDecodeTrace(0, FecResult::UNCORRECTABLE);
+        m_uncorrectableCount++;
+        return FecResult::UNCORRECTABLE;
     }
 
     double pSym = ComputeSymbolErrorProbability(preFecBer);

@@ -6,6 +6,63 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 53: reject-at-boundary for the FEC guard and the double-product DataRate guard, plus FP-clean FEC decode at BER >= 1.0
+
+**What.** The round-53 codex session was killed by a content filter before
+producing a report, but its tool log contained three confirmed findings,
+extracted and verified against the code:
+
+1. **FEC boundary crash.** `SetFecParams(971, 1, 0)` with a 4,423,241-B
+   payload encodes to exactly `UINT32_MAX - 41` — the round-52
+   `kMaxPayload` bound — and the `>` guard let it through. The packet is
+   payload + the 39-B FabricHeader it already carries, so even
+   `encoded == bound` dies inside ns-3's Buffer (`CheckNoZero` assert).
+   Both egress sites (`NvSwitch::SendMulticastResultOnPort`,
+   `FabricEndpoint::SendPacketOnDevice` encode-before-WFQ) now reject
+   `>= kMaxPayload` (max payload body `UINT32_MAX - 41`), with a message
+   directing users to reduce the fragment size or disable FEC.
+
+2. **DataRate double-product boundary.** `DataRate(MAX) * 1.0` and
+   `MAX *= 1.0` aborted: `(double)(2^63 - 1) == 2^63` exactly (1 ulp
+   granularity at that magnitude), so the round-51 inclusive `>=` guard
+   — and even a first attempt written against the literal
+   `9223372036854775807.0`, which also rounds to 2^63 in double —
+   spuriously rejected the identity product. Both `operator*(double)` and
+   `operator*=(double)` now compute the product in `long double` (80-bit
+   x87 represents 2^63 - 1 exactly) and validate against
+   `9223372036854775807.0L` before the narrowing cast. Known limitation:
+   MSVC's long double is double, so `MAX * 1.0` still aborts there
+   (documented in the code).
+
+3. **FP exceptions in the FEC uncorrectability sum at BER >= 1.0.**
+   `ComputePostFecBer` / `DecodeCodeword` evaluate
+   `std::log(1.0 - pSym)` where `pSym == 1` at BER 1.0
+   (`FE_DIVBYZERO`, fatal under `feenableexcept`) and
+   `std::log(negative)` for BER > 1.0 (`FE_INVALID`) — reachable because
+   `LinkDegradationModel::ApplyDegradation` scales `m_baseBer` by
+   `(1 + severity * 999)` with only the attribute input checker-bounded
+   to [0,1]. All three entry points (`ComputeSymbolErrorProbability`,
+   `ComputePostFecBer`, `DecodeCodeword`) short-circuit BER >= 1.0 to the
+   certain outcome (pSym = 1; post-FEC BER = 1; UNCORRECTABLE),
+   mirroring the round-52 error-model rate-1.0 early-out.
+
+**Tests.** `test-data-rate.cc`: boundary cases `DataRate(kMax) * 1.0` and
+`d *= 1.0` must not abort (round 53). `gpu-cluster-test.cc`: new
+`FecModelTest::TestBerAtLeastOne` covers `ComputePostFecBer(1.0) == 1.0`,
+`ComputePostFecBer(2.0) == 1.0`, `T=0` at BER 1.0, and
+`DecodePacket(1.0/3.0)` == UNCORRECTABLE.
+
+**Verified.** Clean build; gpu-cluster suite 183/183 PASS; data-rate +
+error-model suites PASS (boundary cases included); 12 touched-core suites
+PASS (pie-queue-disc, drop-tail-queue, codel/cobalt/fifo/prio-queue-disc,
+fq-codel/fq-pie/fq-cobalt-queue-disc, queue-disc-traces, wifi-mac-queue,
+lr-wpan-error-model); traffic-control-example smoke PASS (Unforced drop
+37/55500, sent 6887/10302800); 15/15 parity scripts PASS (48 PASS lines,
+0 FAIL; 18 pytest cases incl. test_ibgda.py 17 + test_config_fec_enabled.py
+1); surrogate pytest 101 passed; DCQCN anchors byte-stable (congested:
+20802.4 µs / 99985 ECN / 99985 CNP tx / 99974 CNP rx; aligned:
+20300.2 µs).
+
 ### Fixed — codex round 52: boundary correction on the round-51 guards — exclusive DataRate bound, complete-packet FEC check, and endpoint/test portability
 
 **What.** Round 52 re-examined the round-51 range guards at their exact

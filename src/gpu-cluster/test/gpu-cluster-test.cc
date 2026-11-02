@@ -1667,6 +1667,7 @@ class FecModelTest : public TestCase
     void TestBandwidthOverhead();
     void TestPostFecBer();
     void TestZeroBer();
+    void TestBerAtLeastOne();
     void TestTZero();
     void TestEncodedSize();
     void TestEncodedSizeWide();
@@ -1683,6 +1684,7 @@ FecModelTest::DoRun()
     TestBandwidthOverhead();
     TestPostFecBer();
     TestZeroBer();
+    TestBerAtLeastOne();
     TestTZero();
     TestEncodedSize();
     TestEncodedSizeWide();
@@ -1726,6 +1728,39 @@ FecModelTest::TestZeroBer()
     Ptr<FecModel> fec = CreateObject<FecModel>();
     fec->SetFecParams(544, 514, 15);
     NS_TEST_EXPECT_MSG_EQ(fec->ComputePostFecBer(0.0), 0.0, "Zero BER produces zero post-FEC");
+}
+
+void
+FecModelTest::TestBerAtLeastOne()
+{
+    // Round 53: BER >= 1.0 is reachable — LinkDegradationModel scales
+    // m_baseBer by up to (1 + severity * 999), and only the attribute
+    // input is checker-bounded to [0,1]. The log-space uncorrectability
+    // sum evaluates std::log(1 - pSym) = log(0) at BER == 1.0
+    // (FE_DIVBYZERO) and std::log of a negative at BER > 1.0
+    // (FE_INVALID); both must short-circuit to the certain outcome
+    // instead of raising FP exceptions.
+    Ptr<FecModel> fec = CreateObject<FecModel>();
+    fec->SetFecParams(544, 514, 15);
+    fec->SetEnabled(true);
+
+    NS_TEST_EXPECT_MSG_EQ(fec->ComputePostFecBer(1.0), 1.0,
+                          "Post-FEC BER at BER 1.0 is certainly 1");
+    NS_TEST_EXPECT_MSG_EQ(fec->ComputePostFecBer(2.0), 1.0,
+                          "Post-FEC BER above 1.0 (degradation scaling) is certainly 1");
+    fec->SetFecParams(544, 514, 0);
+    NS_TEST_EXPECT_MSG_EQ(fec->ComputePostFecBer(1.0), 1.0,
+                          "T=0 at BER 1.0 is certainly 1");
+
+    // Decode paths must also short-circuit: a codeword under BER >= 1.0
+    // is corrupted with probability 1 and certainly uncorrectable.
+    fec->SetFecParams(544, 514, 15);
+    NS_TEST_EXPECT_MSG_EQ(static_cast<int>(fec->DecodePacket(1.0, 100)),
+                          static_cast<int>(FecResult::UNCORRECTABLE),
+                          "DecodePacket at BER 1.0 is UNCORRECTABLE");
+    NS_TEST_EXPECT_MSG_EQ(static_cast<int>(fec->DecodePacket(3.0, 100)),
+                          static_cast<int>(FecResult::UNCORRECTABLE),
+                          "DecodePacket above BER 1.0 is UNCORRECTABLE");
 }
 
 void

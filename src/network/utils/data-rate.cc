@@ -188,10 +188,19 @@ DataRate::operator*(double rhs) const
     // Pre-scale guard (codex round 51, finding 5): the double product can
     // exceed uint64 (converts to 0 or garbage) or cross 2^63 before the
     // constructor's own check sees it — both produce a rate the fixed-point
-    // time arithmetic cannot represent. Compute in double and validate
-    // before the narrowing conversion.
-    const double product = m_bps * rhs;
-    NS_ABORT_MSG_IF(!(product >= 0.0) || product >= 9223372036854775808.0,
+    // time arithmetic cannot represent. Validate before the narrowing
+    // conversion.
+    //
+    // Exclusive bound, computed in long double (codex round 53): the
+    // representable maximum is 2^63 - 1, which is exactly representable
+    // only in long double (80-bit x87). In double, (2^63 - 1) rounds to
+    // 2^63, so an inclusive >= guard, and even a guard written against
+    // the literal 9223372036854775807.0 (which also rounds to 2^63),
+    // spuriously aborts the identity product MAX * 1.0. On MSVC long
+    // double == double, so MAX * 1.0 still aborts there (documented
+    // limitation); on every other supported platform it succeeds.
+    const long double product = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
+    NS_ABORT_MSG_IF(!(product >= 0.0L) || product > 9223372036854775807.0L,
                     "DataRate product of " << m_bps << " bps * " << rhs
                     << " exceeds the supported range (>= 2^63 bps)");
     return DataRate(static_cast<uint64_t>(product));
@@ -201,9 +210,10 @@ DataRate&
 DataRate::operator*=(double rhs)
 {
     // Same pre-scale guard as operator*(double): in-place mutation
-    // bypasses the constructor aborts.
-    const double product = m_bps * rhs;
-    NS_ABORT_MSG_IF(!(product >= 0.0) || product >= 9223372036854775808.0,
+    // bypasses the constructor aborts. Long double for the same
+    // exclusive-bound reason (round 53).
+    const long double product = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
+    NS_ABORT_MSG_IF(!(product >= 0.0L) || product > 9223372036854775807.0L,
                     "DataRate product of " << m_bps << " bps * " << rhs
                     << " exceeds the supported range (>= 2^63 bps)");
     m_bps = static_cast<uint64_t>(product);

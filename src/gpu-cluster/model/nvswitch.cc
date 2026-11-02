@@ -2083,13 +2083,16 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
             // configuration error, not a truncatable expansion. Bound the
             // complete encoded packet, not the pad alone (round 52: the
             // padding itself can fit uint32 while payload + padding wraps
-            // the 32-bit packet accounting; keep the 41-B header headroom
-            // the rest of the pipeline reserves).
+            // the 32-bit packet accounting). The bound must leave room for
+            // the 39-B header the fragment already carries: the packet size
+            // is payload + header, so encodedPayloadSize == bound would
+            // produce a serialized total of exactly UINT32_MAX + 1 and wrap
+            // the packet accounting (round 53: reject AT the boundary).
             uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
             if (encodedPayloadSize > payloadSize)
             {
                 constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 41u;
-                NS_ABORT_MSG_IF(encodedPayloadSize > kMaxPayload,
+                NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
                                 "FEC parity expansion of a " << payloadSize
                                 << "-B result fragment encodes to " << encodedPayloadSize
                                 << " B, beyond any representable packet: "

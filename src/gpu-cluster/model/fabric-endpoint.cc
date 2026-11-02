@@ -3403,12 +3403,16 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // packet, not the pad alone (round 52: padding alone can fit
         // uint32 while payload + padding wraps the 32-bit packet
         // accounting; keep the 41-B header headroom the rest of the
-        // pipeline reserves).
+        // pipeline reserves, and reject AT the boundary — the packet
+        // size is payload + the 39-B header it already carries, so
+        // encodedPayloadSize == bound would produce a serialized total
+        // of exactly UINT32_MAX + 1 and wrap the packet accounting
+        // (codex round 53: reject AT the boundary).
         uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
         if (encodedPayloadSize > payloadSize)
         {
             constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 41u;
-            NS_ABORT_MSG_IF(encodedPayloadSize > kMaxPayload,
+            NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
                             "FEC parity expansion of a " << payloadSize
                             << "-B payload encodes to " << encodedPayloadSize
                             << " B, beyond any representable packet: "
