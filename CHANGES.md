@@ -6,6 +6,59 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 60: no defects introduced by d35ce22, all four focus categories verified sound
+
+**What.** Round-60 review of commit d35ce22 found no introduced
+[P0]/[P1]/[P2] runtime defects and no remaining action items. The four
+requested categories check out (all probe arithmetic reproduced exactly
+with Python integers):
+
+1. **[Verified sound] NaN handling: no caller divergence.** The three
+   production callers of the public ComputeSymbolErrorProbability
+   (fec-model.cc:256, :351, :463 — ComputePostFecBer, DecodeCodeword,
+   DecodePacket) intercept NaN at their own entry guards first, returning
+   0.0 / NO_ERROR / NO_ERROR; DecodePacket does so before computing the
+   codeword count, covering both packet-size branches. The helper's new
+   NaN -> 1.0 policy is therefore observable only through a DIRECT helper
+   call (the finite-input golden test is the only such caller) — no
+   existing decoding path newly classifies NaN as uncorrectable.
+2. **[Verified sound] Buffer guards: no wrap and no
+   passing-guard/allocator-abort mismatch.** With M = UINT32_MAX,
+   passing the widened guards requires E + g + p + 120 < M, hence
+   E + g + p <= M - 121; the copy-on-append request R = GetInternalSize
+   () + padding <= P + H + (E - P) <= E + p <= M - g - 121 <= M - 121,
+   which Allocate accepts (it permits R <= M - 120), and both R + 100
+   and R + 100 - 1 + sizeof(Buffer::Data) stay representable (at the
+   accepted boundary R = 4,294,967,175 the byte allocation is
+   4,294,967,294).
+3. **[Verified sound] Constexpr accessors.** Buffer::Data (buffer.h:663)
+   is fully defined before GetDataHeaderSize (buffer.h:805); its four
+   uint32 fields plus one-byte array occupy 20 bytes including tail
+   padding, the same value Allocate sees. GetAllocationOverProvision
+   returns the same 100 used by Allocate.
+4. **[Verified sound] Round-59 CHANGES probe values, with historical
+   context.** Payload 5,282,862 with RS (813,1) -> 4,226,290 codewords
+   -> encoded 4,294,967,213; append request 4,294,967,252; +100 wraps
+   modulo 2^32 to 56; the corrected boundary example sums to
+   4,311,744,521 and is rejected by both historical checks. Distinction
+   worth recording: 4,278,189,988 is the maximum passing encoded size at
+   g = 16,777,255, prefix 51 for the round-57/58 guard; the current
+   round-59 guard (which reserves another 120 bytes) passes at most
+   4,278,189,868 there. The DataRate residual (exact product 2^63 + 24,
+   double conversion -8, result 2^63 - 1024) also reproduces and
+   predates d35ce22.
+
+**Verified.** Clean build; PASS data-rate; PASS error-model; PASS
+gpu-cluster; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800; 48
+parity PASS lines (15 scripts); parity pytest 18 passed (test_ibgda +
+test_config_fec_enabled, run from test/parity); surrogate pytest 101
+passed from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 us / 99985-99985-99974; 20300.2 us / 0-0-0).
+
 ### Fixed — codex round 59: public NaN entry point, Buffer::Allocate over-provision wrap, CHANGES.md boundary example
 
 **What.** Round-59 review of commit 4d90395 found no defects introduced
