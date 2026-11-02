@@ -2681,6 +2681,11 @@ FabricEndpoint::SendCreditPacket(uint16_t destRank, uint8_t vcId, uint16_t count
 void
 FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumulative)
 {
+    // Duplicate data may arrive while the original is waiting for memory
+    // service or a staging buffer. It cannot acknowledge unwritten data.
+    if (m_rdmaPendingAck.count({receivedHeader.GetSourceRank(),receivedHeader.GetVirtualChannel(),
+                                receivedHeader.GetFlowId(),receivedHeader.GetSequenceNumber()})) return;
+
     // The ACK has two consumers: the LLR retry store (LLR on) and the So TX
     // window (soTxWindow > 0 — the ACK is the window's clock, the perftest
     // tx_depth analog's completion notification). LLR-off used to suppress
@@ -3402,16 +3407,23 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // fail loudly instead of truncating. Bound the complete encoded
         // packet, not the pad alone (round 52: padding alone can fit
         // uint32 while payload + padding wraps the 32-bit packet
-        // accounting; keep the 41-B header headroom the rest of the
-        // pipeline reserves, and reject AT the boundary — the packet
-        // size is payload + the 39-B header it already carries, so
-        // encodedPayloadSize == bound would produce a serialized total
-        // of exactly UINT32_MAX + 1 and wrap the packet accounting
-        // (codex round 53: reject AT the boundary).
+        // accounting; keep header headroom the rest of the pipeline
+        // reserves, and reject AT the boundary). The headroom is 51 B,
+        // not 41 (codex round 54): Buffer offsets are absolute from the
+        // allocation origin, and Packet::AddHeader grows the buffer with
+        // AddAtStart — a warm prefix (up to 46-B SoRoCE + 2-B PPP +
+        // 3-B SNAP at this very send path) can precede the fragment in
+        // the same Buffer, so an encoded body that fits UINT32_MAX - 41
+        // by itself still overflows the 32-bit offset space once a
+        // prefix exists. 51 B covers the worst-case send-path prefix;
+        // encoded == bound would produce a serialized total of exactly
+        // UINT32_MAX and still trip Buffer's zero-origin assert (codex
+        // round 53: reject AT the boundary; round 54: widen the
+        // headroom for the warm-prefix case).
         uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
         if (encodedPayloadSize > payloadSize)
         {
-            constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 41u;
+            constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 51u;
             NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
                             "FEC parity expansion of a " << payloadSize
                             << "-B payload encodes to " << encodedPayloadSize
@@ -3680,7 +3692,9 @@ FabricEndpoint::OnPacketDelivered(Ptr<Packet> packet, uint32_t seqNum, FabricHea
     }
 
     FabricPacketType packetType = header.GetPacketType();
-    SendLlrAckPacket(header, false);
+    IbgdaPacketTag rdmaTag;
+    if (!packet->PeekPacketTag(rdmaTag) || !rdmaTag.ackIssued)
+        SendLlrAckPacket(header,false);
     // Return credits only for intra-node (Su) traffic. Scale-out (So) packets
     // bypassed credit on send (SendBulkWireTransferSize's IsLocalRank guard),
     // so there is no credit owed back. Returning one for an So packet would

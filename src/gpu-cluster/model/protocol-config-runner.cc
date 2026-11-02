@@ -58,14 +58,18 @@ ProtocolConfigRunner::ApplyBundle(const std::vector<Ptr<FabricEndpoint>>& endpoi
                                   uint32_t bulkChunkSize)
 {
     const uint8_t nvc = bundle.credits ? bundle.credits->GetNumVcs() : 1;
+    std::map<uint32_t,std::shared_ptr<RdmaHostMemoryResources>> hostMemory;
     for (const auto& ep : endpoints)
     {
         if (!ep) continue;
-        if (bundle.rdmaSubmission == "ibgda" && !ep->GetIbgdaSubmissionModel())
+        if (IsDetailedRdmaMode(bundle.rdmaSubmission) && !ep->GetIbgdaSubmissionModel())
         {
             auto model=CreateObject<IbgdaSubmissionModel>();
             model->Configure(bundle.ibgda);
-            ep->SetIbgdaSubmissionModel(model);
+            auto& host=hostMemory[ep->GetNodeId()];
+            if (!host) host=std::make_shared<RdmaHostMemoryResources>();
+            model->SetHostMemoryResources(host);
+            ep->SetRdmaSubmissionModel(model);
         }
         if (bundle.protocol) ep->SetProtocolModel(bundle.protocol);
         if (bundle.payloadBuilder) ep->SetProtocolPayloadBuilder(bundle.payloadBuilder);
@@ -122,7 +126,7 @@ ProtocolConfigRunner::Initialize(const std::vector<Ptr<FabricEndpoint>>& endpoin
     ProtocolTransactionGraph graph;
     ProtocolTransactionNodeId completeNode =
         config.Compile(graph, bundle.protocol, numGpus, dataSize, m_baseFlowId, error,
-                       bundle.rdmaSubmission != "ibgda");
+                       !IsDetailedRdmaMode(bundle.rdmaSubmission));
     if (completeNode == PROTOCOL_TRANSACTION_INVALID_NODE)
     {
         return false;

@@ -191,32 +191,53 @@ DataRate::operator*(double rhs) const
     // time arithmetic cannot represent. Validate before the narrowing
     // conversion.
     //
-    // Exclusive bound, computed in long double (codex round 53): the
-    // representable maximum is 2^63 - 1, which is exactly representable
-    // only in long double (80-bit x87). In double, (2^63 - 1) rounds to
-    // 2^63, so an inclusive >= guard, and even a guard written against
-    // the literal 9223372036854775807.0 (which also rounds to 2^63),
-    // spuriously aborts the identity product MAX * 1.0. On MSVC long
-    // double == double, so MAX * 1.0 still aborts there (documented
-    // limitation); on every other supported platform it succeeds.
-    const long double product = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
-    NS_ABORT_MSG_IF(!(product >= 0.0L) || product > 9223372036854775807.0L,
+    // Range in long double, result in double (codex rounds 53/54): the
+    // bound 2^63 - 1 is exactly representable only in long double (80-bit
+    // x87); in double it rounds to 2^63, so any guard written against a
+    // double literal spuriously rejects the identity product MAX * 1.0.
+    // On platforms where long double == double (MSVC, Apple ARM64) the
+    // range guard degrades to an inclusive 2^63 bound and MAX * 1.0
+    // still aborts there — documented limitation. The value itself is
+    // converted from the DOUBLE product so ordinary in-range scaling
+    // keeps its historical double-rounding quantization (round 54,
+    // finding 5: converting the long-double product changed
+    // DataRate(10) * 0.3 from 3 to 2).
+    const long double range = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
+    NS_ABORT_MSG_IF(!(range >= 0.0L) || range > 9223372036854775807.0L,
                     "DataRate product of " << m_bps << " bps * " << rhs
                     << " exceeds the supported range (>= 2^63 bps)");
-    return DataRate(static_cast<uint64_t>(product));
+    // Boundary clamp (codex round 54 follow-up): the guard above proves
+    // the true product is at most 2^63 - 1, but the DOUBLE product rounds
+    // 2^63 - 1 up to 2^63 (53-bit mantissa) and the constructor aborts on
+    // the rounded value. A double product that reached 2^63 is a rounding
+    // artifact — clamp to the representable maximum instead.
+    const double prod = m_bps * rhs;
+    if (prod >= 9223372036854775808.0) // == 2^63 as a double literal
+    {
+        return DataRate((1ull << 63) - 1);
+    }
+    return DataRate(static_cast<uint64_t>(prod));
 }
 
 DataRate&
 DataRate::operator*=(double rhs)
 {
     // Same pre-scale guard as operator*(double): in-place mutation
-    // bypasses the constructor aborts. Long double for the same
-    // exclusive-bound reason (round 53).
-    const long double product = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
-    NS_ABORT_MSG_IF(!(product >= 0.0L) || product > 9223372036854775807.0L,
+    // bypasses the constructor aborts. Long-double range / double
+    // result for the same reasons (rounds 53/54).
+    const long double range = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
+    NS_ABORT_MSG_IF(!(range >= 0.0L) || range > 9223372036854775807.0L,
                     "DataRate product of " << m_bps << " bps * " << rhs
                     << " exceeds the supported range (>= 2^63 bps)");
-    m_bps = static_cast<uint64_t>(product);
+    // Same boundary clamp as operator*(double): a double product of
+    // 2^63 - 1 rounds up to 2^63, which the constructor would abort on.
+    const double prod = m_bps * rhs;
+    if (prod >= 9223372036854775808.0) // == 2^63 as a double literal
+    {
+        m_bps = (1ull << 63) - 1;
+        return *this;
+    }
+    m_bps = static_cast<uint64_t>(prod);
     return *this;
 }
 

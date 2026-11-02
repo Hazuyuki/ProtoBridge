@@ -1,6 +1,9 @@
 """Real-binary checks of settings whose native source/precedence can change."""
 
 import time
+import csv
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -89,3 +92,42 @@ def test_ibgda_form_reaches_native_runtime_and_waits_for_completion(tmp_path):
     assert job["result"]["ibgdaSubmittedWqes"] == job["result"]["ibgdaCompletedWqes"] == 1
     assert job["result"]["ibgdaStartupSamples"] == 1
     assert job["result"]["simTimeNs"] >= job["result"]["dataDeliveryDurationNs"]
+
+
+@pytest.mark.parametrize("config,actor,path", [
+    ("rdma-host-p2p.cfg", "cpu", "host"),
+    ("rdma-staged-p2p.cfg", "cpu", "staged"),
+    ("rdma-gpudirect-p2p.cfg", "cpu", "gpudirect"),
+    ("ibgda-p2p.cfg", "gpu", "gpudirect"),
+])
+def test_rdma_presets_run_with_downloadable_wr_trace(tmp_path, config, actor, path):
+    with TestClient(create_app(REPO, tmp_path/"runs")) as client:
+        job = run(client, config_id=config, num_nodes=2, gpus_per_node=2,
+                  data_size=9000, stack_overrides={"rdmaStagingChunkBytes": 1024,
+                                                 "rdmaStagingBufferBytes": 2048})
+        result = job["result"]
+        assert result["rdmaInitiator"] == actor and result["rdmaDataPath"] == path
+        assert result["rdmaSubmittedRequests"] == result["rdmaCompletedRequests"] == 1
+        expected = 9 if path == "staged" else 1
+        assert result["rdmaSubmittedWqes"] == result["rdmaCompletedWqes"] == expected
+        artifact = client.get(f"/api/runs/{job['id']}/artifacts/rdma.csv")
+        assert artifact.status_code == 200
+        rows = list(csv.DictReader(io.StringIO(artifact.text)))
+        assert len(rows) == expected
+        assert sum(int(row["bytes"]) for row in rows) == 9000
+        archive = client.get(f"/api/runs/{job['id']}/artifacts/run.zip")
+        with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
+            assert bundle.read("rdma.csv").decode() == artifact.text
+
+
+def test_canonical_form_overrides_legacy_profile_and_stack_aliases(tmp_path):
+    source = (REPO/"configs/protocol_configs/ibgda-p2p.cfg").read_text()
+    source = source.replace("[stack]", "[stack]\nibgdaWqeBuildNs = 20000")
+    with TestClient(create_app(REPO, tmp_path/"runs")) as client:
+        job = run(client, config_id="ibgda-p2p.cfg", config_text=source,
+                  num_nodes=2, gpus_per_node=2, data_size=64,
+                  stack_overrides={"rdmaSubmission": "detailed", "rdmaGpuWqeBuildNs": 1234})
+    assert job["summary"]["settings"]["rdmaGpuWqeBuildNs"] == "1234"
+    assert "rdmaGpuWqeBuildNs = 1234" in job["config"]
+    assert "ibgdaWqeBuildNs" not in job["config"]
+    assert job["result"]["rdmaMeanStartupNs"] >= 1234

@@ -111,32 +111,50 @@ OPTION_GROUPS = [
         field("sprayChunkSize", "Spray 分片大小 · bytes", target="stack", default=131072, minimum=1, maximum=67108864),
         field("bulkChunkSize", "Bulk 包大小上限 · bytes", default=8388608, minimum=1, maximum=67108864),
     ]},
-    {"id": "rdma", "title": "RDMA submission", "subtitle": "Startup delay / IBGDA", "hint": "IBGDA models GPU submission and CQ completion over RoCE. Timing values are explicit inputs; zero adds no stage latency.", "fields": [
-        field("rdmaSubmission", "Submission model", target="stack", scope="multi", default="startup", choices=[("startup", "Startup delay (legacy)"), ("ibgda", "IBGDA · GPU initiated")]),
-        field("ibgdaProducers", "GPU producers", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="ibgda"),
-        field("ibgdaQpsPerPeer", "RC QPs per peer", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="ibgda"),
-        field("ibgdaQueueDepth", "QP depth · WQEs", target="stack", scope="multi", default=128, minimum=1, maximum=65536, when="ibgda"),
-        field("ibgdaDoorbellBatch", "WQEs per doorbell", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="ibgda"),
-        field("ibgdaCqModeration", "CQ moderation · WQEs", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="ibgda"),
-        field("ibgdaMtu", "RDMA packet body limit · bytes", target="stack", scope="multi", default=4096, minimum=1, maximum=1048576, when="ibgda"),
-        field("ibgdaWqeBytes", "WQE fetch size · bytes", target="stack", scope="multi", default=64, minimum=1, maximum=4096, when="ibgda"),
-        field("ibgdaMapQpByProducer", "QP assignment", target="stack", scope="multi", default=1, choices=[("1", "Map by producer"), ("0", "Round robin per request")], when="ibgda"),
-        *[field(key, label, target="stack", scope="multi", default=default, when="ibgda") for key,label,default in [
-            ("ibgdaWqeBuildNs", "WQE construction · ns", 0),
-            ("ibgdaPublishNs", "QP publication · ns", 0),
-            ("ibgdaDoorbellNs", "Doorbell service · ns", 0),
-            ("ibgdaBatchTimeoutNs", "Doorbell tail timeout · ns", 100),
-            ("ibgdaWqeFetchNs", "NIC WQE fetch · ns", 0),
-            ("ibgdaDmaReadNs", "Source DMA latency · ns", 0),
-            ("ibgdaDmaWriteNs", "Destination DMA latency · ns", 0),
-            ("ibgdaCqWriteNs", "CQ write latency · ns", 0),
-            ("ibgdaGpuPollNs", "GPU completion observation · ns", 0),
+    {"id": "rdma", "title": "RDMA submission", "subtitle": "Initiator / memory path / timing", "hint": "Select CPU or GPU submission independently of host memory, host staging, or GPUDirect. Stage costs are explicit inputs.", "fields": [
+        field("rdmaSubmission", "Timing model", target="stack", scope="multi", default="startup", choices=[("startup", "Startup delay (legacy)"), ("detailed", "Detailed RDMA"), ("ibgda", "IBGDA compatibility preset")]),
+        field("rdmaInitiator", "Request initiator", target="stack", scope="multi", default="gpu", choices=[("cpu", "CPU"), ("gpu", "GPU")], when="rdma"),
+        field("rdmaDataPath", "Payload memory path", target="stack", scope="multi", default="gpudirect", choices=[("host", "Host DRAM"), ("staged", "GPU via host staging"), ("gpudirect", "GPUDirect RDMA")], when="rdma"),
+        field("rdmaCpuWorkers", "CPU submission workers", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma-cpu"),
+        field("rdmaGpuProducers", "GPU producers", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma-gpu"),
+        field("rdmaQpsPerPeer", "RC QPs per peer", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma"),
+        field("rdmaQueueDepth", "QP depth · WQEs", target="stack", scope="multi", default=128, minimum=1, maximum=65536, when="rdma"),
+        field("rdmaDoorbellBatch", "WQEs per doorbell", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="rdma"),
+        field("rdmaCqModeration", "CQ moderation · WQEs", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="rdma"),
+        field("rdmaMtu", "RDMA packet body limit · bytes", target="stack", scope="multi", default=4096, minimum=1, maximum=1048576, when="rdma"),
+        field("rdmaWqeBytes", "WQE fetch size · bytes", target="stack", scope="multi", default=64, minimum=1, maximum=4096, when="rdma"),
+        field("rdmaMapQpByProducer", "QP assignment", target="stack", scope="multi", default=1, choices=[("1", "Map by producer"), ("0", "Round robin per request")], when="rdma"),
+        field("rdmaStagingChunkBytes", "Staging chunk · bytes", target="stack", scope="multi", default=65536, minimum=1, maximum=67108864, when="rdma-staged"),
+        field("rdmaStagingBufferBytes", "Staging buffer per direction · bytes", target="stack", scope="multi", default=131072, minimum=1, maximum=1073741824, when="rdma-staged"),
+        *[field(key,label,target="stack",scope="multi",default=default,when=when) for key,label,default,when in [
+            ("rdmaCpuWqeBuildNs", "CPU WQE construction · ns",0,"rdma-cpu"),
+            ("rdmaCpuPublishNs", "CPU QP publication · ns",0,"rdma-cpu"),
+            ("rdmaCpuDoorbellNs", "CPU doorbell service · ns",0,"rdma-cpu"),
+            ("rdmaCpuPollNs", "CPU completion observation · ns",0,"rdma-cpu"),
+            ("rdmaCpuHandoffNs", "GPU-to-CPU request handoff · ns",0,"rdma-cpu"),
+            ("rdmaGpuWqeBuildNs", "WQE construction · ns",0,"rdma-gpu"),
+            ("rdmaGpuPublishNs", "QP publication · ns",0,"rdma-gpu"),
+            ("rdmaGpuDoorbellNs", "Doorbell service · ns",0,"rdma-gpu"),
+            ("rdmaGpuPollNs", "GPU completion observation · ns",0,"rdma-gpu"),
+            ("rdmaBatchTimeoutNs", "Doorbell tail timeout · ns",100,"rdma"),
+            ("rdmaWqeFetchNs", "NIC WQE fetch · ns",0,"rdma"),
+            ("rdmaDmaReadNs", "Source DMA latency · ns",0,"rdma"),
+            ("rdmaDmaWriteNs", "Destination DMA latency · ns",0,"rdma"),
+            ("rdmaCqWriteNs", "CQ write latency · ns",0,"rdma"),
+            ("rdmaD2hNs", "GPU-to-host copy latency · ns",0,"rdma-staged"),
+            ("rdmaH2dNs", "Host-to-GPU copy latency · ns",0,"rdma-staged"),
         ]],
-        *[field(key, label, target="stack", scope="multi", default=0, kind="float", maximum=1000000, when="ibgda") for key,label in [
-            ("ibgdaPcieReadGbps", "PCIe read bandwidth · Gb/s"),
-            ("ibgdaPcieWriteGbps", "PCIe write bandwidth · Gb/s"),
-            ("ibgdaHbmReadGbps", "HBM read bandwidth · Gb/s"),
-            ("ibgdaHbmWriteGbps", "HBM write bandwidth · Gb/s"),
+        *[field(key,label,target="stack",scope="multi",default=0,kind="float",maximum=1000000,when="rdma") for key,label in [
+            ("rdmaPcieReadGbps", "PCIe read bandwidth · Gb/s"),
+            ("rdmaPcieWriteGbps", "PCIe write bandwidth · Gb/s"),
+            ("rdmaHbmReadGbps", "HBM read bandwidth · Gb/s"),
+            ("rdmaHbmWriteGbps", "HBM write bandwidth · Gb/s"),
+            ("rdmaHostReadGbps", "Host DRAM read bandwidth · Gb/s"),
+            ("rdmaHostWriteGbps", "Host DRAM write bandwidth · Gb/s"),
+        ]],
+        *[field(key,label,target="stack",scope="multi",default=0,kind="float",maximum=1000000,when="rdma-staged") for key,label in [
+            ("rdmaD2hGbps", "GPU-to-host copy bandwidth · Gb/s"),
+            ("rdmaH2dGbps", "Host-to-GPU copy bandwidth · Gb/s"),
         ]],
     ]},
     {"id": "flow", "title": "流控与拥塞控制", "subtitle": "Credit / 发送窗口 / PFC", "hint": "Credit 控制每个 VC 的可发分片数；So 窗口控制跨节点在途分片数。PFC 和拥塞控制可同时使用。", "fields": [
@@ -198,6 +216,41 @@ OPTION_GROUPS = [
         field("failureAwareRouting", "按可用链路重算路由", default=0, choices=BOOL, hint="移除链路时会自动重算路由。是否仍连通以原生结果为准。"),
     ]},
 ]
+
+
+RDMA_ALIASES = {
+    'ibgdaProducers': 'rdmaGpuProducers',
+    'ibgdaQpsPerPeer': 'rdmaQpsPerPeer',
+    'ibgdaQueueDepth': 'rdmaQueueDepth',
+    'ibgdaDoorbellBatch': 'rdmaDoorbellBatch',
+    'ibgdaCqModeration': 'rdmaCqModeration',
+    'ibgdaMtu': 'rdmaMtu',
+    'ibgdaWqeBytes': 'rdmaWqeBytes',
+    'ibgdaMapQpByProducer': 'rdmaMapQpByProducer',
+    'ibgdaWqeBuildNs': 'rdmaGpuWqeBuildNs',
+    'ibgdaPublishNs': 'rdmaGpuPublishNs',
+    'ibgdaDoorbellNs': 'rdmaGpuDoorbellNs',
+    'ibgdaGpuPollNs': 'rdmaGpuPollNs',
+    'ibgdaBatchTimeoutNs': 'rdmaBatchTimeoutNs',
+    'ibgdaWqeFetchNs': 'rdmaWqeFetchNs',
+    'ibgdaDmaReadNs': 'rdmaDmaReadNs',
+    'ibgdaDmaWriteNs': 'rdmaDmaWriteNs',
+    'ibgdaCqWriteNs': 'rdmaCqWriteNs',
+    'ibgdaPcieReadGbps': 'rdmaPcieReadGbps',
+    'ibgdaPcieWriteGbps': 'rdmaPcieWriteGbps',
+    'ibgdaHbmReadGbps': 'rdmaHbmReadGbps',
+    'ibgdaHbmWriteGbps': 'rdmaHbmWriteGbps',
+}
+
+
+def normalize_rdma_values(values):
+    result = dict(values)
+    for alias, canonical in RDMA_ALIASES.items():
+        if alias in result:
+            if canonical in result and str(result[canonical]) != str(result[alias]):
+                raise ValueError(f"Conflicting RDMA options: {alias} and {canonical}.")
+            result[canonical] = result.pop(alias)
+    return result
 
 
 def validate_value(key, value, rule):
@@ -390,14 +443,18 @@ def validate_configuration(op, resolved, cli, request):
             notices.append("已注入错误而未启用 LLR；未被 FEC 纠正的丢失可能使操作无法完成。")
         elif not enabled("llrTimeoutRetransmit"):
             notices.append("随机错误可能使 NACK 丢失；可启用“超时主动重传”来恢复这类传输。")
-    if settings.get("rdmaSubmission") == "ibgda":
+    if settings.get("rdmaSubmission") in {"detailed", "ibgda"}:
         if not multi or settings["interNodeFabricType"] != "RoCE":
-            raise ValueError("IBGDA requires a multi-node RoCE scenario.")
-        depth = integer("ibgdaQueueDepth")
-        if integer("ibgdaDoorbellBatch") > depth or integer("ibgdaCqModeration") > depth:
-            raise ValueError("IBGDA doorbell batch and CQ moderation must not exceed the QP depth.")
-        if integer("ibgdaDoorbellBatch") > 1 and integer("ibgdaBatchTimeoutNs") == 0:
-            raise ValueError("IBGDA batching requires a positive tail timeout.")
+            raise ValueError("Detailed RDMA requires a multi-node RoCE scenario.")
+        if settings["rdmaSubmission"] == "ibgda" and (settings["rdmaInitiator"] != "gpu" or settings["rdmaDataPath"] != "gpudirect"):
+            raise ValueError("The IBGDA compatibility preset requires GPU submission and GPUDirect; select Detailed RDMA for other combinations.")
+        depth = integer("rdmaQueueDepth")
+        if integer("rdmaDoorbellBatch") > depth or integer("rdmaCqModeration") > depth:
+            raise ValueError("RDMA doorbell batch and CQ moderation must not exceed the QP depth.")
+        if integer("rdmaDoorbellBatch") > 1 and integer("rdmaBatchTimeoutNs") == 0:
+            raise ValueError("RDMA batching requires a positive tail timeout.")
+        if integer("rdmaStagingBufferBytes") < integer("rdmaStagingChunkBytes"):
+            raise ValueError("The staging buffer must hold at least one staging chunk.")
     if multi:
         if integer("failedOpticalLink") >= 0 or enabled("failureAwareRouting"):
             raise ValueError("当前光链路故障选项用于单节点统一拓扑构建器；请选择单节点 Leaf–spine。")

@@ -2083,15 +2083,24 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
             // configuration error, not a truncatable expansion. Bound the
             // complete encoded packet, not the pad alone (round 52: the
             // padding itself can fit uint32 while payload + padding wraps
-            // the 32-bit packet accounting). The bound must leave room for
-            // the 39-B header the fragment already carries: the packet size
-            // is payload + header, so encodedPayloadSize == bound would
-            // produce a serialized total of exactly UINT32_MAX + 1 and wrap
-            // the packet accounting (round 53: reject AT the boundary).
+            // the 32-bit packet accounting). The bound must leave room
+            // for the 39-B header the fragment already carries (round 53:
+            // reject AT the boundary) and for a worst-case send-path
+            // prefix that precedes the fragment in the same Buffer —
+            // Packet::AddHeader grows the buffer with AddAtStart before
+            // the FEC pad is appended, so a warm prefix shrinks the room
+            // left at the top of the 32-bit offset space (round 54: a
+            // 51-B prefix plus an encoded body of UINT32_MAX - 45 still
+            // overflowed Buffer offsets even though the body alone fit
+            // the round-53 bound). 51 = the largest send-path prefix
+            // (46-B SoRoCE + 2-B PPP + 3-B SNAP) that can already be on
+            // the packet when the FEC pad is added, at the fabric
+            // endpoint; the switch egress uses the same conservative
+            // constant so both sites share one bound.
             uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
             if (encodedPayloadSize > payloadSize)
             {
-                constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 41u;
+                constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 51u;
                 NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
                                 "FEC parity expansion of a " << payloadSize
                                 << "-B result fragment encodes to " << encodedPayloadSize

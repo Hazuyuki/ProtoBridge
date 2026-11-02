@@ -59,9 +59,11 @@ fast enough to sweep many designs where the packet simulator cannot. See
 [surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md) for the guide and
 [doc/CALIBRATION.md](doc/CALIBRATION.md) for the in-repo H200 calibration data.
 
-GPU-initiated RC RDMA Write can be modeled with `--rdmaSubmission=ibgda`.
-The default `startup` mode retains existing behavior. See [doc/IBGDA.md](doc/IBGDA.md)
-for queue, doorbell, DMA and completion parameters and a runnable RoCE example.
+RC RDMA Write supports CPU or GPU initiation and host DRAM, host staging, or
+GPUDirect payload paths with `--rdmaSubmission=detailed`. The default `startup`
+mode retains existing behavior; `ibgda` remains a GPU/GPUDirect compatibility
+preset. See [doc/RDMA.md](doc/RDMA.md) for runnable examples, WebUI controls and
+the C++ interface, or [doc/IBGDA.md](doc/IBGDA.md) for GPU-specific examples.
 
 ## What this is (and is not)
 

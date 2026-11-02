@@ -220,6 +220,8 @@ class SimulationService:
                        f"--numNodes={request.num_nodes}", f"--gpusPerNode={request.gpus_per_node}",
                        f"--RngRun={request.seed}", f"--stepTraceFile={directory/'steps.csv'}",
                        *[f"--{key}={value}" for key, value in cli.items()]]
+            if job["summary"]["settings"].get("rdmaSubmission") in {"detailed", "ibgda"}:
+                command.append(f"--rdmaTraceFile={directory/'rdma.csv'}")
             # Linux prlimit bounds child memory/output and suppresses abort core files.
             # Other hosts retain timeout/cancellation and output-size monitoring.
             limiter = shutil.which("prlimit")

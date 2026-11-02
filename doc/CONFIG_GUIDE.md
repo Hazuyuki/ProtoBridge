@@ -15,6 +15,21 @@ configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
 `numGpus` and `dataSize` stay on the CLI (they are the experiment knobs); the
 `.cfg` carries the protocol + operation + hardware.
 
+For CPU/GPU RDMA Write, `[stack]` also selects submission and payload memory:
+
+```ini
+rdmaSubmission = detailed
+rdmaInitiator = cpu
+rdmaDataPath = gpudirect
+rdmaCpuWqeBuildNs = 100
+rdmaQueueDepth = 128
+```
+
+`rdmaSubmission=startup` retains the existing startup-delay behavior. Detailed
+mode supports `cpu|gpu` initiation independently of `host|staged|gpudirect`
+payload paths. See [RDMA.md](RDMA.md) for examples, parameter meanings and the
+integration interface. The RDMA example profile is illustrative and uncalibrated.
+
 ## 1. The two layers
 
 A `.cfg` has two sections:

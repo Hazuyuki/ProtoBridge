@@ -150,7 +150,7 @@ def create_app(repo: Path | None = None, data_dir: Path | None = None, binary: P
     @application.get("/api/runs/{identifier}/artifacts/{filename}")
     async def artifact(identifier: str, filename: str):
         current = job(identifier)
-        allowed = {"config.cfg", "profile.profile", "stdout.log", "steps.csv", "result.json", "run.zip"}
+        allowed = {"config.cfg", "profile.profile", "stdout.log", "steps.csv", "rdma.csv", "result.json", "run.zip"}
         if filename not in allowed:
             raise HTTPException(404, "没有这个文件。")
         directory = service().data_dir/identifier

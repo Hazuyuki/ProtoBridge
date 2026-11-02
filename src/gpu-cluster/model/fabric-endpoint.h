@@ -220,6 +220,12 @@ class FabricEndpoint : public Application
     /// submits remote bulk transfers as RC work requests before packetization.
     void SetIbgdaSubmissionModel(Ptr<IbgdaSubmissionModel> model);
     Ptr<IbgdaSubmissionModel> GetIbgdaSubmissionModel() const;
+    void SetRdmaSubmissionModel(Ptr<RdmaSubmissionModel> model) { SetIbgdaSubmissionModel(model); }
+    Ptr<RdmaSubmissionModel> GetRdmaSubmissionModel() const { return GetIbgdaSubmissionModel(); }
+    uint64_t SubmitRdmaWrite(uint16_t destRank, uint64_t bytes, uint8_t protocolId,
+                             uint16_t flowId, uint8_t vcId = 0,
+                             uint32_t producer = UINT32_MAX,
+                             RdmaSubmissionModel::Completion complete = {});
     uint64_t SubmitIbgdaWrite(uint16_t destRank, uint64_t bytes, uint8_t protocolId,
                               uint16_t flowId, uint8_t vcId = 0,
                               uint32_t producer = UINT32_MAX,
@@ -949,6 +955,18 @@ class FabricEndpoint : public Application
     using IbgdaPacketKey = std::tuple<uint16_t,uint8_t,uint16_t,uint32_t>;
     std::map<IbgdaPacketKey,std::pair<uint64_t,uint64_t>> m_ibgdaPackets;
     std::vector<Ptr<NetDevice>> m_ibgdaTraceDevices;
+    struct RdmaReceivePiece { Ptr<Packet> packet; FabricHeader header; };
+    struct RdmaReceiveWork
+    {
+        uint64_t bytes{0}, received{0};
+        bool allocated{false};
+        std::vector<RdmaReceivePiece> waiting, ready;
+    };
+    using RdmaReceiveKey = std::pair<uint16_t,uint64_t>;
+    std::map<RdmaReceiveKey,std::shared_ptr<RdmaReceiveWork>> m_rdmaReceiveWork;
+    std::set<IbgdaPacketKey> m_rdmaPendingAck;
+    void StartRdmaHostWrite(const RdmaReceiveKey& key,std::shared_ptr<RdmaReceiveWork> work,
+                             Ptr<Packet> packet,FabricHeader header);
     void SendBulkWireTransferSizeImpl(uint16_t destRank, uint64_t bytes,
                                       uint8_t protocolId, uint16_t flowId, uint8_t vcId);
     bool PrepareIbgdaPacket(Ptr<Packet> packet, uint32_t deviceIndex, const Address& dest);

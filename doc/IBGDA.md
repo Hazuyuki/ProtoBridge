@@ -1,10 +1,15 @@
 # GPU-initiated RDMA submission
 
-ProtoBridge has two selectable RDMA timing paths:
+For CPU submission, host-memory payloads, GPU staging, and the common C++
+interface, see [RDMA.md](RDMA.md). IBGDA is the GPU-initiated GPUDirect case of
+that model. Existing examples and `ibgda*` names on this page remain supported.
+
+ProtoBridge has these selectable RDMA timing paths:
 
 | `rdmaSubmission` | Behavior |
 |---|---|
 | `startup` | Default. Keeps the existing startup-delay, packetization and completion behavior. No IBGDA runtime is mounted. |
+| `detailed` | Select CPU/GPU initiation with `rdmaInitiator` and host/staged/GPUDirect payloads with `rdmaDataPath`. |
 | `ibgda` | Adds GPU WQE generation, per-peer RC QPs, finite WR queues, doorbell batching, NIC fetch, chunk DMA, ACK aggregation and GPU-observed completion. |
 
 These options select a submission model. Both use the existing packet network.
@@ -42,8 +47,9 @@ stage costs before comparing with hardware. All timing inputs default to zero
 except the tail-batch timeout, which defaults to 100 ns. A zero bandwidth input
 removes that bandwidth constraint; it does not derive a hardware bandwidth.
 
-For an existing run, select either `--rdmaSubmission=startup` or
-`--rdmaSubmission=ibgda`. Omitting the flag selects `startup`. As with other
+For an existing run, select `--rdmaSubmission=startup`,
+`--rdmaSubmission=ibgda`, or `detailed` with explicit initiator/path choices.
+Omitting the flag selects `startup`. As with other
 ProtoBridge hardware settings, an explicit `[stack]` / profile value takes
 precedence over the corresponding CLI flag. To switch a profile-based run back
 to legacy timing, change `rdmaSubmission` in the configuration to `startup`.

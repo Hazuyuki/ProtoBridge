@@ -76,8 +76,8 @@ NS_LOG_COMPONENT_DEFINE("GpuClusterSim");
 static uint64_t g_durationNs = 0;
 static bool g_collectiveCompleted = false;
 static uint64_t g_deliveryDurationNs = 0;
-static bool g_waitingIbgda = false;
-static std::vector<Ptr<IbgdaSubmissionModel>> g_ibgdaModels;
+static bool g_waitingRdma = false;
+static std::vector<Ptr<RdmaSubmissionModel>> g_rdmaModels;
 
 // ---------------------------------------------------------------------------
 // Wire-transfer patterns (p2p / fanout / incast): bare point-to-point bulk
@@ -160,19 +160,19 @@ ResolveAutoAlgorithm(const std::string& coll, const std::string& topo,
 void
 OnCollectiveComplete(uint64_t durationNs)
 {
-    if (g_waitingIbgda || g_collectiveCompleted) return;
+    if (g_waitingRdma || g_collectiveCompleted) return;
     g_deliveryDurationNs = durationNs;
-    if (g_ibgdaModels.empty())
+    if (g_rdmaModels.empty())
     {
         g_durationNs = durationNs;
         g_collectiveCompleted = true;
         Simulator::Stop();
         return;
     }
-    g_waitingIbgda = true;
+    g_waitingRdma = true;
     const Time start=Simulator::Now()-NanoSeconds(durationNs);
-    auto remaining=std::make_shared<uint32_t>(g_ibgdaModels.size());
-    for (auto model : g_ibgdaModels)
+    auto remaining=std::make_shared<uint32_t>(g_rdmaModels.size());
+    for (auto model : g_rdmaModels)
     {
         model->Quiet([start,remaining](bool ok) {
             if (!ok) return;
@@ -480,12 +480,13 @@ main(int argc, char* argv[])
 
     uint32_t p2pIterations=1;
     std::string rdmaSubmission="startup";
-    std::string ibgdaTraceFile;
-    IbgdaConfig ibgdaConfig;
+    std::string rdmaTraceFile;
+    RdmaConfig rdmaConfig;
     CommandLine cmd;
-    AddIbgdaCommandLine(cmd,rdmaSubmission,ibgdaConfig);
+    AddRdmaCommandLine(cmd,rdmaSubmission,rdmaConfig);
     cmd.AddValue("p2pIterations","Work requests per p2p/fanout/incast flow",p2pIterations);
-    cmd.AddValue("ibgdaTraceFile","Per-WR IBGDA timing CSV (empty=disabled)",ibgdaTraceFile);
+    cmd.AddValue("rdmaTraceFile","Per-WR RDMA timing CSV (empty=disabled)",rdmaTraceFile);
+    cmd.AddValue("ibgdaTraceFile","Compatibility alias for rdmaTraceFile",rdmaTraceFile);
     cmd.AddValue("topology", "Topology: ring/fullmesh/switched/fattree/railfattree/leafspine/nvl72/torus/mesh/hypercube/2dfullmesh/ndfullmesh/2dfullmeshclos", topology);
     cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce/p2p/fanout/incast", collective);
     cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain/hierarchical/ncclring", algorithm);
@@ -770,11 +771,11 @@ main(int argc, char* argv[])
         {
             prof.Set(kv.first, kv.second);
         }
-        ApplyIbgdaProfile(prof.GetValues(),rdmaSubmission,ibgdaConfig);
+        ApplyRdmaProfile(prof.GetValues(),rdmaSubmission,rdmaConfig);
         pbundle = prof.Build();
         pbundle.rdmaSubmission=rdmaSubmission;
-        pbundle.ibgda=ibgdaConfig;
-        if (rdmaSubmission == "ibgda")
+        pbundle.ibgda=rdmaConfig;
+        if (IsDetailedRdmaMode(rdmaSubmission))
             pbundle.protocol->SetAttributeFailSafe("StartupDelayNs",UintegerValue(0));
         configMode = true;
 
@@ -881,13 +882,12 @@ main(int argc, char* argv[])
 
     NS_ABORT_MSG_IF(p2pIterations == 0 || p2pIterations > 1000000,
                     "p2pIterations must be in [1,1000000]");
-    NS_ABORT_MSG_IF(rdmaSubmission != "startup" && rdmaSubmission != "ibgda",
-                    "rdmaSubmission must be startup or ibgda");
-    if (rdmaSubmission == "ibgda")
+    ApplyRdmaProfile({},rdmaSubmission,rdmaConfig);
+    if (IsDetailedRdmaMode(rdmaSubmission))
     {
-        ibgdaConfig.Validate();
+        rdmaConfig.Validate();
         NS_ABORT_MSG_IF(numNodes < 2 || interNodeFabricTypeStr != "RoCE",
-                        "IBGDA currently requires numNodes>=2 and interNodeFabricType=RoCE");
+                        "Detailed RDMA currently requires numNodes>=2 and interNodeFabricType=RoCE");
         interNodeStartupNs=0;
         interNodeStartupLLNs=interNodeStartupLL128Ns=interNodeStartupSIMPLENs=0;
     }
@@ -1439,7 +1439,7 @@ main(int argc, char* argv[])
                                    DoubleValue(soRoceWireEfficiency));
             }
             roceModel = CreateObject<RoceProtocolModel>();
-            if (rdmaSubmission == "ibgda")
+            if (IsDetailedRdmaMode(rdmaSubmission))
                 roceModel->SetAttribute("StartupDelayNs",UintegerValue(0));
         }
         else if (interNodeFabricType == FabricType::ETHERNET)
@@ -1520,7 +1520,7 @@ main(int argc, char* argv[])
         // (intra-node) framing/timing untouched. Off (--dcqcn=0, default) ->
         // null -> byte-identical.
         Ptr<RocePayloadBuilder> soPayloadBuilder;
-        if (interNodeFabricType == FabricType::ROCE && (enableDcqcn || rdmaSubmission == "ibgda"))
+        if (interNodeFabricType == FabricType::ROCE && (enableDcqcn || IsDetailedRdmaMode(rdmaSubmission)))
         {
             soPayloadBuilder = CreateObject<RocePayloadBuilder>();
         }
@@ -1990,32 +1990,39 @@ main(int argc, char* argv[])
         }
     }
 
-    std::shared_ptr<std::ofstream> ibgdaTrace;
-    if (rdmaSubmission == "ibgda")
+    std::shared_ptr<std::ofstream> rdmaTrace;
+    if (IsDetailedRdmaMode(rdmaSubmission))
     {
-        if (!ibgdaTraceFile.empty())
+        if (!rdmaTraceFile.empty())
         {
-            ibgdaTrace=std::make_shared<std::ofstream>(ibgdaTraceFile);
-            NS_ABORT_MSG_IF(!*ibgdaTrace,"Cannot open ibgdaTraceFile");
-            *ibgdaTrace << "rank,workId,peer,producer,qp,bytes,readyNs,reservedNs,publishedNs,doorbellNs,executeNs,firstWireNs,ackedNs,observedNs\n";
+            rdmaTrace=std::make_shared<std::ofstream>(rdmaTraceFile);
+            NS_ABORT_MSG_IF(!*rdmaTrace,"Cannot open rdmaTraceFile");
+            *rdmaTrace << "rank,workId,peer,producer,qp,bytes,readyNs,reservedNs,publishedNs,doorbellNs,executeNs,firstWireNs,ackedNs,observedNs,requestId,offset,submittedNs,stagingAcquiredNs,sourceStagedNs,initiator,dataPath\n";
         }
+        std::map<uint32_t,std::shared_ptr<RdmaHostMemoryResources>> hostMemory;
         for (auto ep : endpoints)
         {
-            auto model=CreateObject<IbgdaSubmissionModel>();
-            model->Configure(ibgdaConfig);
-            if (ibgdaTrace)
+            auto model=CreateObject<RdmaSubmissionModel>();
+            model->Configure(rdmaConfig);
+            auto& host=hostMemory[ep->GetNodeId()];
+            if (!host) host=std::make_shared<RdmaHostMemoryResources>();
+            model->SetHostMemoryResources(host);
+            if (rdmaTrace)
             {
-                model->SetObserver([ibgdaTrace,rank=ep->GetRank()](const IbgdaWorkTiming& t) {
-                    *ibgdaTrace << rank << ',' << t.id << ',' << t.peer << ',' << t.producer
+                model->SetObserver([rdmaTrace,rank=ep->GetRank(),rdmaConfig](const RdmaWorkTiming& t) {
+                    *rdmaTrace << rank << ',' << t.id << ',' << t.peer << ',' << t.producer
                         << ',' << t.qp << ',' << t.bytes << ',' << t.ready.GetNanoSeconds()
                         << ',' << t.reserved.GetNanoSeconds() << ',' << t.published.GetNanoSeconds()
                         << ',' << t.doorbell.GetNanoSeconds() << ',' << t.execute.GetNanoSeconds()
                         << ',' << t.firstWire.GetNanoSeconds() << ',' << t.acknowledged.GetNanoSeconds()
-                        << ',' << t.observed.GetNanoSeconds() << '\n';
+                        << ',' << t.observed.GetNanoSeconds() << ',' << t.requestId << ',' << t.offset
+                        << ',' << t.submitted.GetNanoSeconds() << ',' << t.stagingAcquired.GetNanoSeconds()
+                        << ',' << t.sourceStaged.GetNanoSeconds() << ',' << rdmaConfig.initiator
+                        << ',' << rdmaConfig.dataPath << '\n';
                 });
             }
-            ep->SetIbgdaSubmissionModel(model);
-            g_ibgdaModels.push_back(model);
+            ep->SetRdmaSubmissionModel(model);
+            g_rdmaModels.push_back(model);
         }
     }
 
@@ -2252,7 +2259,7 @@ main(int argc, char* argv[])
                 ar->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
             // Inter-node startup delay
-            if (rdmaSubmission == "ibgda")
+            if (IsDetailedRdmaMode(rdmaSubmission))
             {
                 ar->SetInterNodeStartupDelay(NanoSeconds(0));
             }
@@ -2425,7 +2432,7 @@ main(int argc, char* argv[])
             a2a->SetStartupPerGpuNs(startupPerGpuNs);
             a2a->SetLlThreshold(llThreshold);
             a2a->SetLl128Threshold(ll128Threshold);
-            if (rdmaSubmission == "ibgda")
+            if (IsDetailedRdmaMode(rdmaSubmission))
             {
                 a2a->SetInterNodeStartupDelay(NanoSeconds(0));
             }
@@ -2540,7 +2547,7 @@ main(int argc, char* argv[])
             {
                 ag->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
-            if (rdmaSubmission == "ibgda")
+            if (IsDetailedRdmaMode(rdmaSubmission))
             {
                 ag->SetInterNodeStartupDelay(NanoSeconds(0));
             }
@@ -2708,7 +2715,7 @@ main(int argc, char* argv[])
             {
                 rs->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
-            if (rdmaSubmission == "ibgda")
+            if (IsDetailedRdmaMode(rdmaSubmission))
             {
                 rs->SetInterNodeStartupDelay(NanoSeconds(0));
             }
@@ -2906,30 +2913,61 @@ main(int argc, char* argv[])
     std::cout << "status=" << statusStr << std::endl;
     std::cout << "rdmaSubmission=" << rdmaSubmission << std::endl;
     std::cout << "p2pIterations=" << p2pIterations << std::endl;
-    if (rdmaSubmission == "ibgda")
+    std::cout << "rdmaInitiator=" << rdmaConfig.initiator << std::endl;
+    std::cout << "rdmaDataPath=" << rdmaConfig.dataPath << std::endl;
+    if (IsDetailedRdmaMode(rdmaSubmission))
     {
-        IbgdaStats total;
-        for (auto model : g_ibgdaModels)
+        RdmaStats total;
+        for (auto model : g_rdmaModels)
         {
             const auto& st=model->GetStats();
-            total.submitted+=st.submitted; total.completed+=st.completed;
-            total.failed+=st.failed; total.doorbells+=st.doorbells; total.cqes+=st.cqes;
-            total.startupSamples+=st.startupSamples; total.startupTotalNs+=st.startupTotalNs;
+            total.requests+=st.requests;total.completedRequests+=st.completedRequests;
+            total.submitted+=st.submitted;total.completed+=st.completed;
+            total.failed+=st.failed;total.doorbells+=st.doorbells;total.cqes+=st.cqes;
+            total.startupSamples+=st.startupSamples;total.startupTotalNs+=st.startupTotalNs;
             total.startupMaxNs=std::max(total.startupMaxNs,st.startupMaxNs);
+            total.requestStartupSamples+=st.requestStartupSamples;
+            total.requestStartupTotalNs+=st.requestStartupTotalNs;
+            total.requestStartupMaxNs=std::max(total.requestStartupMaxNs,st.requestStartupMaxNs);
             total.peakOutstanding=std::max(total.peakOutstanding,st.peakOutstanding);
             total.peakQpOutstanding=std::max(total.peakQpOutstanding,st.peakQpOutstanding);
+            total.sourceD2hBytes+=st.sourceD2hBytes;total.destinationH2dBytes+=st.destinationH2dBytes;
+            total.hostReadBytes+=st.hostReadBytes;total.hostWriteBytes+=st.hostWriteBytes;
+            total.hbmReadBytes+=st.hbmReadBytes;total.hbmWriteBytes+=st.hbmWriteBytes;
+            total.sourceStagingPeakBytes=std::max(total.sourceStagingPeakBytes,st.sourceStagingPeakBytes);
+            total.destinationStagingPeakBytes=std::max(total.destinationStagingPeakBytes,st.destinationStagingPeakBytes);
+            total.lastObservedNs=std::max(total.lastObservedNs,st.lastObservedNs);
+            total.lastDataReadyNs=std::max(total.lastDataReadyNs,st.lastDataReadyNs);
         }
-        std::cout << "ibgdaSubmittedWqes=" << total.submitted << std::endl;
-        std::cout << "ibgdaCompletedWqes=" << total.completed << std::endl;
-        std::cout << "ibgdaFailedWqes=" << total.failed << std::endl;
-        std::cout << "ibgdaDoorbells=" << total.doorbells << std::endl;
-        std::cout << "ibgdaCqes=" << total.cqes << std::endl;
-        std::cout << "ibgdaPeakOutstanding=" << total.peakOutstanding << std::endl;
-        std::cout << "ibgdaPeakQpOutstanding=" << total.peakQpOutstanding << std::endl;
-        std::cout << "ibgdaStartupSamples=" << total.startupSamples << std::endl;
-        std::cout << "ibgdaMeanStartupNs=" << (total.startupSamples ?
-            static_cast<double>(total.startupTotalNs)/total.startupSamples : 0) << std::endl;
-        std::cout << "ibgdaMaxStartupNs=" << total.startupMaxNs << std::endl;
+        auto emit=[&total](const std::string& prefix) {
+            std::cout << prefix << "SubmittedWqes=" << total.submitted << std::endl;
+            std::cout << prefix << "CompletedWqes=" << total.completed << std::endl;
+            std::cout << prefix << "FailedWqes=" << total.failed << std::endl;
+            std::cout << prefix << "Doorbells=" << total.doorbells << std::endl;
+            std::cout << prefix << "Cqes=" << total.cqes << std::endl;
+            std::cout << prefix << "PeakOutstanding=" << total.peakOutstanding << std::endl;
+            std::cout << prefix << "PeakQpOutstanding=" << total.peakQpOutstanding << std::endl;
+            std::cout << prefix << "StartupSamples=" << total.startupSamples << std::endl;
+            std::cout << prefix << "MeanWqeStartupNs=" << (total.startupSamples ?
+                static_cast<double>(total.startupTotalNs)/total.startupSamples : 0) << std::endl;
+            std::cout << prefix << "MeanStartupNs=" << (total.requestStartupSamples ?
+                static_cast<double>(total.requestStartupTotalNs)/total.requestStartupSamples : 0) << std::endl;
+            std::cout << prefix << "MaxStartupNs=" << total.requestStartupMaxNs << std::endl;
+        };
+        emit("rdma");
+        if (rdmaSubmission == "ibgda") emit("ibgda");
+        std::cout << "rdmaSubmittedRequests=" << total.requests << std::endl;
+        std::cout << "rdmaCompletedRequests=" << total.completedRequests << std::endl;
+        std::cout << "rdmaSourceD2hBytes=" << total.sourceD2hBytes << std::endl;
+        std::cout << "rdmaDestinationH2dBytes=" << total.destinationH2dBytes << std::endl;
+        std::cout << "rdmaHostReadBytes=" << total.hostReadBytes << std::endl;
+        std::cout << "rdmaHostWriteBytes=" << total.hostWriteBytes << std::endl;
+        std::cout << "rdmaHbmReadBytes=" << total.hbmReadBytes << std::endl;
+        std::cout << "rdmaHbmWriteBytes=" << total.hbmWriteBytes << std::endl;
+        std::cout << "rdmaSourceStagingPeakBytes=" << total.sourceStagingPeakBytes << std::endl;
+        std::cout << "rdmaDestinationStagingPeakBytes=" << total.destinationStagingPeakBytes << std::endl;
+        std::cout << "rdmaCompletionObservedNs=" << total.lastObservedNs << std::endl;
+        std::cout << "rdmaDataReadyNs=" << total.lastDataReadyNs << std::endl;
         std::cout << "dataDeliveryDurationNs=" << g_deliveryDurationNs << std::endl;
     }
     std::cout << "topology=" << topology << std::endl;

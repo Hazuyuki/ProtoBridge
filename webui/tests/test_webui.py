@@ -78,7 +78,7 @@ def submit(client, **values):
 
 def test_catalog_and_real_parameter_preview(client):
     catalog = client.get("/api/catalog").json()
-    assert len(catalog["configs"]) == 12
+    assert len(catalog["configs"]) == 15
     assert client.get("/").status_code == 200
     assert client.get("/static/app.js").status_code == 200
     body = {"stack_overrides": {"bandwidthGbps": 85}, "num_nodes": 2, "gpus_per_node": 4}
@@ -95,6 +95,18 @@ def test_form_catalog_only_lists_native_algorithms_and_topologies(client):
     assert "2dfullmeshclos" not in {item["value"] for item in options["topologies"]}
     allreduce = next(item for item in options["collectives"] if item["value"] == "allreduce")
     assert {"tree", "ncclring", "nvls", "hierarchical"} <= set(allreduce["algorithms"])
+
+
+def test_rdma_form_validates_independent_choices_and_staging_capacity(client):
+    body = {"config_id": "rdma-host-p2p.cfg", "num_nodes": 2, "gpus_per_node": 2,
+            "stack_overrides": {"rdmaInitiator": "gpu", "rdmaDataPath": "staged",
+                                "rdmaStagingChunkBytes": 1024, "rdmaStagingBufferBytes": 2048}}
+    response = client.post("/api/preview", json=body)
+    assert response.status_code == 200, response.text
+    settings = response.json()["summary"]["settings"]
+    assert settings["rdmaInitiator"] == "gpu" and settings["rdmaDataPath"] == "staged"
+    body["stack_overrides"]["rdmaStagingBufferBytes"] = 512
+    assert client.post("/api/preview", json=body).status_code == 422
 
 
 def test_page_loads_versioned_scripts_with_revalidation(client):

@@ -761,6 +761,7 @@ class LinkDegradationModelTest : public TestCase
     void TestBasicConfiguration();
     void TestBerCalculation();
     void TestDegradationTriggers();
+    void TestSaturatedBer();
     void TestPacketProcessing();
     void TestScheduledDegradation();
     uint32_t m_droppedCount;
@@ -789,6 +790,7 @@ LinkDegradationModelTest::DoRun()
     TestBasicConfiguration();
     TestBerCalculation();
     TestDegradationTriggers();
+    TestSaturatedBer();
     TestPacketProcessing();
     TestScheduledDegradation();
 }
@@ -888,6 +890,48 @@ LinkDegradationModelTest::TestDegradationTriggers()
     model->ApplyDegradation(DegradationTrigger::EXTERNAL, 0.8);
     NS_TEST_EXPECT_MSG_EQ(static_cast<int>(model->GetLinkState()),
                           static_cast<int>(LinkState::DEGRADED), "Link is DEGRADED with external");
+}
+
+void
+LinkDegradationModelTest::TestSaturatedBer()
+{
+    // Round 54, finding 4: ApplyDegradation scales m_baseBer by up to
+    // (1 + severity * 999), which pushes m_ber past 1 even though the
+    // attribute/SetBer bound it to [0,1). The probability calculators
+    // must saturate at 1 instead of evaluating pow(negative, bits)
+    // (silent prob 0 for even bit counts, FE_INVALID/FE_OVERFLOW
+    // otherwise).
+    Ptr<LinkDegradationModel> model = CreateObject<LinkDegradationModel>();
+    model->SetBer(0.002);
+    model->ApplyDegradation(DegradationTrigger::BIT_ERROR, 1.0);
+    NS_TEST_EXPECT_MSG_EQ(model->GetBer() > 1.0, true,
+                          "severity-1 BIT_ERROR scales base 0.002 past 1");
+
+    // Saturated link must deterministically drop every packet, in both
+    // independent and burst modes.
+    m_droppedCount = 0;
+    model->SetPacketDropCallback(MakeCallback(&LinkDegradationModelTest::OnPacketDrop, this));
+    Ptr<Packet> p = Create<Packet>(100);
+    for (int i = 0; i < 20; i++)
+    {
+        NS_TEST_EXPECT_MSG_EQ(model->ProcessPacket(p), false,
+                              "saturated BER drops every packet (independent mode)");
+    }
+    NS_TEST_EXPECT_MSG_EQ(m_droppedCount, 20, "every saturated packet counted as dropped");
+
+    Ptr<LinkDegradationModel> burstModel = CreateObject<LinkDegradationModel>();
+    burstModel->SetErrorMode(ErrorMode::BURST);
+    burstModel->SetBer(0.002);
+    burstModel->ApplyDegradation(DegradationTrigger::BIT_ERROR, 1.0);
+    m_droppedCount = 0;
+    burstModel->SetPacketDropCallback(
+        MakeCallback(&LinkDegradationModelTest::OnPacketDrop, this));
+    for (int i = 0; i < 20; i++)
+    {
+        NS_TEST_EXPECT_MSG_EQ(burstModel->ProcessPacket(p), false,
+                              "saturated BER drops every packet (burst mode)");
+    }
+    NS_TEST_EXPECT_MSG_EQ(m_droppedCount, 20, "every saturated burst packet counted");
 }
 
 void
@@ -1713,9 +1757,16 @@ FecModelTest::TestPostFecBer()
     Ptr<FecModel> fec = CreateObject<FecModel>();
     fec->SetFecParams(544, 514, 15);
 
-    // With very low BER, post-FEC should be essentially zero
+    // With very low BER, post-FEC should be essentially zero. Bound:
+    // pSym ~ 1e-11, so the i=15 tail term alone is ~C(544,15) * p^15 ~
+    // 1e-137 — the true probability is far below double epsilon. The
+    // assert is on the COMPUTED value though: the log-space sum below
+    // cancels to 1 - eps (residue ~4e-16), because the expm1/log1p
+    // pSym (round 54) differs from the raw 1-pow form by ~2.2e-5
+    // relative, enough to keep the residue off exact 0. Assert against
+    // machine epsilon, not the true tail probability.
     double postFec = fec->ComputePostFecBer(1e-12);
-    NS_TEST_EXPECT_MSG_LT(postFec, 1e-20, "Post-FEC BER near zero for very low pre-FEC BER");
+    NS_TEST_EXPECT_MSG_LT(postFec, 1e-14, "Post-FEC BER near zero for very low pre-FEC BER");
 
     // With high BER, post-FEC should be non-trivial
     postFec = fec->ComputePostFecBer(1e-3);

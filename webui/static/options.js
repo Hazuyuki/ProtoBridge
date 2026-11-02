@@ -121,11 +121,21 @@ class SimulationOptions {
       return result;
     };
     const config = parse(document.getElementById("config-editor").value, true);
+    const normalize = (values) => {
+      const result = { ...values };
+      for (const [alias, canonical] of Object.entries(this.schema.rdma_aliases || {})) {
+        if (alias in result) {
+          if (!(canonical in result)) result[canonical] = result[alias];
+          delete result[alias];
+        }
+      }
+      return result;
+    };
     return {
       op: config.op,
       stack: {
-        ...parse(document.getElementById("profile-editor").value, false)[""],
-        ...config.stack,
+        ...normalize(parse(document.getElementById("profile-editor").value, false)[""]),
+        ...normalize(config.stack),
       },
     };
   }
@@ -399,8 +409,13 @@ class SimulationOptions {
       let show = scope;
       if (this.schema.topology_fields.includes(item) && item.scope === "single")
         show = scope && (topology?.params || []).includes(item.key);
-      if (item.when === "ibgda")
-        show = scope && setting("rdmaSubmission") === "ibgda";
+      if (item.when?.startsWith("rdma")) {
+        const detailed = ["detailed", "ibgda"].includes(setting("rdmaSubmission"));
+        show = scope && detailed;
+        if (item.when === "rdma-cpu") show = show && (setting("rdmaInitiator") || "gpu") === "cpu";
+        if (item.when === "rdma-gpu") show = show && (setting("rdmaInitiator") || "gpu") === "gpu";
+        if (item.when === "rdma-staged") show = show && setting("rdmaDataPath") === "staged";
+      }
       if (item.when === "burst")
         show = scope && (setting("errorMode") || "independent") === "burst";
       if (item.when === "root")

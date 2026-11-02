@@ -6,6 +6,92 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 54: expm1/log1p FEC symbol probability, 51-B Buffer-offset headroom, BER saturation in link degradation, and DataRate long-double-range/double-quantization split
+
+**What.** Seven findings, verified and fixed:
+
+1. **[P0] FEC symbol probability rounded to exactly 0/1 at extreme BER.**
+   `ComputeSymbolErrorProbability` used `1 - pow(1-BER, 10)`; at BER
+   0.99 the power rounds to exactly 1 (pSym = 0, `log(0)` =
+   FE_DIVBYZERO) and at BER 1e-18 it rounds so close to 0 that pSym = 1
+   (`log(1-pSym)` = FE_DIVBYZERO) — both fatal under fenv traps. All
+   three entry points now use `-expm1(10 * log1p(-BER))`, which stays
+   off the exact 0/1 boundaries for every BER in (0, 1). Test bound in
+   `TestPostFecBer` adjusted to `< 1e-14` (the true tail probability
+   is ~1e-137 but the log-space cancellation leaves double-epsilon
+   residue ~4e-16 — asserted against machine epsilon, not the true
+   probability).
+2. **[P0] 51-B prefix + payload encoded 4 B below the round-53 bound
+   still overflowed Buffer offsets.** `SetFecParams(995,1,0)` with a
+   4,316,550-B payload encodes to 4,294,967,250 (= UINT32_MAX - 46):
+   the round-53 `kMaxPayload = UINT32_MAX - 41` accepted it, but a
+   warm 51-B send-path prefix (46-B SoRoCE + 2-B PPP + 3-B SNAP) plus
+   the encoded body overflows the 32-bit Buffer offset space. Both
+   egress sites (nvswitch.cc, fabric-endpoint.cc) now bound at
+   `kMaxPayload = UINT32_MAX - 51` (reject `>=`), covering the
+   worst-case prefix that can already be on the packet.
+3. **[P0] long double == double platforms (MSVC, Apple ARM64): the
+   identity product still aborts — documented limitation.** On those
+   platforms `9223372036854775807.0L` rounds to 2^63, so the
+   long-double range guard degrades to an inclusive 2^63 bound and
+   `MAX * 1.0` / `MAX *= 1.0` abort. The code comment documents this;
+   no portable fix exists without an integer identity-path check
+   (which the round-54 scope did not include). All other products
+   (range check in long double, quantization from the double product)
+   behave identically on both platform classes.
+4. **[P0] link-degradation.cc evaluated invalid probabilities for BER
+   > 1.** `SetBer(0.002)` + severity-1 BIT_ERROR degradation produces
+   BER = 2; the raw `pow(1-BER, bits)` then silently returned 0 (even
+   bits) or raised FE_INVALID/FE_OVERFLOW (odd bits). Both independent
+   and burst paths now saturate: `if (m_ber >= 1.0) return 1.0` in
+   `CalculatePacketErrorProbability`, and burst-mode burst-length
+   generation clamps `u = min(u, 1 - 1e-12)` so an injectable
+   DeterministicRandomVariable cannot reach `log(0)` and the uint32
+   UB cast. New `TestSaturatedBer` covers independent + burst mode
+   (burst switched via `SetErrorMode(ErrorMode::BURST)`).
+5. **[P1] round-53 long-double conversion changed ordinary double
+   results.** `DataRate(10) * 0.3` went 3 → 2; `1e9 * 0.7` →
+   699999999; `3 * (1/3)` → 0, because the long-double product retains
+   the scalar's approximation error through the truncation. Fixed by
+   validating the range in long double but converting from the DOUBLE
+   product (preserving the historical double-rounding quantization).
+   **Round-54 follow-up**: the double product of 2^63-1 rounds UP to
+   2^63 (53-bit mantissa), which the constructor aborts on. A
+   post-guard clamp returns kMax whenever the double product reaches
+   2^63 (the guard already proved the true product <= 2^63 - 1), so
+   `MAX * 1.0` and `MAX *= 1.0` return kMax on x87 platforms.
+6. **[P2] injectable RNG u==1.0 in geometric burst length.** Same fix
+   as 4: `uClamped = std::min(u, 1.0 - 1e-12)`.
+7. **[P3] comment/CHANGES.md arithmetic errors corrected.**
+   - The round-53 CHANGES.md entry said the boundary encoded body plus
+     FabricHeader reaches "UINT32_MAX + 1"; the correct statement is
+     that encoded body + FabricHeader = UINT32_MAX - 2, and adding PPP
+     gives UINT32_MAX (not +1). The round-54 headroom comment in
+     fabric-endpoint.cc now states this correctly.
+   - The test comment in test-data-rate.cc incorrectly said
+     "1.0 == 2^63-1 in double"; the correct statement is that
+     `(double)(2^63 - 1)` rounds to 2^63.
+   - The pSym vs 1-pSym explanation in fec-model.cc comments corrected
+     for the even-exponent case (BER > 1 can make the raw pow form
+     negative; the negative log argument is then pSym, not 1-pSym).
+
+**Tests.** `gpu-cluster-test.cc`: `TestSaturatedBer` (independent +
+burst mode, BER > 1 saturation); `TestPostFecBer` bound adjusted;
+`rdma-modes-test.cc` misleading-indentation fixed (`-Werror` clean).
+`test-data-rate.cc`: boundary `MAX * 1.0` / `MAX *= 1.0` assert
+non-abort (parent-process, no fork needed on x87).
+
+**Verified.** Clean build; gpu-cluster suite 183/183 PASS; data-rate +
+error-model suites PASS; 12 touched-core suites PASS (pie-queue-disc,
+drop-tail-queue, codel/cobalt/fifo/prio-queue-disc,
+fq-codel/fq-pie/fq-cobalt-queue-disc, queue-disc-traces, wifi-mac-queue,
+lr-wpan-error-model); traffic-control-example smoke PASS (Unforced drop
+37/55500, sent 6887/10302800); 15 parity scripts PASS (48 PASS lines,
+0 FAIL; 18 pytest cases incl. test_ibgda.py 17 + test_config_fec_enabled.py
+1); surrogate pytest 101 passed; DCQCN anchors byte-stable (congested:
+20802.4 µs / 99985 ECN / 99985 CNP tx / 99974 CNP rx; aligned:
+20300.2 µs).
+
 ### Fixed — codex round 53: reject-at-boundary for the FEC guard and the double-product DataRate guard, plus FP-clean FEC decode at BER >= 1.0
 
 **What.** The round-53 codex session was killed by a content filter before

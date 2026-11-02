@@ -535,11 +535,22 @@ LinkDegradationModel::CancelScheduledDegradation()
 double
 LinkDegradationModel::CalculatePacketErrorProbability(uint32_t packetSize) const
 {
-    // P(error) = 1 - (1 - BER)^(bits)
-    // For small BER, approximately P(error) ≈ BER * bits
+    // P(error) = 1 - (1 - BER)^(bits), via expm1/log1p for accuracy at
+    // both ends. BER >= 1 is saturated at probability 1: ApplyDegradation
+    // scales m_baseBer by up to (1 + severity * 999) with only the
+    // attribute input checker-bounded to [0,1], so m_ber can exceed 1
+    // (codex round 54, finding 4) — the raw std::pow(1 - m_ber, bits)
+    // form then computed pow(negative, bits): even bit counts silently
+    // returned prob 0 (packets survive a BER-2 link), odd counts raised
+    // FE_INVALID, and large negative bases overflowed (FE_OVERFLOW).
+    if (m_ber >= 1.0)
+    {
+        return 1.0;
+    }
     uint64_t bits = static_cast<uint64_t>(packetSize) * 8;
-    double probNoError = std::pow(1.0 - m_ber, bits);
-    return 1.0 - probNoError;
+    const double logNoError = static_cast<double>(bits) * std::log1p(-m_ber);
+    // 1 - exp(logNoError) computed without cancellation at either end.
+    return -std::expm1(logNoError);
 }
 
 void
@@ -589,8 +600,21 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
         {
             // Not in burst: check if a new burst starts
             // Also apply independent BER for codewords outside bursts
-            double codewordBits = static_cast<double>(m_codewordSize) * 8.0;
-            double codewordErrorProb = 1.0 - std::pow(1.0 - m_ber, codewordBits);
+            double codewordErrorProb;
+            if (m_ber >= 1.0)
+            {
+                // BER >= 1 (degradation scaling past the attribute bound):
+                // every codeword certainly fails — saturating avoids the
+                // pow(negative, bits) domain error of the raw form (codex
+                // round 54, finding 4).
+                codewordErrorProb = 1.0;
+            }
+            else
+            {
+                double codewordBits = static_cast<double>(m_codewordSize) * 8.0;
+                codewordErrorProb =
+                    -std::expm1(codewordBits * std::log1p(-m_ber));
+            }
 
             if (ShouldStartBurst())
             {
@@ -604,9 +628,19 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
                 }
                 else
                 {
+                    // Geometric burst length: samples come from the
+                    // injectable random stream, whose values can sit at
+                    // the closed endpoint u == 1 even though the default
+                    // uniform generator never produces it. log1p(-u)
+                    // would be log(0) (FE_DIVBYZERO / -inf -> uint32
+                    // conversion is UB), so clamp into the open domain
+                    // and cap the length after conversion (codex round
+                    // 54, finding 6).
+                    double uClamped = std::min(u, 1.0 - 1e-12);
                     m_burstRemaining = static_cast<uint32_t>(
-                        std::log(1.0 - u) / std::log(static_cast<double>(m_burstLength) /
-                                                      (1.0 + static_cast<double>(m_burstLength)))
+                        std::log1p(-uClamped) /
+                        std::log(static_cast<double>(m_burstLength) /
+                                 (1.0 + static_cast<double>(m_burstLength)))
                     ) + 1;
                     if (m_burstRemaining < 1) m_burstRemaining = 1;
                     if (m_burstRemaining > 1000) m_burstRemaining = 1000;

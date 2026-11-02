@@ -182,7 +182,16 @@ FecModel::ComputeSymbolErrorProbability(double ber) const
     }
     // RS symbol = 10 bits (GF(2^10)), matching Python surrogate
     // P(symbol error) = 1 - (1 - BER)^10
-    return 1.0 - std::pow(1.0 - ber, 10.0);
+    //
+    // Rounded endpoints (codex round 54): 10 * BER is the smallest value
+    // pow(1-BER, 10) can represent below 1; for BER >= 2^-53 the power
+    // rounds to exactly 1 and the raw 1 - pow form yields pSym = 0
+    // (dropping log(pSym) on the caller's FE_DIVBYZERO trap), while for
+    // BER >= 1 - 2^-53/10 it rounds so close to 0 that 1 - pow yields
+    // exactly 1 (dropping log(1-pSym) on the trap). Use expm1/log1p,
+    // which stay accurate at both ends:
+    //   1 - (1-BER)^10 = -expm1(10 * log1p(-BER))
+    return -std::expm1(10.0 * std::log1p(-ber));
 }
 
 double
@@ -212,6 +221,11 @@ FecModel::ComputePostFecBer(double preFecBer) const
 
     // P(uncorrectable) = 1 - sum_{i=0}^{T} C(N,i) * p^i * (1-p)^(N-i)
     // For numerical stability with very small p, use log-space computation
+    //
+    // Rounded endpoints (codex round 54): expm1/log1p keep pSym off the
+    // exact 0/1 boundaries for BER in (0, 1), so std::log(pSym) and
+    // std::log(1 - pSym) below stay finite — both were FE_DIVBYZERO traps
+    // at BER ~1e-18 / ~0.99 respectively.
     double pUncorrectable = 1.0;
     double cumulativeCorrectable = 0.0;
 
