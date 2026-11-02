@@ -3453,10 +3453,19 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             // the live mark and the packet's own header prefix
             // (FabricHeader + optional SoHeader + PPP) so the bound
             // tracks the real offset space.
+            // Round 59: also reserve Buffer::Allocate's 100-B
+            // ALLOC_OVER_PROVISION (plus the Buffer::Data header) — the
+            // append below re-enters Allocate when the shared-buffer
+            // path recycles an oversized Data, and a request within 100
+            // of UINT32_MAX would wrap the uint32 allocation size and
+            // under-allocate the memcpy destination (codex probe: FEC
+            // N=813,K=1 payload 5,282,862 encodes to 4,294,967,213;
+            // request 4,294,967,252 wrapped to 56).
             const uint32_t headerPrefix =
                 hdr.GetSerializedSize() + SoHeader().GetSerializedSize() + 2;
             const uint64_t headroom =
-                static_cast<uint64_t>(Buffer::GetRecommendedStart()) + headerPrefix;
+                static_cast<uint64_t>(Buffer::GetRecommendedStart()) + headerPrefix +
+                Buffer::GetAllocationOverProvision() + Buffer::GetDataHeaderSize();
             NS_ABORT_MSG_IF(encodedPayloadSize + headroom >=
                                 static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
                             "FEC parity expansion of a " << payloadSize

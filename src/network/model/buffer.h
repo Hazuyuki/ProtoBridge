@@ -786,6 +786,26 @@ class Buffer
     {
         return g_recommendedStart;
     }
+    /**
+     * @brief The allocation over-provision applied inside Allocate().
+     * @returns ALLOC_OVER_PROVISION (bytes added to every request).
+     *
+     * Round 59: the FEC padding guards reserve this plus the Data
+     * header so the AddAtEnd re-allocation cannot wrap the uint32
+     * request size.
+     */
+    static constexpr uint32_t GetAllocationOverProvision()
+    {
+        return 100;
+    }
+    /**
+     * @brief Serialized size of the private Buffer::Data header.
+     * @returns sizeof(Buffer::Data).
+     */
+    static constexpr uint32_t GetDataHeaderSize()
+    {
+        return sizeof(Buffer::Data);
+    }
 
   private:
 

@@ -2116,10 +2116,16 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
                 // mark raised by ANY Packet construction) and this
                 // fragment's own serialized header prefix so the bound
                 // tracks the real offset space instead of a fixed slack.
+                // Round 59: also reserve Buffer::Allocate's 100-B
+                // ALLOC_OVER_PROVISION (plus the Buffer::Data header)
+                // — the append below re-enters Allocate on the
+                // shared-buffer path, and a request within 100 of
+                // UINT32_MAX would wrap the uint32 allocation size.
                 const uint32_t headerPrefix =
                     header.GetSerializedSize() + SoHeader().GetSerializedSize() + 2;
                 const uint64_t headroom =
-                    static_cast<uint64_t>(Buffer::GetRecommendedStart()) + headerPrefix;
+                    static_cast<uint64_t>(Buffer::GetRecommendedStart()) + headerPrefix +
+                    Buffer::GetAllocationOverProvision() + Buffer::GetDataHeaderSize();
                 NS_ABORT_MSG_IF(encodedPayloadSize + headroom >=
                                     static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
                                 "FEC parity expansion of a " << payloadSize

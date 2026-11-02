@@ -7,8 +7,11 @@
  */
 #include "buffer.h"
 
+#include "ns3/abort.h"
 #include "ns3/assert.h"
 #include "ns3/log.h"
+
+#include <limits>
 
 #define LOG_INTERNAL_STATE(y)                                                                      \
     NS_LOG_LOGIC(y << "start=" << m_start << ", end=" << m_end                                     \
@@ -160,6 +163,18 @@ Buffer::Allocate(uint32_t reqSize)
         reqSize = 1;
     }
     NS_ASSERT(reqSize >= 1);
+    // Round 59: reqSize is a uint32_t, so reqSize + ALLOC_OVER_PROVISION
+    // wraps for any request above UINT32_MAX - 100 and the memcpy in
+    // AddAtEnd's copy-on-append path then overflows the undersized
+    // allocation (codex probe: a 5,282,862-B payload with FEC N=813,
+    // K=1 encodes to 4,294,967,213 B; the append requests
+    // 4,294,967,252 B which wrapped to 56 after +100). Fail loudly
+    // instead of under-allocating.
+    NS_ABORT_MSG_IF(reqSize > std::numeric_limits<uint32_t>::max() - ALLOC_OVER_PROVISION -
+                                        sizeof(Buffer::Data),
+                    "Buffer::Allocate request " << reqSize << " B leaves no uint32 space for the "
+                                                << ALLOC_OVER_PROVISION << "-B over-provision and "
+                                                << sizeof(Buffer::Data) << "-B header");
     reqSize += ALLOC_OVER_PROVISION;
     uint32_t size = reqSize - 1 + sizeof(Buffer::Data);
     auto b = new uint8_t[size];

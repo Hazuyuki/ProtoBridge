@@ -176,6 +176,18 @@ FecModel::GetEffectiveRateMultiplier() const
 double
 FecModel::ComputeSymbolErrorProbability(double ber) const
 {
+    // Round 59: this helper is PUBLIC, so the caller-side NaN guards in
+    // ComputePostFecBer / DecodeCodeword do not cover a direct call.
+    // isnan must precede every ordered comparison — `ber >= 1.0` raises
+    // FE_INVALID for NaN under fenv traps, and std::isnan is an
+    // unordered quiet predicate that does not signal.
+    if (std::isnan(ber))
+    {
+        // NaN BER: no meaningful symbol error rate; degrade to the
+        // saturated-certain-corruption value the callers' pSym==1.0
+        // early-outs treat as UNCORRECTABLE.
+        return 1.0;
+    }
     if (ber >= 1.0)
     {
         return 1.0;
@@ -196,10 +208,14 @@ FecModel::ComputeSymbolErrorProbability(double ber) const
     // pSym is below double resolution; the raw 1 - pow form rounds to
     // exactly 0 and the callers' log(pSym) raises FE_DIVBYZERO. expm1/
     // log1p stay accurate down to the subnormal range.
-    // Non-finite BER (NaN, -Inf): the caller-side guards in
-    // ComputePostFecBer / DecodeCodeword intercept these before the
-    // log-space sums, so a NaN here degrades to the 1.0 / UNCORRECTABLE
-    // early-out instead of an FE_INVALID trap.
+    // Non-finite BER: NaN is intercepted at this helper's entry (round
+    // 59 — the helper is public, so caller-side guards do not cover a
+    // direct call); -Inf is caught by `ber <= 0` at the callers or, for
+    // a direct call, reaches log1p(+Inf) = +Inf and degrades to the
+    // saturated 1.0 without a trap. The caller-side guards in
+    // ComputePostFecBer / DecodeCodeword intercept non-finite input
+    // before the log-space sums either way, so a NaN here degrades to
+    // the 1.0 / UNCORRECTABLE early-out instead of an FE_INVALID trap.
     return -std::expm1(10.0 * std::log1p(-ber));
 }
 

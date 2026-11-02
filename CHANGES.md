@@ -6,6 +6,61 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 59: public NaN entry point, Buffer::Allocate over-provision wrap, CHANGES.md boundary example
+
+**What.** Round-59 review of commit 4d90395 found no defects introduced
+by that commit and confirmed the round-58 fixes (isnan-first guards at
+fec-model.cc:216/314/420 intercept NaN before every ordered comparison;
+the DataRate residual arithmetic rechecks exactly — 89547301328687144 x
+103 = 2^63 + 24, double conversion -8, product rounds to 2^63 - 1024 =
+9223372036854774784; no out-of-range uint64 cast is reachable; the
+padding guards have no guard-to-append interleaving). It found two
+pre-existing defects plus one documentation error, all fixed here:
+
+1. **[P1] Public ComputeSymbolErrorProbability trapped on direct NaN
+   call.** The helper is public (fec-model.h), so the caller-side
+   isnan guards in ComputePostFecBer / DecodeCodeword do not cover a
+   direct call — its entry `ber >= 1.0` comparison raised FE_INVALID
+   under fenv traps before any interception. Added an entry isnan
+   guard returning the saturated 1.0 (which the callers' pSym==1.0
+   early-outs already treat as UNCORRECTABLE), and corrected the
+   comment that claimed caller-side guards covered non-finite input.
+2. **[P1] Buffer::Allocate wrapped the uint32 request size near
+   UINT32_MAX.** `reqSize += ALLOC_OVER_PROVISION` (buffer.cc) wraps
+   for any request above UINT32_MAX - 100, and the memcpy in
+   AddAtEnd's copy-on-append path then overflows the undersized
+   allocation. Codex's concrete repro (cold g=0, one-device SendData,
+   LLR enabled, SetFecParams(813,1,0)): a 5,282,862-B payload encodes
+   to 4,294,967,213 B; the live-offset padding guard passed
+   (4,294,967,213 + 51 = 4,294,967,264 < UINT32_MAX), but the append
+   requested 4,294,967,252 B which wrapped to 56 after +100, and
+   5,282,901 B were memcpy'd into it. Fixed at both layers: (a)
+   Buffer::Allocate now aborts loudly when reqSize exceeds UINT32_MAX
+   - 100 - sizeof(Buffer::Data), with new constexpr accessors
+   Buffer::GetAllocationOverProvision() / GetDataHeaderSize() in
+   buffer.h; (b) both padding guards (fabric-endpoint.cc, nvswitch.cc)
+   now reserve the over-provision + Data header in their headroom so
+   the abort is a pre-flight configuration error, not a mid-append.
+3. **[Docs] Round-58 CHANGES.md item-3 boundary example was
+   arithmetically wrong.** The stated E = 4,294,967,215 at
+   g = 16,777,255 with prefix 51 sums to 4,311,744,521 — BOTH the old
+   and new checks reject it (max passing E at those offsets is
+   4,278,189,988), so the claimed new-check=0 contrast was
+   unsupported. The example is corrected in place; the verified
+   absolute-offset proof stands, and item 2 above covers the real
+   residual.
+
+**Verified.** Clean build; PASS data-rate; PASS error-model; PASS
+gpu-cluster; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800; 48
+parity PASS lines (15 scripts); parity pytest 18 passed (test_ibgda +
+test_config_fec_enabled, run from test/parity); surrogate pytest 101
+passed from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 us / 99985-99985-99974; 20300.2 us / 0-0-0).
+
 ### Fixed — codex round 58: isnan-first actually first, DataRate residual comment corrected
 
 **What.** The round-58 review (two attempts; both cut off by a content
@@ -33,14 +88,18 @@ verified probe results that were triaged directly):
    is admitted" residual itself is unchanged (pre-HEAD, bounded —
    the returned rate is still < 2^63 so the constructor accepts it).
 3. **[Verified sound] The live-offset padding guard has no off-by-one.**
-   Codex probed the exact boundary with warm g = 16,777,255: at
-   encoded = 4,294,967,215 the OLD round-56 margin would have
-   wrongly aborted (old-check = 1) while the new guard correctly
-   passes (new-check = 0); the SendData harness then segfaulted only
-   because the harness's own 51-B prefix assumption under-counted
-   the real serialized header for that configuration — the guard
-   itself is sound (any encoded size passing the guard has absolute
-   end g + encoded < UINT32_MAX - prefix, proven arithmetically).
+   Round-59 correction: the boundary example previously stated here
+   (encoded = 4,294,967,215 at g = 16,777,255, prefix 51) was
+   arithmetically wrong — the values sum to 4,311,744,521, which
+   BOTH the old and the new checks reject; the maximum encoded
+   size passing at those offsets is 4,278,189,988. The
+   new-check=0 / old-check=1 contrast attributed to that example
+   is unsupported. What remains verified: the guard itself is
+   sound for absolute offsets (any encoded size passing has
+   g + encoded < UINT32_MAX - prefix, proven arithmetically), and
+   round 59 found the guard's REAL residual — the 100-B
+   allocation over-provision in Buffer::Allocate — which is now
+   also reserved (see the round-59 entry above).
 4. **[Verified correct] rdma-operation-engine.cc event pruning.**
    Codex confirmed the `% 1024` gating cannot skip collection
    indefinitely: the condition runs on every Schedule() call and
