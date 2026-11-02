@@ -144,8 +144,9 @@ DataRate::operator+(DataRate rhs) const
     // operator constructs the sum without passing through the uint64_t
     // constructor's >= 2^63 abort. Check before adding; use 2^63 - 1 as
     // the operand bound so a sum landing exactly at 2^63 - 1 is still
-    // representable.
-    NS_ABORT_MSG_IF(rhs.m_bps >= ((1ull << 63) - 1) - m_bps,
+    // representable (codex round 52: the bound is exclusive — rejecting
+    // >= 2^63 - 1 spuriously aborts the representable maximum sum).
+    NS_ABORT_MSG_IF(rhs.m_bps > ((1ull << 63) - 1) - m_bps,
                     "DataRate sum of " << m_bps << " + " << rhs.m_bps
                     << " bps exceeds the supported range (>= 2^63 bps)");
     return DataRate(m_bps + rhs.m_bps);
@@ -158,8 +159,8 @@ DataRate::operator+=(DataRate rhs)
     // finding 5): compound assignment mutates m_bps in place and would
     // otherwise bypass the constructor aborts. Use 2^63 - 1 as the
     // operand bound so a sum landing exactly at 2^63 - 1 is still
-    // representable.
-    NS_ABORT_MSG_IF(rhs.m_bps >= ((1ull << 63) - 1) - m_bps,
+    // representable (codex round 52: exclusive bound, same as above).
+    NS_ABORT_MSG_IF(rhs.m_bps > ((1ull << 63) - 1) - m_bps,
                     "DataRate sum of " << m_bps << " + " << rhs.m_bps
                     << " bps exceeds the supported range (>= 2^63 bps)");
     m_bps += rhs.m_bps;

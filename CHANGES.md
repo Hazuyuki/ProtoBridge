@@ -6,6 +6,67 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 52: boundary correction on the round-51 guards — exclusive DataRate bound, complete-packet FEC check, and endpoint/test portability
+
+**What.** Round 52 re-examined the round-51 range guards at their exact
+boundary conditions and found five off-by-one/portability defects:
+
+1. **[P2] DataRate addition guards rejected the representable maximum.**
+   The round-51 `operator+`/`operator+=` pre-addition check used an
+   INCLUSIVE bound (`rhs >= (2^63 - 1) - lhs`), so a sum landing
+   exactly at `2^63 - 1` — still representable, the constructor
+   accepts up to `2^63 - 1` — spuriously aborted (MAX+0, 0+MAX,
+   (MAX−1)+1 all rejected). Both operators now use the exclusive
+   bound `rhs > (2^63 - 1) - lhs`. The data-rate test suite gains
+   boundary assertions that MAX+0 and 1+=MAX−1 succeed.
+2. **[P2] FEC padding check bounded the pad, not the encoded packet.**
+   Both FEC egress sites (fabric-endpoint.cc, nvswitch.cc) checked
+   `padding > UINT32_MAX` — but the 32-bit packet accounting wraps on
+   `payload + padding`, not on the pad alone. `SetFecParams(512,1,0)`
+   on an 8 MiB payload encodes to exactly 2^32 B: the pad
+   (2^32 − 8 MiB) passes the old check and `AddAtEnd` wraps the
+   packet size to ~423 B. Both sites now bound the complete
+   `encodedPayloadSize` against `UINT32_MAX − 41` (the header-headroom
+   convention the rest of the pipeline reserves), failing loudly with
+   the encoded size in the message.
+3. **[P2] Unconditional POSIX headers broke native Windows test
+   builds.** The round-51 fatal-path tests included `<sys/wait.h>` /
+   `<unistd.h>` and called `fork()`/`waitpid()` unconditionally,
+   breaking MSYS2/MinGW64 compilation. Both test files now guard the
+   includes and the fork-based cases behind
+   `!defined(_WIN32) && !defined(__CYGWIN__)`
+   (`NS3_TEST_HAVE_FORK_ABORT`); the abort-guard cases are skipped on
+   native Windows.
+4. **[P3] `waitpid` ignored EINTR.** Both expectAbort lambdas discarded
+   the `waitpid` return; an interrupted wait left `status == 0`
+   (false "did not abort" failure) and the child unreaped (zombie).
+   Both now retry on `errno == EINTR` in a loop and require the reaped
+   pid before trusting the status.
+5. **[P3] `rate == 1.0` raised floating-point exceptions.** The
+   `expm1/log1p` form evaluates `log1p(-1.0) = -inf` (FE_DIVBYZERO
+   under `feenableexcept`, SIGFPE) and `0 * -inf = NaN` (FE_INVALID)
+   for an empty packet. `DoCorruptByte` and `DoCorruptBit` now
+   short-circuit `rate >= 1.0` to a plain `ranvar < 1.0` comparison —
+   mathematically identical (every unit corrupted) and exception-free.
+   The error-model test suite gains rate-1.0 endpoint coverage for
+   both units, including the empty-packet case.
+
+**Docs.** The round-51 entry's LL/LL128 formula description
+(`(data + line - 1 + header) / line * line`) is corrected: the actual
+code (nccl-protocol-model.cc) divides first and bumps
+(`lines = data / dataPerLine + (data % dataPerLine != 0)`), then
+multiplies by `lineSize` behind an overflow check.
+
+**Verified.** Clean build (0 errors, 0 warnings); gpu-cluster suite
+183/183 PASS; data-rate + error-model suites PASS (including the new
+boundary and rate-1.0 cases); 12 touched-core suites PASS
+(pie, drop-tail, codel/cobalt/fifo/prio, fq-codel/fq-pie/fq-cobalt,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke PASS (Unforced drop 37/55500, sent
+6887/10302800); 15/15 parity scripts PASS (48 PASS lines, 0 FAIL);
+surrogate pytest 101 passed; DCQCN anchors byte-stable (congested:
+20802.4 µs / 99985 ECN / 99974 CNP rx; aligned: 20300.2 µs / 37161 ECN).
+
 ### Fixed — codex round 51: overflow and numerical-stability follow-up — g_recommendedStart headroom, FEC width, raw-path widening, saturation guards, and range-checked rates
 
 **What.** Round 51 re-probed the round-50 fixes at the next boundary and

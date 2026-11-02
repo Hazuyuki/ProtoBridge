@@ -270,7 +270,14 @@ RateErrorModel::DoCorruptByte(Ptr<Packet> p)
     // rounds to exactly 1.0 for a tiny rate (1e-17), so the old
     // pow(1 - rate, size) collapsed to 1 and per to 0 — every packet
     // clean, whatever its size. -expm1(n * log1p(-rate)) keeps the
-    // leading term; mirrors the bit-unit fix from round 50.
+    // leading term; mirrors the bit-unit fix from round 50. Endpoint
+    // (round 52): log1p(-1.0) is -inf (raises FE_DIVBYZERO under
+    // feenableexcept) and 0 * -inf is NaN for an empty packet, so
+    // short-circuit rate == 1.0 where every byte is corrupted anyway.
+    if (m_rate >= 1.0)
+    {
+        return (m_ranvar->GetValue() < 1.0);
+    }
     const double per = -std::expm1(static_cast<double>(p->GetSize())
                                    * std::log1p(-m_rate));
     return (m_ranvar->GetValue() < per);
@@ -287,7 +294,13 @@ RateErrorModel::DoCorruptBit(Ptr<Packet> p)
     // modeled a ~4.6e-7 corruption probability instead of ~0.9998.
     // expm1/log1p (codex round 50, finding 5): 1.0 - m_rate rounds to
     // exactly 1.0 for a tiny BER (m_rate = 1e-17), making every packet
-    // clean. -expm1(n * log1p(-rate)) keeps the leading term.
+    // clean. -expm1(n * log1p(-rate)) keeps the leading term. Endpoint
+    // (round 52): same FE_DIVBYZERO/FE_INVALID hazard as the byte unit
+    // — short-circuit rate == 1.0 where every bit is corrupted anyway.
+    if (m_rate >= 1.0)
+    {
+        return (m_ranvar->GetValue() < 1.0);
+    }
     const double exponent = static_cast<double>(8.0 * p->GetSize());
     const double per = -std::expm1(exponent * std::log1p(-m_rate));
     return (m_ranvar->GetValue() < per);

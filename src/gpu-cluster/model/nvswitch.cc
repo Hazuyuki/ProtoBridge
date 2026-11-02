@@ -8,6 +8,7 @@
 #include "nvswitch.h"
 
 #include <algorithm>
+#include <limits>
 
 #include "ns3/log.h"
 #include "ns3/simulator.h"
@@ -2079,16 +2080,21 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
             uint32_t payloadSize = pkt->GetSize() - header.GetSerializedSize();
             // uint64 encoded size (codex round 51, finding 2): mirrors the
             // endpoint egress guard — an over-UINT32_MAX parity pad is a
-            // configuration error, not a truncatable expansion.
+            // configuration error, not a truncatable expansion. Bound the
+            // complete encoded packet, not the pad alone (round 52: the
+            // padding itself can fit uint32 while payload + padding wraps
+            // the 32-bit packet accounting; keep the 41-B header headroom
+            // the rest of the pipeline reserves).
             uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
             if (encodedPayloadSize > payloadSize)
             {
-                const uint64_t padding = encodedPayloadSize - payloadSize;
-                NS_ABORT_MSG_IF(padding > std::numeric_limits<uint32_t>::max(),
+                constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 41u;
+                NS_ABORT_MSG_IF(encodedPayloadSize > kMaxPayload,
                                 "FEC parity expansion of a " << payloadSize
-                                << "-B result fragment needs a " << padding
-                                << "-B pad, beyond any representable packet: "
+                                << "-B result fragment encodes to " << encodedPayloadSize
+                                << " B, beyond any representable packet: "
                                    "reduce the fragment size or disable FEC");
+                const uint64_t padding = encodedPayloadSize - payloadSize;
                 pkt->AddAtEnd(Create<Packet>(static_cast<uint32_t>(padding)));
                 wireSize = header.GetSerializedSize() + encodedPayloadSize;
             }

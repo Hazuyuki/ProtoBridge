@@ -29,8 +29,19 @@
 #include "ns3/string.h"
 #include "ns3/test.h"
 
+#if !defined(_WIN32) && !defined(__CYGWIN__)
 #include <sys/wait.h>
 #include <unistd.h>
+#define NS3_TEST_HAVE_FORK_ABORT 1
+#else
+// fork/waitpid are POSIX-only; the abort-guard cases below are skipped on
+// native Windows builds (codex round 52: unconditional <sys/wait.h> and
+// <unistd.h> broke MSYS2/MinGW64 test compilation).
+#define NS3_TEST_HAVE_FORK_ABORT 0
+#endif
+
+#include <cerrno>
+#include <string>
 
 using namespace ns3;
 
@@ -310,6 +321,8 @@ RateErrorModelRangeTest::DoRun()
     // every packet silently clean. NS_ABORT exits the process, so each
     // guard forks and checks the child's exit status — the same pattern
     // the ns-3 suite uses for fatal-path tests.
+    // POSIX-only (round 52): no fork() on native Windows builds.
+#if NS3_TEST_HAVE_FORK_ABORT
     auto expectAbort = [this](const std::string& what, void (*fn)()) {
         pid_t pid = fork();
         NS_TEST_ASSERT_MSG_EQ(pid >= 0, true, "fork must succeed for " + what);
@@ -319,9 +332,15 @@ RateErrorModelRangeTest::DoRun()
             _exit(0);
         }
         int status = 0;
-        waitpid(pid, &status, 0);
-        const bool aborted = (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT)
-            || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+        pid_t wpid = 0;
+        // EINTR retry (round 52): an interrupted wait leaves status
+        // zero (false "did not abort") and the child unreaped.
+        while ((wpid = waitpid(pid, &status, 0)) == -1 && errno == EINTR)
+        {
+        }
+        const bool aborted = (wpid == pid)
+            && ((WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT)
+                || (WIFEXITED(status) && WEXITSTATUS(status) != 0));
         NS_TEST_ASSERT_MSG_EQ(aborted, true, what + " must abort");
     };
 
@@ -337,6 +356,7 @@ RateErrorModelRangeTest::DoRun()
         Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
         em->SetAttribute("ErrorRate", DoubleValue(2.0));
     });
+#endif
 
     // Tiny-BER byte stability (codex round 51, finding 6): a rate so small
     // that 1.0 - rate rounds back to 1.0 must still corrupt a large enough
@@ -385,7 +405,9 @@ RateErrorModelRangeTest::DoRun()
                               "tiny BER: 110 MB packet corrupt at a 0.0 draw (per > 0)");
     }
 
-    // Endpoint sanity: rate exactly 1.0 corrupts every byte unit.
+    // Endpoint sanity: rate exactly 1.0 corrupts every byte unit (and
+    // must not evaluate log1p(-1.0), which raises FE_DIVBYZERO under
+    // feenableexcept — codex round 52).
     {
         Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
         em->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_BYTE"));
@@ -396,6 +418,26 @@ RateErrorModelRangeTest::DoRun()
         em->SetRandomVariable(uv);
         Ptr<Packet> p = Create<Packet>(1);
         NS_TEST_EXPECT_MSG_EQ(em->IsCorrupt(p), true, "rate 1.0 corrupts every unit");
+
+        // Empty packet: the early-out must also avoid the 0 * -inf NaN
+        // (FE_INVALID) the log1p(-1.0) form produced at zero size.
+        Ptr<Packet> empty = Create<Packet>(0);
+        NS_TEST_EXPECT_MSG_EQ(em->IsCorrupt(empty), true, "rate 1.0 corrupts an empty packet");
+    }
+
+    // Bit unit: same endpoint coverage (round 52).
+    {
+        Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
+        em->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_BIT"));
+        em->SetRate(1.0);
+        Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
+        uv->SetAttribute("Min", DoubleValue(0.999999));
+        uv->SetAttribute("Max", DoubleValue(0.999999));
+        em->SetRandomVariable(uv);
+        Ptr<Packet> p = Create<Packet>(1);
+        NS_TEST_EXPECT_MSG_EQ(em->IsCorrupt(p), true, "rate 1.0 bit unit corrupts every packet");
+        Ptr<Packet> empty = Create<Packet>(0);
+        NS_TEST_EXPECT_MSG_EQ(em->IsCorrupt(empty), true, "rate 1.0 bit unit: empty packet");
     }
 }
 

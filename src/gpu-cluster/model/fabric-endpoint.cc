@@ -3399,16 +3399,21 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // payload, silently skipping the parity padding and understating
         // serialization. With the widened return, an over-large pad is a
         // configuration error (no uint32-sized packet can carry it) —
-        // fail loudly instead of truncating.
+        // fail loudly instead of truncating. Bound the complete encoded
+        // packet, not the pad alone (round 52: padding alone can fit
+        // uint32 while payload + padding wraps the 32-bit packet
+        // accounting; keep the 41-B header headroom the rest of the
+        // pipeline reserves).
         uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
         if (encodedPayloadSize > payloadSize)
         {
-            const uint64_t padding = encodedPayloadSize - payloadSize;
-            NS_ABORT_MSG_IF(padding > std::numeric_limits<uint32_t>::max(),
+            constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 41u;
+            NS_ABORT_MSG_IF(encodedPayloadSize > kMaxPayload,
                             "FEC parity expansion of a " << payloadSize
-                            << "-B payload needs a " << padding
-                            << "-B pad, beyond any representable packet: "
+                            << "-B payload encodes to " << encodedPayloadSize
+                            << " B, beyond any representable packet: "
                                "reduce the chunk size or disable FEC");
+            const uint64_t padding = encodedPayloadSize - payloadSize;
             packet->AddAtEnd(Create<Packet>(static_cast<uint32_t>(padding)));
         }
     }
