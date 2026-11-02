@@ -178,8 +178,17 @@ RttccRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     // The rate slot this chunk occupies (ns); the next chunk may egress one
     // slot after this chunk's egress start (same pacer as the per-QP ceiling).
     double slotSec = static_cast<double>(chunkBytes) / s.rateBps;
-    int64_t slotNs = std::max<int64_t>(1, static_cast<int64_t>(slotSec * 1e9));
-    s.nextSendNs = (nowNs + delayNs) + slotNs;
+    // Round 64 (codex finding 9): same saturated slot conversion and
+    // deadline addition as the DCQCN pacer (a minimum rate of 2^-40 Gbps
+    // with a 1-MiB chunk rounds the slot to exactly 2^63 ns).
+    const double slotNsD = slotSec * 1e9;
+    int64_t slotNs = (slotNsD >= 9223372036854775807.0)
+                         ? std::numeric_limits<int64_t>::max()
+                         : static_cast<int64_t>(slotNsD);
+    slotNs = std::max<int64_t>(1, slotNs);
+    s.nextSendNs = (slotNs > std::numeric_limits<int64_t>::max() - (nowNs + delayNs))
+                       ? std::numeric_limits<int64_t>::max()
+                       : (nowNs + delayNs) + slotNs;
     return (delayNs > 0) ? NanoSeconds(delayNs) : Time(0);
 }
 

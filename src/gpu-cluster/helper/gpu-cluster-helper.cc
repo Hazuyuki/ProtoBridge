@@ -830,8 +830,14 @@ GpuClusterTopologyHelper::BuildFatTree(uint32_t radix)
 {
     NS_LOG_FUNCTION(this << radix);
 
+    // Round 64 (codex finding 6): a zero radix reached the leaf-count
+    // division unguarded (topology=fattree, fattreeRadix=0).
+    NS_ABORT_MSG_IF(radix == 0, "Fat-tree radix must be positive");
+
     // Calculate number of switches needed
-    uint32_t numLeafSwitches = (m_numGpus + radix - 1) / radix;
+    // Divide-first ceiling (round 64, codex finding 7 pattern).
+    uint32_t numLeafSwitches =
+        m_numGpus / radix + (m_numGpus % radix != 0);
     uint32_t numSpineSwitches = radix;
 
     // Create GPU nodes
@@ -1045,8 +1051,13 @@ GpuClusterTopologyHelper::BuildRailOptimizedFatTree(uint32_t numRails,
                     "Rail-optimized fat tree exposes one fabric interface per GPU");
 
     const uint32_t numEnclosures = m_numGpus / numRails;
+    // Round 64 (codex finding 7): divide-first ceiling — the
+    // (a + b - 1) form wrapped to zero for numEnclosures=4,
+    // nodesPerLeaf=UINT32_MAX, leaving a zero-leaf topology that later
+    // indexed the empty leaf-switch vector. Same fix at the three
+    // sibling copies below (collective embedding, scratch setup).
     const uint32_t leavesPerRail =
-        (numEnclosures + nodesPerLeaf - 1) / nodesPerLeaf;
+        numEnclosures / nodesPerLeaf + (numEnclosures % nodesPerLeaf != 0);
     const uint32_t numLeafSwitches = numRails * leavesPerRail;
     const bool hasCoreTier = numCoreSwitches > 0;
     constexpr uint32_t switchesPerGroup = 32;
@@ -3520,7 +3531,14 @@ GpuClusterTopologyHelper::BuildDragonflyPlus(uint32_t numGroups, uint32_t router
     NS_ABORT_MSG_IF(m_numGpus < 1, "Dragonfly+ requires at least 1 GPU");
     NS_ABORT_MSG_IF(numGroups < 1, "Dragonfly+ requires >= 1 group");
     NS_ABORT_MSG_IF(routersPerGroup < 1, "Dragonfly+ requires >= 1 router per group");
-    uint32_t totalLeafSwitches = numGroups * routersPerGroup;
+    // Round 64 (codex finding 8): compute the group*router product in
+    // uint64 — 65536 x 65536 wraps the uint32 product to zero and the
+    // GPU-count checks below pass a zero divisor into the modulo.
+    const uint64_t totalLeafSwitches64 =
+        static_cast<uint64_t>(numGroups) * routersPerGroup;
+    NS_ABORT_MSG_IF(totalLeafSwitches64 > std::numeric_limits<uint32_t>::max(),
+                    "Dragonfly+ group*router product exceeds the uint32 leaf budget");
+    uint32_t totalLeafSwitches = static_cast<uint32_t>(totalLeafSwitches64);
     NS_ABORT_MSG_IF(m_numGpus < totalLeafSwitches, "GPUs must be >= groups*routers");
     NS_ABORT_MSG_IF(m_numGpus % totalLeafSwitches != 0, "GPUs must divide evenly by groups*routers");
     NS_ABORT_MSG_IF(m_linksPerGpu < 1, "Dragonfly+ requires at least one link per GPU");
@@ -3972,8 +3990,10 @@ GpuClusterTopologyHelper::InstallCollectiveEmbedding(const std::string& family,
         NS_ABORT_MSG_IF(rails == 0 || nodesPerLeaf == 0 || N % rails != 0,
                         "Invalid rail-optimized collective embedding");
         const uint32_t enclosures = N / rails;
+        // Round 64 (codex finding 7): divide-first ceiling (see
+        // BuildRailOptimizedFatTree).
         const uint32_t leavesPerRail =
-            (enclosures + nodesPerLeaf - 1) / nodesPerLeaf;
+            enclosures / nodesPerLeaf + (enclosures % nodesPerLeaf != 0);
         sortedOrder.clear();
         for (uint32_t rail = 0; rail < rails; ++rail)
         {

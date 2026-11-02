@@ -741,6 +741,13 @@ RdmaSubmissionModel::SubmitOperation(RdmaOpcode opcode,
     bool split = m_config.dataPath == "staged" &&
                  (RdmaHasSourcePayload(opcode) || opcode == RdmaOpcode::READ);
     uint64_t dataChunks = split ? 1 + (bytes - 1) / m_config.stagingChunkBytes : 1;
+    // Round 64 (codex finding 10): guard the count addition BEFORE it
+    // wraps — PUT_SIGNAL with bytes=UINT64_MAX and 1-byte staging chunks
+    // produced dataChunks=UINT64_MAX and the +1 wrapped count to zero,
+    // emitting no work items so the completion callback never fired.
+    NS_ABORT_MSG_IF(dataChunks >
+                        UINT64_MAX - (opcode == RdmaOpcode::PUT_SIGNAL ? 1 : 0),
+                    "RDMA staged work-item count overflows uint64");
     uint64_t count = dataChunks + (opcode == RdmaOpcode::PUT_SIGNAL ? 1 : 0);
     NS_ABORT_MSG_IF(count > UINT64_MAX - m_nextId, "RDMA work ID exhausted");
     uint64_t requestId = m_nextId;

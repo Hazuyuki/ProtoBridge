@@ -362,12 +362,28 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
     // field to 0). The fragment stream pads any wireSize up to the
     // 2^62 servicable ledger with at most wireSize chunks, so the
     // minimum chunk wire size is 1 B and the per-chunk effective share
-    // is bounded by effectiveSize / wireSize. Abort when that ratio
-    // exceeds 2^32 - 1 so every per-chunk share survives the header
-    // field; equality is allowed (share == 2^32 - 1 fits).
+    // is bounded by ceil(effectiveSize / wireSize) — the anchored
+    // proportional split gives a chunk covering k wire bytes at most
+    // floor(E*end/W) - floor(E*begin/W) <= ceil(E/W) when end-begin <=
+    // chunkSize and W <= 2^62 (verified exhaustively against the actual
+    // split for all W <= 512, chunkSize <= 512, E <= (W+1)*2^32).
+    // Abort when that ceiling ratio exceeds 2^32 - 1 so every per-chunk
+    // share survives the header field; equality is allowed (share ==
+    // 2^32 - 1 fits).
+    //
+    // Round 64 (codex finding 1): the first divide-first form tested the
+    // FLOOR ratio, but a chunk's share is the CEILING ratio — with
+    // W=2, E=2*(2^32-1)+1 the floor is 2^32-1 (guard passes) while the
+    // anchored split yields shares [2^32-1, 2^32], wrapping the second
+    // header field to 0. Use the exact ceiling test: abort when
+    // E/W > M, or E/W == M with a nonzero remainder (any remainder can
+    // push one chunk's share to M+1 == 2^32).
     constexpr uint64_t maxServicableEffectiveShare = std::numeric_limits<uint32_t>::max();
     NS_ABORT_MSG_IF(effectiveSize / std::max<uint64_t>(wireSize, 1) >
-                        maxServicableEffectiveShare,
+                            maxServicableEffectiveShare ||
+                        (effectiveSize % std::max<uint64_t>(wireSize, 1) != 0 &&
+                         effectiveSize / std::max<uint64_t>(wireSize, 1) ==
+                             maxServicableEffectiveShare),
                     "Collective transfer effective size " << effectiveSize
                     << " B over a " << wireSize
                     << " B wire ledger exceeds " << maxServicableEffectiveShare
@@ -1351,6 +1367,24 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                     {
                         targetWire = bodyHardCap;
                     }
+                    // Round 64 (codex finding 11): the padding append goes
+                    // through the uint32 Packet API, so the COMPLETE padded
+                    // body — existing bytes plus pad — must fit uint32,
+                    // not just the pad. At efficiency 2^-33 a single data
+                    // byte needs a pad of exactly 2^32 B: the pad alone
+                    // wrapped the cast to zero, silently transmitting an
+                    // 11-byte body where the model specifies
+                    // 4,294,967,307 wire bytes (and a body at or past 2^32
+                    // is unrepresentable even with a zero pad). Abort on
+                    // the complete-body bound; fragmenting cannot repair a
+                    // per-chunk expansion this extreme.
+                    NS_ABORT_MSG_IF(targetWire > std::numeric_limits<uint32_t>::max(),
+                                    "RoCE per-chunk padded body " << targetWire
+                                        << " B (pad " << (targetWire - pkt->GetSize())
+                                        << " B over an existing " << pkt->GetSize()
+                                        << "-B body) is not representable in the"
+                                           " uint32 packet API: raise the"
+                                           " efficiency or fragment the transfer");
                     if (pkt->GetSize() < targetWire)
                     {
                         pkt->AddAtEnd(

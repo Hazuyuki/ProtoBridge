@@ -897,8 +897,10 @@ main(int argc, char* argv[])
         NS_ABORT_MSG_IF(railCount == 0 || railNodesPerLeaf == 0 || numGpus % railCount != 0,
                         "railfattree requires a nonzero rail count, a nonzero leaf size, and divisible GPU count");
         const uint32_t enclosures = numGpus / railCount;
+        // Round 64 (codex finding 7): divide-first ceiling (same wrap as
+        // the helper's BuildRailOptimizedFatTree).
         const uint32_t leavesPerRail =
-            (enclosures + railNodesPerLeaf - 1) / railNodesPerLeaf;
+            enclosures / railNodesPerLeaf + (enclosures % railNodesPerLeaf != 0);
         const uint32_t totalLeaves = railCount * leavesPerRail;
         if (railSpineSwitches == 0)
         {
@@ -1658,8 +1660,10 @@ main(int argc, char* argv[])
             else if (topology == "railfattree")
             {
                 const uint32_t enclosures = numGpus / railCount;
+                // Round 64 (codex finding 7): divide-first ceiling (same
+                // wrap as the helper's BuildRailOptimizedFatTree).
                 const uint32_t leavesPerRail =
-                    (enclosures + railNodesPerLeaf - 1) / railNodesPerLeaf;
+                    enclosures / railNodesPerLeaf + (enclosures % railNodesPerLeaf != 0);
                 numSwitches = railCount * leavesPerRail +
                               railSpineSwitches + railCoreSwitches;
             }

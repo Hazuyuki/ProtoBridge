@@ -10,6 +10,7 @@
 #include "ns3/double.h"
 #include "ns3/uinteger.h"
 #include "ns3/random-variable-stream.h"
+#include "ns3/fatal-error.h"
 
 #include <algorithm>
 #include <cmath>
@@ -29,12 +30,18 @@ LatencyStatistics::GetTypeId()
         .SetGroupName("GpuCluster")
         .AddConstructor<LatencyStatistics>()
         // Round 63 (codex finding 16): bind through the setter, not the raw
-        // member. The setter asserts [0, 1); the old direct member binding
+        // member. The setter requires [0, 1); the old direct member binding
         // accepted 1.0 via the attribute (checker admits the inclusive
         // bound), and RecordFlowCompletion then treats every sample as
         // warmup and discards the entire run.
+        // Round 64 (codex finding 4): the stock double checker only
+        // offers inclusive bounds, so 1.0 still passes this checker —
+        // the unconditional NS_ABORT_MSG_IF in SetWarmupFraction below
+        // is the guard (the old NS_ASSERT disappeared in
+        // assert-disabled builds, which then accepted 1.0 and discarded
+        // every sample as warmup).
         .AddAttribute("WarmupFraction",
-                      "Fraction of simulation time to exclude as warmup (0.0 to 1.0)",
+                      "Fraction of simulation time to exclude as warmup [0.0, 1.0)",
                       DoubleValue(0.2),
                       MakeDoubleAccessor(&LatencyStatistics::SetWarmupFraction,
                                          &LatencyStatistics::GetWarmupFraction),
@@ -45,10 +52,15 @@ LatencyStatistics::GetTypeId()
                       MakeTimeAccessor(&LatencyStatistics::SetSimulationDuration,
                                        &LatencyStatistics::GetSimulationDuration),
                       MakeTimeChecker())
+        // Round 64 (codex finding 5): bind through the setter — the old
+        // direct member binding let SetBootstrapResamples(0) bypass the
+        // attribute's >=100 checker, after which BootstrapCi built an
+        // empty percentile vector and indexed element zero.
         .AddAttribute("BootstrapResamples",
                       "Number of bootstrap resamples for confidence intervals",
                       UintegerValue(1000),
-                      MakeUintegerAccessor(&LatencyStatistics::m_bootstrapResamples),
+                      MakeUintegerAccessor(&LatencyStatistics::SetBootstrapResamples,
+                                           &LatencyStatistics::GetBootstrapResamples),
                       MakeUintegerChecker<uint32_t>(100))
         .AddTraceSource("FlowComplete",
                         "A flow completion was recorded",
@@ -166,7 +178,11 @@ void
 LatencyStatistics::SetWarmupFraction(double fraction)
 {
     NS_LOG_FUNCTION(this << fraction);
-    NS_ASSERT_MSG(fraction >= 0.0 && fraction < 1.0, "Warmup fraction must be in [0, 1)");
+    // Round 64 (codex finding 4): unconditional validation — the old
+    // NS_ASSERT_MSG disappears in assert-disabled builds, which then
+    // accepted 1.0 and discarded every sample as warmup.
+    NS_ABORT_MSG_IF(!(fraction >= 0.0 && fraction < 1.0),
+                    "Warmup fraction must be in [0, 1)");
     m_warmupFraction = fraction;
 }
 
@@ -179,6 +195,12 @@ LatencyStatistics::GetWarmupFraction() const
 void
 LatencyStatistics::SetBootstrapResamples(uint32_t resamples)
 {
+    // Round 64 (codex finding 5): match the attribute checker's floor —
+    // BootstrapCi indexes element zero of the bootstrap percentile
+    // vector, which is empty below the >=10-sample fast path when the
+    // resample count is zero.
+    NS_ABORT_MSG_IF(resamples < 100,
+                    "Bootstrap resample count must be at least 100");
     m_bootstrapResamples = resamples;
 }
 

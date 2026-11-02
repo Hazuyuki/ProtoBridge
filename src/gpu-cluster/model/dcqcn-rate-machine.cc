@@ -276,14 +276,25 @@ DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
     // The rate slot this chunk occupies (ns).
     double slotSec = static_cast<double>(chunkBytes) / rateBps;
-    int64_t slotNs = static_cast<int64_t>(slotSec * 1e9);
+    // Round 64 (codex finding 9): the double-to-int64 cast of an
+    // out-of-range slot (a 2^-40 Gbps rate with a 1-MiB chunk rounds to
+    // exactly 2^63 ns) is UB — floating-point diagnostics halt the
+    // process under -fsanitize=float-cast-overflow. Saturate at
+    // INT64_MAX instead; the deadline addition below is also saturated
+    // so a saturated slot cannot wrap the next-send ledger either.
+    const double slotNsD = slotSec * 1e9;
+    int64_t slotNs = (slotNsD >= 9223372036854775807.0)
+                         ? std::numeric_limits<int64_t>::max()
+                         : static_cast<int64_t>(slotNsD);
     if (slotNs < 1)
     {
         slotNs = 1; // avoid a zero-slot spin
     }
     // The next chunk on this flow may egress one slot after this chunk's
     // egress start (nowNs + delayNs).
-    s.nextSendNs = (nowNs + delayNs) + slotNs;
+    s.nextSendNs = (slotNs > std::numeric_limits<int64_t>::max() - (nowNs + delayNs))
+                       ? std::numeric_limits<int64_t>::max()
+                       : (nowNs + delayNs) + slotNs;
     return (delayNs > 0) ? NanoSeconds(delayNs) : Time(0);
 }
 

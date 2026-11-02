@@ -6,6 +6,134 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 64: 12 findings, 12 fixed
+
+**What.** Round-64 review of commit 958be19 returned 12 findings (6 P1, 5 P2,
+1 P3). All 12 were verified against the code with exact python arithmetic
+(integers and Fractions, mirroring the reviewer's own probe script
+`/tmp/protobridge-958be19-audit/compact.py`) before any change; all 12 are
+fixed here. The round-63 entry's deferred RoCE padding item (finding 11
+there) is closed by finding 11 below, and its documentation claim corrected
+by finding 12.
+
+**Fixed (P1).**
+
+1. **Effective-share guard tested the floor ratio, not the ceiling
+   (finding 1).** `fabric-endpoint-send.cc` guarded
+   `effectiveSize / max(wireSize,1) > UINT32_MAX`, but a chunk's
+   effective share is the CEILING ratio: with W=2 and
+   E=2·(2^32−1)+1 = 8,589,934,591 the floor is 2^32−1 (guard passes)
+   while the anchored proportional split yields per-chunk shares
+   [4,294,967,295, 4,294,967,296], wrapping the second chunk's uint32
+   header field to 0 (probe: `F1 2 8589934591 False 1 [4294967295,
+   4294967296] [4294967295, 0]`). The guard is now the exact ceiling
+   test `q > M || (r != 0 && q == M)` (divide-first, no wrap possible);
+   verified against the actual anchored split for all W ≤ 512 and,
+   exhaustively, every E in [W, (W+1)·2^32) for W ≤ 16 — zero misses,
+   and the boundary behaves identically in both directions
+   (E = W·M admits shares ≤ M; E = W·M+1 aborts with max share M+1).
+2. **BwRamp ceil rewrite changed the delay law at exact multiples
+   (finding 2).** The round-63 `ceil(chunkSize/threshold)` denominator
+   doubled the ramp delay wherever chunkSize is a positive exact
+   multiple of the threshold: C=T=4096, delay=1200 ns went from 600 ns
+   (old `1+floor`) to 1200 ns (probe: `F2 4096 4096 1 1 600 1200`).
+   All three hierarchical sites (allreduce/allgather/reducescatter)
+   now use the quotient-plus-one law
+   `delay / (q == UINT64_MAX ? 0 : q + 1)`, which reproduces the
+   historical `1+floor` law everywhere except the top of uint64 —
+   where the wrapped denominator it originally guarded against occurs
+   and zero delay is the documented saturation.
+3. **Generic `SetWeight` stored unclamped (finding 3).** Only the three
+   named setters clamped to [0,1]; `SetWeight(TrafficClass, 2)` with a
+   100 B/s link reported a 200 B/s class rate and a −5 s service-time
+   penalty (probe: `F3 1 2 200 -5`). The generic setter now applies the
+   same `max(0.0, min(1.0, weight))` clamp.
+4. **WarmupFraction validation vanished in assert-disabled builds
+   (finding 4).** The setter's `NS_ASSERT_MSG` disappears when
+   assertions are disabled, and the stock double checker admits the
+   inclusive bound 1.0, after which every sample is discarded as
+   warmup. `SetWarmupFraction` now aborts unconditionally outside
+   [0, 1) (`NS_ABORT_MSG_IF`); the checker stays 2-arg inclusive and
+   the setter is documented as the guard.
+5. **`SetBootstrapResamples(0)` bypassed the attribute checker
+   (finding 5).** The attribute bound the raw member, so a direct
+   setter call of 0 left `BootstrapCi` with an empty bootstrap
+   percentile vector, an out-of-range element-zero index, and an
+   underflowed high index (probe: `F5 10 0 0 18446744073709551615
+   True`). The attribute now binds the getter + validating setter pair
+   and the setter aborts below 100, matching the checker's floor.
+6. **`BuildFatTree(radix=0)` divided by zero (finding 6).** The
+   `topology=fattree, fattreeRadix=0` path reached
+   `(m_numGpus + radix - 1) / radix` unguarded (probe: ZeroDivisionError
+   for 3 GPUs). The builder now aborts on radix 0 before the leaf-count
+   ceiling, which also moved to the divide-first form.
+
+**Fixed (P2).**
+
+7. **Four rail-fat-tree ceiling sites wrapped the numerator (finding
+   7).** `(enclosures + nodesPerLeaf - 1) / nodesPerLeaf` wraps to
+   zero for enclosures=4, nodesPerLeaf=UINT32_MAX (probe: `F7 4
+   4294967295 2 0 1` — numerator mod 2^32 = 2, old leaves 0, exact 1),
+   leaving a zero-leaf topology that later indexes the empty
+   leaf-switch vector. All four copies (`BuildRailOptimizedFatTree`,
+   `InstallCollectiveEmbedding`, and the two scratch/gpu-cluster-sim.cc
+   railfattree sites) use `a/b + (a%b != 0)`.
+8. **Dragonfly+ group×router product wrapped uint32 (finding 8).**
+   `numGroups=routersPerGroup=65536` passed both positive-input guards
+   but the uint32 product is 0 (probe: `F8 65536 65536 0 False
+   ZeroDivisionError`), feeding a zero divisor into the GPU-count
+   modulo. The product is computed in uint64 and aborts above
+   UINT32_MAX before narrowing.
+9. **DCQCN/RTTCC pacer slot cast and deadline addition (finding 9).**
+   A rate of 2^−40 Gbps with a 1-MiB chunk rounds the slot to exactly
+   2^63 ns, outside int64 — the `static_cast<int64_t>` is UB
+   (floating-point diagnostics halt under -fsanitize=float-cast-overflow;
+   probe: `F9 ... 9223372036854775808 False`), and even fitting slots
+   could overflow `(nowNs+delayNs)+slotNs` (probe: `F9-add
+   4611686018427387904 9223372036854775808 False`). Both machines now
+   saturate the double→int64 conversion at INT64_MAX and the deadline
+   addition via `slotNs > INT64_MAX - (nowNs + delayNs)`.
+10. **Staged PUT_SIGNAL count wrapped before the work-ID guard
+    (finding 10).** `bytes=UINT64_MAX` with 1-byte staging chunks
+    gives dataChunks=UINT64_MAX, and the +1 signal-work-item addition
+    wrapped the count to 0 BEFORE the existing work-ID guard — no work
+    emitted, completion callback never fires (probe: `F10
+    18446744073709551615 0 False 0`). The overflow of the addition
+    itself is now guarded before it happens.
+11. **RoCE per-chunk padded body narrowed through the uint32 Packet
+    API (finding 11; closes round-63 finding 11).** A non-RoCE
+    destination model paired with the public RoCE builder at the
+    representable efficiency (2^33−21)/2^65 with bodyHardCap==0 takes
+    the unguarded path: one data byte (11-byte body) targets
+    4,294,967,307 wire bytes needing a pad of exactly 2^32, which the
+    uint32 `Create<Packet>` argument narrows to 0 (probe: `F11-pad 0 11
+    4294967296 0 11 False`) — silently transmitting 11 bytes where the
+    model specifies ~4.295 GB. After the bodyHardCap clamp, the RoCE
+    builder arm now aborts when the COMPLETE padded body exceeds
+    UINT32_MAX (a body ≥ 2^32 is unrepresentable no matter how the pad
+    is split).
+12. **CHANGES.md deferred-item claim corrected (finding 12).** The
+    round-63 entry claimed the existing guard aborts loudly at the
+    boundary; probe F11 shows the pad narrows to zero while the guard
+    stays false. The round-63 deferred bullet above now points at this
+    fix.
+
+**Verified.** (a) `cmake --build cmake-cache -j $(nproc)` — clean after
+all fixes. (b) gpu-cluster test suite PASS in 9.868 s (the NS_FATAL lines
+in its output are the fork-child abort tests asserting their own
+loud-death path — the suite verdict is PASS). (c) DCQCN anchors, exact:
+`--bulkChunkSize=1000 --dcqcn=1` → simTimeUs=20802.4,
+ecnMarkedPackets=99985, cnpPacketsSent=99985, cnpPacketsReceived=99974;
+`--bulkChunkSize=2690 --dcqcn=0` → simTimeUs=20300.2, all three counters
+0. (d) Parity direct-run scripts: 48 ^PASS across 14 scripts (target 48);
+`python3 -m pytest test_ibgda.py test_config_fec_enabled.py` from
+test/parity: 18 passed. (e) Surrogate: `PYTHONPATH=. python3 -m pytest
+test/ -q` — 101 passed. (f) Traffic-control smoke: Unforced drop
+37/55500, Packets/Bytes sent 6887/10302800 — exact. (g) 12 queue-disc
+suites (adaptive-red, cobalt, codel, fifo, pie, prio, red, tbf,
+fq-cobalt, fq-codel, fq-pie, pfifo-fast-queue-disc) all PASS. (h) Full `./test.py -v` at this commit: 805 of 805 tests passed (0
+skipped, 0 failed, 0 crashed, 0 valgrind errors), exit 0.
+
 ### Reviewed — codex round 63: 20 findings, 15 fixed, 5 verified-and-documented
 
 **What.** Round-63 review of commit 96f8cd8 returned 20 findings (5 P1, 11
@@ -128,10 +256,13 @@ false with a reachable probe.
   finding IDs enumerate 13 fixed (2–13 + 17) + 6 documented (1, 14,
   15, 16, 18, 19), contradicting its "15 fixed + 4 documented" header.
   The header now reads 13 fixed, 6 documented.
-- **Finding 11 (deferred).** The RoCE wire-padding narrowing (32-bit
-  header field at multi-GiB pads) is deferred to round 64 as a
-  documented open item; the current guard aborts loudly at the
-  boundary rather than wrapping silently.
+- **Finding 11 (deferred to round 64, now fixed there).** The RoCE
+  wire-padding narrowing (32-bit header field at multi-GiB pads) was
+  deferred to round 64 as a documented open item. The "current guard
+  aborts loudly at the boundary" claim below it was WRONG — round-64
+  finding 11 proved the pad narrows to zero while the guard stays
+  false; the complete-padded-body abort in the round-64 entry is the
+  actual fix.
 - **Finding 20 (superseded).** The standing sweep instruction is
   procedural; no code action.
 
@@ -149,7 +280,12 @@ test_config_fec_enabled.py` from test/parity: 18 passed. (e) Surrogate:
 -control smoke: Unforced drop 37/55500, Packets/Bytes sent
 6887/10302800 — exact. (g) 12 core queue-disc suites (pie, drop-tail,
 codel, cobalt, fifo, prio, fq-codel, fq-pie, fq-cobalt, queue-disc-traces,
-wifi-mac-queue, lr-wpan-error-model) all PASS.
+wifi-mac-queue, lr-wpan-error-model) all PASS. (h) Full `./test.py -v`
+at 958be19: 805 of 805 tests passed, 0 failed, 0 crashed (the run's
+fork-child abort suites print expected NS_FATAL death lines; the
+runner's per-suite verdicts are the authority). The round-64 run at the
+round-64 commit re-confirms the same 805/805 and is cited in the
+round-64 entry.
 
 ### Reviewed — codex round 62: 19 findings, 13 fixed, 6 verified-and-documented
 

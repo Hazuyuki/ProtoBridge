@@ -8,6 +8,7 @@
 
 #include "ns3/log.h"
 
+#include <algorithm>
 #include <limits>
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
@@ -110,10 +111,15 @@ void
 ContentionModel::SetWeight(TrafficClass trafficClass, double weight)
 {
     NS_LOG_FUNCTION(this << static_cast<int>(trafficClass) << weight);
+    // Round 64 (codex finding 3): the generic setter used to store the
+    // weight unclamped while only the three named setters clamped to
+    // [0, 1] — SetWeight(COLLECTIVE, 2) with a 100 B/s link reported a
+    // 200 B/s class rate and negative service-time penalties. Route the
+    // generic setter through the same clamp as the named setters.
     int idx = static_cast<int>(trafficClass);
     if (idx >= 0 && idx < static_cast<int>(TrafficClass::NUM_CLASSES))
     {
-        m_weights[idx] = weight;
+        m_weights[idx] = std::max(0.0, std::min(1.0, weight));
     }
 }
 

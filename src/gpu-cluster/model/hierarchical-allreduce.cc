@@ -7,6 +7,7 @@
 
 #include "hierarchical-allreduce.h"
 #include <algorithm>
+#include <limits>
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/nccl-protocol.h"
@@ -205,9 +206,17 @@ uint64_t HierarchicalAllReduce::GetInterNodeRampDelayNs(uint64_t chunkSize) cons
         // Round 63 (codex finding 17): the old 1 + chunkSize/threshold wrap
     // made the denominator zero for chunkSize at the top of uint64
     // (hierarchical-allreduce.cc:192 et al.). Divide first, then bump.
-    const uint64_t rampDiv = chunkSize / m_interNodeBwRampThreshold +
-                             (chunkSize % m_interNodeBwRampThreshold != 0 ? 1 : 0);
-    return m_interNodeBwRampDelayNs / std::max<uint64_t>(1, rampDiv);
+    // Round 64 (codex finding 2): ceil(chunkSize/threshold) changes the
+    // delay law at every positive exact multiple (C==T: old 1+floor gave
+    // delay/2, ceil gives delay/1). Preserve the old 1 + floor quotient
+    // — the wrapped-denominator defect it fixed only occurs when the
+    // quotient itself is UINT64_MAX (chunkSize/threshold at the top of
+    // uint64), where a zero delay is the documented saturation anyway.
+    const uint64_t rampQuotient = chunkSize / m_interNodeBwRampThreshold;
+    return m_interNodeBwRampDelayNs /
+           (rampQuotient == std::numeric_limits<uint64_t>::max()
+                ? 0
+                : rampQuotient + 1);
 }
 void HierarchicalAllReduce::SetFullmeshPerStepStartupDelays(Time ll, Time ll128, Time simple)
 {
