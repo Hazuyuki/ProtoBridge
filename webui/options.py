@@ -111,6 +111,34 @@ OPTION_GROUPS = [
         field("sprayChunkSize", "Spray 分片大小 · bytes", target="stack", default=131072, minimum=1, maximum=67108864),
         field("bulkChunkSize", "Bulk 包大小上限 · bytes", default=8388608, minimum=1, maximum=67108864),
     ]},
+    {"id": "rdma", "title": "RDMA submission", "subtitle": "Startup delay / IBGDA", "hint": "IBGDA models GPU submission and CQ completion over RoCE. Timing values are explicit inputs; zero adds no stage latency.", "fields": [
+        field("rdmaSubmission", "Submission model", target="stack", scope="multi", default="startup", choices=[("startup", "Startup delay (legacy)"), ("ibgda", "IBGDA · GPU initiated")]),
+        field("ibgdaProducers", "GPU producers", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="ibgda"),
+        field("ibgdaQpsPerPeer", "RC QPs per peer", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="ibgda"),
+        field("ibgdaQueueDepth", "QP depth · WQEs", target="stack", scope="multi", default=128, minimum=1, maximum=65536, when="ibgda"),
+        field("ibgdaDoorbellBatch", "WQEs per doorbell", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="ibgda"),
+        field("ibgdaCqModeration", "CQ moderation · WQEs", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="ibgda"),
+        field("ibgdaMtu", "RDMA packet body limit · bytes", target="stack", scope="multi", default=4096, minimum=1, maximum=1048576, when="ibgda"),
+        field("ibgdaWqeBytes", "WQE fetch size · bytes", target="stack", scope="multi", default=64, minimum=1, maximum=4096, when="ibgda"),
+        field("ibgdaMapQpByProducer", "QP assignment", target="stack", scope="multi", default=1, choices=[("1", "Map by producer"), ("0", "Round robin per request")], when="ibgda"),
+        *[field(key, label, target="stack", scope="multi", default=default, when="ibgda") for key,label,default in [
+            ("ibgdaWqeBuildNs", "WQE construction · ns", 0),
+            ("ibgdaPublishNs", "QP publication · ns", 0),
+            ("ibgdaDoorbellNs", "Doorbell service · ns", 0),
+            ("ibgdaBatchTimeoutNs", "Doorbell tail timeout · ns", 100),
+            ("ibgdaWqeFetchNs", "NIC WQE fetch · ns", 0),
+            ("ibgdaDmaReadNs", "Source DMA latency · ns", 0),
+            ("ibgdaDmaWriteNs", "Destination DMA latency · ns", 0),
+            ("ibgdaCqWriteNs", "CQ write latency · ns", 0),
+            ("ibgdaGpuPollNs", "GPU completion observation · ns", 0),
+        ]],
+        *[field(key, label, target="stack", scope="multi", default=0, kind="float", maximum=1000000, when="ibgda") for key,label in [
+            ("ibgdaPcieReadGbps", "PCIe read bandwidth · Gb/s"),
+            ("ibgdaPcieWriteGbps", "PCIe write bandwidth · Gb/s"),
+            ("ibgdaHbmReadGbps", "HBM read bandwidth · Gb/s"),
+            ("ibgdaHbmWriteGbps", "HBM write bandwidth · Gb/s"),
+        ]],
+    ]},
     {"id": "flow", "title": "流控与拥塞控制", "subtitle": "Credit / 发送窗口 / PFC", "hint": "Credit 控制每个 VC 的可发分片数；So 窗口控制跨节点在途分片数。PFC 和拥塞控制可同时使用。", "fields": [
         field("vcCredits", "每 VC 信用额度 · 分片数", target="credits", minimum=1, maximum=1073741824),
         field("vcCount", "虚拟通道数量", target="stack", scope="stencil", default=4, minimum=1, maximum=255),
@@ -195,6 +223,8 @@ def validate_value(key, value, rule):
         if not math.isfinite(number) or not rule["min"] <= number <= rule["max"]:
             raise ValueError(f"{key} 范围为 {rule['min']}–{rule['max']}。")
 
+
+PROFILE_SOURCED.update(item["key"] for group in OPTION_GROUPS if group["id"] == "rdma" for item in group["fields"])
 
 def validate_configuration(op, resolved, cli, request):
     """Return actual rank count, effective settings and compatibility notes."""
@@ -360,6 +390,14 @@ def validate_configuration(op, resolved, cli, request):
             notices.append("已注入错误而未启用 LLR；未被 FEC 纠正的丢失可能使操作无法完成。")
         elif not enabled("llrTimeoutRetransmit"):
             notices.append("随机错误可能使 NACK 丢失；可启用“超时主动重传”来恢复这类传输。")
+    if settings.get("rdmaSubmission") == "ibgda":
+        if not multi or settings["interNodeFabricType"] != "RoCE":
+            raise ValueError("IBGDA requires a multi-node RoCE scenario.")
+        depth = integer("ibgdaQueueDepth")
+        if integer("ibgdaDoorbellBatch") > depth or integer("ibgdaCqModeration") > depth:
+            raise ValueError("IBGDA doorbell batch and CQ moderation must not exceed the QP depth.")
+        if integer("ibgdaDoorbellBatch") > 1 and integer("ibgdaBatchTimeoutNs") == 0:
+            raise ValueError("IBGDA batching requires a positive tail timeout.")
     if multi:
         if integer("failedOpticalLink") >= 0 or enabled("failureAwareRouting"):
             raise ValueError("当前光链路故障选项用于单节点统一拓扑构建器；请选择单节点 Leaf–spine。")

@@ -399,6 +399,8 @@ class SimulationOptions {
       let show = scope;
       if (this.schema.topology_fields.includes(item) && item.scope === "single")
         show = scope && (topology?.params || []).includes(item.key);
+      if (item.when === "ibgda")
+        show = scope && setting("rdmaSubmission") === "ibgda";
       if (item.when === "burst")
         show = scope && (setting("errorMode") || "independent") === "burst";
       if (item.when === "root")

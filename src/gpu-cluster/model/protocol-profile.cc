@@ -41,6 +41,7 @@ static const char* RESERVED[] = {
 static bool
 IsReserved(const std::string& k)
 {
+    if (k == "rdmaSubmission" || k.rfind("ibgda",0) == 0) return true;
     for (const char* r : RESERVED)
     {
         if (k == r)
@@ -136,6 +137,7 @@ ProtocolBundle
 ProtocolProfile::Build() const
 {
     ProtocolBundle b;
+    ApplyIbgdaProfile(m_kv,b.rdmaSubmission,b.ibgda);
 
     // --- Protocol model ---------------------------------------------------
     std::string tid = Get("protocolModel", "ns3::NcclProtocolModel");
@@ -167,6 +169,8 @@ ProtocolProfile::Build() const
         proto->SetForceProtocolId(id);
     }
     b.protocol = proto;
+    if (b.rdmaSubmission == "ibgda" && tid == "ns3::RoceProtocolModel")
+        proto->SetAttribute("StartupDelayNs",UintegerValue(0));
 
     // --- Payload builder (vendor-specific, paired with the protocol) -----
     // Derive the builder type from the *effective* protocol TypeId (robust to

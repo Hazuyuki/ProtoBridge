@@ -214,6 +214,7 @@ void
 FabricEndpoint::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    DisposeIbgda();
     // Cancel every pending deferred-egress event: each captures raw `this`
     // and dereferences m_devices, which is cleared below. A survivor fired
     // after disposal crashed on the cleared member (codex round 13,
@@ -566,6 +567,7 @@ FabricEndpoint::AddNetDevice(Ptr<NetDevice> device)
     NS_LOG_FUNCTION(this << device);
     uint32_t idx = m_devices.size();
     m_devices.push_back(device);
+    if (m_ibgda) ConnectIbgdaDevice(device);
 
     // Set endpoint MAC address from first device if not already configured
     if (m_address == Mac48Address() && idx == 0)
@@ -1156,6 +1158,12 @@ FabricEndpoint::PumpBulkTxWindow()
         header.SetEffectiveDataSize(desc.fragmentDataSize);
         header.SetTtl(64);
         chunkPacket->AddHeader(header);
+        if (desc.ibgdaWorkId != 0)
+        {
+            IbgdaPacketTag tag;
+            tag.workId=desc.ibgdaWorkId;
+            chunkPacket->AddPacketTag(tag);
+        }
 
         m_bulkTxInflight++;
         // Register window membership so the release paths can release a slot
@@ -2007,6 +2015,17 @@ FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
     uint8_t vcId = originalHeader.GetVirtualChannel();
 
     NS_LOG_FUNCTION(this << seqNum << destRank << static_cast<int>(vcId));
+    if (m_ibgda)
+    {
+        IbgdaPacketKey key{destRank,vcId,originalHeader.GetFlowId(),seqNum};
+        auto it=m_ibgdaPackets.find(key);
+        if (it != m_ibgdaPackets.end())
+        {
+            m_ibgda->NotifyFailure(it->second.first);
+            m_ibgdaPackets.erase(it);
+        }
+    }
+
 
     // A permanently lost chunk will never be ACKed: free its TX-window slot
     // so the window can't leak closed. Gate on window MEMBERSHIP, not just
@@ -2308,6 +2327,18 @@ void
 FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
 {
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
+    if (m_ibgda)
+    {
+        IbgdaPacketKey key{header.GetSourceRank(),header.GetVirtualChannel(),
+                           header.GetFlowId(),header.GetSequenceNumber()};
+        auto it=m_ibgdaPackets.find(key);
+        if (it != m_ibgdaPackets.end())
+        {
+            auto [id,bytes]=it->second;
+            m_ibgdaPackets.erase(it); // duplicate ACKs never retire a WR twice
+            m_ibgda->NotifyPacketAck(id,bytes);
+        }
+    }
 
     // ACK-clocked TX window, independent of LLR: the ACK proves the receiver
     // got the chunk, so its window slot is free — the same "delivery means
@@ -2653,7 +2684,8 @@ FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumula
     // window filled with its first soTxWindow chunks and no ACK ever came
     // to release a slot (the 2:1 incast stall investigation). Keep the LLR
     // store dependencies inside; the plain ACK itself needs neither.
-    if ((!m_llrEnabled || !m_llrManager) && m_soTxWindow == 0)
+    if ((!m_llrEnabled || !m_llrManager) && m_soTxWindow == 0 &&
+        !(m_ibgda && !IsLocalRank(receivedHeader.GetSourceRank())))
     {
         return;
     }
@@ -3159,6 +3191,8 @@ bool
 FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                                     const Address& dest)
 {
+    if (PrepareIbgdaPacket(packet, deviceIndex, dest)) return true;
+
     NS_LOG_FUNCTION(this << packet << deviceIndex);
 
     // PFC throttle (802.1Qbb analog, So-only): while the switch holds a pause
@@ -3271,7 +3305,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 uint64_t flowKey = MakeRateFlowKey(m_rank,
                                                   hdr.GetDestRank(),
                                                   hdr.GetVirtualChannel(),
-                                                  hdr.GetFlowId());
+                                                  GetIbgdaRateFlow(packet,hdr));
                 shapingDelay = m_dcqcnRate->ShapingDelay(packet->GetSize(), flowKey);
             }
         }
@@ -3299,7 +3333,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             uint64_t flowKey = MakeRateFlowKey(m_rank,
                                               hdr.GetDestRank(),
                                               hdr.GetVirtualChannel(),
-                                              hdr.GetFlowId());
+                                              GetIbgdaRateFlow(packet,hdr));
             shapingDelay = std::max(shapingDelay,
                                     m_rttccRate->ShapingDelay(packet->GetSize(), flowKey));
             // At most one probe per ProbeInterval rides ahead of the data
@@ -3309,7 +3343,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             if (m_rttccRate->MaybeStartProbe(flowKey, probeSeq))
             {
                 SendRttProbePacket(hdr.GetDestRank(), hdr.GetVirtualChannel(),
-                                   hdr.GetFlowId(), probeSeq);
+                                   GetIbgdaRateFlow(packet,hdr), probeSeq);
             }
         }
     }
@@ -3611,6 +3645,7 @@ void
 FabricEndpoint::OnPacketDelivered(Ptr<Packet> packet, uint32_t seqNum, FabricHeader header)
 {
     NS_LOG_FUNCTION(this << packet << seqNum);
+    if (DeferIbgdaReceive(packet, header)) return;
     NS_LOG_DEBUG("OnPacketDelivered: rank=" << m_rank << " seq=" << seqNum << " callback null=" << m_receiveCallback.IsNull());
 
     // Record flow completion in latency statistics
@@ -3703,9 +3738,11 @@ FabricEndpoint::SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uin
 }
 
 void
-FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
+FabricEndpoint::SendBulkWireTransferSizeImpl(uint16_t destRank, uint64_t dataSize,
                                           uint8_t protocolId, uint16_t flowId, uint8_t vcId)
 {
+    const uint32_t chunkLimit = m_activeIbgdaWork != 0
+        ? std::min(m_bulkChunkSize, m_ibgda->GetConfig().mtuBytes) : m_bulkChunkSize;
     NS_LOG_FUNCTION(this << destRank << dataSize << static_cast<int>(protocolId) << flowId << vcId);
 
     // A zero-byte transfer carries nothing: emit no packet and no retry-store
@@ -3812,7 +3849,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         (payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
 
     std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
-    const uint64_t MAX_CHUNK_BYTES = m_bulkChunkSize;
+    const uint64_t MAX_CHUNK_BYTES = chunkLimit;
     bool needFragment = (devices.size() > 1) ||
                         (wireSize > MAX_CHUNK_BYTES);
 
@@ -3912,6 +3949,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     break; // wire-padding fragment: no data bytes left to send
                 }
                 BulkTxChunk desc;
+                desc.ibgdaWorkId = m_activeIbgdaWork;
                 desc.destRank = destRank;
                 desc.flowId = flowId;
                 desc.vcId = vcId;
@@ -4247,7 +4285,9 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
         protocolId == static_cast<uint8_t>(RoceProtocol::SIMPLE) &&
         SoHeader::PeekEcn(packet))
     {
-        SendCnpPacket(header);
+        FabricHeader feedbackHeader=header;
+        feedbackHeader.SetFlowId(GetIbgdaRateFlow(packet,header));
+        SendCnpPacket(feedbackHeader);
     }
 
     // Extract pure data from protocol-aware payload (So sources use the So
@@ -4261,6 +4301,8 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
     {
         // Create a new packet with extracted data
         Ptr<Packet> dataPacket = Create<Packet>(extractedData.data(), extracted);
+        IbgdaPacketTag ibgdaTag;
+        if (packet->PeekPacketTag(ibgdaTag)) dataPacket->AddPacketTag(ibgdaTag);
 
         // Deliver to application via callback
         uint8_t vcId = header.GetVirtualChannel();

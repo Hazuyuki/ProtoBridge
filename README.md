@@ -59,6 +59,10 @@ fast enough to sweep many designs where the packet simulator cannot. See
 [surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md) for the guide and
 [doc/CALIBRATION.md](doc/CALIBRATION.md) for the in-repo H200 calibration data.
 
+GPU-initiated RC RDMA Write can be modeled with `--rdmaSubmission=ibgda`.
+The default `startup` mode retains existing behavior. See [doc/IBGDA.md](doc/IBGDA.md)
+for queue, doorbell, DMA and completion parameters and a runnable RoCE example.
+
 ## What this is (and is not)
 
 **Is:** an interconnect-only simulator + a surrogate model. Credit-based flow

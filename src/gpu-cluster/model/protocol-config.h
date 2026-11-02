@@ -124,7 +124,8 @@ class ProtocolConfig
                                       uint16_t numGpus,
                                       uint64_t dataSize,
                                       uint16_t baseFlowId,
-                                      std::string* error = nullptr) const;
+                                      std::string* error = nullptr,
+                                      bool includeStartup = true) const;
 
   private:
     struct Dim

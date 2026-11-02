@@ -75,12 +75,22 @@ CLI_FIELDS: dict[str, dict[str, Any]] = {
     "bgP2pSizeBytes": {"type": "int", "min": 1, "max": 67108864},
     "bgP2pIntervalNs": {"type": "int", "min": 0, "max": 1000000000},
     "bgP2pStartTimeNs": {"type": "int", "min": 0, "max": 1000000000},
+    "p2pIterations": {"type": "int", "min": 1, "max": 1000000},
     "randTraffic": {"type": "bool"},
     "randInjectionRate": {"type": "float", "min": 0.001, "max": 1},
     "randMsgBytes": {"type": "int", "min": 1, "max": 16777216},
     "randWarmupNs": {"type": "int", "min": 0, "max": 10000000},
     "randMeasureNs": {"type": "int", "min": 1, "max": 10000000},
 }
+
+for _group in OPTION_GROUPS:
+    if _group["id"] == "rdma":
+        for _field in _group["fields"]:
+            CLI_FIELDS[_field["key"]] = (
+                {"choices": [choice["value"] for choice in _field["choices"]]}
+                if "choices" in _field else
+                {"type": _field["type"], "min": _field["min"], "max": _field["max"]}
+            )
 
 # The same controls and ranges drive the browser and HTTP validation.
 for _field in [*TOPOLOGY_FIELDS, *[item for group in OPTION_GROUPS for item in group["fields"] if item["target"] == "cli"]]:
@@ -107,6 +117,7 @@ PRESETS = {
     "p2p-single.cfg": ("点对点传输", "同节点 GPU 0 → GPU 1", "stencil", {}),
     "p2p-eth.cfg": ("Ethernet 点对点", "两个节点之间的 DATA 传输", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "ETH", "interNodeTopology": "host"}}),
     "p2p-eth-incast.cfg": ("Ethernet Incast", "两个发送端向同一目标发送", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "ETH", "interNodeTopology": "host"}}),
+    "ibgda-p2p.cfg": ("IBGDA point-to-point", "GPU-initiated RC RDMA over RoCE", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "ibgda", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
     "p2p-roce.cfg": ("RoCE 点对点", "节点间 RoCE 传输", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
     "p2p-roce-lossy.cfg": ("RoCE · Go-back-N", "启用链路重试的 RoCE 场景", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
     "p2p-roce-lossy-sack.cfg": ("RoCE · SACK", "选择重传的 RoCE 场景", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),

@@ -27,6 +27,7 @@ ProtocolConfigRunner::ProtocolConfigRunner() = default;
 
 ProtocolConfigRunner::~ProtocolConfigRunner()
 {
+    *m_alive=false;
     // Detach the receive callbacks BEFORE the runner's memory goes away:
     // they hold this object's raw `this`, and the endpoints survive it. A
     // delivered packet after the runner is destroyed invoked
@@ -60,6 +61,12 @@ ProtocolConfigRunner::ApplyBundle(const std::vector<Ptr<FabricEndpoint>>& endpoi
     for (const auto& ep : endpoints)
     {
         if (!ep) continue;
+        if (bundle.rdmaSubmission == "ibgda" && !ep->GetIbgdaSubmissionModel())
+        {
+            auto model=CreateObject<IbgdaSubmissionModel>();
+            model->Configure(bundle.ibgda);
+            ep->SetIbgdaSubmissionModel(model);
+        }
         if (bundle.protocol) ep->SetProtocolModel(bundle.protocol);
         if (bundle.payloadBuilder) ep->SetProtocolPayloadBuilder(bundle.payloadBuilder);
         if (bundle.fec) ep->SetFecModel(bundle.fec);
@@ -114,7 +121,8 @@ ProtocolConfigRunner::Initialize(const std::vector<Ptr<FabricEndpoint>>& endpoin
 
     ProtocolTransactionGraph graph;
     ProtocolTransactionNodeId completeNode =
-        config.Compile(graph, bundle.protocol, numGpus, dataSize, m_baseFlowId, error);
+        config.Compile(graph, bundle.protocol, numGpus, dataSize, m_baseFlowId, error,
+                       bundle.rdmaSubmission != "ibgda");
     if (completeNode == PROTOCOL_TRANSACTION_INVALID_NODE)
     {
         return false;
@@ -225,12 +233,26 @@ ProtocolConfigRunner::OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, Fab
 void
 ProtocolConfigRunner::OnComplete()
 {
-    m_complete = true;
-    if (m_completionCallback)
+    if (m_drainingIbgda || m_complete) return;
+    m_deliveryDurationNs=Simulator::Now().GetNanoSeconds()-m_startNs;
+    auto finish=[this,alive=m_alive] {
+        if (!*alive) return;
+        m_complete=true;
+        if (m_completionCallback)
+            m_completionCallback(Simulator::Now().GetNanoSeconds()-m_startNs);
+    };
+    std::vector<Ptr<IbgdaSubmissionModel>> models;
+    for (auto ep : m_endpoints)
+        if (ep && ep->GetIbgdaSubmissionModel()) models.push_back(ep->GetIbgdaSubmissionModel());
+    if (models.empty())
     {
-        uint64_t durationNs = Simulator::Now().GetNanoSeconds() - m_startNs;
-        m_completionCallback(durationNs);
+        finish();
+        return;
     }
+    m_drainingIbgda=true;
+    auto remaining=std::make_shared<size_t>(models.size());
+    for (auto model : models)
+        model->Quiet([finish,remaining](bool ok) { if (ok && --*remaining == 0) finish(); });
 }
 
 } // namespace ns3

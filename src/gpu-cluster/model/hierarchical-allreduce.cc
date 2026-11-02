@@ -88,6 +88,8 @@ void HierarchicalAllReduce::SetInterNodeStartupDelays(Time ll, Time ll128, Time 
 }
 uint64_t HierarchicalAllReduce::GetInterNodeStartupDelayNs(uint64_t chunkSize) const
 {
+    if (!m_endpoints.empty() && m_endpoints.front()->GetIbgdaSubmissionModel()) return 0;
+
     // If explicit protocol-aware inter-node startup is set, use it
     if (m_interNodeStartupLLNs > 0 || m_interNodeStartupLL128Ns > 0 || m_interNodeStartupSIMPLENs > 0)
     {

@@ -87,6 +87,8 @@ void HierarchicalReduceScatter::SetInterNodeStartupDelays(Time ll, Time ll128, T
 }
 uint64_t HierarchicalReduceScatter::GetInterNodeStartupDelayNs(uint64_t chunkSize) const
 {
+    if (!m_endpoints.empty() && m_endpoints.front()->GetIbgdaSubmissionModel()) return 0;
+
     if (m_interNodeStartupLLNs > 0 || m_interNodeStartupLL128Ns > 0 || m_interNodeStartupSIMPLENs > 0)
     {
         if (chunkSize < m_llThreshold)

@@ -78,3 +78,14 @@ def test_sack_recovers_actual_random_packet_loss(tmp_path):
                                  "llrRetryTimeout": 200000, "llrRetryLimit": 50, "soTxWindow": 64, "llrBufferSize": 10000})
     assert job["result"]["retransmittedPackets"] > 0
     assert job["result"]["permanentLosses"] == 0
+
+
+def test_ibgda_form_reaches_native_runtime_and_waits_for_completion(tmp_path):
+    with TestClient(create_app(REPO, tmp_path/"runs")) as client:
+        job = run(client, config_id="ibgda-p2p.cfg", num_nodes=2, gpus_per_node=2,
+                  data_size=9000, stack_overrides={"ibgdaQueueDepth": 16,
+                  "ibgdaDoorbellBatch": 8, "ibgdaCqModeration": 16})
+    assert job["result"]["rdmaSubmission"] == "ibgda"
+    assert job["result"]["ibgdaSubmittedWqes"] == job["result"]["ibgdaCompletedWqes"] == 1
+    assert job["result"]["ibgdaStartupSamples"] == 1
+    assert job["result"]["simTimeNs"] >= job["result"]["dataDeliveryDurationNs"]

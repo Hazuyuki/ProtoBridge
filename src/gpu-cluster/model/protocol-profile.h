@@ -45,6 +45,7 @@
 
 #include "ns3/core-module.h"
 #include "flow-control-policy.h"
+#include "ibgda-submission-model.h"
 #include <string>
 #include <unordered_map>
 
@@ -69,6 +70,8 @@ class CreditManager;
  */
 struct ProtocolBundle
 {
+    std::string rdmaSubmission{"startup"};
+    IbgdaConfig ibgda;
     Ptr<ProtocolModel> protocol;       ///< configured protocol model (ready)
     Ptr<ProtocolPayloadBuilder> payloadBuilder; ///< vendor payload builder (ready)
     Ptr<FecModel> fec;                 ///< parameterized FEC model (ready)

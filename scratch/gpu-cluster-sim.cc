@@ -41,6 +41,7 @@
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/ub-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
+#include "ns3/ibgda-submission-model.h"
 #include "ns3/ethernet-protocol-model.h"
 #include "ns3/dcqcn-rate-machine.h"
 #include "ns3/rttcc-rate-machine.h"
@@ -61,6 +62,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <memory>
 #include <iomanip>
 #include <limits>
 #include <queue>
@@ -73,6 +75,9 @@ NS_LOG_COMPONENT_DEFINE("GpuClusterSim");
 
 static uint64_t g_durationNs = 0;
 static bool g_collectiveCompleted = false;
+static uint64_t g_deliveryDurationNs = 0;
+static bool g_waitingIbgda = false;
+static std::vector<Ptr<IbgdaSubmissionModel>> g_ibgdaModels;
 
 // ---------------------------------------------------------------------------
 // Wire-transfer patterns (p2p / fanout / incast): bare point-to-point bulk
@@ -155,9 +160,30 @@ ResolveAutoAlgorithm(const std::string& coll, const std::string& topo,
 void
 OnCollectiveComplete(uint64_t durationNs)
 {
-    g_durationNs = durationNs;
-    g_collectiveCompleted = true;
-    Simulator::Stop();
+    if (g_waitingIbgda || g_collectiveCompleted) return;
+    g_deliveryDurationNs = durationNs;
+    if (g_ibgdaModels.empty())
+    {
+        g_durationNs = durationNs;
+        g_collectiveCompleted = true;
+        Simulator::Stop();
+        return;
+    }
+    g_waitingIbgda = true;
+    const Time start=Simulator::Now()-NanoSeconds(durationNs);
+    auto remaining=std::make_shared<uint32_t>(g_ibgdaModels.size());
+    for (auto model : g_ibgdaModels)
+    {
+        model->Quiet([start,remaining](bool ok) {
+            if (!ok) return;
+            if (--*remaining == 0)
+            {
+                g_durationNs=(Simulator::Now()-start).GetNanoSeconds();
+                g_collectiveCompleted=true;
+                Simulator::Stop();
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +478,14 @@ main(int argc, char* argv[])
     std::string intraNodeAlgorithm = "fullmesh";
 
 
+    uint32_t p2pIterations=1;
+    std::string rdmaSubmission="startup";
+    std::string ibgdaTraceFile;
+    IbgdaConfig ibgdaConfig;
     CommandLine cmd;
+    AddIbgdaCommandLine(cmd,rdmaSubmission,ibgdaConfig);
+    cmd.AddValue("p2pIterations","Work requests per p2p/fanout/incast flow",p2pIterations);
+    cmd.AddValue("ibgdaTraceFile","Per-WR IBGDA timing CSV (empty=disabled)",ibgdaTraceFile);
     cmd.AddValue("topology", "Topology: ring/fullmesh/switched/fattree/railfattree/leafspine/nvl72/torus/mesh/hypercube/2dfullmesh/ndfullmesh/2dfullmeshclos", topology);
     cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce/p2p/fanout/incast", collective);
     cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain/hierarchical/ncclring", algorithm);
@@ -737,7 +770,12 @@ main(int argc, char* argv[])
         {
             prof.Set(kv.first, kv.second);
         }
+        ApplyIbgdaProfile(prof.GetValues(),rdmaSubmission,ibgdaConfig);
         pbundle = prof.Build();
+        pbundle.rdmaSubmission=rdmaSubmission;
+        pbundle.ibgda=ibgdaConfig;
+        if (rdmaSubmission == "ibgda")
+            pbundle.protocol->SetAttributeFailSafe("StartupDelayNs",UintegerValue(0));
         configMode = true;
 
         // Source the profile's PEX + fabric-hardware values into the same
@@ -841,6 +879,18 @@ main(int argc, char* argv[])
         }
     }
 
+    NS_ABORT_MSG_IF(p2pIterations == 0 || p2pIterations > 1000000,
+                    "p2pIterations must be in [1,1000000]");
+    NS_ABORT_MSG_IF(rdmaSubmission != "startup" && rdmaSubmission != "ibgda",
+                    "rdmaSubmission must be startup or ibgda");
+    if (rdmaSubmission == "ibgda")
+    {
+        ibgdaConfig.Validate();
+        NS_ABORT_MSG_IF(numNodes < 2 || interNodeFabricTypeStr != "RoCE",
+                        "IBGDA currently requires numNodes>=2 and interNodeFabricType=RoCE");
+        interNodeStartupNs=0;
+        interNodeStartupLLNs=interNodeStartupLL128Ns=interNodeStartupSIMPLENs=0;
+    }
     if (topology == "railfattree")
     {
         NS_ABORT_MSG_IF(railCount == 0 || railNodesPerLeaf == 0 || numGpus % railCount != 0,
@@ -1049,6 +1099,11 @@ main(int argc, char* argv[])
     else if (protocolModelType == "ns3::UbProtocolModel")
     {
         payloadBuilderType = "ns3::UbPayloadBuilder";
+    }
+    else if (protocolModelType == "ns3::RoceProtocolModel" ||
+             protocolModelType == "ns3::EthernetProtocolModel")
+    {
+        payloadBuilderType = "ns3::RocePayloadBuilder";
     }
     else
     {
@@ -1384,6 +1439,8 @@ main(int argc, char* argv[])
                                    DoubleValue(soRoceWireEfficiency));
             }
             roceModel = CreateObject<RoceProtocolModel>();
+            if (rdmaSubmission == "ibgda")
+                roceModel->SetAttribute("StartupDelayNs",UintegerValue(0));
         }
         else if (interNodeFabricType == FabricType::ETHERNET)
         {
@@ -1463,7 +1520,7 @@ main(int argc, char* argv[])
         // (intra-node) framing/timing untouched. Off (--dcqcn=0, default) ->
         // null -> byte-identical.
         Ptr<RocePayloadBuilder> soPayloadBuilder;
-        if (interNodeFabricType == FabricType::ROCE && enableDcqcn)
+        if (interNodeFabricType == FabricType::ROCE && (enableDcqcn || rdmaSubmission == "ibgda"))
         {
             soPayloadBuilder = CreateObject<RocePayloadBuilder>();
         }
@@ -1933,6 +1990,35 @@ main(int argc, char* argv[])
         }
     }
 
+    std::shared_ptr<std::ofstream> ibgdaTrace;
+    if (rdmaSubmission == "ibgda")
+    {
+        if (!ibgdaTraceFile.empty())
+        {
+            ibgdaTrace=std::make_shared<std::ofstream>(ibgdaTraceFile);
+            NS_ABORT_MSG_IF(!*ibgdaTrace,"Cannot open ibgdaTraceFile");
+            *ibgdaTrace << "rank,workId,peer,producer,qp,bytes,readyNs,reservedNs,publishedNs,doorbellNs,executeNs,firstWireNs,ackedNs,observedNs\n";
+        }
+        for (auto ep : endpoints)
+        {
+            auto model=CreateObject<IbgdaSubmissionModel>();
+            model->Configure(ibgdaConfig);
+            if (ibgdaTrace)
+            {
+                model->SetObserver([ibgdaTrace,rank=ep->GetRank()](const IbgdaWorkTiming& t) {
+                    *ibgdaTrace << rank << ',' << t.id << ',' << t.peer << ',' << t.producer
+                        << ',' << t.qp << ',' << t.bytes << ',' << t.ready.GetNanoSeconds()
+                        << ',' << t.reserved.GetNanoSeconds() << ',' << t.published.GetNanoSeconds()
+                        << ',' << t.doorbell.GetNanoSeconds() << ',' << t.execute.GetNanoSeconds()
+                        << ',' << t.firstWire.GetNanoSeconds() << ',' << t.acknowledged.GetNanoSeconds()
+                        << ',' << t.observed.GetNanoSeconds() << '\n';
+                });
+            }
+            ep->SetIbgdaSubmissionModel(model);
+            g_ibgdaModels.push_back(model);
+        }
+    }
+
     // soTxWindow / soGbnStrict are independent LLR-free opt-ins (the perftest
     // tx_depth analog). They used to live inside the llrEnabled block, so a
     // run with LLR off (lossless RoCE) silently ignored --soTxWindow — an
@@ -2074,7 +2160,10 @@ main(int argc, char* argv[])
             NS_ABORT_MSG("protocol config compile error: " << cfgErr);
         }
         configRunner.SetCompletionCallback(
-            [](uint64_t durationNs) { OnCollectiveComplete(durationNs); });
+            [&configRunner](uint64_t durationNs) {
+                OnCollectiveComplete(durationNs);
+                g_deliveryDurationNs=configRunner.GetDeliveryDurationNs();
+            });
         configRunner.Start();
     }
     else if (collective == "allreduce")
@@ -2163,7 +2252,11 @@ main(int argc, char* argv[])
                 ar->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
             // Inter-node startup delay
-            if (interNodeStartupNs > 0)
+            if (rdmaSubmission == "ibgda")
+            {
+                ar->SetInterNodeStartupDelay(NanoSeconds(0));
+            }
+            else if (interNodeStartupNs > 0)
             {
                 ar->SetInterNodeStartupDelay(NanoSeconds(interNodeStartupNs));
             }
@@ -2332,7 +2425,11 @@ main(int argc, char* argv[])
             a2a->SetStartupPerGpuNs(startupPerGpuNs);
             a2a->SetLlThreshold(llThreshold);
             a2a->SetLl128Threshold(ll128Threshold);
-            if (interNodeStartupNs > 0)
+            if (rdmaSubmission == "ibgda")
+            {
+                a2a->SetInterNodeStartupDelay(NanoSeconds(0));
+            }
+            else if (interNodeStartupNs > 0)
             {
                 a2a->SetInterNodeStartupDelay(NanoSeconds(interNodeStartupNs));
             }
@@ -2443,7 +2540,11 @@ main(int argc, char* argv[])
             {
                 ag->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
-            if (interNodeStartupNs > 0)
+            if (rdmaSubmission == "ibgda")
+            {
+                ag->SetInterNodeStartupDelay(NanoSeconds(0));
+            }
+            else if (interNodeStartupNs > 0)
             {
                 ag->SetInterNodeStartupDelay(NanoSeconds(interNodeStartupNs));
             }
@@ -2607,7 +2708,11 @@ main(int argc, char* argv[])
             {
                 rs->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
-            if (interNodeStartupNs > 0)
+            if (rdmaSubmission == "ibgda")
+            {
+                rs->SetInterNodeStartupDelay(NanoSeconds(0));
+            }
+            else if (interNodeStartupNs > 0)
             {
                 rs->SetInterNodeStartupDelay(NanoSeconds(interNodeStartupNs));
             }
@@ -2706,7 +2811,10 @@ main(int argc, char* argv[])
                 }
             }
         }
-        g_patternExpectedBytes = static_cast<uint64_t>(flows.size()) * dataSize;
+        NS_ABORT_MSG_IF(dataSize != 0 && flows.size() >
+            std::numeric_limits<uint64_t>::max()/dataSize/p2pIterations,
+            "p2pIterations times dataSize overflows the transfer byte ledger");
+        g_patternExpectedBytes = static_cast<uint64_t>(flows.size()) * dataSize * p2pIterations;
         g_patternReceivedBytes = 0;
         g_patternStartNs = Simulator::Now().GetNanoSeconds();
         // Zero-byte pattern (codex round 20, finding 10): SendBulkWire-
@@ -2725,11 +2833,12 @@ main(int argc, char* argv[])
         {
             Simulator::Schedule(NanoSeconds(0),
                                 [src = flows[i].first, dst = flows[i].second,
-                                 endpoints, dataSize, protocolId, i]()
+                                 endpoints, dataSize, protocolId, i, p2pIterations]()
                                 {
-                                    endpoints[src]->SendBulkWireTransferSize(
-                                        dst, dataSize,
-                                        protocolId, static_cast<uint16_t>(i + 1), 0);
+                                    for (uint32_t wr=0;wr<p2pIterations;++wr)
+                                        endpoints[src]->SendBulkWireTransferSize(
+                                            dst, dataSize,protocolId,
+                                            static_cast<uint16_t>(i + 1),0);
                                 });
         }
     }
@@ -2795,6 +2904,34 @@ main(int argc, char* argv[])
     // Print machine-parseable result
     std::cout << "RESULT_START" << std::endl;
     std::cout << "status=" << statusStr << std::endl;
+    std::cout << "rdmaSubmission=" << rdmaSubmission << std::endl;
+    std::cout << "p2pIterations=" << p2pIterations << std::endl;
+    if (rdmaSubmission == "ibgda")
+    {
+        IbgdaStats total;
+        for (auto model : g_ibgdaModels)
+        {
+            const auto& st=model->GetStats();
+            total.submitted+=st.submitted; total.completed+=st.completed;
+            total.failed+=st.failed; total.doorbells+=st.doorbells; total.cqes+=st.cqes;
+            total.startupSamples+=st.startupSamples; total.startupTotalNs+=st.startupTotalNs;
+            total.startupMaxNs=std::max(total.startupMaxNs,st.startupMaxNs);
+            total.peakOutstanding=std::max(total.peakOutstanding,st.peakOutstanding);
+            total.peakQpOutstanding=std::max(total.peakQpOutstanding,st.peakQpOutstanding);
+        }
+        std::cout << "ibgdaSubmittedWqes=" << total.submitted << std::endl;
+        std::cout << "ibgdaCompletedWqes=" << total.completed << std::endl;
+        std::cout << "ibgdaFailedWqes=" << total.failed << std::endl;
+        std::cout << "ibgdaDoorbells=" << total.doorbells << std::endl;
+        std::cout << "ibgdaCqes=" << total.cqes << std::endl;
+        std::cout << "ibgdaPeakOutstanding=" << total.peakOutstanding << std::endl;
+        std::cout << "ibgdaPeakQpOutstanding=" << total.peakQpOutstanding << std::endl;
+        std::cout << "ibgdaStartupSamples=" << total.startupSamples << std::endl;
+        std::cout << "ibgdaMeanStartupNs=" << (total.startupSamples ?
+            static_cast<double>(total.startupTotalNs)/total.startupSamples : 0) << std::endl;
+        std::cout << "ibgdaMaxStartupNs=" << total.startupMaxNs << std::endl;
+        std::cout << "dataDeliveryDurationNs=" << g_deliveryDurationNs << std::endl;
+    }
     std::cout << "topology=" << topology << std::endl;
     std::cout << "collective=" << collective << std::endl;
     std::cout << "algorithm=" << algorithm << std::endl;

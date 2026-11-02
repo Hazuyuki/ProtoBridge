@@ -78,7 +78,7 @@ def submit(client, **values):
 
 def test_catalog_and_real_parameter_preview(client):
     catalog = client.get("/api/catalog").json()
-    assert len(catalog["configs"]) == 11
+    assert len(catalog["configs"]) == 12
     assert client.get("/").status_code == 200
     assert client.get("/static/app.js").status_code == 200
     body = {"stack_overrides": {"bandwidthGbps": 85}, "num_nodes": 2, "gpus_per_node": 4}
@@ -327,10 +327,15 @@ def test_shutdown_interrupts_active_process_and_persists_status(tmp_path, execut
 
 
 def test_exposed_cli_fields_exist_in_native_entry_point():
-    source = (REPO/"scratch/gpu-cluster-sim.cc").read_text()
     import re
+    import subprocess
+    from webui.simulation import find_binary
 
-    actual_flags = set(re.findall(r'cmd\.AddValue\("(\w+)"', source))
+    binary = find_binary(REPO)
+    if binary is None:
+        pytest.skip("Build gpu-cluster-sim to inspect its command-line interface.")
+    result = subprocess.run([str(binary), "--PrintHelp"], capture_output=True, text=True, check=True)
+    actual_flags = set(re.findall(r"--(\w+)", result.stdout + result.stderr))
     assert set(CLI_FIELDS) <= actual_flags
 
 
