@@ -16,6 +16,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <limits>
 
 namespace ns3
 {
@@ -39,17 +40,17 @@ FecModel::GetTypeId()
                             .AddAttribute("N",
                                           "Total codeword length (data + parity symbols)",
                                           UintegerValue(544),
-                                          MakeUintegerAccessor(&FecModel::m_n),
+                                          MakeUintegerAccessor(&FecModel::GetN, &FecModel::SetNAttribute),
                                           MakeUintegerChecker<uint32_t>())
                             .AddAttribute("K",
                                           "Data symbols per codeword",
                                           UintegerValue(514),
-                                          MakeUintegerAccessor(&FecModel::m_k),
+                                          MakeUintegerAccessor(&FecModel::GetK, &FecModel::SetKAttribute),
                                           MakeUintegerChecker<uint32_t>())
                             .AddAttribute("T",
                                           "Error correction capability in symbols",
                                           UintegerValue(15),
-                                          MakeUintegerAccessor(&FecModel::m_t),
+                                          MakeUintegerAccessor(&FecModel::GetT, &FecModel::SetTAttribute),
                                           MakeUintegerChecker<uint32_t>())
                             .AddAttribute("EncodeLatency",
                                           "FEC encode latency per codeword",
@@ -112,10 +113,79 @@ FecModel::SetFecParams(uint32_t n, uint32_t k, uint32_t t)
     // (a zero-data codeword carries no symbols).
     NS_ASSERT_MSG(k >= 1, "K must be at least 1");
     NS_ASSERT_MSG(n > k, "N must be greater than K");
-    NS_ASSERT_MSG(2 * t <= n - k, "T must satisfy 2T <= N-K for MDS codes");
+    // Round 62: widen 2 * t to uint64 before the comparison — at
+    // t > 2^31 the uint32 multiplication wrapped to 0 and the assert
+    // passed for any (n, k) (codex probe: SetFecParams(2, 1, 2147483648)
+    // satisfied every round-61 assertion).
+    NS_ASSERT_MSG(static_cast<uint64_t>(2) * t <= n - k,
+                  "T must satisfy 2T <= N-K for MDS codes");
     m_n = n;
     m_k = k;
     m_t = t;
+}
+
+void
+FecModel::SetNAttribute(uint32_t n)
+{
+    // Round 62: attribute setter re-validation (codex finding 2). The
+    // direct member binding used to let SetAttribute("N", ...) install
+    // values that violate the MDS relation or zero a divisor. Re-check
+    // against the current siblings, then run the full assert suite so
+    // any attribute write lands on the same valid triple SetFecParams
+    // would produce.
+    uint32_t k = m_k;
+    uint32_t t = m_t;
+    if (n <= k)
+    {
+        n = k + 1;
+    }
+    if (static_cast<uint64_t>(2) * t > n - k)
+    {
+        n = k + static_cast<uint32_t>(std::min<uint64_t>(
+            std::numeric_limits<uint32_t>::max() - k,
+            static_cast<uint64_t>(2) * t));
+    }
+    SetFecParams(n, k, t);
+}
+
+void
+FecModel::SetKAttribute(uint32_t k)
+{
+    // Round 62: attribute setter re-validation (codex finding 2).
+    // K >= 1 keeps dataBitsPerCodeword nonzero and K < N preserves the
+    // code-rate precondition; both are repaired against the current N
+    // before the full assert suite runs.
+    uint32_t n = m_n;
+    uint32_t t = m_t;
+    if (k < 1)
+    {
+        k = 1;
+    }
+    if (k >= n)
+    {
+        k = n - 1;
+    }
+    if (static_cast<uint64_t>(2) * t > n - k)
+    {
+        k = n - static_cast<uint32_t>(std::min<uint64_t>(
+            n - 1, static_cast<uint64_t>(2) * t));
+    }
+    SetFecParams(n, k, t);
+}
+
+void
+FecModel::SetTAttribute(uint32_t t)
+{
+    // Round 62: attribute setter re-validation (codex finding 2). The
+    // uint64 widening below matches SetFecParams — a T > 2^31 wrapped
+    // 2 * t to 0 under the old uint32 assert and passed unchecked.
+    uint32_t n = m_n;
+    uint32_t k = m_k;
+    if (static_cast<uint64_t>(2) * t > n - k)
+    {
+        t = static_cast<uint32_t>((n - k) / 2);
+    }
+    SetFecParams(n, k, t);
 }
 
 uint32_t
@@ -477,8 +547,17 @@ FecModel::DecodePacket(double preFecBer, uint32_t payloadSize) const
 
     uint64_t payloadBits = static_cast<uint64_t>(payloadSize) * 8;
     uint64_t dataBitsPerCodeword = static_cast<uint64_t>(m_k) * RS_SYMBOL_BITS;
-    uint32_t numCodewords = static_cast<uint32_t>(
-        (payloadBits + dataBitsPerCodeword - 1) / dataBitsPerCodeword);
+    // Wrap-free ceiling in uint64 (codex round 62): the payload is a
+    // uint32, so payloadBits tops out at 2^35 and the old addition could
+    // wrap only if a future caller widened the signature; divide first,
+    // then bump on a nonzero remainder, so the count is correct for any
+    // uint64 payloadBits this function may see after such a widening.
+    uint64_t numCodewordsWide = payloadBits / dataBitsPerCodeword +
+                                (payloadBits % dataBitsPerCodeword != 0 ? 1 : 0);
+    // Narrow back to the uint32 packet-codeword count the downstream
+    // probability math uses; payloadSize is a uint32, so a payload's
+    // codeword count cannot exceed 2^35 / 10 < 2^32 for K >= 1.
+    uint32_t numCodewords = static_cast<uint32_t>(numCodewordsWide);
 
     if (numCodewords <= 1)
     {
@@ -528,7 +607,11 @@ FecModel::GetEncodedSize(uint32_t payloadSize) const
 
     uint64_t payloadBits = static_cast<uint64_t>(payloadSize) * 8;
     uint64_t dataBitsPerCodeword = static_cast<uint64_t>(m_k) * RS_SYMBOL_BITS;
-    uint64_t numCodewords = (payloadBits + dataBitsPerCodeword - 1) / dataBitsPerCodeword;
+    // Wrap-free ceiling (codex round 62): divide first, then bump on a
+    // nonzero remainder — the uint64 (bits + per-codeword - 1) addition
+    // wrapped for payloads in the top per-codeword range of 2^64.
+    uint64_t numCodewords = payloadBits / dataBitsPerCodeword +
+                            (payloadBits % dataBitsPerCodeword != 0 ? 1 : 0);
     uint64_t encodedBits = numCodewords * m_n * RS_SYMBOL_BITS;
     // uint64 return (codex round 51, finding 2): the encoded size of a
     // ~4-GB payload crosses UINT32_MAX; the old uint32 return narrowed it

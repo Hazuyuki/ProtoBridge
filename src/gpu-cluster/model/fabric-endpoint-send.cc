@@ -344,6 +344,21 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
     const uint32_t OVERFLOW_THRESHOLD_COLLECTIVE = 500 * 1024 * 1024;
     bool needFragmentColl = (sendDevices.size() > 1) ||
                             (wireSize > OVERFLOW_THRESHOLD_COLLECTIVE);
+    // Round 62: in the SINGLE-PACKET arm (no fragmentation) both sizes
+    // flow into uint32 packet/header fields (codex finding 17) — an
+    // effective size that wraps the cast advertises 0 delivered bytes
+    // for a nonzero transfer. The fragmented arms split everything
+    // under the spray/coalesce caps (<= 8 MiB per chunk), so only this
+    // arm can see the wide values; abort loud rather than narrow.
+    // SendCollective's per-chunk effective split (round 25, finding 2)
+    // feeds fragments under that cap, so the wide-volume test (4 GiB
+    // in 8-MiB chunks) still passes.
+    if (!needFragmentColl)
+    {
+        NS_ABORT_MSG_IF(effectiveSize > std::numeric_limits<uint32_t>::max(),
+                        "Collective transfer effective size " << effectiveSize
+                        << " B exceeds the uint32 header field");
+    }
 
     if (needFragmentColl)
     {
@@ -1295,8 +1310,19 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                 {
                     SoHeader soh;
                     pkt->PeekHeader(soh);
-                    uint64_t targetWire = static_cast<uint64_t>(
-                        std::ceil(soh.GetDataSize() / efficiency));
+                    // Round 62: check the ceil quotient BEFORE the uint64
+                    // cast (codex finding 8). The cast used to run ahead
+                    // of the bodyHardCap clamp, and at a pathological
+                    // efficiency the double quotient reaches 2^64 —
+                    // out of range for the conversion (floating-point
+                    // diagnostics halt the process under
+                    // -fsanitize=float-cast-overflow).
+                    const double targetWireD =
+                        std::ceil(soh.GetDataSize() / efficiency);
+                    NS_ABORT_MSG_IF(!(targetWireD < 18446744073709551616.0),
+                                    "RoCE per-chunk padding target "
+                                        << targetWireD << " B is out of uint64 range");
+                    uint64_t targetWire = static_cast<uint64_t>(targetWireD);
                     // Degenerate-cap guard (round 43, finding 5): never let
                     // the padded body exceed the wire cap — ceil(data/eff)
                     // can overshoot when the data cap was clamped up from a

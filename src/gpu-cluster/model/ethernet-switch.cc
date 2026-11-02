@@ -219,7 +219,15 @@ EthernetSwitch::EffectivePfcPauseThreshold(uint32_t outPort) const
             double occupancy = static_cast<double>(GetVoqSize(outPort))
                                / static_cast<double>(depth);
             double scaled = static_cast<double>(m_pfcPauseThreshold) * (1.0 - occupancy);
-            return std::max<uint32_t>(1u, static_cast<uint32_t>(scaled));
+            // Round 62: clamp to a nonnegative value BEFORE the cast
+            // (codex finding 13). GetVoqSize can exceed GetVoqDepth —
+            // SetVoqDepth is public and may be lowered below the live
+            // backlog — so occupancy > 1 makes scaled negative, and the
+            // float->uint32 conversion of a negative double is UB
+            // (aborting under -fsanitize=float-cast-overflow) before
+            // std::max ever runs.
+            return std::max<uint32_t>(1u,
+                                      static_cast<uint32_t>(std::max(0.0, scaled)));
         }
     }
     return m_pfcPauseThreshold;
@@ -244,7 +252,11 @@ EthernetSwitch::EffectivePfcPauseThreshold(uint32_t outPort, uint8_t vcId) const
             double occupancy = static_cast<double>(GetVoqSize(outPort))
                                / static_cast<double>(depth);
             double scaled = static_cast<double>(base) * (1.0 - occupancy);
-            return std::max<uint32_t>(1u, static_cast<uint32_t>(scaled));
+            // Round 62: same negative-product clamp as the port-level
+            // overload above (occupancy can exceed 1 when the live
+            // backlog outgrows a subsequently lowered VOQ depth).
+            return std::max<uint32_t>(1u,
+                                      static_cast<uint32_t>(std::max(0.0, scaled)));
         }
     }
     return base;

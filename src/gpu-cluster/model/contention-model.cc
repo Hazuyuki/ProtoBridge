@@ -7,6 +7,8 @@
 #include "fabric-header.h"
 
 #include "ns3/log.h"
+
+#include <limits>
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
 
@@ -243,7 +245,18 @@ ContentionModel::GetEffectiveBandwidth(TrafficClass trafficClass) const
 
     // Otherwise, get weighted share
     double weight = GetWeight(trafficClass);
-    return static_cast<uint64_t>(weight * static_cast<double>(m_bandwidth));
+    // Round 62: saturation guard (codex finding 11). With bandwidth near
+    // UINT64_MAX and 2+ active classes the weighted product rounds up to
+    // 2^64 in double precision and the static_cast is out of range
+    // (floating-point diagnostics halt the process under
+    // -fsanitize=float-cast-overflow). Saturate like the protocol-model
+    // helpers (round 51, finding 8).
+    const double product = weight * static_cast<double>(m_bandwidth);
+    if (!(product < 18446744073709551616.0)) // >= 2^64
+    {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return static_cast<uint64_t>(product);
 }
 
 Time

@@ -480,6 +480,14 @@ RdmaOperationEngine::SendPayload(uint16_t peer,
                                              m_model->GetConfig().mtuBytes > 14
                                                  ? m_model->GetConfig().mtuBytes - 14
                                                  : 1u);
+    // Round 62: a payload-limit callback returning 0 with a nonzero
+    // request stalls forever here — offset never advances while the loop
+    // keeps emitting zero-length pieces (codex probe: SetPayloadLimit(0)
+    // then SendPayload(..., bytes=1)). The default fallback is floored
+    // at 1, so only an explicit callback can trip this.
+    NS_ABORT_MSG_IF(cap == 0 && bytes > 0,
+                    "RdmaOperationEngine::SendPayload zero payload-limit cap for a "
+                        << bytes << "-B operation");
     for (uint64_t offset = 0; offset < bytes;)
     {
         uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(cap, bytes - offset));

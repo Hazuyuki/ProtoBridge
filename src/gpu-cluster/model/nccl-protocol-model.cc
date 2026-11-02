@@ -120,7 +120,23 @@ NcclProtocolModel::GetDataSize(uint64_t wireSize, uint8_t protocolId) const
     const auto protocol = static_cast<NcclProtocol>(protocolId);
     if (protocol == NcclProtocol::SIMPLE)
     {
-        return static_cast<uint64_t>(wireSize * m_simpleWireEfficiency);
+        // Round 62: inverse-direction guard, mirroring the checked
+        // GetWireSize forward form (codex round 51, finding 8). At
+        // SimpleWireEfficiency 1.0 the forward helper returns the input
+        // unconverted, but here double(UINT64_MAX) rounds up to 2^64 and
+        // the static_cast is UB on any platform. Efficiency 1.0 is exact
+        // — return the input; otherwise saturate on an out-of-range
+        // product.
+        if (m_simpleWireEfficiency == 1.0)
+        {
+            return wireSize;
+        }
+        const double product = static_cast<double>(wireSize) * m_simpleWireEfficiency;
+        if (!(product < 18446744073709551616.0)) // >= 2^64
+        {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return static_cast<uint64_t>(product);
     }
     return GetDataSize(wireSize, protocol);
 }

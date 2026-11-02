@@ -65,7 +65,8 @@ LinkDegradationModel::GetTypeId()
                             .AddAttribute("CodewordSize",
                                           "Codeword size in bytes for burst error granularity",
                                           UintegerValue(256),
-                                          MakeUintegerAccessor(&LinkDegradationModel::m_codewordSize),
+                                          MakeUintegerAccessor(&LinkDegradationModel::GetCodewordSize,
+                                                               &LinkDegradationModel::SetCodewordSize),
                                           MakeUintegerChecker<uint32_t>())
                             .AddAttribute("BurstLength",
                                           "Mean burst length in codewords",
@@ -253,7 +254,14 @@ void
 LinkDegradationModel::SetCodewordSize(uint32_t sizeBytes)
 {
     NS_LOG_FUNCTION(this << sizeBytes);
-    m_codewordSize = sizeBytes;
+    // Round 62: a zero codeword size divides by zero at the burst-mode
+    // codeword-count step (codex probe: SetCodewordSize(0) then any
+    // packet in BURST mode evaluated numCodewords = 0/0), and values
+    // near UINT32_MAX wrapped the (packetSize + size - 1) ceiling
+    // addition to 0 so a small packet was treated as zero codewords —
+    // it survived burst mode untouched even at BER 500. Floor at one
+    // byte (the attribute accessor routes through this setter too).
+    m_codewordSize = std::max(1u, sizeBytes);
 }
 
 uint32_t
@@ -573,7 +581,12 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
     NS_LOG_FUNCTION(this << packet);
 
     uint32_t packetSize = packet->GetSize();
-    uint32_t numCodewords = (packetSize + m_codewordSize - 1) / m_codewordSize;
+    // Round 62: wrap-free ceiling division (codex finding 4). The old
+    // (packetSize + size - 1) addition wrapped in uint32 for
+    // m_codewordSize near UINT32_MAX, counting a small packet as zero
+    // codewords so it dodged burst mode entirely; dividing first then
+    // bumping on a nonzero remainder cannot overflow.
+    uint32_t numCodewords = packetSize / m_codewordSize + (packetSize % m_codewordSize != 0 ? 1 : 0);
 
     for (uint32_t i = 0; i < numCodewords; i++)
     {

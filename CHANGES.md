@@ -6,6 +6,148 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 62: 19 findings, 15 fixed, 4 verified-and-documented
+
+**What.** Round-62 review of commit 40a34cc returned 19 findings (4 P1, 12
+P2, 3 P3). The five round-61 guard categories were all confirmed clean on
+their guarded paths. Fifteen findings are fixed with loud-abort guards,
+validating setters, wrap-free ceiling divisions, and inverse-direction
+saturation clamps; four were verified numerically and documented
+(buffer.cc is upstream ns-3 code vendored inside protobridge — its four
+wrap sites are documented as upstream-parity, not fixed; the round-61
+CHANGES numbers were corrected against codex's original probe, which
+round-62 python-verified arithmetic confirms).
+
+**Fixed (P1).**
+
+1. **FecModel attribute bypass (finding 2).** `GetTypeId` bound
+   `MakeUintegerAccessor` DIRECTLY to the private m_n/m_k/m_t members, so
+   `SetAttribute("K", UintegerValue(0))` bypassed the round-61
+   SetFecParams assert and made DecodePacket / GetEncodedSize divide by
+   zero (dataBitsPerCodeword = 0); `SetAttribute("N", ...)` could zero
+   the GetPayloadSize divisor the same way. The N/K/T attributes now
+   bind getter + validating setter pairs (`SetNAttribute` /
+   `SetKAttribute` / `SetTAttribute`) that repair each parameter against
+   the current siblings (raising floors where the MDS relation
+   2T <= N-K demands) and then run the full SetFecParams assert suite,
+   so every write path — method or attribute — lands on a valid triple.
+2. **UbPayloadBuilder MESSAGE framing wrap (finding 3).** dataSize =
+   2^64-16 wrapped `16 + thisChunkDataSize` to 0 (payload[0] wrote into
+   an empty vector), and a 2^32-16 chunk framed to exactly 2^32 narrows
+   to 0 at the uint32-taking `Create<Packet>`. Added
+   `NS_ABORT_MSG_IF` guards: MAINTENANCE payloads over UINT32_MAX, zero
+   chunkSize, and any chunk leaving no uint32 room for the 16-B
+   transaction header.
+3. **LinkDegradationModel burst-mode codeword count (finding 4).**
+   `(packetSize + m_codewordSize - 1) / m_codewordSize` divided by zero
+   at SetCodewordSize(0), and at codewordSize = UINT32_MAX with a
+   2-byte packet the addition wrapped to 0 codewords — the packet
+   always survived even at BER 500. The setter now floors at 1 byte
+   (the attribute accessor routes through it) and the count uses the
+   wrap-free divide-then-bump form.
+4. **UbProtocolModel::GetDataSize header-underflow (finding 12).**
+   `GetDataSize(0, MAINTENANCE)` evaluated unsigned 0 - 16 =
+   18446744073709551600, and the data-port branches multiplied the
+   underflowed value through an unchecked double->uint64 cast. A
+   `wireSize <= 16` early-out maps anything at or below the header to
+   zero data.
+
+**Fixed (P2).**
+
+5. **FecModel 2*t assert overflow (finding 5).** `2 * t` wrapped in
+   uint32: SetFecParams(2, 1, 2147483648) passed every round-61
+   assertion. Both the SetFecParams assert and the new attribute
+   setters widen to `static_cast<uint64_t>(2) * t` before comparing.
+6. **NcclProtocolPayloadBuilder::BuildSimpleChunk narrowing (finding
+   6).** `Create<Packet>(data, dataBytes)` takes a uint32 size; a
+   dataBytes at or above 2^32 narrowed to a truncated/empty packet.
+   Added `NS_ABORT_MSG_IF(dataBytes > UINT32_MAX, ...)`.
+7. **Zero-progress loops (finding 7).** `UbPayloadBuilder::BuildChunks`
+   with chunkSize=0 emitted 16-B headers forever (remaining never
+   decreased); `RdmaOperationEngine::SendPayload` with a payload-limit
+   callback returning 0 looped on count=offset=0. Both now abort loud:
+   zero chunkSize, and zero cap with a nonzero request.
+8. **RoCE per-chunk padding cast order (finding 8).** The RoCE arm
+   cast `ceil(soh.GetDataSize() / efficiency)` to uint64 BEFORE the
+   bodyHardCap clamp; at a pathological efficiency the double quotient
+   reaches 2^64 — out of range for the conversion (floating-point
+   diagnostics halt the process under -fsanitize=float-cast-overflow).
+   The quotient is now range-checked before the cast.
+9. **Protocol-model GetDataSize inverses (finding 9).** The public
+   inverse `GetDataSize` in EthernetProtocolModel, McclProtocolModel,
+   RoceProtocolModel, and NcclProtocolModel's SIMPLE branch multiplied
+   through an unchecked `static_cast<uint64_t>(wireSize *
+   m_wireEfficiency)`: at efficiency 1.0, double(UINT64_MAX) rounds up
+   to 2^64 and the cast is UB (the round-51 guard covered only the
+   forward GetWireSize). Each inverse now returns the input exactly at
+   efficiency 1.0 and saturates on an out-of-range product, mirroring
+   the forward-helper policy.
+10. **UbPayloadBuilder::GetWireSize overflow (finding 10).**
+    `dataSize * (1/0.98)` overflowed for large inputs (the
+    double product of UINT64_MAX * 1.02 exceeds 2^64). Now saturated
+    with the same guard shape.
+11. **ContentionModel::GetEffectiveBandwidth overflow (finding 11).**
+    `weight * double(m_bandwidth)` overflowed when bandwidth is near
+    UINT64_MAX with 2+ active classes. Saturates on an out-of-range
+    product.
+12. **EthernetSwitch PFC mode-2 negative product (finding 13).** PFC
+    mode-2 `scaled = base * (1.0 - occupancy)` can be negative —
+    occupancy exceeds 1.0 when the live VOQ backlog outgrows a
+    subsequently lowered GetVoqDepth (SetVoqDepth is public on
+    NvSwitch) — and `static_cast<uint32_t>(scaled)` on a negative
+    double is UB before `std::max(1u, ...)` runs. Both the port and
+    per-VC overloads now clamp with `std::max(0.0, scaled)` before
+    the cast.
+13. **SendCollectiveBulk single-packet narrowing (finding 17).** In the
+    no-fragmentation arm both sizes flow into uint32 packet/header
+    fields; SendCollectiveBulk(type, dest, 4294967296, 1) passed the
+    entry guards, built a 1-byte packet, and advertised
+    effectiveDataSize=0. The fragmented arms split under the
+    spray/coalesce caps, so the guard is scoped to `!needFragmentColl`;
+    the wide-volume SendCollective test (4 GiB in 8-MiB chunks) still
+    passes.
+
+**Verified and documented (no further code change).**
+
+14. **buffer.cc wrap sites (findings 1, 14, 15, 16).** AddAtStart
+    newSize wrap, GetDistanceFrom int32 narrowing,
+    RemoveAtStart(UINT32_MAX) "restoring" bytes, and Deserialize
+    sizeCheck wrap all reproduce as probed — but buffer.cc is upstream
+    ns-3 code vendored inside protobridge, and GetDistanceFrom /
+    Iterator::GetSize return uint32, so >4 GiB buffers are
+    signature-limited regardless. Documented as upstream-parity, not
+    fixed (consistent with every prior round's buffer.cc treatment).
+15. **Round-61 CHANGES numbers corrected (finding 18, P3).** The
+    round-61 entry "corrected" codex's original r61 probe value using a
+    mis-scaled payloadBits; round-62 python-verified exact arithmetic
+    (see the round-61 entry below) confirms codex's original
+    1,610,612,736 B returned / 36,893,488,160,304,005,120 exact bits /
+    12,884,901,888 wrapped bits / 4,611,686,020,038,000,640 exact bytes.
+    The round-61 entry is corrected in place.
+16. **DataRate long-double ABI qualification (finding 19, P3).** On
+    x86-64 (80-bit extended long double, LDBL_MANT_DIG >
+    DBL_MANT_DIG) the guard bound is the 2^63-1 literal and the exact
+    product 89,547,301,328,687,144 * 103 = 2^63 + 24 exceeds it by 25,
+    so the path aborts there; the "accepts 2^63 - 1024" case in the
+    round-59 entry holds only on ld==double platforms. The round-59
+    entry is annotated in place.
+
+**Also hardened this round.** Both FecModel ceiling divisions
+(DecodePacket's codeword count and GetEncodedSize's) now use the
+wrap-free divide-then-bump form, matching the round-51 policy.
+
+**Verified.** Clean build; PASS data-rate; PASS error-model; PASS
+gpu-cluster; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model); traffic-control
+smoke Unforced drop 37/55500, sent 6887/10302800; parity 48 PASS across
+14 scripts + 18/18 pytest (test_ibgda + test_config_fec_enabled);
+surrogate 101 passed. DCQCN anchors unchanged: bulkChunkSize=1000/dcqcn=1
+simTimeUs=20802.4, ecnMarkedPackets=99985, cnpPacketsSent=99985,
+cnpPacketsReceived=99974; bulkChunkSize=2690/dcqcn=0 simTimeUs=20300.2,
+counters 0/0/0.
+
 ### Reviewed — codex round 61: 8 pre-existing defects, 5 fixed, 3 verified-and-documented
 
 **What.** Round-61 review of commit b5eab88 found eight pre-existing defects
@@ -69,14 +211,16 @@ probes were recomputed independently before acting.
    the explicit test seam — production uploads go through the guarded
    SendCollectiveBulk path — so documented as seam-scope, not fixed.
 7. **FEC encoded-bits uint64 overflow (P2, verified, codex probe value
-   wrong)** — `SetFecParams(2^31, 1, 0)` + `GetEncodedSize(2^31)` computes
-   exact encoded bits = 46,116,860,184,273,879,040 (~2^65.3), which wraps
-   mod 2^64 to 9,223,372,036,854,775,808 bits. The codex-claimed wrapped
-   result (1,610,612,736 B) was **wrong**; independent recomputation gives
-   wrapped bytes = 1,152,921,504,606,846,976 vs exact
-   5,764,607,523,034,234,880. Not fixed: N = 2^31 needs k*t ≤ 2^31
-   anyway, and every in-tree payloadSize is uint32 — callers cannot reach
-   the overflowing product.
+   right)** — `SetFecParams(2^31, 1, 0)` + `GetEncodedSize(2^31)` computes
+   exact encoded bits = 36,893,488,160,304,005,120 (~2^64.99), which wraps
+   mod 2^64 to 12,884,901,888 bits = 1,610,612,736 B returned. (Round 61
+   recomputed numCodewords against a mis-scaled payloadBits and wrongly
+   "corrected" this value; round 62 re-verified the original probe with
+   exact integer arithmetic — codex's 1,610,612,736 B stands.) Exact
+   unwrapped size 4,611,686,020,038,000,640 B. Not fixed: N = 2^31 needs
+   k*t ≤ 2^31 anyway, and every in-tree payloadSize is uint32 — callers
+   cannot reach the overflowing product. Round 62 additionally made both
+   ceiling divisions wrap-free (divide, then bump on nonzero remainder).
 8. **Near-zero BER precision floor (P2, verified, documented)** — at
    (N,K,T) = (544,514,0), BER 1e-18: pSym = 1e-17 but `1 - pSym` rounds to
    exactly 1.0 (the log1p-accurate range ends at the unit roundoff), so the
@@ -381,13 +525,17 @@ verified with probes before fixing:
    now use a platform-conditional guard bound: `nextafter(2^63, 0)`
    (= 2^63 - 1024, the largest double below 2^63) when
    `LDBL_MANT_DIG == DBL_MANT_DIG`, `9223372036854775807.0L`
-   elsewhere. Probe-validated: the 2^63 - 1024 bound agrees with
-   exact arithmetic on 5/6 cases — rejects (2^62)*2.0 and
-   (2^62+1)*2.0 (abort), accepts (2^63-1024)*1.0 (pass) and
-   2^62*(2-2ulp) = 2^63-1024 (pass); the unavoidable mismatch is
+   elsewhere. Probe-validated on ld==double platforms: the 2^63 - 1024
+   bound agrees with exact arithmetic on 5/6 cases — rejects (2^62)*2.0
+   and (2^62+1)*2.0 (abort), accepts (2^63-1024)*1.0 (pass) and
+   2^62*(2-2ulp) = 2^63-1024 (pass). The unavoidable mismatch is
    MAX*1.0 whose exact value 2^63-1 rounds to 2^63 in double and
    therefore aborts on those platforms (documented, same behavior the
-   old literal produced).
+   old literal produced). Round-62 ABI note: on x86-64 (80-bit extended
+   long double, LDBL_MANT_DIG > DBL_MANT_DIG) the guard bound is the
+   2^63-1 literal and the product 89,547,301,328,687,144 * 103 = exactly
+   2^63 + 24 exceeds it by 25, so the path aborts there; the "accepts
+   2^63 - 1024" case above holds only on ld==double platforms.
 4. **[P0] BurstLength == 0 raised FE_DIVBYZERO in the geometric
    formula.** The denominator `log(0 / (1 + 0))` = log(0). The
    burst-start branch now short-circuits `m_burstLength == 0` to a

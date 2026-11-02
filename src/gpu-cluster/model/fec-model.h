@@ -174,6 +174,23 @@ class FecModel : public Object
   private:
     void DoDispose() override;
 
+    /**
+     * Round 62: N/K/T must satisfy the same divisor invariants no matter
+     * how they are set. SetFecParams validates the triple atomically, but
+     * the TypeId attributes used to bind MakeUintegerAccessor directly to
+     * these members, so SetAttribute("K", UintegerValue(0)) bypassed the
+     * round-61 assert and made DecodePacket / GetEncodedSize divide by
+     * zero (dataBitsPerCodeword = 0), and SetAttribute("N", ...) could
+     * zero the GetPayloadSize divisor the same way. The attribute setters
+     * below re-validate each parameter against the CURRENT siblings
+     * (raising the floor where the MDS relation 2T <= N-K demands it) and
+     * then run the full SetFecParams assert suite, so every write path —
+     * method or attribute — lands on a valid triple.
+     */
+    void SetNAttribute(uint32_t n);
+    void SetKAttribute(uint32_t k);
+    void SetTAttribute(uint32_t t);
+
     uint32_t m_n;              ///< Total codeword length (symbols)
     uint32_t m_k;              ///< Data symbols per codeword
     uint32_t m_t;              ///< Error correction capability (symbols)

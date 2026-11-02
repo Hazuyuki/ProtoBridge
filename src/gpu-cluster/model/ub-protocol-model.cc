@@ -163,6 +163,19 @@ UbProtocolModel::GetDataSize(uint64_t wireSize, uint8_t protocolId) const
 {
     UbTransaction txn = static_cast<UbTransaction>(protocolId);
 
+    // Round 62: the inverse framing subtracts the 16-B transaction header
+    // BEFORE checking it exists. GetDataSize(0, MAINTENANCE) evaluated
+    // unsigned 0 - 16 = 18446744073709551600 (codex probe), and the
+    // data-port branches further multiplied the underflowed value through
+    // an unchecked double->uint64 cast — at efficiency 1.0 even a
+    // representable input like wireSize 1 underflowed to 2^64 - 15 and
+    // the conversion was undefined. Framing never carries data smaller
+    // than its header; map anything at or below the header to zero data.
+    if (wireSize <= 16)
+    {
+        return 0;
+    }
+
     switch (txn)
     {
         case UbTransaction::MEM_SYNC:
