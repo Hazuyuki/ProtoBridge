@@ -5,7 +5,11 @@ build_lib(
     model/fabric-endpoint.cc
     model/fabric-endpoint-send.cc
     model/fabric-endpoint-ibgda.cc
+    model/fabric-endpoint-rdma.cc
     model/rdma-submission-model.cc
+    model/rdma-operation.cc
+    model/rdma-operation-engine.cc
+    model/rdma-operation-traffic.cc
     model/nvswitch.cc
     model/arbiter.cc
     model/credit-manager.cc
@@ -65,6 +69,9 @@ build_lib(
     model/fabric-endpoint.h
     model/ibgda-submission-model.h
     model/rdma-submission-model.h
+    model/rdma-operation.h
+    model/rdma-operation-engine.h
+    model/rdma-operation-traffic.h
     model/device-type.h
     model/fabric-switch.h
     model/nvswitch.h
@@ -125,5 +132,5 @@ build_lib(
     helper/hybrid-topology-helper.h
     helper/multi-node-topology-helper.h
   LIBRARIES_TO_LINK ${libnetwork} ${libpoint-to-point}
-  TEST_SOURCES test/gpu-cluster-test.cc test/integration-test.cc test/ibgda-test.cc test/rdma-modes-test.cc
+  TEST_SOURCES test/gpu-cluster-test.cc test/integration-test.cc test/ibgda-test.cc test/rdma-modes-test.cc test/rdma-operations-test.cc
 )

@@ -42,6 +42,7 @@
 #include "ns3/ub-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
 #include "ns3/rdma-submission-model.h"
+#include "ns3/rdma-operation-traffic.h"
 #include "ns3/ethernet-protocol-model.h"
 #include "ns3/dcqcn-rate-machine.h"
 #include "ns3/rttcc-rate-machine.h"
@@ -947,10 +948,15 @@ main(int argc, char* argv[])
     if (collective != "allreduce" && collective != "alltoall" &&
         collective != "allgather" && collective != "reducescatter" &&
         collective != "broadcast" && collective != "reduce" &&
-        collective != "p2p" && collective != "fanout" && collective != "incast")
+        collective != "p2p" && collective != "fanout" && collective != "incast" && collective != "rdma")
     {
-        NS_ABORT_MSG("Unknown collective: " << collective << ". Supported: allreduce, alltoall, allgather, reducescatter, broadcast, reduce, p2p, fanout, incast");
+        NS_ABORT_MSG("Unknown collective: " << collective << ". Supported: allreduce, alltoall, allgather, reducescatter, broadcast, reduce, p2p, fanout, incast, rdma");
     }
+
+    NS_ABORT_MSG_IF(collective=="rdma" && (!IsDetailedRdmaMode(rdmaSubmission) || numNodes<2),
+                    "collective=rdma requires detailed timing and multiple nodes");
+    NS_ABORT_MSG_IF(rdmaConfig.operation!="write" && collective!="rdma",
+                    "rdmaOperation selects the collective=rdma workload; it does not replace collective transfers");
 
     if (verbose)
     {
@@ -1997,7 +2003,7 @@ main(int argc, char* argv[])
         {
             rdmaTrace=std::make_shared<std::ofstream>(rdmaTraceFile);
             NS_ABORT_MSG_IF(!*rdmaTrace,"Cannot open rdmaTraceFile");
-            *rdmaTrace << "rank,workId,peer,producer,qp,bytes,readyNs,reservedNs,publishedNs,doorbellNs,executeNs,firstWireNs,ackedNs,observedNs,requestId,offset,submittedNs,stagingAcquiredNs,sourceStagedNs,initiator,dataPath\n";
+            *rdmaTrace << "rank,workId,peer,producer,qp,bytes,readyNs,reservedNs,publishedNs,doorbellNs,executeNs,firstWireNs,ackedNs,observedNs,requestId,offset,submittedNs,stagingAcquiredNs,sourceStagedNs,initiator,dataPath,opcode\n";
         }
         std::map<uint32_t,std::shared_ptr<RdmaHostMemoryResources>> hostMemory;
         for (auto ep : endpoints)
@@ -2018,7 +2024,7 @@ main(int argc, char* argv[])
                         << ',' << t.observed.GetNanoSeconds() << ',' << t.requestId << ',' << t.offset
                         << ',' << t.submitted.GetNanoSeconds() << ',' << t.stagingAcquired.GetNanoSeconds()
                         << ',' << t.sourceStaged.GetNanoSeconds() << ',' << rdmaConfig.initiator
-                        << ',' << rdmaConfig.dataPath << '\n';
+                        << ',' << rdmaConfig.dataPath << ',' << RdmaOpcodeName(t.opcode) << '\n';
                 });
             }
             ep->SetRdmaSubmissionModel(model);
@@ -2063,6 +2069,7 @@ main(int argc, char* argv[])
               << llrReloadLatencyNs << "ns" << std::endl;
 
     Ptr<CollectiveInjector> injector;
+    Ptr<RdmaOperationTraffic> rdmaTraffic;
     ProtocolConfigRunner configRunner;  // used only in config mode
     // Resolve "auto" for the single-shot path (trace path resolves per-phase
     // inside CreateTraceCollectiveInjector). hasNvls follows the same rule.
@@ -2786,6 +2793,18 @@ main(int argc, char* argv[])
         injector = rd;
     }
 
+    else if (collective == "rdma")
+    {
+        NS_ABORT_MSG_IF(!IsDetailedRdmaMode(rdmaSubmission) || numNodes<2,
+                        "collective=rdma requires detailed RDMA and at least two nodes");
+        uint16_t peer=static_cast<uint16_t>((rootRank+gpusPerNode)%numGpus);
+        rdmaTraffic=CreateObject<RdmaOperationTraffic>();
+        rdmaTraffic->Initialize(endpoints[rootRank],endpoints[peer],dataSize,p2pIterations,rdmaConfig);
+        rdmaTraffic->SetCompletionCallback([](bool success,uint64_t duration){
+            if(success) OnCollectiveComplete(duration);else Simulator::Stop();
+        });
+        Simulator::ScheduleNow(&RdmaOperationTraffic::Start,rdmaTraffic);
+    }
     else if (collective == "p2p" || collective == "fanout" || collective == "incast")
     {
         // Bare wire-transfer patterns on the credit-gated bulk path (see
@@ -2915,6 +2934,18 @@ main(int argc, char* argv[])
     std::cout << "p2pIterations=" << p2pIterations << std::endl;
     std::cout << "rdmaInitiator=" << rdmaConfig.initiator << std::endl;
     std::cout << "rdmaDataPath=" << rdmaConfig.dataPath << std::endl;
+    if(rdmaTraffic)
+    {
+        std::cout << "rdmaOperation=" << rdmaConfig.operation << std::endl;
+        std::cout << "rdmaOperationsCompleted=" << rdmaTraffic->GetCompleted() << std::endl;
+        std::cout << "rdmaOperationsFailed=" << rdmaTraffic->GetFailed() << std::endl;
+        std::cout << "rdmaLastAtomicValue=" << rdmaTraffic->GetLastValue() << std::endl;
+        std::cout << "rdmaRemoteValue=" << rdmaTraffic->GetRemoteValue() << std::endl;
+        std::cout << "rdmaSignalValue=" << rdmaTraffic->GetSignalValue() << std::endl;
+        std::cout << "rdmaLastAtomicValueHex=0x" << std::hex << rdmaTraffic->GetLastValue() << std::dec << std::endl;
+        std::cout << "rdmaRemoteValueHex=0x" << std::hex << rdmaTraffic->GetRemoteValue() << std::dec << std::endl;
+        std::cout << "rdmaSignalValueHex=0x" << std::hex << rdmaTraffic->GetSignalValue() << std::dec << std::endl;
+    }
     if (IsDetailedRdmaMode(rdmaSubmission))
     {
         RdmaStats total;
@@ -2922,6 +2953,8 @@ main(int argc, char* argv[])
         {
             const auto& st=model->GetStats();
             total.requests+=st.requests;total.completedRequests+=st.completedRequests;
+            total.failedRequests+=st.failedRequests;
+            total.peakReadAtomic=std::max(total.peakReadAtomic,st.peakReadAtomic);
             total.submitted+=st.submitted;total.completed+=st.completed;
             total.failed+=st.failed;total.doorbells+=st.doorbells;total.cqes+=st.cqes;
             total.startupSamples+=st.startupSamples;total.startupTotalNs+=st.startupTotalNs;
@@ -2958,6 +2991,28 @@ main(int argc, char* argv[])
         if (rdmaSubmission == "ibgda") emit("ibgda");
         std::cout << "rdmaSubmittedRequests=" << total.requests << std::endl;
         std::cout << "rdmaCompletedRequests=" << total.completedRequests << std::endl;
+        std::cout << "rdmaFailedRequests=" << total.failedRequests << std::endl;
+        std::cout << "rdmaPeakReadAtomic=" << total.peakReadAtomic << std::endl;
+        RdmaOperationStats operations;
+        for(auto ep:endpoints) if(ep && ep->GetRdmaOperationEngine())
+        {
+            const auto& st=ep->GetRdmaOperationEngine()->GetStats();
+            operations.readRequests+=st.readRequests;operations.readResponseBytes+=st.readResponseBytes;
+            operations.atomicExecutions+=st.atomicExecutions;operations.rnrRetries+=st.rnrRetries;
+            operations.rnrExhausted+=st.rnrExhausted;operations.receiveCompletions+=st.receiveCompletions;
+            operations.signalUpdates+=st.signalUpdates;operations.responsePeak=std::max(operations.responsePeak,st.responsePeak);
+            operations.wireDataBytes+=st.wireDataBytes;operations.wireControlBytes+=st.wireControlBytes;
+        }
+        std::cout << "rdmaReadRequests=" << operations.readRequests << std::endl;
+        std::cout << "rdmaReadResponseBytes=" << operations.readResponseBytes << std::endl;
+        std::cout << "rdmaAtomicExecutions=" << operations.atomicExecutions << std::endl;
+        std::cout << "rdmaRnrRetries=" << operations.rnrRetries << std::endl;
+        std::cout << "rdmaRnrExhausted=" << operations.rnrExhausted << std::endl;
+        std::cout << "rdmaReceiveCompletions=" << operations.receiveCompletions << std::endl;
+        std::cout << "rdmaSignalUpdates=" << operations.signalUpdates << std::endl;
+        std::cout << "rdmaResponderPeak=" << operations.responsePeak << std::endl;
+        std::cout << "rdmaOperationDataBytes=" << operations.wireDataBytes << std::endl;
+        std::cout << "rdmaOperationControlBytes=" << operations.wireControlBytes << std::endl;
         std::cout << "rdmaSourceD2hBytes=" << total.sourceD2hBytes << std::endl;
         std::cout << "rdmaDestinationH2dBytes=" << total.destinationH2dBytes << std::endl;
         std::cout << "rdmaHostReadBytes=" << total.hostReadBytes << std::endl;

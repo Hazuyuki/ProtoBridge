@@ -8,6 +8,7 @@ from __future__ import annotations
 
 
 COLLECTIVES = [
+    {"value": "rdma", "label": "RDMA operations", "algorithms": ["p2p"], "scope": "multi"},
     {"value": "allreduce", "label": "AllReduce", "algorithms": ["auto", "ring", "tree", "fullmesh", "nvls", "sharp", "hierarchical", "ncclring"]},
     {"value": "allgather", "label": "AllGather", "algorithms": ["auto", "ring", "fullmesh", "nvls", "hierarchical"]},
     {"value": "reducescatter", "label": "ReduceScatter", "algorithms": ["ring", "fullmesh", "hierarchical"]},
@@ -16,6 +17,7 @@ COLLECTIVES = [
     {"value": "reduce", "label": "Reduce", "algorithms": ["ring"]},
 ]
 ALGORITHMS = {
+    "p2p": "Point-to-point",
     "auto": "Auto · 按数据量选择", "ring": "Ring", "tree": "Tree",
     "fullmesh": "Full mesh", "nvls": "NVLS", "sharp": "SHARP",
     "hierarchical": "Hierarchical · 分层", "ncclring": "NCCL pipelined ring",
@@ -115,6 +117,34 @@ OPTION_GROUPS = [
         field("rdmaSubmission", "Timing model", target="stack", scope="multi", default="startup", choices=[("startup", "Startup delay (legacy)"), ("detailed", "Detailed RDMA"), ("ibgda", "IBGDA compatibility preset")]),
         field("rdmaInitiator", "Request initiator", target="stack", scope="multi", default="gpu", choices=[("cpu", "CPU"), ("gpu", "GPU")], when="rdma"),
         field("rdmaDataPath", "Payload memory path", target="stack", scope="multi", default="gpudirect", choices=[("host", "Host DRAM"), ("staged", "GPU via host staging"), ("gpudirect", "GPUDirect RDMA")], when="rdma"),
+        field("rdmaOperation", "RDMA operation", target="stack", scope="multi", default="write", choices=[
+            ("write", "RDMA Write"), ("read", "RDMA Read / Get"), ("send", "Send / Recv"),
+            ("write_imm", "Write with immediate"), ("send_imm", "Send with immediate"),
+            ("fetch_add", "Atomic fetch-and-add"), ("compare_swap", "Atomic compare-and-swap"),
+            ("put_signal", "Put with signal"), ("signal", "Signal update")], when="rdma-ops"),
+        *[field(key,label,target="stack",scope="multi",default=default,minimum=minimum,maximum=maximum,when="rdma-ops")
+          for key,label,default,minimum,maximum in [
+            ("rdmaMaxReadAtomic", "Outstanding Reads / atomics per QP",16,0,65536),
+            ("rdmaResponderDepth", "Responder slots",16,1,65536),
+            ("rdmaReceiveQueueDepth", "Posted receive capacity",128,1,65536),
+            ("rdmaRnrRetryLimit", "RNR retry limit",7,0,65536),
+            ("rdmaRnrRetryNs", "RNR retry delay · ns",1000,1,1000000000),
+            ("rdmaReadServiceNs", "Read responder latency · ns",0,0,1000000000),
+            ("rdmaAtomicServiceNs", "Atomic service latency · ns",0,0,1000000000),
+            ("rdmaReceivePostNs", "Receive posting service · ns",0,0,1000000000),
+            ("rdmaReceivePostDelayNs", "Start posting receives after · ns",0,0,1000000000),
+            ("rdmaSignalPollNs", "Signal observation delay · ns",0,0,1000000000),
+            ("rdmaOperand", "Atomic add / swap value",1,0,9007199254740991),
+            ("rdmaCompare", "Atomic comparison value",0,0,9007199254740991),
+            ("rdmaInitialValue", "Initial remote atomic value",0,0,9007199254740991),
+            ("rdmaImmediate", "Immediate notification · uint32",0,0,4294967295),
+            ("rdmaSignalValue", "Signal value",1,0,9007199254740991),
+            ("rdmaLocalAddress", "Local buffer address",0,0,9007199254740991),
+            ("rdmaRemoteAddress", "Remote buffer address",0,0,9007199254740991),
+            ("rdmaSignalAddress", "Remote signal address",281474976710656,0,9007199254740991),
+          ]],
+        field("rdmaSignalOp", "Signal operation", target="stack", scope="multi", default="set",
+              choices=[("set", "Set"), ("add", "Add")], when="rdma-ops"),
         field("rdmaCpuWorkers", "CPU submission workers", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma-cpu"),
         field("rdmaGpuProducers", "GPU producers", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma-gpu"),
         field("rdmaQpsPerPeer", "RC QPs per peer", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma"),
@@ -443,6 +473,20 @@ def validate_configuration(op, resolved, cli, request):
             notices.append("已注入错误而未启用 LLR；未被 FEC 纠正的丢失可能使操作无法完成。")
         elif not enabled("llrTimeoutRetransmit"):
             notices.append("随机错误可能使 NACK 丢失；可启用“超时主动重传”来恢复这类传输。")
+    if op.get("collective") != "rdma" and settings.get("rdmaOperation") != "write":
+        raise ValueError("Choose an RDMA operations preset to change the operation type.")
+    if op.get("collective") == "rdma":
+        if settings.get("rdmaSubmission") not in {"detailed", "ibgda"}:
+            raise ValueError("RDMA operations require detailed timing.")
+        opcode = settings["rdmaOperation"]
+        if opcode in {"read", "fetch_add", "compare_swap", "put_signal", "signal"} and integer("rdmaMaxReadAtomic") == 0:
+            raise ValueError("Read and atomic operations require a positive outstanding Read/atomic limit.")
+        if opcode in {"fetch_add", "compare_swap"} and (integer("rdmaRemoteAddress") % 8 or integer("rdmaLocalAddress") % 8):
+            raise ValueError("Atomic buffer addresses must be 8-byte aligned.")
+        if opcode in {"put_signal", "signal"} and integer("rdmaSignalAddress") % 8:
+            raise ValueError("Signal addresses must be 8-byte aligned.")
+        if settings["rdmaDataPath"] == "staged" and opcode in {"fetch_add", "compare_swap", "put_signal", "signal"} and integer("rdmaStagingBufferBytes") < 8:
+            raise ValueError("Staged atomic and signal operations need at least 8 bytes of staging space.")
     if settings.get("rdmaSubmission") in {"detailed", "ibgda"}:
         if not multi or settings["interNodeFabricType"] != "RoCE":
             raise ValueError("Detailed RDMA requires a multi-node RoCE scenario.")

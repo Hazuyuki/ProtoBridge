@@ -131,3 +131,27 @@ def test_canonical_form_overrides_legacy_profile_and_stack_aliases(tmp_path):
     assert "rdmaGpuWqeBuildNs = 1234" in job["config"]
     assert "ibgdaWqeBuildNs" not in job["config"]
     assert job["result"]["rdmaMeanStartupNs"] >= 1234
+
+
+@pytest.mark.parametrize("name,opcode", [("rdma-read", "read"), ("rdma-send", "send"),
+                                        ("rdma-atomic", "fetch_add"), ("rdma-put-signal", "put_signal")])
+def test_rdma_operation_presets_execute_native_verbs(tmp_path, name, opcode):
+    with TestClient(create_app(REPO, tmp_path/"runs")) as client:
+        job = run(client, config_id=name+".cfg", num_nodes=2, gpus_per_node=2,
+                  data_size=3017, stack_overrides={"rdmaDataPath": "staged",
+                      "rdmaStagingChunkBytes": 1024, "rdmaStagingBufferBytes": 2048})
+        artifact = client.get(f"/api/runs/{job['id']}/artifacts/rdma.csv")
+    assert job["result"]["rdmaOperation"] == opcode
+    assert job["result"]["rdmaOperationsCompleted"] == 1
+    rows = list(csv.DictReader(io.StringIO(artifact.text)))
+    assert all(row["opcode"] in {opcode, "signal"} for row in rows)
+
+
+def test_web_form_can_select_immediate_and_delayed_receives(tmp_path):
+    with TestClient(create_app(REPO, tmp_path/"runs")) as client:
+        job = run(client, config_id="rdma-send.cfg", num_nodes=2, gpus_per_node=2,
+                  data_size=731, stack_overrides={"rdmaOperation": "send_imm", "rdmaImmediate": 65537,
+                      "rdmaReceivePostDelayNs": 5000, "rdmaRnrRetryLimit": 20})
+    assert job["result"]["rdmaOperation"] == "send_imm"
+    assert job["result"]["rdmaReceiveCompletions"] == 1
+    assert job["result"]["rdmaRnrRetries"] > 0

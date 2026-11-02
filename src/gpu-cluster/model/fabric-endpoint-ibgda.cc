@@ -11,12 +11,49 @@ void
 FabricEndpoint::SetIbgdaSubmissionModel(Ptr<IbgdaSubmissionModel> model)
 {
     NS_ABORT_MSG_IF(m_ibgda && (m_ibgda->GetOutstanding() || !m_rdmaReceiveWork.empty() ||
-                                !m_rdmaPendingAck.empty()),
+                                !m_rdmaPendingAck.empty() || !m_rdmaTxQueue.empty() ||
+                                (m_rdmaOperations && m_rdmaOperations->HasPending())),
                     "Cannot change RDMA mode while work is outstanding");
     DisposeIbgda();
     m_ibgda = model;
     if (m_ibgda)
     {
+        m_rdmaOperations = CreateObject<RdmaOperationEngine>();
+        m_rdmaOperations->Configure(
+            m_rank,
+            m_ibgda,
+            [this](uint16_t peer,
+                   Ptr<Packet> packet,
+                   const RdmaOperationTag& tag,
+                   uint32_t qp,
+                   uint16_t flow,
+                   uint8_t vc,
+                   uint32_t overhead) {
+                QueueRdmaOperationPacket(peer, packet, tag, qp, flow, vc, overhead);
+            },
+            [this](const FabricHeader& h) { SendLlrAckPacket(h, false); },
+            [this](const FabricHeader& h, bool held) {
+                IbgdaPacketKey key{h.GetSourceRank(),
+                                   h.GetVirtualChannel(),
+                                   h.GetFlowId(),
+                                   h.GetSequenceNumber()};
+                if (held)
+                {
+                    m_rdmaPendingAck.insert(key);
+                }
+                else
+                {
+                    m_rdmaPendingAck.erase(key);
+                }
+            });
+        m_rdmaOperations->SetPayloadLimit([this](uint16_t peer) {
+            double efficiency = GetProtocolModelForDest(peer)->GetEfficiency(1);
+            uint32_t mtu = m_ibgda->GetConfig().mtuBytes;
+            uint64_t cap = static_cast<uint64_t>(mtu * efficiency);
+            return std::max(
+                1u,
+                std::min(mtu > 14 ? mtu - 14 : 1u, cap > 4 ? static_cast<uint32_t>(cap - 4) : 1u));
+        });
         for (auto device : m_devices)
         {
             ConnectIbgdaDevice(device);
@@ -44,6 +81,12 @@ FabricEndpoint::ConnectIbgdaDevice(Ptr<NetDevice> device)
 void
 FabricEndpoint::DisposeIbgda()
 {
+    if (m_rdmaOperations)
+    {
+        m_rdmaOperations->Dispose();
+    }
+    m_rdmaOperations = nullptr;
+    m_rdmaTxQueue.clear();
     for (auto device : m_ibgdaTraceDevices)
     {
         device->TraceDisconnectWithoutContext(
@@ -275,6 +318,11 @@ FabricEndpoint::OnIbgdaPhyTxBegin(Ptr<const Packet> packet)
     }
     IbgdaPacketTag tag;
     if (!packet->PeekPacketTag(tag))
+    {
+        return;
+    }
+    RdmaOperationTag operation;
+    if (packet->PeekPacketTag(operation) && operation.owner != m_rank)
     {
         return;
     }

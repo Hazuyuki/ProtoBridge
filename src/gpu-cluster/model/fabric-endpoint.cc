@@ -1221,6 +1221,7 @@ FabricEndpoint::ReleaseBulkTxSlot()
         m_bulkTxInflight--;
     }
     PumpBulkTxWindow();
+    PumpRdmaOperationPackets();
 }
 
 bool
@@ -2014,6 +2015,7 @@ FabricEndpoint::DeliverBypassDataPacket(Ptr<Packet> packet, const FabricHeader& 
 void
 FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
 {
+    if(m_rdmaOperations) m_rdmaOperations->PermanentLoss(originalHeader);
     uint32_t seqNum = originalHeader.GetSequenceNumber();
     uint16_t destRank = originalHeader.GetDestRank();
     uint8_t vcId = originalHeader.GetVirtualChannel();
@@ -2330,6 +2332,7 @@ FabricEndpoint::SendRetransmission(LlrManager::Retransmission retransmission)
 void
 FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
 {
+    if(m_rdmaOperations) m_rdmaOperations->PacketAcknowledged(header,packet);
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
     if (m_ibgda)
     {
@@ -2730,6 +2733,7 @@ FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumula
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(receivedHeader.GetSourceRank()));
     packet->AddHeader(header);
+    if(m_rdmaOperations) m_rdmaOperations->DecorateAck(receivedHeader,packet);
 
     uint32_t deviceIndex = ResolveDeviceIndex(receivedHeader.GetSourceRank());
     SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(receivedHeader.GetSourceRank()));
@@ -3408,25 +3412,31 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // packet, not the pad alone (round 52: padding alone can fit
         // uint32 while payload + padding wraps the 32-bit packet
         // accounting; keep header headroom the rest of the pipeline
-        // reserves, and reject AT the boundary). The headroom is 101 B,
-        // not 51 (codex rounds 54/55): Buffer offsets are absolute from
-        // the allocation origin, and Packet::AddHeader grows the buffer
-        // with AddAtStart — a warm prefix (up to 51 B: 39-B FabricHeader
-        // + 10-B SoHeader + 2-B PPP at this very send path) can precede
-        // the fragment in the same Buffer, so an encoded body that fits
-        // UINT32_MAX - 51 by itself still overflows the 32-bit offset
-        // space once a prefix exists. Round 55 doubled the margin: a
-        // probe reproduced the overflow AT kMaxPayload - 1 because
-        // Buffer's recommended starting offset is a process-global
-        // high-water mark (packet.cc: g_recommendedStart) raised by any
-        // earlier large Packet(bytes, N) constructor call — at 8 the
-        // wrap happens 8 B sooner, and any encoded size >= the guard
-        // boundary can then overflow. 101 B = 51-B worst-case warm
-        // prefix + 50 B of slack for the global starting-offset drift.
+        // reserves, and reject AT the boundary). The headroom is 9 MiB,
+        // not 51 B (codex rounds 54/55/56): Buffer offsets are absolute
+        // from the allocation origin, and Packet::AddHeader grows the
+        // buffer with AddAtStart — a warm prefix (up to 51 B: 39-B
+        // FabricHeader + 10-B SoHeader + 2-B PPP at this very send path)
+        // can precede the fragment in the same Buffer, so an encoded
+        // body that fits UINT32_MAX - 51 by itself still overflows the
+        // 32-bit offset space once a prefix exists. Round 55 doubled
+        // the margin after a probe reproduced the overflow AT
+        // kMaxPayload - 1 because Buffer's recommended starting offset
+        // is a process-global high-water mark (buffer.cc:
+        // g_recommendedStart) raised by any earlier large
+        // Packet(bytes, N) constructor call. Round 56: the drift is
+        // UNBOUNDED in principle, so a fixed slack of any size is not a
+        // proof; instead the margin is the maximum in-module chunk
+        // construction (8 MiB bulk cap + 1 MiB slack for collective
+        // result fragments and headers), which no in-module
+        // configuration exceeds — so g_recommendedStart can never drift
+        // past the margin before this guard would abort the very
+        // construction that caused the drift.
         uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
         if (encodedPayloadSize > payloadSize)
         {
-            constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 101u;
+            constexpr uint64_t kMaxPayload =
+                std::numeric_limits<uint32_t>::max() - 9u * 1024u * 1024u;
             NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
                             "FEC parity expansion of a " << payloadSize
                             << "-B payload encodes to " << encodedPayloadSize
@@ -3685,6 +3695,7 @@ void
 FabricEndpoint::OnPacketDelivered(Ptr<Packet> packet, uint32_t seqNum, FabricHeader header)
 {
     NS_LOG_FUNCTION(this << packet << seqNum);
+    if(m_rdmaOperations && m_rdmaOperations->Receive(packet,header)) return;
     if (DeferIbgdaReceive(packet, header)) return;
     NS_LOG_DEBUG("OnPacketDelivered: rank=" << m_rank << " seq=" << seqNum << " callback null=" << m_receiveCallback.IsNull());
 
@@ -4360,6 +4371,8 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
         Ptr<Packet> dataPacket = Create<Packet>(extractedData.data(), extracted);
         IbgdaPacketTag ibgdaTag;
         if (packet->PeekPacketTag(ibgdaTag)) dataPacket->AddPacketTag(ibgdaTag);
+        RdmaOperationTag operationTag;
+        if(packet->PeekPacketTag(operationTag)) dataPacket->AddPacketTag(operationTag);
 
         // Deliver to application via callback
         uint8_t vcId = header.GetVirtualChannel();

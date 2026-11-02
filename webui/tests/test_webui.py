@@ -78,7 +78,7 @@ def submit(client, **values):
 
 def test_catalog_and_real_parameter_preview(client):
     catalog = client.get("/api/catalog").json()
-    assert len(catalog["configs"]) == 15
+    assert len(catalog["configs"]) == 19
     assert client.get("/").status_code == 200
     assert client.get("/static/app.js").status_code == 200
     body = {"stack_overrides": {"bandwidthGbps": 85}, "num_nodes": 2, "gpus_per_node": 4}
@@ -107,6 +107,16 @@ def test_rdma_form_validates_independent_choices_and_staging_capacity(client):
     assert settings["rdmaInitiator"] == "gpu" and settings["rdmaDataPath"] == "staged"
     body["stack_overrides"]["rdmaStagingBufferBytes"] = 512
     assert client.post("/api/preview", json=body).status_code == 422
+
+
+def test_operation_controls_validate_credits_and_alignment(client):
+    body = {"config_id": "rdma-read.cfg", "num_nodes": 2, "gpus_per_node": 2,
+            "stack_overrides": {"rdmaMaxReadAtomic": 0}}
+    assert client.post("/api/preview", json=body).status_code == 422
+    body["stack_overrides"] = {"rdmaOperation": "fetch_add", "rdmaRemoteAddress": 3}
+    assert client.post("/api/preview", json=body).status_code == 422
+    body["stack_overrides"] = {"rdmaOperation": "send_imm", "rdmaImmediate": 4294967295}
+    assert client.post("/api/preview", json=body).status_code == 200
 
 
 def test_page_loads_versioned_scripts_with_revalidation(client):

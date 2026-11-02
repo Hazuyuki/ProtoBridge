@@ -140,6 +140,10 @@ class SimulationOptions {
     };
   }
 
+  collectiveChoices() {
+    return this.schema.collectives.filter((item) => item.scope !== "multi" || this.context().multi);
+  }
+
   reset(request = {}) {
     this.preview = null;
     const stencil = !("collective" in this.source().op);
@@ -154,7 +158,7 @@ class SimulationOptions {
     }
     this.setChoices(
       "collective-select",
-      this.schema.collectives,
+      this.collectiveChoices(),
       request.op_overrides?.collective ?? "",
     );
     this.setChoices(
@@ -412,6 +416,7 @@ class SimulationOptions {
       if (item.when?.startsWith("rdma")) {
         const detailed = ["detailed", "ibgda"].includes(setting("rdmaSubmission"));
         show = scope && detailed;
+        if (item.when === "rdma-ops") show = show && operation.collective === "rdma";
         if (item.when === "rdma-cpu") show = show && (setting("rdmaInitiator") || "gpu") === "cpu";
         if (item.when === "rdma-gpu") show = show && (setting("rdmaInitiator") || "gpu") === "gpu";
         if (item.when === "rdma-staged") show = show && setting("rdmaDataPath") === "staged";
@@ -419,7 +424,7 @@ class SimulationOptions {
       if (item.when === "burst")
         show = scope && (setting("errorMode") || "independent") === "burst";
       if (item.when === "root")
-        show = scope && ["broadcast", "reduce"].includes(operation.collective);
+        show = scope && ["broadcast", "reduce", "rdma"].includes(operation.collective);
       if (["ncclring", "hierarchical"].includes(item.when))
         show = scope && operation.algorithm === item.when;
       if (item.when?.startsWith("so-"))
@@ -664,7 +669,7 @@ class SimulationOptions {
       }
     }
     for (const [id, choices] of [
-      ["collective-select", this.schema.collectives],
+      ["collective-select", this.collectiveChoices()],
       ["physical-topology", this.schema.topologies],
     ])
       this.setChoices(id, choices, document.getElementById(id).value);

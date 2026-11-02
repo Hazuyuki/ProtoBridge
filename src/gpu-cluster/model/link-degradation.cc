@@ -622,8 +622,12 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
                 m_inBurst = true;
                 // Geometric distribution for burst length with mean m_burstLength
                 double u = GetRandomValue();
-                if (u < 1.0 / (1.0 + static_cast<double>(m_burstLength)))
+                if (m_burstLength == 0 || u < 1.0 / (1.0 + static_cast<double>(m_burstLength)))
                 {
+                    // BurstLength == 0 (round 56): the geometric formula
+                    // below has denominator log(0 / 1) = log(0) ->
+                    // FE_DIVBYZERO; a zero-length burst means every
+                    // affected codeword stands alone.
                     m_burstRemaining = 1;
                 }
                 else
@@ -640,11 +644,15 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
                     // ~1.2e11, and a direct static_cast<uint32_t> of an
                     // out-of-range double is undefined behavior (UBSan)
                     // that executes before the old post-conversion cap.
+                    // Round 56: the clamped bound is 999, not 1000, so
+                    // the trailing +1 yields at most 1000 — the old
+                    // min(quot, 1000) + 1 could emit a 1001-codeword
+                    // burst. Ordinary (uncapped) inputs are unchanged.
                     double uClamped = std::min(u, 1.0 - 1e-12);
                     double length = std::log1p(-uClamped) /
                                     std::log(static_cast<double>(m_burstLength) /
                                              (1.0 + static_cast<double>(m_burstLength)));
-                    length = std::min(length, 1000.0);
+                    length = std::min(length, 999.0);
                     m_burstRemaining = static_cast<uint32_t>(length) + 1;
                     if (m_burstRemaining < 1) m_burstRemaining = 1;
                 }

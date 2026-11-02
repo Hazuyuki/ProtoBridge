@@ -17,6 +17,7 @@ NS_OBJECT_ENSURE_REGISTERED(RdmaPacketTag);
 namespace
 {
 using UintFields = std::vector<std::pair<std::string, uint32_t*>>;
+using U64Fields = std::vector<std::pair<std::string, uint64_t*>>;
 using TimeFields = std::vector<std::pair<std::string, Time*>>;
 using RateFields = std::vector<std::pair<std::string, double*>>;
 
@@ -32,28 +33,41 @@ UintOptions(RdmaConfig& c)
             {"rdmaMtu", &c.mtuBytes},
             {"rdmaWqeBytes", &c.wqeBytes},
             {"rdmaStagingChunkBytes", &c.stagingChunkBytes},
-            {"rdmaStagingBufferBytes", &c.stagingBufferBytes}};
+            {"rdmaStagingBufferBytes", &c.stagingBufferBytes},
+            {"rdmaMaxReadAtomic", &c.maxReadAtomic},
+            {"rdmaResponderDepth", &c.responderDepth},
+            {"rdmaReceiveQueueDepth", &c.receiveQueueDepth},
+            {"rdmaRnrRetryLimit", &c.rnrRetryLimit},
+            {"rdmaImmediate", &c.immediate}};
+}
+
+U64Fields
+U64Options(RdmaConfig& c)
+{
+    return {{"rdmaOperand", &c.operand},
+            {"rdmaCompare", &c.compare},
+            {"rdmaInitialValue", &c.initialValue},
+            {"rdmaSignalValue", &c.signalValue},
+            {"rdmaLocalAddress", &c.localAddress},
+            {"rdmaRemoteAddress", &c.remoteAddress},
+            {"rdmaSignalAddress", &c.signalAddress}};
 }
 
 TimeFields
 TimeOptions(RdmaConfig& c)
 {
-    return {{"rdmaGpuWqeBuildNs", &c.wqeBuild},
-            {"rdmaCpuWqeBuildNs", &c.cpuWqeBuild},
-            {"rdmaGpuPublishNs", &c.publish},
-            {"rdmaCpuPublishNs", &c.cpuPublish},
-            {"rdmaGpuDoorbellNs", &c.doorbell},
-            {"rdmaCpuDoorbellNs", &c.cpuDoorbell},
-            {"rdmaGpuPollNs", &c.gpuPoll},
-            {"rdmaCpuPollNs", &c.cpuPoll},
-            {"rdmaCpuHandoffNs", &c.cpuHandoff},
-            {"rdmaBatchTimeoutNs", &c.batchTimeout},
-            {"rdmaWqeFetchNs", &c.wqeFetch},
-            {"rdmaDmaReadNs", &c.dmaReadLatency},
-            {"rdmaDmaWriteNs", &c.dmaWriteLatency},
-            {"rdmaCqWriteNs", &c.cqWrite},
-            {"rdmaD2hNs", &c.d2hLatency},
-            {"rdmaH2dNs", &c.h2dLatency}};
+    return {
+        {"rdmaGpuWqeBuildNs", &c.wqeBuild},     {"rdmaCpuWqeBuildNs", &c.cpuWqeBuild},
+        {"rdmaGpuPublishNs", &c.publish},       {"rdmaCpuPublishNs", &c.cpuPublish},
+        {"rdmaGpuDoorbellNs", &c.doorbell},     {"rdmaCpuDoorbellNs", &c.cpuDoorbell},
+        {"rdmaGpuPollNs", &c.gpuPoll},          {"rdmaCpuPollNs", &c.cpuPoll},
+        {"rdmaCpuHandoffNs", &c.cpuHandoff},    {"rdmaBatchTimeoutNs", &c.batchTimeout},
+        {"rdmaWqeFetchNs", &c.wqeFetch},        {"rdmaDmaReadNs", &c.dmaReadLatency},
+        {"rdmaDmaWriteNs", &c.dmaWriteLatency}, {"rdmaCqWriteNs", &c.cqWrite},
+        {"rdmaD2hNs", &c.d2hLatency},           {"rdmaH2dNs", &c.h2dLatency},
+        {"rdmaReadServiceNs", &c.readService},  {"rdmaAtomicServiceNs", &c.atomicService},
+        {"rdmaRnrRetryNs", &c.rnrRetry},        {"rdmaReceivePostNs", &c.receivePost},
+        {"rdmaSignalPollNs", &c.signalPoll},    {"rdmaReceivePostDelayNs", &c.receivePostDelay}};
 }
 
 RateFields
@@ -131,6 +145,12 @@ AddRdmaCommandLine(CommandLine& cmd, std::string& mode, RdmaConfig& config)
 {
     cmd.AddValue("rdmaSubmission", "RDMA timing: startup, detailed, or legacy ibgda alias", mode);
     cmd.AddValue("rdmaInitiator", "Request submitter: cpu or gpu", config.initiator);
+    cmd.AddValue("rdmaOperation", "Opcode for collective=rdma; see doc/RDMA.md", config.operation);
+    cmd.AddValue("rdmaSignalOp", "Signal update: set or add", config.signalOperation);
+    for (auto [name, dest] : U64Options(config))
+    {
+        cmd.AddValue(name, "RDMA operand/address", *dest);
+    }
     cmd.AddValue("rdmaDataPath",
                  "Payload memory path: host, staged, or gpudirect",
                  config.dataPath);
@@ -201,7 +221,9 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
     std::vector<std::string> known{"rdmaSubmission",
                                    "rdmaInitiator",
                                    "rdmaDataPath",
-                                   "rdmaMapQpByProducer"};
+                                   "rdmaMapQpByProducer",
+                                   "rdmaOperation",
+                                   "rdmaSignalOp"};
     for (auto [name, dest] : UintOptions(config))
     {
         known.push_back(name);
@@ -211,6 +233,10 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
         known.push_back(name);
     }
     for (auto [name, dest] : RateOptions(config))
+    {
+        known.push_back(name);
+    }
+    for (auto [name, dest] : U64Options(config))
     {
         known.push_back(name);
     }
@@ -230,6 +256,28 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
     assign("rdmaSubmission", mode);
     assign("rdmaInitiator", config.initiator);
     assign("rdmaDataPath", config.dataPath);
+    assign("rdmaOperation", config.operation);
+    assign("rdmaSignalOp", config.signalOperation);
+    for (auto [name, dest] : U64Options(config))
+    {
+        auto it = values.find(name);
+        if (it == values.end())
+        {
+            continue;
+        }
+        try
+        {
+            size_t pos = 0;
+            NS_ABORT_MSG_IF(it->second.empty() || it->second[0] == '-',
+                            "Invalid RDMA integer: " << name);
+            *dest = std::stoull(it->second, &pos);
+            NS_ABORT_MSG_IF(pos != it->second.size(), "Invalid RDMA integer: " << name);
+        }
+        catch (const std::exception&)
+        {
+            NS_ABORT_MSG("Invalid RDMA integer: " << name);
+        }
+    }
     for (auto [name, dest] : UintOptions(config))
     {
         auto it = values.find(name);
@@ -295,6 +343,14 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
 void
 RdmaConfig::Validate() const
 {
+    ParseRdmaOpcode(operation);
+    NS_ABORT_MSG_IF(signalOperation != "set" && signalOperation != "add",
+                    "rdmaSignalOp must be set or add");
+    NS_ABORT_MSG_IF(maxReadAtomic > 65536 || responderDepth == 0 || responderDepth > 65536 ||
+                        receiveQueueDepth == 0 || receiveQueueDepth > 1048576 ||
+                        rnrRetryLimit > 65536,
+                    "RDMA read/atomic/receive limits exceed supported bounds");
+    NS_ABORT_MSG_IF(rnrRetry.IsZero(), "rdmaRnrRetryNs must be positive");
     NS_ABORT_MSG_IF(initiator != "cpu" && initiator != "gpu", "rdmaInitiator must be cpu or gpu");
     NS_ABORT_MSG_IF(dataPath != "host" && dataPath != "staged" && dataPath != "gpudirect",
                     "rdmaDataPath must be host, staged or gpudirect");
@@ -310,22 +366,11 @@ RdmaConfig::Validate() const
                     "RDMA doorbell batch and CQ moderation must be in [1, queueDepth]");
     NS_ABORT_MSG_IF(mtuBytes == 0 || mtuBytes > (1u << 20) || wqeBytes == 0,
                     "RDMA needs MTU in [1,1048576] B and positive WQE bytes");
-    for (Time t : {wqeBuild,
-                   publish,
-                   doorbell,
-                   batchTimeout,
-                   wqeFetch,
-                   dmaReadLatency,
-                   dmaWriteLatency,
-                   cqWrite,
-                   gpuPoll,
-                   cpuWqeBuild,
-                   cpuPublish,
-                   cpuDoorbell,
-                   cpuPoll,
-                   cpuHandoff,
-                   d2hLatency,
-                   h2dLatency})
+    for (Time t :
+         {wqeBuild,        publish,     doorbell,   batchTimeout,    wqeFetch,    dmaReadLatency,
+          dmaWriteLatency, cqWrite,     gpuPoll,    cpuWqeBuild,     cpuPublish,  cpuDoorbell,
+          cpuPoll,         cpuHandoff,  d2hLatency, h2dLatency,      readService, atomicService,
+          rnrRetry,        receivePost, signalPoll, receivePostDelay})
     {
         NS_ABORT_MSG_IF(t.IsStrictlyNegative(), "RDMA timings must be nonnegative");
     }
@@ -452,6 +497,18 @@ uint64_t
 RdmaSubmissionModel::GetBytesForWork(uint64_t id) const
 {
     return m_work.at(id).time.bytes;
+}
+
+RdmaWorkTiming
+RdmaSubmissionModel::GetWorkTiming(uint64_t id) const
+{
+    return m_work.at(id).time;
+}
+
+bool
+RdmaSubmissionModel::RequestSucceeded(uint64_t id) const
+{
+    return *m_work.at(id).requestSucceeded;
 }
 
 void
@@ -591,30 +648,58 @@ RdmaSubmissionModel::ReleaseReceiveStaging(uint64_t bytes)
 }
 
 void
+RdmaSubmissionModel::StageSourcePayload(uint64_t bytes, std::function<void()> ready)
+{
+    NS_ABORT_MSG_IF(bytes == 0 || bytes > m_config.stagingBufferBytes,
+                    "Responder staging buffer is too small");
+    m_sourceStagingWaiting.push_back({0, bytes, std::move(ready)});
+    PumpSourceStaging();
+}
+
+void
+RdmaSubmissionModel::ReleaseSourceStaging(uint64_t bytes)
+{
+    NS_ABORT_MSG_IF(bytes > m_sourceStagingUsed, "Source staging buffer accounting underflow");
+    m_sourceStagingUsed -= bytes;
+    PumpSourceStaging();
+}
+
+void
 RdmaSubmissionModel::PumpSourceStaging()
 {
     while (!m_sourceStagingWaiting.empty())
     {
-        uint64_t id = m_sourceStagingWaiting.front();
-        auto& w = m_work.at(id);
-        if (w.time.bytes > m_config.stagingBufferBytes - m_sourceStagingUsed)
+        auto pending = m_sourceStagingWaiting.front();
+        if (pending.bytes > m_config.stagingBufferBytes - m_sourceStagingUsed)
         {
             break;
         }
         m_sourceStagingWaiting.pop_front();
-        w.stagingAllocated = true;
-        w.time.stagingAcquired = Simulator::Now();
-        m_sourceStagingUsed += w.time.bytes;
+        m_sourceStagingUsed += pending.bytes;
         m_stats.sourceStagingPeakBytes =
             std::max(m_stats.sourceStagingPeakBytes, m_sourceStagingUsed);
-        Time delay = ReserveSourceD2h(w.time.bytes);
-        Schedule(delay, [this, id] {
-            auto& ready = m_work.at(id);
-            ready.time.sourceStaged = Simulator::Now();
-            ready.time.submitted = Simulator::Now();
-            QpKey key{ready.time.peer, ready.time.qp};
-            m_qps[key].waiting.push_back(id);
-            Pump(key);
+        if (pending.id)
+        {
+            auto& work = m_work.at(pending.id);
+            work.stagingAllocated = true;
+            work.time.stagingAcquired = Simulator::Now();
+        }
+        Schedule(ReserveSourceD2h(pending.bytes), [this, pending] {
+            if (pending.id)
+            {
+                auto& work = m_work.at(pending.id);
+                work.time.sourceStaged = Simulator::Now();
+                work.time.submitted = Simulator::Now();
+                QpKey key{work.time.peer, work.time.qp};
+                auto& waiting = m_qps[key].waiting;
+                waiting.insert(std::upper_bound(waiting.begin(), waiting.end(), pending.id),
+                               pending.id);
+                Pump(key);
+            }
+            else
+            {
+                pending.ready();
+            }
         });
     }
 }
@@ -626,111 +711,177 @@ RdmaSubmissionModel::Submit(uint16_t peer,
                             uint32_t producer,
                             Completion complete)
 {
+    return SubmitOperation(RdmaOpcode::WRITE,
+                           peer,
+                           bytes,
+                           std::move(execute),
+                           producer,
+                           std::move(complete));
+}
+
+uint64_t
+RdmaSubmissionModel::SubmitOperation(RdmaOpcode opcode,
+                                     uint16_t peer,
+                                     uint64_t bytes,
+                                     Execute execute,
+                                     uint32_t producer,
+                                     Completion complete)
+{
     NS_ABORT_MSG_IF(m_disposed || !execute || bytes == 0,
-                    "RDMA needs a live model, nonzero bytes and an execute callback");
+                    "RDMA needs live model, nonzero bytes and execution");
+    NS_ABORT_MSG_IF((RdmaUsesReadAtomicCredit(opcode) || opcode == RdmaOpcode::PUT_SIGNAL) &&
+                        m_config.maxReadAtomic == 0,
+                    "RDMA Read/atomic operations require rdmaMaxReadAtomic > 0");
     if (m_producerFree.empty())
     {
         Configure(m_config);
     }
-    if (producer != UINT32_MAX)
-    {
-        NS_ABORT_MSG_IF(producer >= m_config.ProducerCount(), "RDMA producer ID out of range");
-    }
-    const uint64_t chunks =
-        m_config.dataPath == "staged" ? 1 + (bytes - 1) / m_config.stagingChunkBytes : 1;
-    NS_ABORT_MSG_IF(chunks > UINT64_MAX - m_nextId, "RDMA work ID exhausted");
-    const uint64_t requestId = m_nextId;
+    NS_ABORT_MSG_IF(producer != UINT32_MAX && producer >= m_config.ProducerCount(),
+                    "RDMA producer ID out of range");
+    bool split = m_config.dataPath == "staged" &&
+                 (RdmaHasSourcePayload(opcode) || opcode == RdmaOpcode::READ);
+    uint64_t dataChunks = split ? 1 + (bytes - 1) / m_config.stagingChunkBytes : 1;
+    uint64_t count = dataChunks + (opcode == RdmaOpcode::PUT_SIGNAL ? 1 : 0);
+    NS_ABORT_MSG_IF(count > UINT64_MAX - m_nextId, "RDMA work ID exhausted");
+    uint64_t requestId = m_nextId;
     ++m_stats.requests;
-    auto remaining = std::make_shared<uint64_t>(chunks);
-    auto requestReachedWire = std::make_shared<bool>(false);
-    auto finish = [this, remaining, complete](bool ok) {
+    auto remaining = std::make_shared<uint64_t>(count);
+    auto succeeded = std::make_shared<bool>(true), reachedWire = std::make_shared<bool>(false);
+    auto finish = [this, remaining, succeeded, complete](bool ok) {
+        *succeeded = *succeeded && ok;
         if (--*remaining == 0)
         {
-            ++m_stats.completedRequests;
+            if (*succeeded)
+            {
+                ++m_stats.completedRequests;
+            }
+            else
+            {
+                ++m_stats.failedRequests;
+            }
             if (complete)
             {
-                complete(ok);
+                complete(*succeeded);
             }
         }
     };
-    std::vector<uint64_t> deferred;
-    Time handoff = (m_config.initiator == "cpu" && m_config.dataPath != "host")
-                       ? m_config.cpuHandoff
-                       : Time(0);
-    for (uint64_t offset = 0; offset < bytes;)
+    auto enqueue = [this](uint64_t id) {
+        auto& w = m_work.at(id);
+        w.time.submitted = Simulator::Now();
+        if (m_config.dataPath == "staged" && RdmaHasSourcePayload(w.time.opcode))
+        {
+            m_sourceStagingWaiting.push_back({id, w.time.bytes, {}});
+        }
+        else
+        {
+            QpKey key{w.time.peer, w.time.qp};
+            auto& waiting = m_qps[key].waiting;
+            waiting.insert(std::upper_bound(waiting.begin(), waiting.end(), id), id);
+            Pump(key);
+        }
+    };
+    std::vector<uint64_t> ids;
+    uint64_t offset = 0;
+    for (uint64_t index = 0; index < count; ++index)
     {
-        uint64_t length = m_config.dataPath == "staged"
-                              ? std::min<uint64_t>(m_config.stagingChunkBytes, bytes - offset)
-                              : bytes;
+        bool signal = index == dataChunks;
+        uint64_t length =
+            signal
+                ? 8
+                : (split ? std::min<uint64_t>(m_config.stagingChunkBytes, bytes - offset) : bytes);
         uint64_t id = m_nextId++;
         uint32_t selected = producer == UINT32_MAX ? (id - 1) % m_config.ProducerCount() : producer;
         uint32_t qp =
             (m_config.mapQpByProducer ? selected : m_nextQp[peer]++) % m_config.qpsPerPeer;
-        Work w;
-        w.time.id = id;
-        w.time.requestId = requestId;
-        w.time.offset = offset;
-        w.time.bytes = length;
-        w.time.peer = peer;
-        w.time.producer = selected;
-        w.time.qp = qp;
-        w.time.ready = Simulator::Now();
-        w.time.submitted = Simulator::Now();
+        Work work;
+        work.time.id = id;
+        work.time.requestId = requestId;
+        work.time.offset = offset;
+        work.time.bytes = length;
+        work.time.peer = peer;
+        work.time.producer = selected;
+        work.time.qp = qp;
+        work.time.opcode = signal ? RdmaOpcode::SIGNAL : opcode;
+        work.time.ready = Simulator::Now();
+        work.time.submitted = Simulator::Now();
+        work.execute = execute;
+        work.complete = finish;
+        work.requestReachedWire = reachedWire;
+        work.requestSucceeded = succeeded;
         auto fence = m_fences.find(peer);
         if (fence != m_fences.end())
         {
-            w.fenceThrough = fence->second;
+            work.fenceThrough = fence->second;
         }
-        w.execute = execute;
-        w.complete = finish;
-        w.requestReachedWire = requestReachedWire;
-        m_work.emplace(id, std::move(w));
+        // An unsent payload DMA must not be overtaken by a later Read/atomic
+        // request on its RC SQ. Waiting for visibility is conservative.
+        if (RdmaUsesReadAtomicCredit(work.time.opcode))
+        {
+            for (const auto& [earlierId, earlier] : m_work)
+            {
+                if (earlier.time.peer == peer && earlier.time.qp == qp &&
+                    RdmaHasSourcePayload(earlier.time.opcode))
+                {
+                    work.fenceThrough = std::max(work.fenceThrough, earlierId);
+                }
+            }
+        }
+        if (signal)
+        {
+            work.fenceThrough = id - 1; // all payload chunks must be remotely visible first
+        }
+        m_work.emplace(id, std::move(work));
         ++m_stats.submitted;
-        if (!handoff.IsZero())
+        ids.push_back(id);
+        if (!signal)
         {
-            deferred.push_back(id);
+            offset += length;
         }
-        else if (m_config.dataPath == "staged")
-        {
-            m_sourceStagingWaiting.push_back(id);
-        }
-        else
-        {
-            QpKey key{peer, qp};
-            m_qps[key].waiting.push_back(id);
-            Pump(key);
-        }
-        offset += length;
     }
-    if (!deferred.empty())
-    {
-        Schedule(handoff, [this, deferred] {
-            for (uint64_t id : deferred)
-            {
-                auto& work = m_work.at(id);
-                work.time.submitted = Simulator::Now();
-                if (m_config.dataPath == "staged")
-                {
-                    m_sourceStagingWaiting.push_back(id);
-                }
-                else
-                {
-                    QpKey key{work.time.peer, work.time.qp};
-                    m_qps[key].waiting.push_back(id);
-                    Pump(key);
-                }
-            }
-            if (m_config.dataPath == "staged")
-            {
-                PumpSourceStaging();
-            }
-        });
-    }
-    if (m_config.dataPath == "staged")
-    {
+    Time handoff = (m_config.initiator == "cpu" && m_config.dataPath != "host")
+                       ? m_config.cpuHandoff
+                       : Time(0);
+    auto start = [this, ids, enqueue] {
+        for (auto id : ids)
+        {
+            enqueue(id);
+        }
         PumpSourceStaging();
+    };
+    if (handoff.IsZero())
+    {
+        start();
+    }
+    else
+    {
+        Schedule(handoff, std::move(start));
     }
     return requestId;
+}
+
+void
+RdmaSubmissionModel::NotifyOperationComplete(uint64_t id, bool success)
+{
+    auto it = m_work.find(id);
+    if (it == m_work.end() || it->second.acked)
+    {
+        return;
+    }
+    auto& work = it->second;
+    if (!success && !work.failed)
+    {
+        work.failed = true;
+        ++m_stats.failed;
+        *work.requestSucceeded = false;
+    }
+    work.acknowledgedBytes = work.time.bytes;
+    work.acked = true;
+    work.time.acknowledged = Simulator::Now();
+    Progress({work.time.peer, work.time.qp});
+    for (auto& [key, qp] : m_qps)
+    {
+        Pump(key);
+    }
 }
 
 bool
@@ -762,12 +913,23 @@ RdmaSubmissionModel::Pump(const QpKey& key)
     {
         uint64_t id = qp.waiting.front();
         Work& w = m_work.at(id);
+        if (RdmaUsesReadAtomicCredit(w.time.opcode) &&
+            qp.readAtomicOccupied >= m_config.maxReadAtomic)
+        {
+            break;
+        }
         if (BlockedByFence(w))
         {
             break;
         }
         qp.waiting.pop_front();
         ++qp.occupied;
+        if (RdmaUsesReadAtomicCredit(w.time.opcode))
+        {
+            ++qp.readAtomicOccupied;
+            m_stats.peakReadAtomic =
+                std::max<uint64_t>(m_stats.peakReadAtomic, qp.readAtomicOccupied);
+        }
         qp.outstanding.push_back(id);
         w.time.reserved = Simulator::Now();
         Time buildStart = std::max(Simulator::Now(), m_producerFree[w.time.producer]);
@@ -959,7 +1121,7 @@ void
 RdmaSubmissionModel::Observe(const QpKey& key, uint64_t through)
 {
     auto& qp = m_qps.at(key);
-    std::vector<Completion> callbacks;
+    std::vector<std::pair<Completion, bool>> callbacks;
     std::vector<RdmaWorkTiming> timings;
     uint64_t releasedStaging = 0;
     for (auto it = m_work.begin(); it != m_work.end();)
@@ -983,10 +1145,17 @@ RdmaSubmissionModel::Observe(const QpKey& key, uint64_t through)
         timings.push_back(w.time);
         if (w.complete)
         {
-            callbacks.push_back(std::move(w.complete));
+            callbacks.emplace_back(std::move(w.complete), !w.failed);
         }
         --qp.occupied;
-        ++m_stats.completed;
+        if (RdmaUsesReadAtomicCredit(w.time.opcode))
+        {
+            --qp.readAtomicOccupied;
+        }
+        if (!w.failed)
+        {
+            ++m_stats.completed;
+        }
         it = m_work.erase(it);
     }
     NS_ABORT_MSG_IF(releasedStaging > m_sourceStagingUsed,
@@ -1012,9 +1181,9 @@ RdmaSubmissionModel::Observe(const QpKey& key, uint64_t through)
             }
         }
     }
-    for (auto& cb : callbacks)
+    for (auto& [cb, ok] : callbacks)
     {
-        cb(true);
+        cb(ok);
         if (m_disposed)
         {
             return;
@@ -1077,6 +1246,7 @@ RdmaSubmissionModel::NotifyFailure(uint64_t id)
     if (it != m_work.end() && !it->second.failed)
     {
         it->second.failed = true;
+        *it->second.requestSucceeded = false;
         ++m_stats.failed;
     }
     // Failed WRs stay outstanding: neither quiet nor a successful completion

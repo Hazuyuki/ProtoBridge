@@ -1,9 +1,13 @@
 # RDMA initiation and payload paths
 
-ProtoBridge models RC RDMA Write over its existing RoCE packet network. The
+ProtoBridge models RC RDMA operations over its existing RoCE packet network. The
 submission model determines how a request reaches the NIC. The payload path
 determines which memory the NIC reads and writes. These choices are independent.
 No physical GPU, NIC, CUDA installation, or RDMA driver is needed.
+
+Write, Read/Get, Send/Recv, immediate variants, 64-bit FetchAdd/CAS and
+PutSignal/Wait/Test are available through the [RDMA operation API and examples](RDMA_OPERATIONS.md).
+The bulk-transfer examples below retain their timing-only Write behavior.
 
 ## Choose a mode
 
@@ -225,9 +229,9 @@ GPU initiation and GPUDirect; use `detailed` for other combinations. See
 [IBGDA.md](IBGDA.md) for the older GPU-specific examples.
 
 All modes share abstract RoCE framing, ACK/retry, flow-control and congestion
-mechanisms. Host RDMA does not add TCP/IP or an operating-system model. RDMA
-Read, atomics, put-with-signal, native InfiniBand framing, mlx5 instruction
-encoding, GPU instruction execution and SM scheduling are outside this version.
+mechanisms. Host RDMA does not add TCP/IP or an operating-system model. Native
+InfiniBand framing, mlx5 instruction encoding, GPU instruction execution and SM
+scheduling are outside this version.
 CQ moderation groups completions and drains tails; it does not reproduce a
 specific NIC's full signaled-WQE policy.
 

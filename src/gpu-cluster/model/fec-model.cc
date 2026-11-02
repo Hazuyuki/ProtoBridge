@@ -180,16 +180,14 @@ FecModel::ComputeSymbolErrorProbability(double ber) const
     {
         return 1.0;
     }
-    // RS symbol = 10 bits (GF(2^10)), matching Python surrogate
-    // P(symbol error) = 1 - (1 - BER)^10
-    //
-    // Near-one endpoint (codex rounds 54/55): for BER >= ~0.975 the true
-    // pSym is within 2^-53 of 1.0, so no double can represent it — the
-    // expm1/log1p form below rounds to exactly 1.0 and the callers'
-    // log(1 - pSym) raises FE_DIVBYZERO under fenv traps. For BER >=
-    // 1 - 2^-53/10 the same is true of the raw 1 - pow form. Since a
-    // representable pSym this close to 1 is numerically indistinguishable
-    // from the certain-corruption limit, saturate it:
+    // No representable pSym at the top of the range (codex rounds 55/56):
+    // for BER above ~0.975 the true 1 - (1-BER)^10 is within 2^-53 of
+    // 1.0, so no IEEE-754 double can hold it — expm1/log1p rounds to
+    // exactly 1.0 and the callers' log(1 - pSym) raises FE_DIVBYZERO
+    // under fenv traps. Saturate at the helper boundary; the CALLERS
+    // treat pSym == 1.0 as certain corruption without evaluating
+    // log(1 - pSym) (round 56: the helper returning 1.0 is not enough —
+    // ComputePostFecBer / DecodeCodeword must skip the log-space sum).
     if (ber >= 1.0 - 1e-13)
     {
         return 1.0;
@@ -198,6 +196,10 @@ FecModel::ComputeSymbolErrorProbability(double ber) const
     // pSym is below double resolution; the raw 1 - pow form rounds to
     // exactly 0 and the callers' log(pSym) raises FE_DIVBYZERO. expm1/
     // log1p stay accurate down to the subnormal range.
+    // Non-finite BER (NaN, -Inf): the caller-side guards in
+    // ComputePostFecBer / DecodeCodeword intercept these before the
+    // log-space sums, so a NaN here degrades to the 1.0 / UNCORRECTABLE
+    // early-out instead of an FE_INVALID trap.
     return -std::expm1(10.0 * std::log1p(-ber));
 }
 
@@ -208,6 +210,12 @@ FecModel::ComputePostFecBer(double preFecBer) const
 
     if (preFecBer <= 0.0)
     {
+        return 0.0;
+    }
+    if (!(preFecBer > 0.0))
+    {
+        // NaN BER (round 56): no meaningful symbol error rate; degrade to
+        // the clean path rather than propagate NaN into log-space sums.
         return 0.0;
     }
 
@@ -226,13 +234,25 @@ FecModel::ComputePostFecBer(double preFecBer) const
 
     double pSym = ComputeSymbolErrorProbability(preFecBer);
 
+    // pSym at (or indistinguishable from) 1.0 — helper saturation branch
+    // for BER >= ~0.975 where no double is representable closer to 1, or
+    // NaN input. Skip the log-space sum: std::log(1.0 - pSym) would be
+    // log(0) -> FE_DIVBYZERO (round 56; round 55's helper-side saturation
+    // alone was not enough). The codeword is certainly uncorrectable, so
+    // the post-FEC BER is 1.0.
+    if (!(pSym < 1.0))
+    {
+        return 1.0;
+    }
+
     // P(uncorrectable) = 1 - sum_{i=0}^{T} C(N,i) * p^i * (1-p)^(N-i)
     // For numerical stability with very small p, use log-space computation
     //
     // Rounded endpoints (codex round 54): expm1/log1p keep pSym off the
     // exact 0/1 boundaries for BER in (0, 1), so std::log(pSym) and
     // std::log(1 - pSym) below stay finite — both were FE_DIVBYZERO traps
-    // at BER ~1e-18 / ~0.99 respectively.
+    // at BER ~1e-18 / ~0.99 respectively. The >= 1.0 early-outs above and
+    // here keep that property for the saturated top of the range too.
     double pUncorrectable = 1.0;
     double cumulativeCorrectable = 0.0;
 
@@ -286,6 +306,11 @@ FecModel::DecodeCodeword(double preFecBer) const
     {
         return FecResult::NO_ERROR;
     }
+    if (!(preFecBer > 0.0))
+    {
+        // NaN BER (round 56): degrade to the clean path.
+        return FecResult::NO_ERROR;
+    }
 
     // Same BER >= 1.0 early-out as ComputePostFecBer (round 53): the
     // log-space sum below would raise FE_DIVBYZERO (BER == 1.0) or
@@ -299,6 +324,18 @@ FecModel::DecodeCodeword(double preFecBer) const
     }
 
     double pSym = ComputeSymbolErrorProbability(preFecBer);
+
+    // pSym at (or indistinguishable from) 1.0 — helper saturation branch
+    // for BER >= ~0.975 where no double is representable closer to 1, or
+    // NaN input. Skip the log-space sums: std::log(1.0 - pSym) would be
+    // log(0) -> FE_DIVBYZERO (round 56). The codeword is certainly
+    // uncorrectable.
+    if (!(pSym < 1.0))
+    {
+        m_fecDecodeTrace(0, FecResult::UNCORRECTABLE);
+        m_uncorrectableCount++;
+        return FecResult::UNCORRECTABLE;
+    }
 
     // Compute probability of exactly 0 errors and probability of correctable errors
     double pNoError = std::pow(1.0 - pSym, static_cast<double>(m_n));

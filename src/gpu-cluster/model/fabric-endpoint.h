@@ -24,6 +24,7 @@
 #include "dcqcn-rate-machine.h"
 #include "rttcc-rate-machine.h"
 #include "ibgda-submission-model.h"
+#include "rdma-operation-engine.h"
 
 #include "ns3/application.h"
 #include "ns3/net-device.h"
@@ -222,6 +223,17 @@ class FabricEndpoint : public Application
     Ptr<IbgdaSubmissionModel> GetIbgdaSubmissionModel() const;
     void SetRdmaSubmissionModel(Ptr<RdmaSubmissionModel> model) { SetIbgdaSubmissionModel(model); }
     Ptr<RdmaSubmissionModel> GetRdmaSubmissionModel() const { return GetIbgdaSubmissionModel(); }
+    Ptr<RdmaOperationEngine> GetRdmaOperationEngine() const { return m_rdmaOperations; }
+    uint64_t SubmitRdmaOperation(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaRead(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaSend(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaFetchAdd(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaCompareSwap(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaPutSignal(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    void RegisterRdmaMemory(uint64_t address,uint64_t bytes,uint32_t key = 1);
+    void PostRdmaReceive(uint64_t id,uint64_t address,uint64_t bytes,
+                         RdmaOperationEngine::ReceiveCompletion complete,
+                         uint16_t peer = UINT16_MAX,uint32_t qp = UINT32_MAX,uint32_t key = 1);
     /// Submit at request/data-ready time. Returns a logical request ID; the
     /// callback fires once after all child WR completions are observed.
     /// Staged completion acknowledges remote host DRAM, before optional H2D.
@@ -958,6 +970,21 @@ class FabricEndpoint : public Application
     using IbgdaPacketKey = std::tuple<uint16_t,uint8_t,uint16_t,uint32_t>;
     std::map<IbgdaPacketKey,std::pair<uint64_t,uint64_t>> m_ibgdaPackets;
     std::vector<Ptr<NetDevice>> m_ibgdaTraceDevices;
+    Ptr<RdmaOperationEngine> m_rdmaOperations;
+    struct RdmaPendingPacket
+    {
+        uint16_t peer;
+        Ptr<Packet> packet;
+        RdmaOperationTag tag;
+        uint32_t qp;
+        uint16_t flow;
+        uint8_t vc;
+        uint32_t overhead;
+    };
+    std::deque<RdmaPendingPacket> m_rdmaTxQueue;
+    void QueueRdmaOperationPacket(uint16_t peer,Ptr<Packet> packet,const RdmaOperationTag& tag,
+                                   uint32_t qp,uint16_t flow,uint8_t vc,uint32_t overhead);
+    void PumpRdmaOperationPackets();
     struct RdmaReceivePiece { Ptr<Packet> packet; FabricHeader header; };
     struct RdmaReceiveWork
     {

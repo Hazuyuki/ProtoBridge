@@ -181,7 +181,11 @@ its use by remote bulk transfers and collectives. It reuses ProtoBridge's
 abstract FabricHeader/SoHeader/PPP byte accounting and existing congestion,
 flow-control and retry paths. It is not a literal mlx5 WQE/BTH encoder.
 
-RDMA Read, atomics, put-with-signal, DCI/DCT connection switching, GPU instruction
+Read/Get, Send/Recv, immediate notifications, 64-bit atomics and PutSignal/Wait/Test
+are supported by the [operation API](RDMA_OPERATIONS.md), including GPU initiation.
+The examples on this page describe the original bulk Write interface.
+
+DCI/DCT connection switching, GPU instruction
 execution, detailed cache effects, and SM occupancy interference with compute
 are not implemented here. GPU parallelism is represented by producer service
 resources and producer-to-QP mapping. Native InfiniBand link-layer credits and

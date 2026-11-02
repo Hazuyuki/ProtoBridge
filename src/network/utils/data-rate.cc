@@ -12,6 +12,8 @@
 #include "ns3/log.h"
 #include "ns3/nstime.h"
 
+#include <cmath>
+#include <float.h>
 #include <limits>
 
 namespace ns3
@@ -195,27 +197,40 @@ DataRate::operator*(double rhs) const
     // bound 2^63 - 1 is exactly representable only in long double (80-bit
     // x87); in double it rounds to 2^63, so any guard written against a
     // double literal spuriously rejects the identity product MAX * 1.0.
-    // On platforms where long double == double (MSVC, Apple ARM64) the
-    // range guard degrades to an inclusive 2^63 bound and MAX * 1.0
-    // still aborts there — documented limitation. The value itself is
-    // converted from the DOUBLE product so ordinary in-range scaling
-    // keeps its historical double-rounding quantization (round 54,
-    // finding 5: converting the long-double product changed
-    // DataRate(10) * 0.3 from 3 to 2).
+    //
+    // On platforms where long double == double (MSVC, Apple ARM64,
+    // -mlong-double-64), the literal 9223372036854775807.0L rounds UP to
+    // 2^63 and the strict > guard would pass a true product of exactly
+    // 2^63 (e.g. (1<<62) * 2.0) — the exact product 2^63 equals the
+    // rounded bound, so range > bound is false and the guard lets a
+    // genuine overflow through to the clamp below, which silently
+    // returns MAX for it (round 56). Use the next representable double
+    // below 2^63 (2^63 - 1024) as the guard bound on those platforms:
+    // it rejects any exact product >= 2^63 (which always rounds the
+    // double product to 2^63 and trips the clamp) and accepts every
+    // exact product <= 2^63 - 1024. Documented residual: the identity
+    // product MAX * 1.0 has exact value 2^63 - 1, which rounds to
+    // 2^63 in double and therefore aborts on those platforms — the same
+    // behavior the 2^63 - 1 literal produced before this fix, and
+    // unavoidable on a guard whose comparison happens in double.
+#if LDBL_MANT_DIG == DBL_MANT_DIG
+    const long double maxProduct = static_cast<long double>(std::nextafter(9223372036854775808.0, 0.0));
+#else
+    const long double maxProduct = 9223372036854775807.0L;
+#endif
     const long double range = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
-    NS_ABORT_MSG_IF(!(range >= 0.0L) || range > 9223372036854775807.0L,
+    NS_ABORT_MSG_IF(!(range >= 0.0L) || range > maxProduct,
                     "DataRate product of " << m_bps << " bps * " << rhs
-                    << " exceeds the supported range (>= 2^63 bps)");
+                                           << " exceeds the supported range (>= 2^63 bps)");
     // Boundary clamp (codex rounds 54/55): the guard above proves the
-    // true product is at most 2^63 - 1, but the DOUBLE product rounds
-    // 2^63 - 1 up to 2^63 (53-bit mantissa) and the constructor aborts
-    // on the rounded value. A double product that reached 2^63 is a
-    // rounding artifact — clamp to the representable maximum instead.
-    // On platforms where long double == double (MSVC, Apple ARM64) this
-    // clamp is unreachable for genuine overflow: the guard's maximum
-    // literal rounds to 2^63 there, so range > 2^63 - 1 still aborts
-    // before the double product is formed (round 55: verified with a
-    // -mlong-double-64 build, where (1<<62) * 2.0 aborts as intended).
+    // true product is below 2^63, but the DOUBLE product rounds values
+    // in (2^63 - 1024, 2^63) up to exactly 2^63 (53-bit mantissa) and
+    // the constructor aborts on the rounded value. A double product
+    // that reached 2^63 is a rounding artifact of an in-range true
+    // product — clamp to the representable maximum instead.
+    // On ld==double platforms the guard bound 2^63 - 1024 already
+    // rejects true products >= 2^63 before this line, so the clamp is
+    // unreachable for genuine overflow there (round 56).
     const double prod = m_bps * rhs;
     if (prod >= 9223372036854775808.0) // == 2^63 as a double literal
     {
@@ -229,15 +244,22 @@ DataRate::operator*=(double rhs)
 {
     // Same pre-scale guard as operator*(double): in-place mutation
     // bypasses the constructor aborts. Long-double range / double
-    // result for the same reasons (rounds 53/54).
+    // result for the same reasons (rounds 53/54); the platform-
+    // conditional guard bound is the same as operator*(double)
+    // (round 56).
+#if LDBL_MANT_DIG == DBL_MANT_DIG
+    const long double maxProduct = static_cast<long double>(std::nextafter(9223372036854775808.0, 0.0));
+#else
+    const long double maxProduct = 9223372036854775807.0L;
+#endif
     const long double range = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
-    NS_ABORT_MSG_IF(!(range >= 0.0L) || range > 9223372036854775807.0L,
+    NS_ABORT_MSG_IF(!(range >= 0.0L) || range > maxProduct,
                     "DataRate product of " << m_bps << " bps * " << rhs
-                    << " exceeds the supported range (>= 2^63 bps)");
+                                           << " exceeds the supported range (>= 2^63 bps)");
     // Same boundary clamp as operator*(double): a double product of
-    // 2^63 - 1 rounds up to 2^63, which the constructor would abort on.
-    // Unreachable for genuine overflow on long double == double
-    // platforms for the same reason as above (round 55).
+    // an in-range true value rounds up to 2^63, which the constructor
+    // would abort on. Unreachable for genuine overflow on long double
+    // == double platforms for the same reason as above (round 55/56).
     const double prod = m_bps * rhs;
     if (prod >= 9223372036854775808.0) // == 2^63 as a double literal
     {

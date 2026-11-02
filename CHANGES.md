@@ -6,6 +6,78 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 56: caller-side FEC saturation, Buffer global-offset drift bound, DataRate ld==double guard, burst-length zero/cap, and CHANGES.md corrections
+
+**What.** Six findings from the round-56 review of commit c2c5d58; all
+verified with probes before fixing:
+
+1. **[P0] Round-55's helper-side pSym saturation was wrong.** Returning
+   1.0 from `ComputeSymbolErrorProbability` is exactly the value that
+   breaks callers: `ComputePostFecBer` (fec-model.cc) and
+   `DecodeCodeword` evaluate `log(1 - pSym)` unconditionally, and
+   `log(0)` = FE_DIVBYZERO. Probe confirmed pSym == 1.0 for BER in
+   {0.98, 0.99, 1-1e-13, nextafter(1-1e-13,0), 1-2e-13,
+   0.9999999999999} (at 0.975 pSym = 0.99999999999999989 IS
+   representable — the transition sits between those). Both callers
+   now early-out on `!(pSym < 1.0)` before the log-space sums
+   (returns 1.0 / UNCORRECTABLE respectively), which also covers NaN.
+   NaN `preFecBer` itself is now guarded explicitly at both entry
+   points (degrades to the clean path rather than propagating NaN
+   into the sums and tripping FE_INVALID).
+2. **[P0] kMaxPayload margin still overflowed: the global drift is
+   unbounded.** Round 55's 101-B margin assumed a bounded 50-B drift,
+   but `Buffer::g_recommendedStart` (buffer.cc) is a process-global
+   high-water mark raised by ANY `Packet(bytes, N)` construction —
+   the probe's 116-B drift broke the guard at an encoded payload of
+   4,294,967,180 < UINT32_MAX - 101. No fixed slack is a proof. The
+   margin is now `UINT32_MAX - 9 MiB` at both egress sites, sized to
+   the largest in-module chunk construction (8 MiB bulk cap +
+   1 MiB slack): no in-module configuration can construct a
+   `Packet(bytes, N)` >= kMaxPayload, so the drift can never reach
+   the margin before this guard aborts the construction that would
+   cause it.
+3. **[P0] Round-55's ld==double dismissal was wrong by arithmetic
+   error.** 2^62 * 2.0 = 2^63 EQUALS the rounded literal
+   `9223372036854775807.0L` on ld==double platforms, so `range >
+   maxL` passed and silent saturation occurred (codex proved with
+   -mlong-double-64). Both `operator*(double)` and `operator*=(double)`
+   now use a platform-conditional guard bound: `nextafter(2^63, 0)`
+   (= 2^63 - 1024, the largest double below 2^63) when
+   `LDBL_MANT_DIG == DBL_MANT_DIG`, `9223372036854775807.0L`
+   elsewhere. Probe-validated: the 2^63 - 1024 bound agrees with
+   exact arithmetic on 5/6 cases — rejects (2^62)*2.0 and
+   (2^62+1)*2.0 (abort), accepts (2^63-1024)*1.0 (pass) and
+   2^62*(2-2ulp) = 2^63-1024 (pass); the unavoidable mismatch is
+   MAX*1.0 whose exact value 2^63-1 rounds to 2^63 in double and
+   therefore aborts on those platforms (documented, same behavior the
+   old literal produced).
+4. **[P0] BurstLength == 0 raised FE_DIVBYZERO in the geometric
+   formula.** The denominator `log(0 / (1 + 0))` = log(0). The
+   burst-start branch now short-circuits `m_burstLength == 0` to a
+   single-codeword burst before evaluating the geometric formula.
+5. **[P1] Round-55's burst cap introduced a 1001-codeword maximum.**
+   `min(length, 1000.0) + 1` gave 1001 at the cap (probe: L=1000,
+   u=0.9 -> quot 2303.74 -> cap+1 = 1001). The clamp is now 999.0 so
+   cap+1 = 1000. Ordinary uncapped inputs unchanged (probe: L=1000,
+   u=0.5 -> 693.494 -> 694; L=UINT32_MAX, u=0.5 -> ~2.98e9, capped).
+6. **[P2] Round-54 CHANGES.md item 1 was still wrong.** The raw form
+   gives pSym == 1 at BER 0.99 (not "power rounds to 1 so close to 1
+   that 1-pow yields exactly 1" — the raw 1-pow form yields exactly 0
+   at BER 0.99 because pow underflows to 1) and pSym == 0 at BER 1e-18.
+   The `1 - BER` rounds-to-1 transition is at 2^-54 (half of 2^-53),
+   not 2^-53. Round-55 item 1 also updated with the round-56 follow-up.
+
+**Verified.** Clean build; `PASS data-rate`; `PASS error-model`;
+`PASS gpu-cluster`; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800;
+48 parity PASS lines (15 scripts); 18 pytest parity cases
+(test_ibgda.py + test_config_fec_enabled.py); surrogate pytest 101
+from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 µs / 99985/99985/99974 and 20300.2 µs).
+
 ### Fixed — codex round 55: pSym saturation near BER 1.0, Buffer global-offset drift, DataRate clamp documentation, and burst-length UB
 
 **What.** Five findings; the first four verified with probes, fixed, and
@@ -20,20 +92,31 @@ re-probed:
    rounding to one — the fix is saturation:
    `ComputeSymbolErrorProbability` now returns 1.0 for
    `ber >= 1.0 - 1e-13` (indistinguishable from the certain-
-   corruption limit in double arithmetic).
+   corruption limit in double arithmetic). **Round-56 follow-up**:
+   helper-side saturation alone was NOT enough — returning 1.0 is
+   exactly the value that breaks callers. `ComputePostFecBer` and
+   `DecodeCodeword` now early-out on `!(pSym < 1.0)` before the
+   log-space sums (covers the saturated branch and NaN), and both
+   entry points also guard NaN `preFecBer` explicitly.
 2. **[P0] The 51-B bound still permitted Buffer offset overflow.**
    Buffer's recommended starting offset is a process-global
-   high-water mark (`packet.cc: g_recommendedStart`): any earlier
+   high-water mark (`buffer.cc: g_recommendedStart`): any earlier
    `Packet(bytes, N)` constructor call raises it, shrinking the room
    left at the top of the 32-bit offset space. A probe with the
    global offset raised to 64 reproduced the wrap at an encoded
    payload of exactly `kMaxPayload - 1` (guard accepted, AddAtEnd
    tripped buffer.cc's offset assert). Both egress sites now bound at
-   `kMaxPayload = UINT32_MAX - 101` (51-B worst-case warm prefix +
-   50-B slack for the global-offset drift). Framing note: the actual
+   `kMaxPayload = UINT32_MAX - 9 MiB` (8 MiB = the in-module bulk
+   chunk cap at fabric-endpoint-send.cc MAX_CHUNK_BYTES, +1 MiB for
+   collective result fragments and headers). **Round-56 rationale**:
+   the global drift is unbounded in principle, so no fixed slack is a
+   proof; instead the margin is sized to the largest chunk the module
+   itself ever constructs, so `g_recommendedStart` can never drift
+   past the margin before this guard would abort the very
+   construction that caused the drift. Framing note: the actual
    send-path prefixes are 39-B FabricHeader at the endpoint and
-   10-B SoHeader + 2-B PPP at the switch uplink — the 51-B figure
-   remains the conservative worst case.
+   10-B SoHeader + 2-B PPP at the switch uplink — well inside the
+   51-B warm-prefix budget folded into this constant.
 3. **[P0→documentation] The round-54 clamp does NOT silently accept
    genuine overflow on long double == double platforms.** On that
    platform class the guard's maximum literal rounds to 2^63, but an
@@ -42,7 +125,17 @@ re-probed:
    verified by rebuilding with GCC `-mlong-double-64` (silent
    saturation NOT observed; `(1<<62) * 2.0` aborts). Code comments
    and the round-54 CHANGES.md item updated to state this; no source
-   change needed.
+   change needed. **Round-56 correction**: that dismissal was wrong
+   by an arithmetic error — 2^62 * 2.0 = 2^63 EQUALS the rounded
+   literal, so `range > maxL` passes on ld==double and silent
+   saturation occurs (codex proved with -mlong-double-64). Both
+   operators now use a platform-conditional guard bound:
+   `nextafter(2^63, 0)` (= 2^63 - 1024, the only pure-double bound
+   that rejects true products >= 2^63 while accepting every exact
+   product <= 2^63 - 1024) on LDBL_MANT_DIG == DBL_MANT_DIG
+   platforms, `9223372036854775807.0L` elsewhere. Documented
+   residual: MAX * 1.0 (exact 2^63 - 1) still aborts on ld==double
+   platforms — unavoidable when the comparison happens in double.
 4. **[P0] Burst-length conversion could still invoke UB before the
    cap.** With BURST mode, positive BER, BurstArrivalRate=1,
    BurstLength=UINT32_MAX and an injected RNG sequence {0.0, 1.0},
@@ -50,7 +143,14 @@ re-probed:
    `static_cast<uint32_t>` of that out-of-range double is UB (UBSan
    report), and the old 1000-codeword cap ran after the conversion.
    The cap now applies to the DOUBLE quotient before the cast:
-   `length = min(length, 1000.0)` then convert.
+   `length = min(length, 999.0)` then convert (+1 -> at most 1000).
+   **Round-56 follow-ups**: (a) BurstLength == 0 now short-circuits
+   to a single-codeword burst — the geometric denominator
+   `log(0 / (1 + 0))` = log(0) was FE_DIVBYZERO; (b) the clamp bound
+   is 999, not 1000, because the old `min(quot, 1000) + 1` emitted
+   a 1001-codeword burst at the cap (probe: L=1000, u=0.9 gives
+   quot 2303.74 -> old cap+1 = 1001; new cap+1 = 1000). Ordinary
+   uncapped inputs are unchanged (probe: L=1000, u=0.5 -> 694).
 5. **[P2] Round-54 CHANGES.md/comment inaccuracies corrected.**
    - Item 1's endpoint examples were reversed: BER 0.99 yields
      pSym == 1, BER 1e-18 yields pSym == 0 (now stated correctly).
@@ -81,10 +181,9 @@ from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
 
 1. **[P0] FEC symbol probability rounded to exactly 0/1 at extreme BER.**
    `ComputeSymbolErrorProbability` used `1 - pow(1-BER, 10)`; at BER
-   0.99 the power rounds to exactly 1 (`1 - pow` = 0, `log(0)` =
-   FE_DIVBYZERO) and at BER 1e-18 the power rounds to exactly 1 so
-   close to 1 that `1 - pow` yields exactly 1 (`log(1-pSym)` =
-   FE_DIVBYZERO) — both fatal under fenv traps. All three entry points
+   0.99 the raw form yields pSym == 1 (`log(1-pSym)` = FE_DIVBYZERO)
+   and at BER 1e-18 it yields pSym == 0 (`log(pSym)` = FE_DIVBYZERO)
+   — both fatal under fenv traps. All three entry points
    now use `-expm1(10 * log1p(-BER))`, which stays off the exact 0/1
    boundaries for every BER in (0, 1) where the true pSym is
    representable at all. Test bound in `TestPostFecBer` adjusted to
@@ -114,7 +213,12 @@ from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
    class — the guard's `range > 2^63 - 1` still aborts there because
    the true range of an overflowing product (e.g. 2^62 * 2.0 = 2^63)
    exceeds even the rounded literal; verified with a GCC
-   `-mlong-double-64` build.
+   `-mlong-double-64` build. **Round-56 correction**: that
+   round-55 dismissal was wrong — 2^62 * 2.0 EQUALS the rounded
+   literal 2^63, so `range > maxL` does NOT abort on ld==double and
+   silent saturation occurred. The round-56 fix uses a
+   platform-conditional guard bound `nextafter(2^63, 0)` on those
+   platforms; see the round-55 entry for details.
 4. **[P0] link-degradation.cc evaluated invalid probabilities for BER
    > 1.** `SetBer(0.002)` + severity-1 BIT_ERROR degradation produces
    BER = 2; the raw `pow(1-BER, bits)` then silently returned 0 (even

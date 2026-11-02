@@ -2095,20 +2095,30 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
             // the round-53 bound). Round 55 doubled the margin after a
             // probe reproduced the overflow AT kMaxPayload - 1: Buffer's
             // recommended starting offset is a process-global high-water
-            // mark (packet.cc: g_recommendedStart), so any earlier large
+            // mark (buffer.cc: g_recommendedStart), so any earlier large
             // Packet(bytes, N) constructor call raises it — at 8 the
             // wrap happens 8 B sooner, and any encoded size >= the guard
-            // boundary can then overflow. 101 B = the round-54 51-B
-            // worst-case warm prefix + 50 B of slack for the global
-            // starting-offset drift; the switch egress uses the same
-            // conservative constant so both sites share one bound. The
+            // boundary can then overflow. Round 56: the drift is
+            // UNBOUNDED in principle (any Packet(bytes, N) up to the
+            // guard boundary raises it), so a fixed slack of any size is
+            // not a proof. Instead the margin is set to the maximum
+            // in-module chunk construction: 9 MiB = 8 MiB bulk chunk
+            // cap (fabric-endpoint-send.cc MAX_CHUNK_BYTES) + 1 MiB
+            // slack for collective result fragments and protocol
+            // headers, which no configuration in this module exceeds.
+            // Any in-module Packet(bytes, N) construction is therefore
+            // provably below kMaxPayload, so g_recommendedStart can
+            // never drift past the margin before the guard itself would
+            // abort the construction that caused the drift. The
             // realistic send-path prefixes (39-B FabricHeader at the
             // endpoint, 10-B SoHeader + 2-B PPP at the switch uplink)
-            // fit well inside 51 B.
+            // fit well inside the 51-B warm-prefix budget folded into
+            // this constant.
             uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
             if (encodedPayloadSize > payloadSize)
             {
-                constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 101u;
+                constexpr uint64_t kMaxPayload =
+                    std::numeric_limits<uint32_t>::max() - 9u * 1024u * 1024u;
                 NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
                                 "FEC parity expansion of a " << payloadSize
                                 << "-B result fragment encodes to " << encodedPayloadSize

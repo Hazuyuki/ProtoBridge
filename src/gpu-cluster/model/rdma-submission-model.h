@@ -2,6 +2,8 @@
 #ifndef RDMA_SUBMISSION_MODEL_H
 #define RDMA_SUBMISSION_MODEL_H
 
+#include "rdma-operation.h"
+
 #include "ns3/event-id.h"
 #include "ns3/nstime.h"
 #include "ns3/object.h"
@@ -19,7 +21,7 @@ namespace ns3
 {
 class CommandLine;
 
-/** CPU- or GPU-initiated RC RDMA Write timing with independent payload paths.
+/** CPU- or GPU-initiated RC RDMA timing with independent payload paths.
  * Times default to zero, not a fitted NIC profile. QP depth counts network work
  * requests (staging chunks for staged transfers), independently of the endpoint
  * packet window. A producer is a CPU worker or an abstract GPU warp/CTA.
@@ -57,6 +59,15 @@ struct RdmaConfig
     Time d2hLatency{NanoSeconds(0)}, h2dLatency{NanoSeconds(0)};
     uint32_t stagingChunkBytes{65536};
     uint32_t stagingBufferBytes{131072}; ///< Separate source and destination pools
+    uint32_t maxReadAtomic{16}, responderDepth{16}, receiveQueueDepth{128}, rnrRetryLimit{7};
+    Time readService{NanoSeconds(0)}, atomicService{NanoSeconds(0)};
+    Time rnrRetry{NanoSeconds(1000)}, receivePost{NanoSeconds(0)}, signalPoll{NanoSeconds(0)};
+    // Inputs for the optional native RDMA-operations workload.
+    std::string operation{"write"}, signalOperation{"set"};
+    uint64_t operand{1}, compare{0}, initialValue{0}, signalValue{1};
+    uint64_t localAddress{0}, remoteAddress{0}, signalAddress{1ull << 48};
+    uint32_t immediate{0};
+    Time receivePostDelay{NanoSeconds(0)};
 
     uint32_t ProducerCount() const
     {
@@ -74,6 +85,7 @@ struct RdmaWorkTiming
     uint16_t peer{0};
     uint32_t producer{0};
     uint32_t qp{0};
+    RdmaOpcode opcode{RdmaOpcode::WRITE};
     Time ready, reserved, published, doorbell, execute, firstWire, acknowledged, observed;
     Time stagingAcquired, sourceStaged, submitted;
     bool reachedWire{false};
@@ -82,6 +94,7 @@ struct RdmaWorkTiming
 struct RdmaStats
 {
     uint64_t requests{0}, completedRequests{0};
+    uint64_t failedRequests{0}, peakReadAtomic{0};
     uint64_t submitted{0}, completed{0}, failed{0}, doorbells{0}, cqes{0};
     uint64_t peakOutstanding{0}, peakQpOutstanding{0};
     uint64_t startupSamples{0}, startupTotalNs{0}, startupMaxNs{0};
@@ -138,11 +151,21 @@ class RdmaSubmissionModel : public Object
     uint64_t GetOutstanding() const;
     uint32_t GetQpForWork(uint64_t workId) const;
     uint64_t GetBytesForWork(uint64_t workId) const;
+    RdmaWorkTiming GetWorkTiming(uint64_t workId) const;
+    bool RequestSucceeded(uint64_t workId) const;
     uint64_t Submit(uint16_t peer,
                     uint64_t bytes,
                     Execute execute,
                     uint32_t producer = UINT32_MAX,
                     Completion complete = {});
+    uint64_t SubmitOperation(RdmaOpcode opcode,
+                             uint16_t peer,
+                             uint64_t bytes,
+                             Execute execute,
+                             uint32_t producer = UINT32_MAX,
+                             Completion complete = {});
+    /// Complete an operation after its response/data/notification condition.
+    void NotifyOperationComplete(uint64_t workId, bool success = true);
     /// Flush all published tails and await the requests issued before this call.
     void Quiet(Completion complete);
     /// Enforce subsequent same-peer requests after prior remote completions.
@@ -156,6 +179,9 @@ class RdmaSubmissionModel : public Object
     Time ReserveDestinationH2d(uint64_t bytes);
     void AcquireReceiveStaging(uint64_t bytes, std::function<void()> ready);
     void ReleaseReceiveStaging(uint64_t bytes);
+    /// D2H plus finite source space for responder-generated read/atomic traffic.
+    void StageSourcePayload(uint64_t bytes, std::function<void()> ready);
+    void ReleaseSourceStaging(uint64_t bytes);
     void NotifyDataReady();
     void SetObserver(Observer observer);
 
@@ -176,12 +202,14 @@ class RdmaSubmissionModel : public Object
         bool failed{false};
         bool stagingAllocated{false};
         std::shared_ptr<bool> requestReachedWire;
+        std::shared_ptr<bool> requestSucceeded;
     };
 
     struct Qp
     {
         std::deque<uint64_t> waiting, published, outstanding;
         uint32_t occupied{0};
+        uint32_t readAtomicOccupied{0};
         Time publishFree, fetchFree;
         EventId batchEvent;
     };
@@ -222,7 +250,14 @@ class RdmaSubmissionModel : public Object
     std::shared_ptr<RdmaHostMemoryResources> m_hostMemory{
         std::make_shared<RdmaHostMemoryResources>()};
     uint64_t m_sourceStagingUsed{0}, m_receiveStagingUsed{0};
-    std::deque<uint64_t> m_sourceStagingWaiting;
+
+    struct SourceStageWait
+    {
+        uint64_t id{0}, bytes{0};
+        std::function<void()> ready;
+    };
+
+    std::deque<SourceStageWait> m_sourceStagingWaiting;
     std::deque<std::pair<uint64_t, std::function<void()>>> m_receiveStagingWaiting;
 };
 
