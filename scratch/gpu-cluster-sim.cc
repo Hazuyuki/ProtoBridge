@@ -2198,7 +2198,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2299,7 +2307,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2425,7 +2441,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2531,7 +2555,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2663,7 +2695,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }

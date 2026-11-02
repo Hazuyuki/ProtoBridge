@@ -177,11 +177,29 @@ RttccRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
     // The rate slot this chunk occupies (ns); the next chunk may egress one
     // slot after this chunk's egress start (same pacer as the per-QP ceiling).
-    double slotSec = static_cast<double>(chunkBytes) / s.rateBps;
-    // Round 64 (codex finding 9): same saturated slot conversion and
-    // deadline addition as the DCQCN pacer (a minimum rate of 2^-40 Gbps
-    // with a 1-MiB chunk rounds the slot to exactly 2^63 ns).
-    const double slotNsD = slotSec * 1e9;
+    // Round 65 (codex finding 9): same saturated slot conversion and
+    // deadline addition as the DCQCN pacer. A positive configured rate can
+    // still make (chunkBytes / rateBps) * 1e9 overflow binary64 (rate
+    // 2^-1022 Gbps, 1-MiB chunk), raising SIGFPE under floating-point
+    // diagnostics before the saturation comparison can run, so guard the
+    // product with a pre-check on the seconds quotient; the guarded product
+    // is bit-identical to the historical (bytes / rate) * 1e9 on every
+    // non-overflow input. A NaN rate saturates too: !(NaN <= x) is true.
+    const double slotSec = static_cast<double>(chunkBytes) / s.rateBps;
+    double slotNsD;
+    if (!(slotSec <= 9223372036854775807.0 / 1e9))
+    {
+        slotNsD = 9223372036854775807.0;
+    }
+    else
+    {
+        slotNsD = slotSec * 1e9;
+    }
+    if (!(slotNsD <= 9223372036854775807.0))
+    {
+        // +inf from the division itself, or a NaN rate — saturate.
+        slotNsD = 9223372036854775807.0;
+    }
     int64_t slotNs = (slotNsD >= 9223372036854775807.0)
                          ? std::numeric_limits<int64_t>::max()
                          : static_cast<int64_t>(slotNsD);

@@ -839,6 +839,18 @@ GpuClusterTopologyHelper::BuildFatTree(uint32_t radix)
     uint32_t numLeafSwitches =
         m_numGpus / radix + (m_numGpus % radix != 0);
     uint32_t numSpineSwitches = radix;
+    // Round 65 (codex finding 6): the node-container size below is the
+    // uint32 SUM of the two switch counts — 1 GPU at radix UINT32_MAX
+    // gives leaves=1 + spines=2^32-1 = 2^32, wrapping the node count to
+    // zero and indexing node zero of an empty container. Abort past the
+    // same representability bound the dragonfly product uses; the
+    // individual counts are correct.
+    NS_ABORT_MSG_IF(
+        static_cast<uint64_t>(numLeafSwitches) + numSpineSwitches >
+            std::numeric_limits<uint32_t>::max(),
+        "Fat-tree with " << m_numGpus << " GPUs at radix " << radix << " needs "
+                         << (static_cast<uint64_t>(numLeafSwitches) + numSpineSwitches)
+                         << " switches, which exceeds the uint32 node count");
 
     // Create GPU nodes
     m_gpuNodes.Create(m_numGpus);

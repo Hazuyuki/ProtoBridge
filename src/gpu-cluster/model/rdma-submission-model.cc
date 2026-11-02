@@ -537,7 +537,17 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
 {
     Time start = std::max(earliest, free);
     Time service = gbps > 0 ? Seconds(static_cast<double>(bytes) * 8 / (gbps * 1e9)) : Time(0);
-    free = start + service;
+    // Round 65 (codex finding 8): saturate the free ledger instead of
+    // wrapping. The saturating bound is a no-op for every realistic service
+    // (start + service wrapping needs ~292 years of queued PCIe service at
+    // pcieReadGbps=2^-32), but a degenerate gbps makes Seconds() overflow the
+    // int64 nanosecond count and the addition would wrap the ledger past
+    // Time(0). wqeBytes=125000000 @ pcieReadGbps=2^-32 is the probe.
+    const int64_t startNs = start.GetNanoSeconds();
+    const int64_t serviceNs = service.GetNanoSeconds();
+    free = Time(std::numeric_limits<int64_t>::max() - serviceNs < startNs
+                    ? std::numeric_limits<int64_t>::max()
+                    : startNs + serviceNs);
     return free;
 }
 

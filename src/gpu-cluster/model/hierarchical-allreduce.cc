@@ -212,11 +212,13 @@ uint64_t HierarchicalAllReduce::GetInterNodeRampDelayNs(uint64_t chunkSize) cons
     // — the wrapped-denominator defect it fixed only occurs when the
     // quotient itself is UINT64_MAX (chunkSize/threshold at the top of
     // uint64), where a zero delay is the documented saturation anyway.
+    // Round 65 (codex finding 3): the ternary must surround the DIVISION
+    // — a zero literal denominator still raises SIGFPE. Return 0 directly
+    // at the saturation boundary (C=UINT64_MAX, T=1: 1200/0 -> DIV0).
     const uint64_t rampQuotient = chunkSize / m_interNodeBwRampThreshold;
-    return m_interNodeBwRampDelayNs /
-           (rampQuotient == std::numeric_limits<uint64_t>::max()
-                ? 0
-                : rampQuotient + 1);
+    return rampQuotient == std::numeric_limits<uint64_t>::max()
+               ? 0
+               : m_interNodeBwRampDelayNs / (rampQuotient + 1);
 }
 void HierarchicalAllReduce::SetFullmeshPerStepStartupDelays(Time ll, Time ll128, Time simple)
 {

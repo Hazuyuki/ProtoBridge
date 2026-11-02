@@ -274,15 +274,40 @@ DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     int64_t nowNs = Simulator::Now().GetNanoSeconds();
     // Earliest this chunk may egress (ns); 0 before the flow's first paced chunk.
     int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
-    // The rate slot this chunk occupies (ns).
-    double slotSec = static_cast<double>(chunkBytes) / rateBps;
-    // Round 64 (codex finding 9): the double-to-int64 cast of an
-    // out-of-range slot (a 2^-40 Gbps rate with a 1-MiB chunk rounds to
-    // exactly 2^63 ns) is UB — floating-point diagnostics halt the
-    // process under -fsanitize=float-cast-overflow. Saturate at
-    // INT64_MAX instead; the deadline addition below is also saturated
-    // so a saturated slot cannot wrap the next-send ledger either.
-    const double slotNsD = slotSec * 1e9;
+    // The rate slot this chunk occupies (ns). Round 65 (codex finding 9):
+    // a positive configured rate can still make (chunkBytes / rateBps) * 1e9
+    // overflow binary64 (rate 2^-1022 Gbps with a 1-MiB chunk: the seconds
+    // quotient is finite but the nanosecond product exceeds DBL_MAX), and
+    // the overflow raises SIGFPE under floating-point diagnostics before the
+    // saturation comparison below can run. Guard the product with a
+    // pre-check on the seconds quotient; the guarded product is bit-identical
+    // to the historical (bytes / rate) * 1e9 on every non-overflow input. A
+    // NaN rate saturates too: !(NaN <= x) is true.
+    const double slotSec = static_cast<double>(chunkBytes) / rateBps;
+    double slotNsD;
+    if (!(slotSec <= 9223372036854775807.0 / 1e9))
+    {
+        slotNsD = 9223372036854775807.0;
+    }
+    else
+    {
+        slotNsD = slotSec * 1e9;
+    }
+    if (!(slotNsD <= 9223372036854775807.0))
+    {
+        // +inf from the division itself (chunkBytes > rateBps *
+        // DBL_MAX * 1e-9), or a NaN rate — saturate as documented.
+        // Round 64 (codex finding 9): the double-to-int64 cast of an
+        // out-of-range slot (a 2^-40 Gbps rate with a 1-MiB chunk
+        // rounds to exactly 2^63 ns) is UB — floating-point diagnostics
+        // halt the process under -fsanitize=float-cast-overflow.
+        // Saturate at INT64_MAX; the deadline addition below is also
+        // saturated so a saturated slot cannot wrap the next-send
+        // ledger either. The caller additions on the returned Time are
+        // out of scope for this machine (fabric-endpoint.cc WFQ/FEC
+        // serialization sums).
+        slotNsD = 9223372036854775807.0;
+    }
     int64_t slotNs = (slotNsD >= 9223372036854775807.0)
                          ? std::numeric_limits<int64_t>::max()
                          : static_cast<int64_t>(slotNsD);

@@ -38,6 +38,22 @@ Key derivations (see WHITEBOX_SURROGATE.md for the complete equations):
 import math
 from dataclasses import dataclass
 
+def _iceil(a, b):
+    """Integer ceiling division (round 65, codex finding 7).
+
+    math.ceil(a / b) converts the ratio to binary64 first, which can
+    absorb a remainder before the ceiling: at payload 2^53+1 LL lines,
+    (2^53+1)/64 rounds to 2^47 exactly and the ceiling loses the last
+    line (18014398509481984 vs the exact 18014398509482112 wire bytes).
+    ``-(-a // b)`` is exact integer ceiling division, matching the C++
+    (a + b - 1) / b / divide-first forms bit-for-bit for every input.
+    The result is coerced with ``int(...)`` so a float input (e.g. a
+    fractional per-rank share) yields an int, not a float that would
+    later trip ``range()`` / ``max()`` int-only consumers.
+    """
+    return int(-(-a // b))
+
+
 
 @dataclass
 class Topology:
@@ -415,9 +431,9 @@ class TheoryDerivedSurrogate:
         header per 128 B line; SIMPLE: payload as-is (efficiency 1.0).
         """
         if protocol == 'LL':
-            return math.ceil(payload_bytes / 64) * 128
+            return _iceil(payload_bytes, 64) * 128
         if protocol == 'LL128':
-            return math.ceil(payload_bytes / 120) * 128
+            return _iceil(payload_bytes, 120) * 128
         return payload_bytes
 
     def _wire_bytes_per_transfer(self, data_bytes, num_gpus, algo,
@@ -444,6 +460,10 @@ class TheoryDerivedSurrogate:
                 per_rank = data_bytes
             protocol = self._nccl_protocol_for(per_rank)
             return self._nccl_wire_bytes(data_bytes, protocol)
+        # Per-rank share D/N: the protocol selection sees the (possibly
+        # fractional) share, and `_nccl_wire_bytes` plus the fragmentation
+        # ceilings below it apply integer ceiling division internally
+        # (`_iceil` coerces its result to int — round 65, codex finding 7).
         transfer_bytes = (data_bytes if collective == 'sendrecv'
                           else data_bytes / max(1, num_gpus))
         if algo == 'nvls':
@@ -477,10 +497,10 @@ class TheoryDerivedSurrogate:
         if wire_bytes <= 0:
             return 1
         num_chunks = max(self.num_lanes,
-                         math.ceil(wire_bytes / self.bulk_chunk_size))
-        wire_chunk = math.ceil(wire_bytes / num_chunks)
-        sent_chunks = math.ceil(wire_bytes / wire_chunk)
-        data_chunk = math.ceil(data_bytes / max(1, sent_chunks))
+                         _iceil(wire_bytes, self.bulk_chunk_size))
+        wire_chunk = _iceil(wire_bytes, num_chunks)
+        sent_chunks = _iceil(wire_bytes, wire_chunk)
+        data_chunk = _iceil(data_bytes, max(1, sent_chunks))
         emitted = 0
         for i in range(num_chunks):
             if i * wire_chunk >= wire_bytes:
@@ -512,15 +532,15 @@ class TheoryDerivedSurrogate:
         coalesce_threshold = 512 * 1024 * 1024
         min_chunks = max(1, self.num_lanes)  # ports per GPU
         num_chunks = max(min_chunks,
-                         math.ceil(data_bytes / spray_chunk))
-        coalesced = math.ceil(data_bytes / max_chunk)
+                         _iceil(data_bytes, spray_chunk))
+        coalesced = _iceil(data_bytes, max_chunk)
         if data_bytes > coalesce_threshold and coalesced > min_chunks:
-            path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
+            path_balanced = _iceil(coalesced, min_chunks) * min_chunks
             num_chunks = max(min_chunks,
                              min(num_chunks, path_balanced))
         sent = sum(1 for i in range(num_chunks)
-                   if i * math.ceil(data_bytes / num_chunks) < data_bytes)
-        frag_bytes = math.ceil(data_bytes / num_chunks) if num_chunks else 1
+                   if i * _iceil(data_bytes, num_chunks) < data_bytes)
+        frag_bytes = _iceil(data_bytes, num_chunks) if num_chunks else 1
         return max(1, sent), max(1, frag_bytes)
 
     def _spray_fragments(self, data_bytes):
@@ -589,18 +609,18 @@ class TheoryDerivedSurrogate:
         # returned infinity for a config ns-3 completes in 4,251.879 us
         # with zero permanent losses).
         if data_bytes > coalesce_threshold:
-            coalesced = math.ceil(data_bytes / max_chunk_bytes)
+            coalesced = _iceil(data_bytes, max_chunk_bytes)
             if coalesced > min_chunks:
-                path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
+                path_balanced = _iceil(coalesced, min_chunks) * min_chunks
                 num_chunks = max(min_chunks,
                                  min(num_chunks, path_balanced))
                 # Recompute after coalescing changes numChunks: the skip rule
                 # (offset >= wire end) applies to the FINAL chunk geometry.
                 sent_fragments = sum(
                     1 for i in range(num_chunks)
-                    if i * math.ceil(data_bytes / num_chunks) < data_bytes
+                    if i * _iceil(data_bytes, num_chunks) < data_bytes
                 )
-        frag_bytes = math.ceil(data_bytes / num_chunks)
+        frag_bytes = _iceil(data_bytes, num_chunks)
         return sent_fragments, frag_bytes
 
     def _packets_per_transfer(self, data_bytes, num_gpus, algo, collective=None):
