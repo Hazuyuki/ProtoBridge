@@ -137,7 +137,7 @@ ProtocolBundle
 ProtocolProfile::Build() const
 {
     ProtocolBundle b;
-    ApplyIbgdaProfile(m_kv,b.rdmaSubmission,b.ibgda);
+    ApplyRdmaProfile(m_kv,b.rdmaSubmission,b.ibgda);
 
     // --- Protocol model ---------------------------------------------------
     std::string tid = Get("protocolModel", "ns3::NcclProtocolModel");

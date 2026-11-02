@@ -41,7 +41,7 @@
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/ub-protocol-model.h"
 #include "ns3/roce-protocol-model.h"
-#include "ns3/ibgda-submission-model.h"
+#include "ns3/rdma-submission-model.h"
 #include "ns3/ethernet-protocol-model.h"
 #include "ns3/dcqcn-rate-machine.h"
 #include "ns3/rttcc-rate-machine.h"

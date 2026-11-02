@@ -3408,22 +3408,25 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // packet, not the pad alone (round 52: padding alone can fit
         // uint32 while payload + padding wraps the 32-bit packet
         // accounting; keep header headroom the rest of the pipeline
-        // reserves, and reject AT the boundary). The headroom is 51 B,
-        // not 41 (codex round 54): Buffer offsets are absolute from the
-        // allocation origin, and Packet::AddHeader grows the buffer with
-        // AddAtStart — a warm prefix (up to 46-B SoRoCE + 2-B PPP +
-        // 3-B SNAP at this very send path) can precede the fragment in
-        // the same Buffer, so an encoded body that fits UINT32_MAX - 41
-        // by itself still overflows the 32-bit offset space once a
-        // prefix exists. 51 B covers the worst-case send-path prefix;
-        // encoded == bound would produce a serialized total of exactly
-        // UINT32_MAX and still trip Buffer's zero-origin assert (codex
-        // round 53: reject AT the boundary; round 54: widen the
-        // headroom for the warm-prefix case).
+        // reserves, and reject AT the boundary). The headroom is 101 B,
+        // not 51 (codex rounds 54/55): Buffer offsets are absolute from
+        // the allocation origin, and Packet::AddHeader grows the buffer
+        // with AddAtStart — a warm prefix (up to 51 B: 39-B FabricHeader
+        // + 10-B SoHeader + 2-B PPP at this very send path) can precede
+        // the fragment in the same Buffer, so an encoded body that fits
+        // UINT32_MAX - 51 by itself still overflows the 32-bit offset
+        // space once a prefix exists. Round 55 doubled the margin: a
+        // probe reproduced the overflow AT kMaxPayload - 1 because
+        // Buffer's recommended starting offset is a process-global
+        // high-water mark (packet.cc: g_recommendedStart) raised by any
+        // earlier large Packet(bytes, N) constructor call — at 8 the
+        // wrap happens 8 B sooner, and any encoded size >= the guard
+        // boundary can then overflow. 101 B = 51-B worst-case warm
+        // prefix + 50 B of slack for the global starting-offset drift.
         uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
         if (encodedPayloadSize > payloadSize)
         {
-            constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 51u;
+            constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 101u;
             NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
                             "FEC parity expansion of a " << payloadSize
                             << "-B payload encodes to " << encodedPayloadSize

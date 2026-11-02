@@ -183,14 +183,21 @@ FecModel::ComputeSymbolErrorProbability(double ber) const
     // RS symbol = 10 bits (GF(2^10)), matching Python surrogate
     // P(symbol error) = 1 - (1 - BER)^10
     //
-    // Rounded endpoints (codex round 54): 10 * BER is the smallest value
-    // pow(1-BER, 10) can represent below 1; for BER >= 2^-53 the power
-    // rounds to exactly 1 and the raw 1 - pow form yields pSym = 0
-    // (dropping log(pSym) on the caller's FE_DIVBYZERO trap), while for
-    // BER >= 1 - 2^-53/10 it rounds so close to 0 that 1 - pow yields
-    // exactly 1 (dropping log(1-pSym) on the trap). Use expm1/log1p,
-    // which stay accurate at both ends:
-    //   1 - (1-BER)^10 = -expm1(10 * log1p(-BER))
+    // Near-one endpoint (codex rounds 54/55): for BER >= ~0.975 the true
+    // pSym is within 2^-53 of 1.0, so no double can represent it — the
+    // expm1/log1p form below rounds to exactly 1.0 and the callers'
+    // log(1 - pSym) raises FE_DIVBYZERO under fenv traps. For BER >=
+    // 1 - 2^-53/10 the same is true of the raw 1 - pow form. Since a
+    // representable pSym this close to 1 is numerically indistinguishable
+    // from the certain-corruption limit, saturate it:
+    if (ber >= 1.0 - 1e-13)
+    {
+        return 1.0;
+    }
+    // Near-zero endpoint (codex round 54): for BER <= ~2^-53 the true
+    // pSym is below double resolution; the raw 1 - pow form rounds to
+    // exactly 0 and the callers' log(pSym) raises FE_DIVBYZERO. expm1/
+    // log1p stay accurate down to the subnormal range.
     return -std::expm1(10.0 * std::log1p(-ber));
 }
 

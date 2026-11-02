@@ -2092,15 +2092,23 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
             // left at the top of the 32-bit offset space (round 54: a
             // 51-B prefix plus an encoded body of UINT32_MAX - 45 still
             // overflowed Buffer offsets even though the body alone fit
-            // the round-53 bound). 51 = the largest send-path prefix
-            // (46-B SoRoCE + 2-B PPP + 3-B SNAP) that can already be on
-            // the packet when the FEC pad is added, at the fabric
-            // endpoint; the switch egress uses the same conservative
-            // constant so both sites share one bound.
+            // the round-53 bound). Round 55 doubled the margin after a
+            // probe reproduced the overflow AT kMaxPayload - 1: Buffer's
+            // recommended starting offset is a process-global high-water
+            // mark (packet.cc: g_recommendedStart), so any earlier large
+            // Packet(bytes, N) constructor call raises it — at 8 the
+            // wrap happens 8 B sooner, and any encoded size >= the guard
+            // boundary can then overflow. 101 B = the round-54 51-B
+            // worst-case warm prefix + 50 B of slack for the global
+            // starting-offset drift; the switch egress uses the same
+            // conservative constant so both sites share one bound. The
+            // realistic send-path prefixes (39-B FabricHeader at the
+            // endpoint, 10-B SoHeader + 2-B PPP at the switch uplink)
+            // fit well inside 51 B.
             uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
             if (encodedPayloadSize > payloadSize)
             {
-                constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 51u;
+                constexpr uint64_t kMaxPayload = std::numeric_limits<uint32_t>::max() - 101u;
                 NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
                                 "FEC parity expansion of a " << payloadSize
                                 << "-B result fragment encodes to " << encodedPayloadSize

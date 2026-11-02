@@ -222,6 +222,9 @@ class FabricEndpoint : public Application
     Ptr<IbgdaSubmissionModel> GetIbgdaSubmissionModel() const;
     void SetRdmaSubmissionModel(Ptr<RdmaSubmissionModel> model) { SetIbgdaSubmissionModel(model); }
     Ptr<RdmaSubmissionModel> GetRdmaSubmissionModel() const { return GetIbgdaSubmissionModel(); }
+    /// Submit at request/data-ready time. Returns a logical request ID; the
+    /// callback fires once after all child WR completions are observed.
+    /// Staged completion acknowledges remote host DRAM, before optional H2D.
     uint64_t SubmitRdmaWrite(uint16_t destRank, uint64_t bytes, uint8_t protocolId,
                              uint16_t flowId, uint8_t vcId = 0,
                              uint32_t producer = UINT32_MAX,

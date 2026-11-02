@@ -633,17 +633,20 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
                     // the closed endpoint u == 1 even though the default
                     // uniform generator never produces it. log1p(-u)
                     // would be log(0) (FE_DIVBYZERO / -inf -> uint32
-                    // conversion is UB), so clamp into the open domain
-                    // and cap the length after conversion (codex round
-                    // 54, finding 6).
+                    // conversion is UB), so clamp into the open domain.
+                    // Round 55: the 1000-codeword cap must apply to the
+                    // DOUBLE quotient BEFORE the uint32 conversion — for
+                    // BurstLength near UINT32_MAX the quotient reaches
+                    // ~1.2e11, and a direct static_cast<uint32_t> of an
+                    // out-of-range double is undefined behavior (UBSan)
+                    // that executes before the old post-conversion cap.
                     double uClamped = std::min(u, 1.0 - 1e-12);
-                    m_burstRemaining = static_cast<uint32_t>(
-                        std::log1p(-uClamped) /
-                        std::log(static_cast<double>(m_burstLength) /
-                                 (1.0 + static_cast<double>(m_burstLength)))
-                    ) + 1;
+                    double length = std::log1p(-uClamped) /
+                                    std::log(static_cast<double>(m_burstLength) /
+                                             (1.0 + static_cast<double>(m_burstLength)));
+                    length = std::min(length, 1000.0);
+                    m_burstRemaining = static_cast<uint32_t>(length) + 1;
                     if (m_burstRemaining < 1) m_burstRemaining = 1;
-                    if (m_burstRemaining > 1000) m_burstRemaining = 1000;
                 }
                 m_totalBursts++;
                 m_burstTrace(m_burstRemaining, m_burstRemaining);

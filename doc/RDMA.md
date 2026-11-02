@@ -98,7 +98,8 @@ Fixed latencies can overlap; bandwidth service reserves the relevant resources.
 
 The main executable and config runner share host DRAM read/write resources
 between endpoints on the same simulated host. HBM, NIC PCIe and D2H/H2D service
-resources are per endpoint. `rdmaD2hGbps` / `rdmaH2dGbps` are separate effective
+resources, CPU workers and GPU producers are per endpoint. `rdmaD2hGbps` /
+`rdmaH2dGbps` are separate effective
 copy-path limits; they do not contend with NIC PCIe resources. A shared PCIe root
 complex, caches, page mapping and TLP arbitration are outside this model.
 

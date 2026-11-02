@@ -58,16 +58,19 @@ ProtocolConfigRunner::ApplyBundle(const std::vector<Ptr<FabricEndpoint>>& endpoi
                                   uint32_t bulkChunkSize)
 {
     const uint8_t nvc = bundle.credits ? bundle.credits->GetNumVcs() : 1;
-    std::map<uint32_t,std::shared_ptr<RdmaHostMemoryResources>> hostMemory;
+    std::map<uint32_t, std::shared_ptr<RdmaHostMemoryResources>> hostMemory;
     for (const auto& ep : endpoints)
     {
         if (!ep) continue;
-        if (IsDetailedRdmaMode(bundle.rdmaSubmission) && !ep->GetIbgdaSubmissionModel())
+        if (IsDetailedRdmaMode(bundle.rdmaSubmission) && !ep->GetRdmaSubmissionModel())
         {
-            auto model=CreateObject<IbgdaSubmissionModel>();
+            auto model = CreateObject<RdmaSubmissionModel>();
             model->Configure(bundle.ibgda);
-            auto& host=hostMemory[ep->GetNodeId()];
-            if (!host) host=std::make_shared<RdmaHostMemoryResources>();
+            auto& host = hostMemory[ep->GetNodeId()];
+            if (!host)
+            {
+                host = std::make_shared<RdmaHostMemoryResources>();
+            }
             model->SetHostMemoryResources(host);
             ep->SetRdmaSubmissionModel(model);
         }

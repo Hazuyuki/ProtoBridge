@@ -6,39 +6,115 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 55: pSym saturation near BER 1.0, Buffer global-offset drift, DataRate clamp documentation, and burst-length UB
+
+**What.** Five findings; the first four verified with probes, fixed, and
+re-probed:
+
+1. **[P0] FEC still raised FE_DIVBYZERO below BER 1.0.** With default
+   RS(544,514,15), BER 0.98/0.99/`nextafter(1.0, 0.0)` makes the
+   round-54 `-expm1(10 * log1p(-ber))` return exactly 1.0: the true
+   pSym is within 2^-53 of 1, so no double can represent it, and the
+   callers' `log(1 - pSym)` hits the FE_DIVBYZERO trap. Accurate
+   computation cannot prevent a probability this close to one from
+   rounding to one — the fix is saturation:
+   `ComputeSymbolErrorProbability` now returns 1.0 for
+   `ber >= 1.0 - 1e-13` (indistinguishable from the certain-
+   corruption limit in double arithmetic).
+2. **[P0] The 51-B bound still permitted Buffer offset overflow.**
+   Buffer's recommended starting offset is a process-global
+   high-water mark (`packet.cc: g_recommendedStart`): any earlier
+   `Packet(bytes, N)` constructor call raises it, shrinking the room
+   left at the top of the 32-bit offset space. A probe with the
+   global offset raised to 64 reproduced the wrap at an encoded
+   payload of exactly `kMaxPayload - 1` (guard accepted, AddAtEnd
+   tripped buffer.cc's offset assert). Both egress sites now bound at
+   `kMaxPayload = UINT32_MAX - 101` (51-B worst-case warm prefix +
+   50-B slack for the global-offset drift). Framing note: the actual
+   send-path prefixes are 39-B FabricHeader at the endpoint and
+   10-B SoHeader + 2-B PPP at the switch uplink — the 51-B figure
+   remains the conservative worst case.
+3. **[P0→documentation] The round-54 clamp does NOT silently accept
+   genuine overflow on long double == double platforms.** On that
+   platform class the guard's maximum literal rounds to 2^63, but an
+   overflowing product's true range (e.g. 2^62 * 2.0 = 2^63) still
+   exceeds the rounded literal, so the guard aborts as intended —
+   verified by rebuilding with GCC `-mlong-double-64` (silent
+   saturation NOT observed; `(1<<62) * 2.0` aborts). Code comments
+   and the round-54 CHANGES.md item updated to state this; no source
+   change needed.
+4. **[P0] Burst-length conversion could still invoke UB before the
+   cap.** With BURST mode, positive BER, BurstArrivalRate=1,
+   BurstLength=UINT32_MAX and an injected RNG sequence {0.0, 1.0},
+   the geometric quotient reaches ~1.19e11 — a direct
+   `static_cast<uint32_t>` of that out-of-range double is UB (UBSan
+   report), and the old 1000-codeword cap ran after the conversion.
+   The cap now applies to the DOUBLE quotient before the cast:
+   `length = min(length, 1000.0)` then convert.
+5. **[P2] Round-54 CHANGES.md/comment inaccuracies corrected.**
+   - Item 1's endpoint examples were reversed: BER 0.99 yields
+     pSym == 1, BER 1e-18 yields pSym == 0 (now stated correctly).
+   - The fec-model.cc comment claimed the raw form breaks "for
+     BER >= 2^-53"; the accurate threshold is BER <= ~1e-16 (2^-53
+     is where `1 - BER` itself rounds to 1, above the actual break).
+   - Item 2's arithmetic: 4,294,967,250 = UINT32_MAX - 45 (not -46).
+   - The TestPostFecBer bound rationale cited the i=15 term
+     (~1e-137) as the tail; i=15 is still correctable (t=15). The
+     uncorrectable tail starts at i=16: C(544,16) * p^16 ~ 2.25e-146.
+     The 1e-14 bound stands (machine-epsilon residue, not the true
+     tail).
+
+**Verified.** Clean build; `PASS data-rate`; `PASS error-model`;
+`PASS gpu-cluster`; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800;
+48 parity PASS lines (15 scripts); 18 pytest parity cases
+(test_ibgda.py + test_config_fec_enabled.py); surrogate pytest 101
+from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 µs / 99985/99985/99974 and 20300.2 µs).
+
 ### Fixed — codex round 54: expm1/log1p FEC symbol probability, 51-B Buffer-offset headroom, BER saturation in link degradation, and DataRate long-double-range/double-quantization split
 
 **What.** Seven findings, verified and fixed:
 
 1. **[P0] FEC symbol probability rounded to exactly 0/1 at extreme BER.**
    `ComputeSymbolErrorProbability` used `1 - pow(1-BER, 10)`; at BER
-   0.99 the power rounds to exactly 1 (pSym = 0, `log(0)` =
-   FE_DIVBYZERO) and at BER 1e-18 it rounds so close to 0 that pSym = 1
-   (`log(1-pSym)` = FE_DIVBYZERO) — both fatal under fenv traps. All
-   three entry points now use `-expm1(10 * log1p(-BER))`, which stays
-   off the exact 0/1 boundaries for every BER in (0, 1). Test bound in
-   `TestPostFecBer` adjusted to `< 1e-14` (the true tail probability
-   is ~1e-137 but the log-space cancellation leaves double-epsilon
-   residue ~4e-16 — asserted against machine epsilon, not the true
-   probability).
+   0.99 the power rounds to exactly 1 (`1 - pow` = 0, `log(0)` =
+   FE_DIVBYZERO) and at BER 1e-18 the power rounds to exactly 1 so
+   close to 1 that `1 - pow` yields exactly 1 (`log(1-pSym)` =
+   FE_DIVBYZERO) — both fatal under fenv traps. All three entry points
+   now use `-expm1(10 * log1p(-BER))`, which stays off the exact 0/1
+   boundaries for every BER in (0, 1) where the true pSym is
+   representable at all. Test bound in `TestPostFecBer` adjusted to
+   `< 1e-14` (the true uncorrectable tail is ~2.25e-146 — term i=16,
+   since C(544,16) * p^16 with p ~ 1e-11 — but the log-space
+   cancellation leaves double-epsilon residue ~4e-16; the assert is
+   against machine epsilon, not the true probability).
 2. **[P0] 51-B prefix + payload encoded 4 B below the round-53 bound
    still overflowed Buffer offsets.** `SetFecParams(995,1,0)` with a
-   4,316,550-B payload encodes to 4,294,967,250 (= UINT32_MAX - 46):
+   4,316,550-B payload encodes to 4,294,967,250 (= UINT32_MAX - 45):
    the round-53 `kMaxPayload = UINT32_MAX - 41` accepted it, but a
-   warm 51-B send-path prefix (46-B SoRoCE + 2-B PPP + 3-B SNAP) plus
-   the encoded body overflows the 32-bit Buffer offset space. Both
-   egress sites (nvswitch.cc, fabric-endpoint.cc) now bound at
-   `kMaxPayload = UINT32_MAX - 51` (reject `>=`), covering the
-   worst-case prefix that can already be on the packet.
+   warm 51-B send-path prefix plus the encoded body overflows the
+   32-bit Buffer offset space. Both egress sites (nvswitch.cc,
+   fabric-endpoint.cc) now bound at `kMaxPayload = UINT32_MAX - 51`
+   (reject `>=`), covering the worst-case prefix that can already be
+   on the packet.
 3. **[P0] long double == double platforms (MSVC, Apple ARM64): the
    identity product still aborts — documented limitation.** On those
    platforms `9223372036854775807.0L` rounds to 2^63, so the
    long-double range guard degrades to an inclusive 2^63 bound and
-   `MAX * 1.0` / `MAX *= 1.0` abort. The code comment documents this;
-   no portable fix exists without an integer identity-path check
-   (which the round-54 scope did not include). All other products
-   (range check in long double, quantization from the double product)
-   behave identically on both platform classes.
+   `MAX * 1.0` / `MAX *= 1.0` abort. No portable fix exists without an
+   integer identity-path check (which the round-54 scope did not
+   include). All other products (range check in long double,
+   quantization from the double product) behave identically on both
+   platform classes. **Round-55 clarification**: the round-54 boundary
+   clamp cannot silently accept genuine overflow on this platform
+   class — the guard's `range > 2^63 - 1` still aborts there because
+   the true range of an overflowing product (e.g. 2^62 * 2.0 = 2^63)
+   exceeds even the rounded literal; verified with a GCC
+   `-mlong-double-64` build.
 4. **[P0] link-degradation.cc evaluated invalid probabilities for BER
    > 1.** `SetBer(0.002)` + severity-1 BIT_ERROR degradation produces
    BER = 2; the raw `pow(1-BER, bits)` then silently returned 0 (even

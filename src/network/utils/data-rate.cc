@@ -206,11 +206,16 @@ DataRate::operator*(double rhs) const
     NS_ABORT_MSG_IF(!(range >= 0.0L) || range > 9223372036854775807.0L,
                     "DataRate product of " << m_bps << " bps * " << rhs
                     << " exceeds the supported range (>= 2^63 bps)");
-    // Boundary clamp (codex round 54 follow-up): the guard above proves
-    // the true product is at most 2^63 - 1, but the DOUBLE product rounds
-    // 2^63 - 1 up to 2^63 (53-bit mantissa) and the constructor aborts on
-    // the rounded value. A double product that reached 2^63 is a rounding
-    // artifact — clamp to the representable maximum instead.
+    // Boundary clamp (codex rounds 54/55): the guard above proves the
+    // true product is at most 2^63 - 1, but the DOUBLE product rounds
+    // 2^63 - 1 up to 2^63 (53-bit mantissa) and the constructor aborts
+    // on the rounded value. A double product that reached 2^63 is a
+    // rounding artifact — clamp to the representable maximum instead.
+    // On platforms where long double == double (MSVC, Apple ARM64) this
+    // clamp is unreachable for genuine overflow: the guard's maximum
+    // literal rounds to 2^63 there, so range > 2^63 - 1 still aborts
+    // before the double product is formed (round 55: verified with a
+    // -mlong-double-64 build, where (1<<62) * 2.0 aborts as intended).
     const double prod = m_bps * rhs;
     if (prod >= 9223372036854775808.0) // == 2^63 as a double literal
     {
@@ -231,6 +236,8 @@ DataRate::operator*=(double rhs)
                     << " exceeds the supported range (>= 2^63 bps)");
     // Same boundary clamp as operator*(double): a double product of
     // 2^63 - 1 rounds up to 2^63, which the constructor would abort on.
+    // Unreachable for genuine overflow on long double == double
+    // platforms for the same reason as above (round 55).
     const double prod = m_bps * rhs;
     if (prod >= 9223372036854775808.0) // == 2^63 as a double literal
     {
