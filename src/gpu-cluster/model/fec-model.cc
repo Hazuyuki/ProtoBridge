@@ -360,7 +360,7 @@ FecModel::DecodePacket(double preFecBer, uint32_t payloadSize) const
     return result;
 }
 
-uint32_t
+uint64_t
 FecModel::GetEncodedSize(uint32_t payloadSize) const
 {
     if (!m_enabled)
@@ -372,7 +372,11 @@ FecModel::GetEncodedSize(uint32_t payloadSize) const
     uint64_t dataBitsPerCodeword = static_cast<uint64_t>(m_k) * RS_SYMBOL_BITS;
     uint64_t numCodewords = (payloadBits + dataBitsPerCodeword - 1) / dataBitsPerCodeword;
     uint64_t encodedBits = numCodewords * m_n * RS_SYMBOL_BITS;
-    return static_cast<uint32_t>((encodedBits + 7) / 8);
+    // uint64 return (codex round 51, finding 2): the encoded size of a
+    // ~4-GB payload crosses UINT32_MAX; the old uint32 return narrowed it
+    // below the payload size, and the padding site's `encoded > payload`
+    // test silently skipped the parity expansion entirely.
+    return (encodedBits + 7) / 8;
 }
 
 uint32_t

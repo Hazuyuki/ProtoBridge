@@ -661,16 +661,17 @@ void
 FabricEndpoint::SetSprayChunkSize(uint32_t chunkSize)
 {
     // Zero is a division-by-zero in every spray chunk count (codex round
-    // 50, finding 3); the header-headroom cap mirrors SetBulkChunkSize
-    // (finding 1).
+    // 50, finding 3); the representability cap mirrors SetBulkChunkSize
+    // (rounds 50-51: bodies stay under 2^30 — Buffer's grown
+    // g_recommendedStart headroom overflows a UINT32_MAX-41 body before
+    // the first AddHeader).
     NS_ABORT_MSG_IF(chunkSize == 0, "Spray chunk size must be greater than zero");
-    constexpr uint32_t packetOverhead = 39 + 2;
-    constexpr uint32_t maxChunk =
-        std::numeric_limits<uint32_t>::max() - packetOverhead;
+    constexpr uint32_t maxChunk = 1u << 30;
     if (chunkSize > maxChunk)
     {
         NS_LOG_WARN("SprayChunkSize " << chunkSize << " capped to " << maxChunk
-                    << " to keep the packet inside uint32 after headers");
+                    << " to keep every fragment body representable in the "
+                       "packet pipeline");
         chunkSize = maxChunk;
     }
     m_sprayChunkSize = chunkSize;
@@ -1049,19 +1050,22 @@ void
 FabricEndpoint::SetBulkChunkSize(uint32_t bytes)
 {
     NS_ABORT_MSG_IF(bytes == 0, "Bulk chunk size must be greater than zero");
-    // Header headroom (codex round 50, finding 1): a chunk-sized body plus
-    // the 39-B FabricHeader and the 2-B PPP prepend must stay inside the
-    // uint32 the packet pipeline serializes — a UINT32_MAX-sized body wraps
-    // the total to 38 B and every downstream size consumer misbehaves.
-    // Cap at the largest body that keeps the FULL packet representable;
-    // transfers just fragment into more chunks.
-    constexpr uint32_t packetOverhead = 39 + 2;
-    constexpr uint32_t maxChunk =
-        std::numeric_limits<uint32_t>::max() - packetOverhead;
+    // Representability cap (codex rounds 50-51): a body near UINT32_MAX
+    // breaks the packet pipeline in layers below the 39-B FabricHeader +
+    // 2-B PPP prepend: Buffer::Initialize starts the zero area at
+    // g_recommendedStart — headroom grown by every prior Buffer's header
+    // prefix (up to 51 B in the default pipeline) — so a
+    // UINT32_MAX - 41 body overflows m_zeroAreaStart + zeroSize in uint32
+    // and the first AddHeader asserts. The 1-GiB bound is the same
+    // representability invariant SendDataInternal's cap already uses
+    // (bodies stay under 2^30, with every downstream consumer in uint32
+    // range); transfers just fragment into more chunks.
+    constexpr uint32_t maxChunk = 1u << 30;
     if (bytes > maxChunk)
     {
         NS_LOG_WARN("BulkChunkSize " << bytes << " capped to " << maxChunk
-                    << " to keep the packet inside uint32 after headers");
+                    << " to keep every fragment body representable in the "
+                       "packet pipeline");
         bytes = maxChunk;
     }
     m_bulkChunkSize = bytes;
@@ -3389,11 +3393,23 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         FabricHeader hdr;
         packet->PeekHeader(hdr);
         uint32_t payloadSize = packet->GetSize() - hdr.GetSerializedSize();
-        uint32_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
+        // uint64 encoded size (codex round 51, finding 2): the encoded
+        // size of a near-4-GB payload crosses UINT32_MAX — the old uint32
+        // GetEncodedSize narrowed 4,339,299,640 to 44,332,344, BELOW the
+        // payload, silently skipping the parity padding and understating
+        // serialization. With the widened return, an over-large pad is a
+        // configuration error (no uint32-sized packet can carry it) —
+        // fail loudly instead of truncating.
+        uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
         if (encodedPayloadSize > payloadSize)
         {
-            uint32_t padding = encodedPayloadSize - payloadSize;
-            packet->AddAtEnd(Create<Packet>(padding));
+            const uint64_t padding = encodedPayloadSize - payloadSize;
+            NS_ABORT_MSG_IF(padding > std::numeric_limits<uint32_t>::max(),
+                            "FEC parity expansion of a " << payloadSize
+                            << "-B payload needs a " << padding
+                            << "-B pad, beyond any representable packet: "
+                               "reduce the chunk size or disable FEC");
+            packet->AddAtEnd(Create<Packet>(static_cast<uint32_t>(padding)));
         }
     }
 
@@ -3802,6 +3818,17 @@ FabricEndpoint::SendBulkWireTransferSizeImpl(uint16_t destRank, uint64_t dataSiz
                     "Bulk transfer of " << dataSize << " B to rank " << destRank
                     << " computed a ZERO wire ledger (model arithmetic "
                        "overflowed): reduce the transfer size");
+    // Wrapped-nonzero ledger (codex round 51, finding 4): a protocol
+    // model whose framing arithmetic wraps can return a small NONZERO
+    // ledger for a huge dataSize (the UB MAINTENANCE arm wrapped
+    // 16 + UINT64_MAX to 15 and max(128, 15) = 128 passed both guards
+    // above). No honest efficiency > 0 ever yields wire bytes below the
+    // data size, so an under-sized ledger is always a model bug.
+    NS_ABORT_MSG_IF(wireSize < dataSize,
+                    "Bulk transfer of " << dataSize << " B to rank " << destRank
+                    << " computed a wire ledger of " << wireSize
+                    << " B below the data size (model arithmetic "
+                       "overflowed): reduce the transfer size");
 
     NS_LOG_INFO("Bulk wire transfer: dataSize=" << dataSize << " wireSize=" << wireSize
                << " efficiency=" << efficiency << " protocol=" << static_cast<int>(protocolId));
@@ -3877,16 +3904,20 @@ FabricEndpoint::SendBulkWireTransferSizeImpl(uint16_t destRank, uint64_t dataSiz
         // (wireSize - offset underflows) and emit zero/phantom data bytes.
         uint64_t memCapChunks = (wireSize + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
         uint64_t numChunks = std::max(minChunks, memCapChunks);
-        // Header headroom (codex round 50, findings 1+3): the fragment body
-        // plus the 39-B FabricHeader and 2-B PPP prepend must stay inside a
-        // uint32 — and m_bulkChunkSize/m_sprayChunkSize set through the raw
-        // attributes can sit near UINT32_MAX (the setters cap; the attribute
-        // path bypasses them). Clamp the fragment body; the transfer just
-        // fragments into more chunks. This also subsumes the unused
-        // sizeBasedChunks division (removed: it divided by a possibly-zero
-        // spray size and its result was never consumed).
-        constexpr uint64_t maxFragmentBody =
-            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - (39 + 2);
+        // Header headroom (codex rounds 50-51, findings 1+3): the fragment
+        // body must stay representable in the packet pipeline — not merely
+        // inside a uint32 after the 39-B FabricHeader + 2-B PPP prepend:
+        // Buffer::Initialize starts the zero area at g_recommendedStart
+        // (prefix headroom grown by every prior Buffer, up to 51 B), so a
+        // UINT32_MAX - 41 body overflows the uint32 end computation and
+        // the first AddHeader asserts. The 2^30 bound is the same
+        // representability invariant SendDataInternal's cap uses. The raw
+        // attributes can also sit near UINT32_MAX (the setters cap; the
+        // attribute path bypasses them). Clamp the fragment body; the
+        // transfer just fragments into more chunks. This also subsumes the
+        // unused sizeBasedChunks division (removed: it divided by a
+        // possibly-zero spray size and its result was never consumed).
+        constexpr uint64_t maxFragmentBody = 1ull << 30;
         if (MAX_CHUNK_BYTES > maxFragmentBody)
         {
             const uint64_t bodyCapChunks =

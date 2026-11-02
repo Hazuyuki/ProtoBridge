@@ -137,9 +137,13 @@ class FecModel : public Object
     /**
      * @brief Apply FEC encoding to a packet (returns encoded size)
      * @param payloadSize Original payload size in bytes
-     * @return Encoded size in bytes (payload * N/K, rounded up to codeword boundary)
+     * @return Encoded size in bytes (payload * N/K, rounded up to codeword
+     *         boundary). uint64 (codex round 51, finding 2): a ~4-GB
+     *         payload encodes past UINT32_MAX and the old uint32 return
+     *         narrowed 4,339,299,640 to 44,332,344 — SMALLER than the
+     *         payload, silently skipping the parity padding.
      */
-    uint32_t GetEncodedSize(uint32_t payloadSize) const;
+    uint64_t GetEncodedSize(uint32_t payloadSize) const;
 
     /**
      * @brief Get original payload size from encoded size

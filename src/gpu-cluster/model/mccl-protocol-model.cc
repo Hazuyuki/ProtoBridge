@@ -10,6 +10,7 @@
 #include "ns3/uinteger.h"
 
 #include <cmath>
+#include <limits>
 
 namespace ns3
 {
@@ -75,7 +76,23 @@ uint64_t
 McclProtocolModel::GetWireSize(uint64_t dataSize, uint8_t protocolId) const
 {
     (void)protocolId;
-    return static_cast<uint64_t>(std::ceil(dataSize / m_wireEfficiency));
+    // Checked conversion (codex round 51, finding 8): at dataSize =
+    // UINT64_MAX even efficiency 1.0 rounds the double quotient to 2^64,
+    // and the direct static_cast is undefined behavior. Efficiency 1.0 is
+    // exact — return the input; otherwise saturate on an out-of-range
+    // quotient (the send paths abort on ledgers above the serviceable
+    // bound, which a saturated value always exceeds).
+    if (m_wireEfficiency == 1.0)
+    {
+        return dataSize;
+    }
+    const double quotient =
+        std::ceil(static_cast<double>(dataSize) / m_wireEfficiency);
+    if (quotient >= 18446744073709551615.0) // >= 2^64 - 1
+    {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return static_cast<uint64_t>(quotient);
 }
 
 uint64_t

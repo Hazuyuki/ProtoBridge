@@ -157,10 +157,13 @@ RateErrorModel::GetTypeId()
                                           ERROR_UNIT_PACKET,
                                           "ERROR_UNIT_PACKET"))
             .AddAttribute("ErrorRate",
-                          "The error rate.",
+                          "The error rate (a probability in [0, 1]).",
                           DoubleValue(0.0),
                           MakeDoubleAccessor(&RateErrorModel::m_rate),
-                          MakeDoubleChecker<double>())
+                          // Domain restriction (codex round 51, finding 9):
+                          // a rate above 1 makes log1p(-rate) NaN, and NaN
+                          // compares false — every packet silently clean.
+                          MakeDoubleChecker<double>(0.0, 1.0))
             .AddAttribute("RanVar",
                           "The decision variable attached to this error model.",
                           StringValue("ns3::UniformRandomVariable[Min=0.0|Max=1.0]"),
@@ -204,6 +207,12 @@ void
 RateErrorModel::SetRate(double rate)
 {
     NS_LOG_FUNCTION(this << rate);
+    // Same domain restriction as the attribute checker (codex round 51,
+    // finding 9): a rate above 1 (or NaN) makes the expm1/log1p
+    // probability NaN, and NaN compares false — every packet clean.
+    NS_ABORT_MSG_IF(std::isnan(rate) || rate < 0.0 || rate > 1.0,
+                    "RateErrorModel rate " << rate
+                    << " is not a probability in [0, 1]");
     m_rate = rate;
 }
 
@@ -256,8 +265,14 @@ bool
 RateErrorModel::DoCorruptByte(Ptr<Packet> p)
 {
     NS_LOG_FUNCTION(this << p);
-    // compute pkt error rate, assume uniformly distributed byte error
-    double per = 1 - std::pow(1.0 - m_rate, static_cast<double>(p->GetSize()));
+    // compute pkt error rate, assume uniformly distributed byte error.
+    // Stable expm1/log1p form (codex round 51, finding 6): 1.0 - m_rate
+    // rounds to exactly 1.0 for a tiny rate (1e-17), so the old
+    // pow(1 - rate, size) collapsed to 1 and per to 0 — every packet
+    // clean, whatever its size. -expm1(n * log1p(-rate)) keeps the
+    // leading term; mirrors the bit-unit fix from round 50.
+    const double per = -std::expm1(static_cast<double>(p->GetSize())
+                                   * std::log1p(-m_rate));
     return (m_ranvar->GetValue() < per);
 }
 

@@ -12,6 +12,9 @@
 #include "ns3/test.h"
 #include "ns3/tuple.h"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 using namespace ns3;
 
 /**
@@ -257,6 +260,52 @@ DataRateTestCase2::DoRun()
     MultiplicationIntTest("4Mb/s", 1000, "4Gb/s");
     MultiplicationDoubleTest("1Gb/s", 0.001, "1Mb/s");
     MultiplicationDoubleTest("6Gb/s", 1.0 / 7.0, "857142857.14b/s");
+
+    // Range guards (codex round 51, finding 5): compound assignment and
+    // the non-assigning operators mutate or construct the rate without
+    // passing through the uint64_t constructor's >= 2^63 abort. NS_ABORT
+    // exits the process, so each guard forks and checks the child's exit
+    // status — the same pattern the ns-3 suite uses for fatal-path tests.
+    // (4e18 = 4 * 10^18 bps, below the 2^63 ~ 9.22e18 constructor bound.)
+    auto expectAbort = [this](const std::string& what, void (*fn)()) {
+        pid_t pid = fork();
+        NS_TEST_ASSERT_MSG_EQ(pid >= 0, true, "fork must succeed for " + what);
+        if (pid == 0)
+        {
+            fn(); // must abort; reaching the next line is the failure
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        const bool aborted = (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT)
+            || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+        NS_TEST_ASSERT_MSG_EQ(aborted, true, what + " must abort past 2^63 bps");
+    };
+
+    expectAbort("DataRate += past 2^63", []() {
+        DataRate dr(static_cast<uint64_t>(4e18));
+        dr += DataRate(static_cast<uint64_t>(8e18));
+    });
+    expectAbort("DataRate operator+ past 2^63", []() {
+        const DataRate sum = DataRate(static_cast<uint64_t>(4e18)) + DataRate(static_cast<uint64_t>(8e18));
+        (void)sum;
+    });
+    expectAbort("DataRate *= (uint64_t) past 2^63", []() {
+        DataRate dr(static_cast<uint64_t>(4e18));
+        dr *= static_cast<uint64_t>(3);
+    });
+    expectAbort("DataRate * (double) past 2^63", []() {
+        const DataRate prod = DataRate(static_cast<uint64_t>(4e18)) * 3.0;
+        (void)prod;
+    });
+    expectAbort("DataRate *= (double) past 2^63", []() {
+        DataRate dr(static_cast<uint64_t>(4e18));
+        dr *= 3.0;
+    });
+    expectAbort("DataRate * (uint64_t) past 2^63", []() {
+        const DataRate prod = DataRate(static_cast<uint64_t>(4e18)) * static_cast<uint64_t>(3);
+        (void)prod;
+    });
 }
 
 /**

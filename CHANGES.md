@@ -6,6 +6,80 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 51: overflow and numerical-stability follow-up — g_recommendedStart headroom, FEC width, raw-path widening, saturation guards, and range-checked rates
+
+**What.** Round 51 re-probed the round-50 fixes at the next boundary and
+audited the send paths' arithmetic for silent wrap/saturation defects:
+
+1. **[P2] `g_recommendedStart` overflowed at exactly 2^30 B.** The function
+   computed `dataSize + needed` in uint64 but compared the result against
+   a `UINT32_MAX` headroom bound; a `dataSize` of exactly `2^30` (the
+   maximum the receiving side can buffer before saturating) wrapped the
+   headroom computation and recommended starting at an offset near zero.
+   The headroom check now caps against `2^30` (the receiver's saturation
+   bound) instead of `UINT32_MAX`, so the recommendation stays
+   representable for every legal input.
+2. **[P2] `FecModel::GetEncodedSize` returned uint32.** A ~4-GiB payload's
+   encoded size crosses `UINT32_MAX`; the narrowing produced an encoded
+   size smaller than the payload, and the padding site's `encoded >
+   payload` test then skipped the parity expansion entirely. The return
+   type is now `uint64_t` throughout.
+3. **[P2] The raw send path truncated bulk-chunk byte accounting.** The
+   raw `SendData` path (which bypasses protocol framing) accumulated wire
+   bytes in a uint32 local; a >4-GiB transfer silently wrapped the
+   ledger. The accumulator is now `uint64_t`, matching every other send
+   path.
+4. **[P2] UB MAINTENANCE wraparound.** The microbenchmark maintenancer's
+   tick counter wrapped to zero after `UINT64_MAX` ticks, restarting the
+   maintenance interval from the beginning. The counter now saturates at
+   `UINT64_MAX`, so the interval check simply stops re-firing.
+5. **[P2] DataRate arithmetic operators bypassed the constructor guard.**
+   Round 50 guarded both constructors; round 51 found the mutating
+   operators could still produce a rate >= 2^63 without passing through
+   them: `+=` overflowed silently, `*=` (double) could overflow or
+   produce NaN, and `*` (uint64) wrapped BEFORE the constructor check.
+   All four compound operators plus the non-assigning `operator+` now
+   check against the `2^63 - 1` bound before mutating or constructing;
+   `operator-`/`operator-=` assert non-negative.
+6. **[P2] `RateErrorModel::DoCorruptByte` used `pow(1 - rate, size)`.**
+   For `rate = 1e-17`, `1.0 - rate` rounds to exactly 1.0 and every
+   packet is clean. The computation now uses `-expm1(size * log1p(-rate))`,
+   matching the `DoCorruptBit` fix from round 50 and preserving the
+   leading-order term. `SetRate` also rejects non-probability values
+   (negative, NaN, or > 1) that would otherwise make `log1p(-rate)` NaN.
+7. **[P3] LL/LL128 wire-size divide-then-bump truncated.** The ceiling
+   division rounded up BEFORE adding the per-line header, so a payload
+   needing an exact multiple of lines received one fewer line. The
+   division now adds the line size first: `(data + line - 1 + header) /
+   line * line`.
+8. **[P3] SIMPLE/MCCL/RoCE/Ethernet efficiency==1.0 computed the full
+   pad path.** The efficiency-1.0 fast path now skips the padding
+   loop entirely and, for the remaining cases, saturates to `UINT64_MAX`
+   instead of wrapping.
+9. **[P3] `ErrorRate` attribute accepted values outside [0, 1].** The
+   checker now validates `0 <= rate <= 1`; `SetRate` aborts outside the
+   range.
+
+**Also fixed (round 51 hardening).** During verification, the
+`DataRate::operator+` guard was found missing entirely: the non-assigning
+operator constructed the sum directly, bypassing the constructor's abort.
+A pre-addition check (`rhs >= (2^63 - 1) - lhs`) was added to match the
+other operators. The fatal-path unit tests (range-rejection aborts) were
+also converted from the broken try/catch pattern to `fork()` +
+`waitpid()`: `NS_ABORT` exits the process, so the tests now verify the
+child's exit status (`SIGABRT` or non-zero exit) instead of relying on
+unreachable catch blocks. Three abort tests in error-model-test-suite.cc
+and six in test-data-rate.cc use this pattern.
+
+**Verified.** Clean `-Werror` build; gpu-cluster suite 183/183 PASS
+(test-runner + test.py); data-rate + error-model suites PASS (test-runner
++ test.py); three parity scripts PASS; DCQCN anchors byte-stable
+(congested: 20802.4 µs / 99985 ECN / 99974 CNP rx; aligned: 20300.2 µs /
+37161 ECN); every touched-core suite PASS (pie, drop-tail,
+codel/cobalt/fifo/prio, fq-codel/fq-pie/fq-cobalt, queue-disc-traces,
+wifi-mac-queue, lr-wpan-error-model) plus a traffic-control-example
+smoke run.
+
 ### Fixed — codex round 50: configuration-boundary robustness at the fragment/ledger edge — header headroom, wrapped LL ledgers, zero spray size, negative DataRates, and tiny BERs
 
 **What.** Round 50 pushed the send paths' configurable knobs to their

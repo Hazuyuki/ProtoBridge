@@ -29,6 +29,9 @@
 #include "ns3/string.h"
 #include "ns3/test.h"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 using namespace ns3;
 
 static void
@@ -281,6 +284,125 @@ BurstErrorModelSimple::DoRun()
  * @ingroup network-test
  * @ingroup tests
  *
+ * RateErrorModel domain and stability unit tests (codex round 51,
+ * findings 6 and 9).
+ */
+class RateErrorModelRangeTest : public TestCase
+{
+  public:
+    RateErrorModelRangeTest();
+    ~RateErrorModelRangeTest() override = default;
+
+  private:
+    void DoRun() override;
+};
+
+RateErrorModelRangeTest::RateErrorModelRangeTest()
+    : TestCase("RateErrorModel domain and tiny-BER stability")
+{
+}
+
+void
+RateErrorModelRangeTest::DoRun()
+{
+    // SetRate must reject a non-probability (codex round 51, finding 9):
+    // a rate above 1 makes log1p(-rate) NaN, and NaN compares false —
+    // every packet silently clean. NS_ABORT exits the process, so each
+    // guard forks and checks the child's exit status — the same pattern
+    // the ns-3 suite uses for fatal-path tests.
+    auto expectAbort = [this](const std::string& what, void (*fn)()) {
+        pid_t pid = fork();
+        NS_TEST_ASSERT_MSG_EQ(pid >= 0, true, "fork must succeed for " + what);
+        if (pid == 0)
+        {
+            fn(); // must abort; reaching the next line is the failure
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        const bool aborted = (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT)
+            || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+        NS_TEST_ASSERT_MSG_EQ(aborted, true, what + " must abort");
+    };
+
+    expectAbort("SetRate(1.5)", []() {
+        Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
+        em->SetRate(1.5);
+    });
+    expectAbort("SetRate(-0.1)", []() {
+        Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
+        em->SetRate(-0.1);
+    });
+    expectAbort("ErrorRate=2.0 attribute", []() {
+        Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
+        em->SetAttribute("ErrorRate", DoubleValue(2.0));
+    });
+
+    // Tiny-BER byte stability (codex round 51, finding 6): a rate so small
+    // that 1.0 - rate rounds back to 1.0 must still corrupt a large enough
+    // packet. With the old pow(1 - rate, size) form, per collapsed to 0
+    // for ANY size. Use a deterministic ranvar pinned to 0.5 so the
+    // comparison against per is the only variable.
+    {
+        Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
+        em->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_BYTE"));
+        em->SetRate(1e-17);
+        Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
+        uv->SetAttribute("Min", DoubleValue(0.5));
+        uv->SetAttribute("Max", DoubleValue(0.5));
+        em->SetRandomVariable(uv);
+
+        // per = -expm1(size * log1p(-1e-17)) ~ size * 1e-17.
+        // A 4 KiB packet: per ~ 4.1e-14 < 0.5  -> kept.
+        Ptr<Packet> small = Create<Packet>(4096);
+        bool corrupt = em->IsCorrupt(small);
+        NS_TEST_EXPECT_MSG_EQ(corrupt, false, "tiny BER: 4 KiB packet survives a 0.5 draw");
+
+        // A 1 TiB packet: per ~ 1.1e-5 < 0.5 -> still kept, but the old
+        // form would also keep it (both round); the discriminating case is
+        // a ranvar draw below per.
+        Ptr<UniformRandomVariable> uvLow = CreateObject<UniformRandomVariable>();
+        uvLow->SetAttribute("Min", DoubleValue(1e-6));
+        uvLow->SetAttribute("Max", DoubleValue(1e-6));
+        em->SetRandomVariable(uvLow);
+        Ptr<Packet> large = Create<Packet>(110000000); // 110 MB: per ~ 1.1e-9
+        corrupt = em->IsCorrupt(large);
+        // Old pow form: per == 0 exactly -> 1e-6 < 0 false -> not corrupt.
+        // Stable form: per ~ 1.1e-9; 1e-6 < 1.1e-9 false -> not corrupt.
+        // Both agree here; the distinguishing assertion is below.
+        NS_TEST_EXPECT_MSG_EQ(corrupt, false, "tiny BER: 110 MB packet survives a 1e-6 draw");
+
+        // Draw 0.0: stable form reports corrupt iff per > 0. With per
+        // collapsed to 0 the old form never corrupts; the stable form
+        // corrupts a 110 MB packet because per ~ 1.1e-9 > 0.
+        Ptr<UniformRandomVariable> uvZero = CreateObject<UniformRandomVariable>();
+        uvZero->SetAttribute("Min", DoubleValue(0.0));
+        uvZero->SetAttribute("Max", DoubleValue(0.0));
+        em->SetRandomVariable(uvZero);
+        corrupt = em->IsCorrupt(large);
+        NS_TEST_EXPECT_MSG_EQ(corrupt,
+                              true,
+                              "tiny BER: 110 MB packet corrupt at a 0.0 draw (per > 0)");
+    }
+
+    // Endpoint sanity: rate exactly 1.0 corrupts every byte unit.
+    {
+        Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
+        em->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_BYTE"));
+        em->SetRate(1.0);
+        Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
+        uv->SetAttribute("Min", DoubleValue(0.999999));
+        uv->SetAttribute("Max", DoubleValue(0.999999));
+        em->SetRandomVariable(uv);
+        Ptr<Packet> p = Create<Packet>(1);
+        NS_TEST_EXPECT_MSG_EQ(em->IsCorrupt(p), true, "rate 1.0 corrupts every unit");
+    }
+}
+
+/**
+ * @ingroup network-test
+ * @ingroup tests
+ *
  * @brief ErrorModel TestSuite
  *
  *  This is the start of an error model test suite.  For starters, this is
@@ -298,6 +420,7 @@ ErrorModelTestSuite::ErrorModelTestSuite()
 {
     AddTestCase(new ErrorModelSimple, TestCase::Duration::QUICK);
     AddTestCase(new BurstErrorModelSimple, TestCase::Duration::QUICK);
+    AddTestCase(new RateErrorModelRangeTest, TestCase::Duration::QUICK);
 }
 
 // Do not forget to allocate an instance of this TestSuite

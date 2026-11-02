@@ -140,12 +140,28 @@ DataRate::DataRate(uint64_t bps)
 DataRate
 DataRate::operator+(DataRate rhs) const
 {
+    // Pre-addition guard (codex round 51, finding 5): the non-assigning
+    // operator constructs the sum without passing through the uint64_t
+    // constructor's >= 2^63 abort. Check before adding; use 2^63 - 1 as
+    // the operand bound so a sum landing exactly at 2^63 - 1 is still
+    // representable.
+    NS_ABORT_MSG_IF(rhs.m_bps >= ((1ull << 63) - 1) - m_bps,
+                    "DataRate sum of " << m_bps << " + " << rhs.m_bps
+                    << " bps exceeds the supported range (>= 2^63 bps)");
     return DataRate(m_bps + rhs.m_bps);
 }
 
 DataRate&
 DataRate::operator+=(DataRate rhs)
 {
+    // Same signed-range guard as the constructors (codex round 51,
+    // finding 5): compound assignment mutates m_bps in place and would
+    // otherwise bypass the constructor aborts. Use 2^63 - 1 as the
+    // operand bound so a sum landing exactly at 2^63 - 1 is still
+    // representable.
+    NS_ABORT_MSG_IF(rhs.m_bps >= ((1ull << 63) - 1) - m_bps,
+                    "DataRate sum of " << m_bps << " + " << rhs.m_bps
+                    << " bps exceeds the supported range (>= 2^63 bps)");
     m_bps += rhs.m_bps;
     return *this;
 }
@@ -168,25 +184,52 @@ DataRate::operator-=(DataRate rhs)
 DataRate
 DataRate::operator*(double rhs) const
 {
-    return DataRate((uint64_t)(m_bps * rhs));
+    // Pre-scale guard (codex round 51, finding 5): the double product can
+    // exceed uint64 (converts to 0 or garbage) or cross 2^63 before the
+    // constructor's own check sees it — both produce a rate the fixed-point
+    // time arithmetic cannot represent. Compute in double and validate
+    // before the narrowing conversion.
+    const double product = m_bps * rhs;
+    NS_ABORT_MSG_IF(!(product >= 0.0) || product >= 9223372036854775808.0,
+                    "DataRate product of " << m_bps << " bps * " << rhs
+                    << " exceeds the supported range (>= 2^63 bps)");
+    return DataRate(static_cast<uint64_t>(product));
 }
 
 DataRate&
 DataRate::operator*=(double rhs)
 {
-    m_bps *= rhs;
+    // Same pre-scale guard as operator*(double): in-place mutation
+    // bypasses the constructor aborts.
+    const double product = m_bps * rhs;
+    NS_ABORT_MSG_IF(!(product >= 0.0) || product >= 9223372036854775808.0,
+                    "DataRate product of " << m_bps << " bps * " << rhs
+                    << " exceeds the supported range (>= 2^63 bps)");
+    m_bps = static_cast<uint64_t>(product);
     return *this;
 }
 
 DataRate
 DataRate::operator*(uint64_t rhs) const
 {
+    // Pre-scale guard (codex round 51, finding 5): the uint64 product
+    // wraps BEFORE the constructor's check runs — 2^62 bps * 4 wrapped to
+    // zero, silently creating a divide-by-zero rate. Check the operands
+    // against the 2^63 bound before multiplying.
+    NS_ABORT_MSG_IF(m_bps != 0 && rhs > (((1ull << 63) - 1) / m_bps),
+                    "DataRate product of " << m_bps << " bps * " << rhs
+                    << " exceeds the supported range (>= 2^63 bps)");
     return DataRate(m_bps * rhs);
 }
 
 DataRate&
 DataRate::operator*=(uint64_t rhs)
 {
+    // Same pre-scale guard as operator*(uint64_t): in-place mutation
+    // bypasses the constructor aborts.
+    NS_ABORT_MSG_IF(m_bps != 0 && rhs > (((1ull << 63) - 1) / m_bps),
+                    "DataRate product of " << m_bps << " bps * " << rhs
+                    << " exceeds the supported range (>= 2^63 bps)");
     m_bps *= rhs;
     return *this;
 }

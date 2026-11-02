@@ -144,7 +144,16 @@ UbProtocolModel::GetWireSize(uint64_t dataSize, uint8_t protocolId) const
         }
 
         case UbTransaction::MAINTENANCE:
-            // Small fixed-format, ~128B wire for tiny payload
+            // Small fixed-format, ~128B wire for tiny payload. Addition
+            // guard (codex round 51, finding 4): dataSize near UINT64_MAX
+            // wraps 16 + dataSize to a small value — a 128-B "ledger" for
+            // an (unservicable) 2^64-1-B transfer passed every downstream
+            // send guard. Saturate instead: the send paths abort on
+            // ledgers above the serviceable bound.
+            if (dataSize > std::numeric_limits<uint64_t>::max() - 16)
+            {
+                return std::numeric_limits<uint64_t>::max();
+            }
             return std::max(static_cast<uint64_t>(128), 16 + dataSize);
     }
 }

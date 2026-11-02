@@ -57,9 +57,17 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
 
         // Ensure at least one chunk per link for proper BW utilization.
         // When numChunks < numLinks, some links sit idle, causing flat latency.
+        // All count/size arithmetic widened to uint64 (codex round 51,
+        // finding 3): with size near UINT32_MAX the uint32 ceiling
+        // numerators (size + m_sprayChunkSize - 1, size + MAX_CHUNK_BYTES
+        // - 1, size + numChunks - 1) wrapped to small values — numChunks
+        // collapsed to the per-link minimum and chunkSize wrapped to zero,
+        // emitting empty data packets.
+        const uint64_t size64 = size;
         uint32_t minChunks = static_cast<uint32_t>(sendDevices.size());
-        uint32_t sizeBasedChunks = (size + m_sprayChunkSize - 1) / m_sprayChunkSize;
-        uint32_t numChunks = std::max(minChunks, sizeBasedChunks);
+        uint64_t sizeBasedChunks =
+            (size64 + m_sprayChunkSize - 1) / m_sprayChunkSize;
+        uint64_t numChunks = std::max<uint64_t>(minChunks, sizeBasedChunks);
         // Coalesce very large transfers into memory-safe chunks: tiny 128 KB
         // chunks flood the event loop at GB scale (millions of packet-events),
         // so cap each chunk at MAX_CHUNK_BYTES. Gated on memCapChunks > minChunks
@@ -68,31 +76,43 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         // Total wire bytes and path striping are unchanged. Queue and credit
         // events occur at the coalesced granularity, so this path is intended
         // for bulk-transfer timing rather than fine-grained contention tests.
-        const uint32_t MAX_CHUNK_BYTES = 8 * 1024 * 1024;
-        uint32_t memCapChunks = (size + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
+        const uint64_t MAX_CHUNK_BYTES = 8 * 1024 * 1024;
+        uint64_t memCapChunks = (size64 + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
         if (memCapChunks > minChunks)
         {
-            numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
+            numChunks = std::max<uint64_t>(minChunks,
+                                           std::min(sizeBasedChunks, memCapChunks));
         }
         // Bound the chunk count by the transfer size: the one-chunk-per-link
         // spray can otherwise produce trailing fragments whose offset is past
         // the buffer end (size - offset underflows; Create<Packet> would read
         // out of bounds). Never more than one 1-byte chunk per data byte.
-        numChunks = std::min(numChunks, std::max<uint32_t>(size, 1));
-        uint32_t chunkSize = (size + numChunks - 1) / numChunks;
+        numChunks = std::min<uint64_t>(numChunks, std::max<uint64_t>(size64, 1));
+        // Representability guard (codex round 51, finding 1): every fragment
+        // body must stay under the 2^30 pipeline bound — a near-UINT32_MAX
+        // body overflows Buffer's grown prefix headroom before the first
+        // AddHeader. SprayChunkSize's raw attribute can still sit near
+        // UINT32_MAX (the setter caps; the attribute path bypasses it).
+        constexpr uint64_t maxFragmentBody = 1ull << 30;
+        if (numChunks * maxFragmentBody < size64)
+        {
+            numChunks = (size64 + maxFragmentBody - 1) / maxFragmentBody;
+        }
+        uint64_t chunkSize = (size64 + numChunks - 1) / numChunks;
 
         NS_LOG_INFO("Fragmenting " << size << " bytes to dest " << destRank
                     << " across " << sendDevices.size() << " links in " << numChunks << " chunks"
                     << " starting at offset " << m_globalSprayOffset);
 
-        for (uint32_t i = 0; i < numChunks; i++)
+        for (uint64_t i = 0; i < numChunks; i++)
         {
-            uint32_t offset = i * chunkSize;
-            if (offset >= size)
+            uint64_t offset = i * chunkSize;
+            if (offset >= size64)
             {
                 continue; // trailing lane-pad fragment past the buffer end
             }
-            uint32_t thisChunkSize = std::min(chunkSize, size - offset);
+            uint32_t thisChunkSize = static_cast<uint32_t>(
+                std::min<uint64_t>(chunkSize, size64 - offset));
 
             // Generate sequence number for each chunk
             uint64_t seqKey = MakeSeqKey(destRank, vcId, flowId);
@@ -137,14 +157,15 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 m_sendQueue.push_back(entry);
 
                 // Queue remaining chunks
-                for (uint32_t j = i + 1; j < numChunks; j++)
+                for (uint64_t j = i + 1; j < numChunks; j++)
                 {
-                    uint32_t remOffset = j * chunkSize;
-                    if (remOffset >= size)
+                    uint64_t remOffset = j * chunkSize;
+                    if (remOffset >= size64)
                     {
                         continue; // trailing lane-pad fragment past the buffer end
                     }
-                    uint32_t remChunkSize = std::min(chunkSize, size - remOffset);
+                    uint32_t remChunkSize = static_cast<uint32_t>(
+                        std::min<uint64_t>(chunkSize, size64 - remOffset));
                     uint64_t remSeqKey = MakeSeqKey(destRank, vcId, flowId);
                     uint32_t remSeqNum = m_nextSeqNum[remSeqKey]++;
 
@@ -195,7 +216,8 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         }
 
         // Increment global offset so next SendData call starts from different link
-        m_globalSprayOffset = (m_globalSprayOffset + numChunks) % sendDevices.size();
+        m_globalSprayOffset = static_cast<uint32_t>(
+            (m_globalSprayOffset + numChunks) % sendDevices.size());
     }
     else
     {
@@ -350,14 +372,16 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             numChunks = std::max(minChunks, std::min(sizeBasedChunks, pathBalancedChunks));
         }
         uint64_t chunkSize = (wireSize + numChunks - 1) / numChunks;
-        // Header headroom (codex round 50, finding 1): a fragment body plus
-        // the 39-B FabricHeader and the 2-B PPP prepend must stay inside the
-        // uint32 the packet pipeline serializes. The SprayChunkSize
+        // Header headroom (codex rounds 50-51, finding 1): the fragment
+        // body must stay representable in the packet pipeline — a body near
+        // UINT32_MAX overflows Buffer's grown g_recommendedStart headroom
+        // (up to 51 B of prefix) in the uint32 end computation and asserts
+        // at the first AddHeader. The 2^30 bound matches
+        // SendDataInternal's representability cap. The SprayChunkSize
         // attribute can still be set near UINT32_MAX directly (the setter
         // caps, the raw attribute path bypasses it), so clamp here too: the
         // transfer just fragments into more chunks.
-        constexpr uint64_t maxFragmentBody =
-            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - (39 + 2);
+        constexpr uint64_t maxFragmentBody = 1ull << 30;
         if (chunkSize > maxFragmentBody)
         {
             const uint64_t minChunksForBody =

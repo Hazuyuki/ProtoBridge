@@ -81,6 +81,7 @@
 #include <array>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1440,6 +1441,20 @@ NcclProtocolPayloadTest::TestLLPayloadEfficiency()
     dataSize = 128;  // 2 * 64
     wireSize = NcclProtocolModel::GetWireSize(dataSize, NcclProtocol::LL);
     NS_TEST_EXPECT_MSG_EQ(wireSize, 256, "LL: 128 bytes data -> 256 bytes wire (two lines)");
+
+    // Wrap-free ceiling (codex round 51, finding 7): the last
+    // dataPerLine - 1 input values overflowed the ceil ADDITION
+    // (dataSize + dataPerLine - 1) before the division. UINT64_MAX is the
+    // extreme: the old form wrapped the addition to 62, the division
+    // produced 0 lines, and the multiplication saturation never ran —
+    // the caller saw a zero wire ledger for a nonzero transfer. The new
+    // divide-then-bump form produces ceil(UINT64_MAX / 64) lines, and the
+    // pre-existing lines * lineSize saturation caps the ledger.
+    wireSize = NcclProtocolModel::GetWireSize(std::numeric_limits<uint64_t>::max(),
+                                              NcclProtocol::LL);
+    NS_TEST_EXPECT_MSG_EQ(wireSize,
+                          std::numeric_limits<uint64_t>::max(),
+                          "LL: UINT64_MAX saturates instead of wrapping to zero");
 }
 
 void
@@ -1654,6 +1669,7 @@ class FecModelTest : public TestCase
     void TestZeroBer();
     void TestTZero();
     void TestEncodedSize();
+    void TestEncodedSizeWide();
     void TestGoldenSymbolError();
 };
 
@@ -1669,6 +1685,7 @@ FecModelTest::DoRun()
     TestZeroBer();
     TestTZero();
     TestEncodedSize();
+    TestEncodedSizeWide();
     TestGoldenSymbolError();
 }
 
@@ -1746,6 +1763,62 @@ FecModelTest::TestEncodedSize()
     // Disabled: returns payload unchanged
     fec->SetEnabled(false);
     NS_TEST_EXPECT_MSG_EQ(fec->GetEncodedSize(100), 100u, "Disabled: passthrough");
+}
+
+void
+FecModelTest::TestEncodedSizeWide()
+{
+    // uint64 return (codex round 51, finding 2): a payload near 4 GiB
+    // encodes past UINT32_MAX. The old uint32 return narrowed
+    // 4,339,299,640 to 44,332,344 — SMALLER than the payload, and the
+    // padding site's `encoded > payload` test silently skipped the parity
+    // expansion. Exercise the boundary payloads.
+    Ptr<FecModel> fec = CreateObject<FecModel>();
+    fec->SetFecParams(544, 514, 15);
+    fec->SetEnabled(true);
+
+    // 514,000,000 bytes = 8,000,000 codewords exactly -> *680/640 ratio
+    // gives encoded = payload * 544 / 512 (10-bit symbols, byte-aligned
+    // payload): 514,000,000 * 544 / 512 = 546,125,000 < 2^32.
+    const uint64_t encodedMedium = fec->GetEncodedSize(514000000u);
+    NS_TEST_EXPECT_MSG_GT(encodedMedium,
+                          514000000u,
+                          "medium payload expands under FEC (encoded > payload)");
+
+    // Payload just below the 2^32 encoded boundary stays a uint32 value.
+    NS_TEST_EXPECT_MSG_LT(encodedMedium,
+                          (1ull << 32),
+                          "medium encoded size still below 2^32");
+
+    // Payload whose encoded form crosses 2^32. Each 514-byte payload unit
+    // produces 680 wire bytes (a full 544-symbol codeword), so the encoded
+    // size is ceil(payload*8 / 5140) * 680. For 4096000000 payload bytes:
+    // ceil(32,768,000,000 / 5,140) = 6,375,098 codewords -> * 680 =
+    // 4,335,066,640 wire bytes, safely above 2^32 = 4,294,967,296.
+    const uint64_t payloadWide = 4096000000u; // ~3.81 GiB
+    const uint64_t encodedWide = fec->GetEncodedSize(static_cast<uint32_t>(payloadWide));
+    NS_TEST_EXPECT_MSG_GT(encodedWide,
+                          (1ull << 32),
+                          "wide payload encodes past 2^32 (uint64 return)");
+    NS_TEST_EXPECT_MSG_GT(encodedWide,
+                          payloadWide,
+                          "wide encoded size still exceeds the payload (no narrowing)");
+
+    // A payload chosen so the pre-fix uint32 return wraps below the
+    // payload: 4,050,278,528 payload bytes -> ceil(4,050,278,528*8 / 5140)
+    // = 6,303,936 codewords -> * 680 = 4,286,676,480 wire bytes, above
+    // 2^32. Mod 2^32 the old uint32 return would hand the padding site
+    // exactly the same value (it fits in 32 bits), so the narrowing
+    // failure this guards against needs an encoded size >= 2^32; the
+    // wide payload above exercises that path. Here we pin the exact
+    // arithmetic the implementation must produce for a ~3.77 GiB
+    // payload — the uint64 return must not truncate or round.
+    const uint64_t payloadRegression = 4050278528u;
+    const uint64_t encodedRegression =
+        fec->GetEncodedSize(static_cast<uint32_t>(payloadRegression));
+    NS_TEST_EXPECT_MSG_EQ(encodedRegression,
+                          4286676480ull,
+                          "regression payload encodes to 4,286,676,480 (exact codeword math)");
 }
 
 void

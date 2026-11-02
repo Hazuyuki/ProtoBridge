@@ -2077,11 +2077,19 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
         if (pkt->PeekHeader(header))
         {
             uint32_t payloadSize = pkt->GetSize() - header.GetSerializedSize();
-            uint32_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
+            // uint64 encoded size (codex round 51, finding 2): mirrors the
+            // endpoint egress guard — an over-UINT32_MAX parity pad is a
+            // configuration error, not a truncatable expansion.
+            uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
             if (encodedPayloadSize > payloadSize)
             {
-                uint32_t padding = encodedPayloadSize - payloadSize;
-                pkt->AddAtEnd(Create<Packet>(padding));
+                const uint64_t padding = encodedPayloadSize - payloadSize;
+                NS_ABORT_MSG_IF(padding > std::numeric_limits<uint32_t>::max(),
+                                "FEC parity expansion of a " << payloadSize
+                                << "-B result fragment needs a " << padding
+                                << "-B pad, beyond any representable packet: "
+                                   "reduce the fragment size or disable FEC");
+                pkt->AddAtEnd(Create<Packet>(static_cast<uint32_t>(padding)));
                 wireSize = header.GetSerializedSize() + encodedPayloadSize;
             }
             codingLatency = m_fecModel->GetEncodeLatency()
