@@ -6,6 +6,70 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 57: live-offset FEC padding guard, NaN-guard ordering, size-independent DecodePacket NaN policy, and comment corrections
+
+**What.** Six findings from the round-57 review of commit 1497318; the
+first four verified with probes before fixing:
+
+1. **[P0] Round-56's fixed 9-MiB margin was still unsound.** The raw
+   SendData single-packet path (fabric-endpoint-send.cc) constructs
+   `Create<Packet>(data, size)` up to the 128 MiB MEM_SAFE_THRESHOLD,
+   so `Buffer::g_recommendedStart` — a process-global high-water mark
+   raised by ANY Packet(bytes, N) construction — drifts past any fixed
+   slack. Probe: a 16 MiB packet + 39-B header drove
+   g_recommendedStart to 16,777,255, and SetFecParams(995,1,0) with a
+   4,305,000-B payload produced an encoded payload of 4,283,475,000
+   (< round-56's kMaxPayload 4,285,530,111) whose AddAtEnd recycled an
+   oversized free-list Data and wrapped the end offset to 979,959,
+   tripping the buffer.cc assertion. No fixed margin can bound
+   unbounded drift, so both egress padding sites (fabric-endpoint.cc,
+   nvswitch.cc) now guard against LIVE state:
+   `Buffer::GetRecommendedStart()` (new read-only static accessor on
+   Buffer, buffer.h) plus the packet's own serialized header prefix
+   (FabricHeader + SoHeader + 2-B PPP) is compared against UINT32_MAX
+   and NS_ABORT_MSG_IF aborts before the parity-expansion AddAtEnd.
+2. **[P0] The NaN guards raised FE_INVALID before intercepting NaN.**
+   `preFecBer <= 0.0` is an ordered comparison that signals for NaN
+   under fenv traps, so the round-56 `!(preFecBer > 0.0)` guard sat
+   AFTER the comparison that already raised the trap. Both
+   ComputePostFecBer and DecodeCodeword (fec-model.cc) now test
+   `std::isnan(preFecBer)` FIRST — std::isnan is an unordered quiet
+   predicate and does not signal.
+3. **[P0] DataRate ld==double guard residual documented.** The
+   round-56 claim "rejects any exact product >= 2^63" is false for
+   m_bps values whose double conversion rounds down: probe
+   m_bps = 89547301328687144, rhs = 103.0 gives an exact product of
+   2^63 + 24, but the double conversion of m_bps rounds down by 8 so
+   both products equal 2^63 - 1024, the guard passes, and the clamp
+   returns 9,223,372,036,854,774,784. This predates HEAD; bounded
+   because the double product still lands at 2^63 and the clamp
+   returns DataRate(2^63 - 1), so no garbage rate escapes. The
+   data-rate.cc comment now documents this residual and corrects the
+   claim that the MAX*1.0 abort is "previous behavior" — the
+   pre-round-56 parent returned MAX through the clamp, so the abort
+   is a NEW restriction.
+4. **[P1] DecodePacket NaN policy was size-dependent.** NaN,642 ->
+   NO_ERROR (single-codeword branch, DecodeCodeword's NaN early-out)
+   but NaN,643 -> UNCORRECTABLE (multi-codeword branch recomputes NaN
+   pSym and both comparisons fail). DecodePacket now intercepts NaN
+   at entry so the clean-path policy (NO_ERROR) holds for any
+   payload size.
+5. **[P2] CHANGES.md round-56 item 6 parenthetical corrected.** The
+   raw form yields pSym == 1 at BER 0.99 because pow(1-0.99, 10) ~=
+   1e-20 rounds to 1 so `1 - pow(...)` == 1.0 — not "underflows to
+   1".
+
+**Verified.** Clean build; `PASS data-rate`; `PASS error-model`;
+`PASS gpu-cluster`; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800;
+48 parity PASS lines (15 scripts); 18 pytest parity cases
+(test_ibgda.py + test_config_fec_enabled.py); surrogate pytest 101
+from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 us / 99985/99985/99974 ECN/CNP and 20300.2 us / 0/0/0).
+
 ### Fixed — codex round 56: caller-side FEC saturation, Buffer global-offset drift bound, DataRate ld==double guard, burst-length zero/cap, and CHANGES.md corrections
 
 **What.** Six findings from the round-56 review of commit c2c5d58; all
@@ -63,7 +127,8 @@ verified with probes before fixing:
 6. **[P2] Round-54 CHANGES.md item 1 was still wrong.** The raw form
    gives pSym == 1 at BER 0.99 (not "power rounds to 1 so close to 1
    that 1-pow yields exactly 1" — the raw 1-pow form yields exactly 0
-   at BER 0.99 because pow underflows to 1) and pSym == 0 at BER 1e-18.
+   at BER 0.99 because pow(1-0.99, 10) ~= 1e-20 rounds to 1, so
+   `1 - pow(...)` == 1.0) and pSym == 0 at BER 1e-18.
    The `1 - BER` rounds-to-1 transition is at 2^-54 (half of 2^-53),
    not 2^-53. Round-55 item 1 also updated with the round-56 follow-up.
 

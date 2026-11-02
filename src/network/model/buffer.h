@@ -772,6 +772,23 @@ class Buffer
      */
     static uint32_t g_recommendedStart;
 
+  public:
+    /**
+     * @brief Read the process-global recommended start offset.
+     * @returns the current value of g_recommendedStart.
+     *
+     * Round 57: the FEC padding guard in fabric-endpoint.cc needs the
+     * live high-water mark to bound Buffer absolute offsets; expose a
+     * read-only accessor rather than friend-ing the endpoint into this
+     * low-level class.
+     */
+    static uint32_t GetRecommendedStart()
+    {
+        return g_recommendedStart;
+    }
+
+  private:
+
     /**
      * offset to the start of the virtual zero area from the start
      * of m_data->m_data

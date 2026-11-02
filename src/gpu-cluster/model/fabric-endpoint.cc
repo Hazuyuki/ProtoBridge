@@ -22,6 +22,8 @@
 #include "ns3/enum.h"
 
 #include <algorithm>
+#include <cfenv>
+#include <cmath>
 #include <limits>
 
 namespace ns3
@@ -3424,24 +3426,51 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // kMaxPayload - 1 because Buffer's recommended starting offset
         // is a process-global high-water mark (buffer.cc:
         // g_recommendedStart) raised by any earlier large
-        // Packet(bytes, N) constructor call. Round 56: the drift is
-        // UNBOUNDED in principle, so a fixed slack of any size is not a
-        // proof; instead the margin is the maximum in-module chunk
-        // construction (8 MiB bulk cap + 1 MiB slack for collective
-        // result fragments and headers), which no in-module
-        // configuration exceeds — so g_recommendedStart can never drift
-        // past the margin before this guard would abort the very
-        // construction that caused the drift.
+        // Packet(bytes, N) constructor call. Round 57: the round-56 "margin" reasoning was unsound — the raw
+        // SendData single-packet path constructs Create<Packet>(data,
+        // size) with size up to the 128 MiB fragmentation threshold
+        // (fabric-endpoint-send.cc SendData), so g_recommendedStart can
+        // drift far past any fixed slack, and Buffer::AddAtEnd(Buffer)
+        // reuses a recycled oversized Data whose absolute offsets wrap
+        // the uint32 end computation for any encoded body near
+        // kMaxPayload. There is no in-module bound on the drift, so the
+        // guard must be expressed against the ACTUAL headroom: the live
+        // g_recommendedStart value plus the packet's own serialized
+        // header prefix.
         uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
         if (encodedPayloadSize > payloadSize)
         {
-            constexpr uint64_t kMaxPayload =
-                std::numeric_limits<uint32_t>::max() - 9u * 1024u * 1024u;
-            NS_ABORT_MSG_IF(encodedPayloadSize >= kMaxPayload,
+            // Absolute-offset guard (codex round 57): Buffer::Initialize
+            // starts every new buffer's zero area at
+            // Buffer::g_recommendedStart, a process-global high-water
+            // mark raised by ANY Packet construction (buffer.cc). A
+            // fixed margin cannot bound it: SendData's single-packet
+            // path alone admits bodies up to 128 MiB
+            // (MEM_SAFE_THRESHOLD). The AddAtEnd(padding) below recycles
+            // an oversized Data whose m_start already sits near the old
+            // mark; the uint32 m_zeroAreaEnd / m_end then wrap for any
+            // encoded body whose absolute end exceeds UINT32_MAX. Read
+            // the live mark and the packet's own header prefix
+            // (FabricHeader + optional SoHeader + PPP) so the bound
+            // tracks the real offset space.
+            const uint32_t headerPrefix =
+                hdr.GetSerializedSize() + SoHeader().GetSerializedSize() + 2;
+            const uint64_t headroom =
+                static_cast<uint64_t>(Buffer::GetRecommendedStart()) + headerPrefix;
+            NS_ABORT_MSG_IF(encodedPayloadSize + headroom >=
+                                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
                             "FEC parity expansion of a " << payloadSize
-                            << "-B payload encodes to " << encodedPayloadSize
-                            << " B, beyond any representable packet: "
-                               "reduce the chunk size or disable FEC");
+                                                       << "-B payload encodes to "
+                                                       << encodedPayloadSize
+                                                       << " B; with the current Buffer "
+                                                          "recommended-start "
+                                                       << Buffer::GetRecommendedStart()
+                                                       << " B and " << headerPrefix
+                                                       << " B of header prefix there is no "
+                                                          "uint32 offset space left "
+                                                          "— reduce the chunk size, disable "
+                                                          "FEC, or lower the preceding "
+                                                          "packet sizes");
             const uint64_t padding = encodedPayloadSize - payloadSize;
             packet->AddAtEnd(Create<Packet>(static_cast<uint32_t>(padding)));
         }

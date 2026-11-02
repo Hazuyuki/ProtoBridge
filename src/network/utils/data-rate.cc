@@ -206,13 +206,23 @@ DataRate::operator*(double rhs) const
     // genuine overflow through to the clamp below, which silently
     // returns MAX for it (round 56). Use the next representable double
     // below 2^63 (2^63 - 1024) as the guard bound on those platforms:
-    // it rejects any exact product >= 2^63 (which always rounds the
-    // double product to 2^63 and trips the clamp) and accepts every
-    // exact product <= 2^63 - 1024. Documented residual: the identity
-    // product MAX * 1.0 has exact value 2^63 - 1, which rounds to
-    // 2^63 in double and therefore aborts on those platforms — the same
-    // behavior the 2^63 - 1 literal produced before this fix, and
-    // unavoidable on a guard whose comparison happens in double.
+    // Documented residuals (codex round 57): (a) the guard compares in
+    // long double, and when rhs is an integer-valued double the product
+    // m_bps * rhs is exact in long double — but m_bps itself passes
+    // through double conversion on the way, so an m_bps whose 64-bit
+    // value rounds DOWN to its double can admit an exact product slightly
+    // ABOVE 2^63 (probe: m_bps = 89547301328687144, rhs = 103.0 -> both
+    // the exact and the double product collapse to 2^63 - 1024, the
+    // guard passes, and the clamp below returns 2^63 - 1). This predates
+    // HEAD; it is bounded because the double product still lands at
+    // 2^63 and the clamp returns DataRate(2^63 - 1), so no garbage rate
+    // escapes — the abort simply cannot catch every exact overflow on
+    // ld==double platforms. (b) The identity product MAX * 1.0 has exact
+    // value 2^63 - 1, which rounds to 2^63 in double and therefore
+    // aborts here — note this abort is a NEW restriction (round 57): the
+    // pre-round-56 parent returned DataRate(2^63 - 1) through the clamp
+    // for the same input, so the abort is a behavior change, not
+    // previous behavior.
 #if LDBL_MANT_DIG == DBL_MANT_DIG
     const long double maxProduct = static_cast<long double>(std::nextafter(9223372036854775808.0, 0.0));
 #else

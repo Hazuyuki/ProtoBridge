@@ -417,6 +417,7 @@ class SimulationOptions {
         const detailed = ["detailed", "ibgda"].includes(setting("rdmaSubmission"));
         show = scope && detailed;
         if (item.when === "rdma-ops") show = show && operation.collective === "rdma";
+        if (item.operations) show = show && item.operations.includes(setting("rdmaOperation") || "write");
         if (item.when === "rdma-cpu") show = show && (setting("rdmaInitiator") || "gpu") === "cpu";
         if (item.when === "rdma-gpu") show = show && (setting("rdmaInitiator") || "gpu") === "gpu";
         if (item.when === "rdma-staged") show = show && setting("rdmaDataPath") === "staged";

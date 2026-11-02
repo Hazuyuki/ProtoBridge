@@ -93,10 +93,15 @@ RdmaOperationEngine::Configure(uint16_t rank,
 void
 RdmaOperationEngine::Schedule(Time delay, std::function<void()> action)
 {
-    m_events.erase(std::remove_if(m_events.begin(),
-                                  m_events.end(),
-                                  [](const auto& event) { return event.IsExpired(); }),
-                   m_events.end());
+    // A large direct transfer can schedule thousands of packets at once.
+    // Periodic collection avoids scanning every live event for every packet.
+    if (m_events.size() % 1024 == 0)
+    {
+        m_events.erase(std::remove_if(m_events.begin(),
+                                      m_events.end(),
+                                      [](const auto& event) { return event.IsExpired(); }),
+                       m_events.end());
+    }
     m_events.push_back(Simulator::Schedule(delay, [this, action = std::move(action)] {
         if (!m_disposed)
         {
@@ -361,12 +366,13 @@ RdmaOperationEngine::Submit(const RdmaRequest& input, Completion complete)
         (request.opcode == RdmaOpcode::FETCH_ADD || request.opcode == RdmaOpcode::COMPARE_SWAP) &&
             request.localAddress % 8,
         "RDMA atomic result address must be aligned");
-    if(request.opcode==RdmaOpcode::PUT_SIGNAL)
+    if (request.opcode == RdmaOpcode::PUT_SIGNAL)
     {
-        NS_ABORT_MSG_IF(request.bytes>UINT64_MAX-request.remoteAddress || request.signalAddress>UINT64_MAX-8,
+        NS_ABORT_MSG_IF(request.bytes > UINT64_MAX - request.remoteAddress ||
+                            request.signalAddress > UINT64_MAX - 8,
                         "RDMA put/signal address range wraps");
-        NS_ABORT_MSG_IF(request.signalAddress<request.remoteAddress+request.bytes &&
-                        request.remoteAddress<request.signalAddress+8,
+        NS_ABORT_MSG_IF(request.signalAddress < request.remoteAddress + request.bytes &&
+                            request.remoteAddress < request.signalAddress + 8,
                         "RDMA put payload and signal must not overlap");
     }
     auto result = std::make_shared<uint64_t>(0), identity = std::make_shared<uint64_t>(0);

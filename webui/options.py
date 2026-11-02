@@ -248,6 +248,32 @@ OPTION_GROUPS = [
 ]
 
 
+# Show operation-specific inputs only where they affect the selected verb.
+_RDMA_OPERATION_FIELDS = {
+    "rdmaMaxReadAtomic": ["read", "fetch_add", "compare_swap", "put_signal", "signal"],
+    "rdmaResponderDepth": ["read", "fetch_add", "compare_swap", "put_signal", "signal"],
+    "rdmaReadServiceNs": ["read"],
+    "rdmaAtomicServiceNs": ["fetch_add", "compare_swap", "put_signal", "signal"],
+    "rdmaReceiveQueueDepth": ["send", "send_imm", "write_imm"],
+    "rdmaReceivePostNs": ["send", "send_imm", "write_imm"],
+    "rdmaReceivePostDelayNs": ["send", "send_imm", "write_imm"],
+    "rdmaRnrRetryLimit": ["send", "send_imm", "write_imm"],
+    "rdmaRnrRetryNs": ["send", "send_imm", "write_imm"],
+    "rdmaImmediate": ["send_imm", "write_imm"],
+    "rdmaOperand": ["fetch_add", "compare_swap"],
+    "rdmaCompare": ["compare_swap"],
+    "rdmaInitialValue": ["fetch_add", "compare_swap"],
+    "rdmaSignalPollNs": ["put_signal", "signal"],
+    "rdmaSignalAddress": ["put_signal", "signal"],
+    "rdmaSignalValue": ["put_signal", "signal"],
+    "rdmaSignalOp": ["put_signal", "signal"],
+}
+for _group in OPTION_GROUPS:
+    for _field in _group["fields"]:
+        if _field["key"] in _RDMA_OPERATION_FIELDS:
+            _field["operations"] = _RDMA_OPERATION_FIELDS[_field["key"]]
+
+
 RDMA_ALIASES = {
     'ibgdaProducers': 'rdmaGpuProducers',
     'ibgdaQpsPerPeer': 'rdmaQpsPerPeer',
