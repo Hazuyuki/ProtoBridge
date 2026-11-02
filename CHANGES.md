@@ -6,6 +6,59 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Fixed — codex round 58: isnan-first actually first, DataRate residual comment corrected
+
+**What.** The round-58 review (two attempts; both cut off by a content
+filter during the probe phase, but the transcript contained four
+verified probe results that were triaged directly):
+
+1. **[P0] The round-57 "isnan-first" reorder was not actually first.**
+   Both ComputePostFecBer and DecodeCodeword kept `preFecBer <= 0.0`
+   ABOVE the `std::isnan` guard, and the ordered comparison raises
+   FE_INVALID for NaN under fenv traps before the guard is reached.
+   Round-58 probe (traps enabled): direct ComputePostFecBer(NaN) and
+   DecodeCodeword(NaN) both died with rc = -8 (SIGFPE from the trap);
+   DecodePacket(NaN, 642) and DecodePacket(NaN, 643) returned 0 /
+   NO_ERROR with invalid=0 (its entry guard was already correctly
+   first). The isnan guard now precedes every ordered comparison in
+   all three entry points.
+2. **[P0] data-rate.cc residual comment corrected.** The round-57
+   wording said the probe (m_bps = 89547301328687144, rhs = 103.0)
+   "passes the guard, and the clamp below returns 2^63 - 1". The
+   round-58 probe shows the clamp is NOT taken: double(m_bps) =
+   m_bps - 8, so the double product is exactly 2^63 - 1024, which is
+   below the clamp's 2^63 trigger — the function returns
+   DataRate(2^63 - 1024) directly via static_cast<uint64_t>. Comment
+   now states the exact returned value; the "true product 2^63 + 24
+   is admitted" residual itself is unchanged (pre-HEAD, bounded —
+   the returned rate is still < 2^63 so the constructor accepts it).
+3. **[Verified sound] The live-offset padding guard has no off-by-one.**
+   Codex probed the exact boundary with warm g = 16,777,255: at
+   encoded = 4,294,967,215 the OLD round-56 margin would have
+   wrongly aborted (old-check = 1) while the new guard correctly
+   passes (new-check = 0); the SendData harness then segfaulted only
+   because the harness's own 51-B prefix assumption under-counted
+   the real serialized header for that configuration — the guard
+   itself is sound (any encoded size passing the guard has absolute
+   end g + encoded < UINT32_MAX - prefix, proven arithmetically).
+4. **[Verified correct] rdma-operation-engine.cc event pruning.**
+   Codex confirmed the `% 1024` gating cannot skip collection
+   indefinitely: the condition runs on every Schedule() call and
+   size() only grows between prunes, so it necessarily hits a
+   multiple of 1024 within 1024 appends regardless of burst sizes.
+
+**Verified.** Clean build; `PASS data-rate`; `PASS error-model`;
+`PASS gpu-cluster`; 12/12 core suites (pie-queue-disc,
+drop-tail-queue, codel-queue-disc, cobalt-queue-disc,
+fifo-queue-disc, prio-queue-disc, fq-codel-queue-disc,
+fq-pie-queue-disc, fq-cobalt-queue-disc, queue-disc-traces,
+wifi-mac-queue, lr-wpan-error-model); traffic-control-example
+smoke counters 37/55500 and 6887/10302800; 48 parity PASS lines
+(15 scripts); parity pytest 18 passed (test_ibgda +
+test_config_fec_enabled, run from test/parity); surrogate pytest
+101 passed from surrogate/ with PYTHONPATH=.; DCQCN anchors
+byte-stable (20802.4 us / 99985-99985-99974; 20300.2 us / 0-0-0).
+
 ### Fixed — codex round 57: live-offset FEC padding guard, NaN-guard ordering, size-independent DecodePacket NaN policy, and comment corrections
 
 **What.** Six findings from the round-57 review of commit 1497318; the

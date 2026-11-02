@@ -208,17 +208,19 @@ FecModel::ComputePostFecBer(double preFecBer) const
 {
     NS_LOG_FUNCTION(this << preFecBer);
 
-    if (preFecBer <= 0.0)
-    {
-        return 0.0;
-    }
-    // Round 57: the NaN guard must precede ANY ordered comparison —
-    // `preFecBer <= 0.0` above already raises FE_INVALID for NaN under
-    // fenv traps. std::isnan is an unordered quiet predicate and does not.
+    // Round 58: the NaN guard must precede ANY ordered comparison —
+    // `preFecBer <= 0.0` raises FE_INVALID for NaN under fenv traps, and
+    // std::isnan is an unordered quiet predicate that does not signal.
+    // (The round-57 reorder kept the `<= 0.0` check first; the direct
+    // ComputePostFecBer(NaN) call with traps enabled still aborted.)
     if (std::isnan(preFecBer))
     {
         // NaN BER: no meaningful symbol error rate; degrade to the clean
         // path rather than propagate NaN into log-space sums.
+        return 0.0;
+    }
+    if (preFecBer <= 0.0)
+    {
         return 0.0;
     }
 
@@ -305,16 +307,17 @@ FecModel::DecodeCodeword(double preFecBer) const
         return FecResult::NO_ERROR;
     }
 
-    if (preFecBer <= 0.0)
-    {
-        return FecResult::NO_ERROR;
-    }
-    // Round 57: isnan-first ordering — see ComputePostFecBer. The old
-    // `!(preFecBer > 0.0)` guard sat AFTER this `<= 0.0` comparison and so
-    // could never intercept the FE_INVALID the earlier comparison raised.
+    // Round 58: isnan precedes every ordered comparison — see
+    // ComputePostFecBer. The round-57 reorder kept `<= 0.0` first, so the
+    // direct DecodeCodeword(NaN) call with traps enabled still aborted
+    // (codex probe: rc = -8 = SIGFPE).
     if (std::isnan(preFecBer))
     {
         // NaN BER: degrade to the clean path.
+        return FecResult::NO_ERROR;
+    }
+    if (preFecBer <= 0.0)
+    {
         return FecResult::NO_ERROR;
     }
 
@@ -409,6 +412,11 @@ FecModel::DecodePacket(double preFecBer, uint32_t payloadSize) const
     // the multi-codeword branch below recomputes pSym and reaches different
     // comparisons, so NaN,642 -> NO_ERROR while NaN,643 -> UNCORRECTABLE.
     // Intercept at entry to match the clean-path policy for any payload.
+    // Round 58: the entry guard also keeps NaN off the `<= 0.0` comparison
+    // below, so DecodePacket(NaN, traps) exits cleanly while the direct
+    // ComputePostFecBer / DecodeCodeword entry points needed their own
+    // isnan-first reorder (codex probe: both returned 0 / NO_ERROR with
+    // invalid=0).
     if (std::isnan(preFecBer))
     {
         return FecResult::NO_ERROR;

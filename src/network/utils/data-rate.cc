@@ -210,19 +210,22 @@ DataRate::operator*(double rhs) const
     // long double, and when rhs is an integer-valued double the product
     // m_bps * rhs is exact in long double — but m_bps itself passes
     // through double conversion on the way, so an m_bps whose 64-bit
-    // value rounds DOWN to its double can admit an exact product slightly
-    // ABOVE 2^63 (probe: m_bps = 89547301328687144, rhs = 103.0 -> both
-    // the exact and the double product collapse to 2^63 - 1024, the
-    // guard passes, and the clamp below returns 2^63 - 1). This predates
-    // HEAD; it is bounded because the double product still lands at
-    // 2^63 and the clamp returns DataRate(2^63 - 1), so no garbage rate
-    // escapes — the abort simply cannot catch every exact overflow on
-    // ld==double platforms. (b) The identity product MAX * 1.0 has exact
-    // value 2^63 - 1, which rounds to 2^63 in double and therefore
-    // aborts here — note this abort is a NEW restriction (round 57): the
-    // pre-round-56 parent returned DataRate(2^63 - 1) through the clamp
-    // for the same input, so the abort is a behavior change, not
-    // previous behavior.
+    // value rounds DOWN to its double can admit a TRUE product slightly
+    // ABOVE 2^63 (round-58 probe: m_bps = 89547301328687144, rhs =
+    // 103.0 -> true product 2^63 + 24, but double(m_bps) = m_bps - 8 so
+    // the double AND the long-double-range product both equal
+    // 2^63 - 1024 = 9223372036854774784). The guard passes and the clamp
+    // is NOT taken (the double product is below 2^63), so
+    // DataRate(static_cast<uint64_t>(prod)) returns exactly
+    // 2^63 - 1024. This predates HEAD; it is bounded because the
+    // returned value is still < 2^63 (the constructor accepts it), so no
+    // garbage rate escapes — the abort simply cannot catch every true
+    // overflow on ld==double platforms. (b) The identity product
+    // MAX * 1.0 has exact value 2^63 - 1, which rounds to 2^63 in
+    // double and therefore aborts here — note this abort is a NEW
+    // restriction (round 57): the pre-round-56 parent returned
+    // DataRate(2^63 - 1) through the clamp for the same input, so the
+    // abort is a behavior change, not previous behavior.
 #if LDBL_MANT_DIG == DBL_MANT_DIG
     const long double maxProduct = static_cast<long double>(std::nextafter(9223372036854775808.0, 0.0));
 #else
