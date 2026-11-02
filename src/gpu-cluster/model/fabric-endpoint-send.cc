@@ -14,6 +14,7 @@
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/packet.h"
+#include "ns3/abort.h"
 
 #include <algorithm>
 #include <limits>
@@ -754,6 +755,13 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
     // Pack address prefix + data into payload
+    // Round 61: size is a uint32_t, so 8 + size wraps for size >
+    // UINT32_MAX - 8 (e.g. 4,294,967,288 wraps to 0) and the address
+    // copy below writes eight bytes into an empty vector — real
+    // out-of-bounds UB before any allocator or FEC guard can intercept.
+    NS_ABORT_MSG_IF(size > std::numeric_limits<uint32_t>::max() - 8,
+                    "SendMemoryWrite size " << size << " B leaves no uint32 room for the "
+                                            << "8-B address prefix");
     uint32_t payloadSize = 8 + size;
     std::vector<uint8_t> payload(payloadSize);
     std::memcpy(payload.data(), &address, 8);
@@ -899,6 +907,11 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     // zeros — the receiving MEMORY endpoint applies MEMORY_WRITE payloads
     // verbatim, so a zero-padded "read" would overwrite the target with 0s.
     const bool isRead = (data == nullptr);
+    // Round 61: same wrap as SendMemoryWrite above — the 8 + size (or
+    // 12 + 0 read form) payload-size addition must stay in uint32.
+    NS_ABORT_MSG_IF(!isRead && size > std::numeric_limits<uint32_t>::max() - 8,
+                    "SendMemorySemantic write size " << size << " B leaves no uint32 room for the "
+                                                     << "8-B address prefix");
     uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 

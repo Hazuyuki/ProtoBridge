@@ -104,6 +104,13 @@ void
 FecModel::SetFecParams(uint32_t n, uint32_t k, uint32_t t)
 {
     NS_LOG_FUNCTION(this << n << k << t);
+    // Round 61: K == 0 passes the two assertions below but makes
+    // dataBitsPerCodeword zero, so DecodePacket / GetEncodedSize divide
+    // by zero at the codeword-count step (codex probe: SetFecParams(544,
+    // 0, 15) then DecodePacket(1e-6, 1) evaluates 7 / 0 even with
+    // assertions enabled). K >= 1 is also the MDS code precondition
+    // (a zero-data codeword carries no symbols).
+    NS_ASSERT_MSG(k >= 1, "K must be at least 1");
     NS_ASSERT_MSG(n > k, "N must be greater than K");
     NS_ASSERT_MSG(2 * t <= n - k, "T must satisfy 2T <= N-K for MDS codes");
     m_n = n;
@@ -188,6 +195,22 @@ FecModel::ComputeSymbolErrorProbability(double ber) const
         // early-outs treat as UNCORRECTABLE.
         return 1.0;
     }
+    // Round 61: the helper is PUBLIC, so the caller-side `ber <= 0.0`
+    // lower-bound guards in ComputePostFecBer / DecodeCodeword /
+    // DecodePacket do not cover a direct call. A negative finite BER
+    // reaches log1p(-ber) = log1p(|ber|) and drives expm1(10 * log1p
+    // (1e31)) = expm1(713.80...) into overflow (a diagnostic halt under
+    // overflow traps), and a moderate direct value (-0.1) returns the
+    // invalid negative probability -1.5937... — an unguarded negative
+    // probability would flow straight into the callers' log-space sums.
+    // Saturate to the same certain-corruption value the NaN / >= 1.0
+    // branches return: every negative BER is non-physical, and the
+    // decoding entry points already map ber <= 0.0 to NO_ERROR, so the
+    // saturated helper policy cannot diverge on any in-tree path.
+    if (ber <= 0.0)
+    {
+        return 1.0;
+    }
     if (ber >= 1.0)
     {
         return 1.0;
@@ -210,12 +233,13 @@ FecModel::ComputeSymbolErrorProbability(double ber) const
     // log1p stay accurate down to the subnormal range.
     // Non-finite BER: NaN is intercepted at this helper's entry (round
     // 59 — the helper is public, so caller-side guards do not cover a
-    // direct call); -Inf is caught by `ber <= 0` at the callers or, for
-    // a direct call, reaches log1p(+Inf) = +Inf and degrades to the
-    // saturated 1.0 without a trap. The caller-side guards in
-    // ComputePostFecBer / DecodeCodeword intercept non-finite input
-    // before the log-space sums either way, so a NaN here degrades to
-    // the 1.0 / UNCORRECTABLE early-out instead of an FE_INVALID trap.
+    // direct call); negative finite BER (including -Inf) is caught by
+    // the `ber <= 0.0` saturation above (round 61 — without it a direct
+    // call reached log1p(+|ber|) = +Inf and drove expm1 into overflow).
+    // The caller-side guards in ComputePostFecBer / DecodeCodeword /
+    // DecodePacket intercept non-finite and non-positive input before
+    // the log-space sums either way, so the helper's saturated 1.0
+    // policy degrades to the UNCORRECTABLE early-out instead of a trap.
     return -std::expm1(10.0 * std::log1p(-ber));
 }
 
@@ -440,6 +464,14 @@ FecModel::DecodePacket(double preFecBer, uint32_t payloadSize) const
 
     if (preFecBer <= 0.0)
     {
+        // Round 61: this early-out also covers the near-zero-BER precision
+        // floor. Below BER ~2^-53 / pSym ~5e-16, `1 - pSym` rounds to
+        // exactly 1.0 in double precision (the log1p-accurate range ends at
+        // the unit roundoff), so the multi-codeword math below would
+        // degrade to the all-clean path (post-FEC probability 0). The true
+        // binomial at (N,K,T)=(544,514,0), BER 1e-18 is ~5.44e-15 — far
+        // below any simulation-relevant loss rate, so mapping the
+        // unrepresentable range to NO_ERROR is the correct policy.
         return FecResult::NO_ERROR;
     }
 

@@ -6,6 +6,114 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 61: 8 pre-existing defects, 5 fixed, 3 verified-and-documented
+
+**What.** Round-61 review of commit b5eab88 found eight pre-existing defects
+(3 P1, 5 P2) reachable through public/configuration seams. Five are fixed
+with loud-abort / assert guards; three were verified numerically and
+documented in-code as out-of-scope or below simulation relevance. All eight
+probes were recomputed independently before acting.
+
+**Fixed (round 61).**
+
+1. **Memory-write payload-size wrap (P1, ×2 sites)** —
+   `FabricEndpoint::SendMemoryWrite` and the `SendMemorySemantic` write
+   branch computed `payloadSize = 8 + size` in uint32. For
+   `size > UINT32_MAX - 8` (probe: size = 4,294,967,288 wraps to 0) the
+   address prefix memcpy writes eight bytes into an empty vector — real
+   out-of-bounds UB before any allocator or FEC guard can intercept. Added
+   `NS_ABORT_MSG_IF(size > UINT32_MAX - 8, ...)` ahead of the addition at
+   `fabric-endpoint-send.cc:758` and `:910` (SendMemorySemantic write
+   branch, guarded by `!isRead`).
+2. **K = 0 division-by-zero through SetFecParams (P1)** —
+   `SetFecParams(544, 0, 15)` passes both existing assertions, leaving
+   `dataBitsPerCodeword = 0`, so `DecodePacket` / `GetEncodedSize` divide by
+   zero at the codeword-count step (probe: `DecodePacket(1e-6, 1)` evaluates
+   `7 / 0` even with assertions enabled). Added `NS_ASSERT_MSG(k >= 1, ...)`
+   at `fec-model.cc:107` — also the MDS-code precondition (a zero-data
+   codeword carries no symbols).
+3. **RDMA wire-efficiency padding UB (P2)** —
+   `PumpRdmaOperationPackets` cast `ceil((dataBytes + overhead) /
+   efficiency)` to uint32. Built-in checkers floor efficiency at
+   `std::numeric_limits<double>::min()` (2^-1022, smallest normal), where a
+   ~4-byte body already targets 2^1024; a custom model without a checker
+   can go lower. Added an `NS_ABORT_MSG_IF(!(expanded < 4294967296.0), ...)`
+   before the cast at `fabric-endpoint-rdma.cc:121`, matching the
+   hard-configuration-error policy of the SendDataInternal pad abort.
+4. **Public ComputeSymbolErrorProbability negative-BER overflow (P2)** —
+   the helper is public, so the callers' `ber <= 0.0` guards do not cover a
+   direct call. Probe: ber = -1e31 reaches `expm1(10*log1p(1e31)) =
+   expm1(713.801...)` — a diagnostic halt under overflow traps; ber = -0.1
+   returns the invalid negative probability -1.5937... Added an
+   `if (ber <= 0.0) return 1.0;` saturation at `fec-model.cc:198` after the
+   isnan guard: every negative BER is non-physical, and the decoding entry
+   points already map `ber <= 0.0` to NO_ERROR, so the saturated helper
+   policy cannot diverge on any in-tree path.
+5. **Payload-builder uint64→uint32 narrowing (P2, ×2)** —
+   `McclPayloadBuilder::BuildChunks` (`mccl-payload-builder.cc:49`) and
+   `RocePayloadBuilder::BuildChunks` (`roce-payload-builder.cc:56`) passed
+   uint64 chunk sizes straight into uint32-taking `Create<Packet>(...)` /
+   `SoHeader::SetDataSize` (probe: dataSize = chunkSize = 2^32 → one empty
+   packet, payload lost, completion reported). In-tree endpoint paths cap
+   chunks at 1 GiB; added `NS_ABORT_MSG_IF(size > UINT32_MAX, ...)` so a
+   direct caller that bypasses those caps fails loudly.
+
+**Verified and documented (no code change).**
+
+6. **Virtual-packet offset wrap at test seam (P1, verified sound)** —
+   `Buffer::Initialize` (`buffer.cc:259`) adds the global zero-size counter
+   to `start` without widening: a destroyed 100-byte packet leaves g = 100,
+   and the test seam `NvSwitch::InjectAggregateUpload` (`nvswitch.cc:525`)
+   with effectiveSize = 4,294,967,196 yields 100 + 4,294,967,196 = 2^32,
+   wrapping the buffer end to 0 (iterator assert). Reachable only through
+   the explicit test seam — production uploads go through the guarded
+   SendCollectiveBulk path — so documented as seam-scope, not fixed.
+7. **FEC encoded-bits uint64 overflow (P2, verified, codex probe value
+   wrong)** — `SetFecParams(2^31, 1, 0)` + `GetEncodedSize(2^31)` computes
+   exact encoded bits = 46,116,860,184,273,879,040 (~2^65.3), which wraps
+   mod 2^64 to 9,223,372,036,854,775,808 bits. The codex-claimed wrapped
+   result (1,610,612,736 B) was **wrong**; independent recomputation gives
+   wrapped bytes = 1,152,921,504,606,846,976 vs exact
+   5,764,607,523,034,234,880. Not fixed: N = 2^31 needs k*t ≤ 2^31
+   anyway, and every in-tree payloadSize is uint32 — callers cannot reach
+   the overflowing product.
+8. **Near-zero BER precision floor (P2, verified, documented)** — at
+   (N,K,T) = (544,514,0), BER 1e-18: pSym = 1e-17 but `1 - pSym` rounds to
+   exactly 1.0 (the log1p-accurate range ends at the unit roundoff), so the
+   multi-codeword math degrades to the all-clean path → always NO_ERROR.
+   True binomial ≈ 5.44e-15, far below any simulation-relevant loss rate.
+   Documented at the DecodePacket `ber <= 0.0` early-out
+   (`fec-model.cc:467`) explaining the NO_ERROR policy for the
+   unrepresentable range.
+
+**Also verified this round.** No remaining unguarded quiet-NaN comparison
+exists in `fec-model.cc` (comparisons at 191/203, 238/251, 335/344, 441
+follow isnan guards; 264/358 consume finite helper results; 306/307,
+387/391, 466, 470/475 consume constructed probabilities). No
+SaturatedQFunction / normal-CDF / erfinv / sqrt paths exist at HEAD. The
+round-60 CHANGES numbers all reproduce.
+
+**Files changed.** `src/gpu-cluster/model/fabric-endpoint-send.cc`
+(×2 guards + ns3/abort.h), `src/gpu-cluster/model/fec-model.cc`
+(K≥1 assert, ber≤0 saturation, near-zero-BER doc), `src/gpu-cluster/model/
+fabric-endpoint-rdma.cc` (padding abort), `src/gpu-cluster/model/
+mccl-payload-builder.cc`, `src/gpu-cluster/model/roce-payload-builder.cc`
+(narrowing aborts + ns3/abort.h + <limits>).
+
+**Verified.**
+
+- `cmake --build cmake-cache -j $(nproc)` clean.
+- ns3 suites: data-rate, error-model, gpu-cluster — PASS; 12 core suites
+  (pie/drop-tail/codel/cobalt/fifo/prio/fq-codel/fq-pie/fq-cobalt/
+  queue-disc-traces/wifi-mac-queue/lr-wpan-error-model) — PASS.
+- traffic-control smoke: Unforced drop 37/55500, sent 6887/10302800.
+- parity: 48 PASS lines across 14 scripts + `test_ibgda.py` +
+  `test_config_fec_enabled.py` (18 passed) under pytest from test/parity.
+- surrogate: `PYTHONPATH=. python3 -m pytest test/ -q` — 101 passed.
+- DCQCN anchors: bulkChunkSize=1000/dcqcn=1 → simTimeUs=20802.4,
+  ecnMarkedPackets=99985, cnpPacketsSent=99985, cnpPacketsReceived=99974;
+  bulkChunkSize=2690/dcqcn=0 → simTimeUs=20300.2, counters 0/0/0.
+
 ### Reviewed — codex round 60: no defects introduced by d35ce22, all four focus categories verified sound
 
 **What.** Round-60 review of commit d35ce22 found no introduced

@@ -118,9 +118,22 @@ FabricEndpoint::PumpRdmaOperationPackets()
         so.SetChunkIndex(seq);
         packet->AddHeader(so);
         double efficiency = GetProtocolModelForDest(pending.peer)->GetEfficiency(1);
-        uint32_t target = static_cast<uint32_t>(
-            std::max<double>(packet->GetSize(),
-                             std::ceil((dataBytes + pending.overhead) / efficiency)));
+        // Round 61: the uint32 cast below is UB when the /efficiency
+        // expansion reaches 2^32. The built-in model checkers floor
+        // efficiency at std::numeric_limits<double>::min() (2^-1022, the
+        // smallest normal), where even a ~4-byte body already targets
+        // 2^1024, and a custom model registered without a checker can go
+        // lower still. Fail loudly on any expansion that cannot be
+        // represented as a uint32 — the same hard-configuration-error
+        // policy as the SendDataInternal wire-efficiency pad abort
+        // (fabric-endpoint-send.cc).
+        const double expanded =
+            std::ceil(static_cast<double>(dataBytes + pending.overhead) / efficiency);
+        NS_ABORT_MSG_IF(!(expanded < 4294967296.0),
+                        "RDMA wire-efficiency padding target " << expanded << " B (efficiency "
+                                                               << efficiency << ") cannot be "
+                                                               << "represented as a uint32 packet");
+        uint32_t target = static_cast<uint32_t>(std::max<double>(packet->GetSize(), expanded));
         if (target > packet->GetSize())
         {
             packet->AddAtEnd(Create<Packet>(target - packet->GetSize()));
