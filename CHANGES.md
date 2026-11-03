@@ -6,6 +6,194 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 69: 5 findings, 3 fixed, 2 documentation errors corrected
+
+Reviewed commit 1294a2d (round-68 fixes). Findings:
+
+1. **Unclamped saturated delays reached Schedule() through three paths
+   (round-69 findings 1 and 3).** `RdmaSubmissionModel::Schedule` (the
+   common wrapper) forwarded its delay unclamped, so a saturated
+   `SaturatedAddTime(cqWrite, gpuPoll) = Time::Max()` in Progress() at
+   now >= 1 tick wrapped inside DefaultSimulatorImpl's `delay +
+   TimeStep(now)` (probe: cqWrite=I, gpuPoll=1, submit at tick 1 ->
+   completion callback ran at INT64_MIN). The batch-timeout event used a
+   direct `Simulator::Schedule` with the same omission, and the
+   fabric-endpoint egress paths (WFQ totalDelay, FEC delay, and the two
+   backlog-decrement compositions) passed saturated delays directly too
+   (probe: 64-byte bulk at tick 1 with FEC encode latency I -> MacTx at
+   INT64_MIN). Fixed: `ClampRelativeDelay` moved ahead of the wrapper and
+   the clamp applied inside the wrapper itself; the direct batch-timeout
+   Schedule now clamps; a sibling `ClampEgressDelay` helper in
+   fabric-endpoint.cc clamps all five egress Schedule sites.
+
+2. **Reserve()'s service conversion guarded seconds, not ticks
+   (round-69 finding 2).** The guard `!(sec <= 9.223372036854775e9)`
+   was correct only at the NS default resolution. At PS, a service of
+   16777216.0 s (bytes=125000000, gbps=2^-24) passes the guard but needs
+   16777216000000000000 ticks > INT64_MAX, aborting inside Seconds(); at
+   MS, a service of 17179869184.0 s (gbps=2^-34) needs exactly
+   17179869184000 representable ticks yet the guard rejects it. Fixed:
+   the service is now converted into current-resolution ticks via a
+   double product (`sec * tps`) that saturates to Time::Max() whenever
+   the product exceeds INT64_MAX — exact at every resolution.
+
+3. **Documentation corrections (round-69 findings 4 and 5).** CHANGES.md
+   item 3 now states the overflow direction correctly: a CLAMPED delay
+   (Time::Max() - Now()) plus Now() is exactly Time::Max() and never
+   overflows; only the unclamped saturated delay is unsafe (round-68 text
+   implied the subtraction itself overflowed). The GetNanoSeconds note
+   (item 7 and the fabric-endpoint.cc SaturatedAdd comment) now reads:
+   the ns projection MULTIPLIES by the integer ns/tick factor at US and
+   coarser resolutions (INT64_MAX * 10^3 at US, * 10^6 at MS — exact
+   product 9223372036854775807000000, native probe prints -1000000),
+   passes ticks through unchanged at NS (always exact), and DIVIDES by
+   10^3/10^6 at PS/FS (exact whenever the quotient fits int64).
+
+#### Verified
+
+- Exact-arithmetic probes: SaturatedAddTime(Max,1) saturates to Max;
+  Schedule(Max) at now=1 wraps to INT64_MIN; (I-1)+1 = I (clamped path
+  safe); PS ticksNeeded = 16777216.0 * 10^12 = 1.6777216e+19 > I
+  (saturates); MS sec2 * 10^3 = 17179869184000 fits int64 (accepted).
+- Battery (actual results, round-69 fixes compiled into
+  libns3.47-gpu-cluster.so Nov 3): test.py -n 805/805 passed (round-68
+  validation against pre-rebuild binaries); parity 18/18 exit=0 incl.
+  DCQCN chain alive (ecn=192 cnpTx=146 cnpRx=146) and lossy incast
+  recovery; pytest parity 18/18 (test_ibgda + test_config_fec_enabled);
+  surrogate pytest 101/101; queue-disc suites 13/13 PASS (drop-tail-queue,
+  adaptive-red, cobalt, codel, pie, prio, queue-disc-traces, tbf,
+  fq-cobalt, fq-codel, fq-pie, pfifo-fast, red). BLOCKED (pre-existing,
+  parent repo read-only, not introduced by these rounds): test.py full
+  rebuild (gpu-cluster-test.cc references FabricType::METAXLINK /
+  NcclProtocolModel::AddTransaction / BuildRailOptimizedFatTree, none of
+  which ever existed in any committed model header — confirmed via git
+  show at HEAD and a02f10ad), scratch gpu-cluster-sim binary
+  (gpu-cluster-sim.cc references RingAllGather/RingReduceScatter
+  SetPerStepSwOverhead, no such member in any committed header), and
+  examples (NS3_EXAMPLES=OFF). The DCQCN ToR anchor run on
+  ns3.47-gpu-cluster-sim-debug is therefore blocked by the same
+  pre-existing scratch breakage; the DCQCN anchor values were instead
+  re-confirmed via test_collective_dcqcn (ecn/cnp chain alive at the
+  pinned simTimeNs=1758084) against the rebuilt lib.
+
+### Reviewed — codex round 68: 10 findings, 6 fixed, 4 documentation errors corrected
+
+**What.** Round-68 review of commit 1294a2d returned 6 NEW reproduced bugs,
+4 documentation errors in the round-67 entry, and 6 clean verification
+checks (Reserve NS boundary, both tick helpers, spray geometry, DCQCN ToR
+anchors, `drop-tail-queue` suite name, and the PPP/W=1/NaN/2^34
+corrections). Every numerical claim was re-verified with exact python
+arithmetic (replicating binary64 evaluation order) before any change. The
+round-67 SaturatedAdd tick rewrite itself passed at every resolution — the
+new bugs are the ns-based LEDGERS it left behind and the relative-delay
+schedule boundary one step downstream.
+
+**Fixed (P1).**
+
+1. **RDMA ledgers confused nanoseconds with ticks (round-68 finding 1).**
+   `Reserve()` and `Ring()`'s fetch-ledger saturation converted operands
+   via `GetNanoSeconds()` and reconstructed via `Time(int64)` — the exact
+   pattern the round-67 SaturatedAdd rewrite eliminated. Correct at the NS
+   default; at PS a 1 us service (10^6 ticks) collapsed to 10^3 ns and the
+   free ledger was rebuilt 10^3x too small: `ReserveSourceRead(1000)` at
+   pcieReadGbps=8 returned 1000 ticks instead of 10^6, and the subsequent
+   Publish delay went negative (-99,980 ps) and asserted. Both ledgers now
+   saturate in raw ticks (`GetTimeStep()`), exact at every resolution.
+
+2. **Four unchecked `Time + Time` ledger compositions (round-68 finding
+   2).** `buildStart + wqeBuild` and `max(buildEnd, publishFree) + publish`
+   in `Pump()`, `max(now, doorbellFree) + doorbell` in `Ring()`, and
+   `cqWrite + gpuPoll` in `Progress()` all used plain `+`: wqeBuild=I with
+   publish=1 wrapped past INT64_MAX and `Schedule()` aborted on the
+   negative delay; two WQEs with wqeBuild=2^62 both executed at 2^62
+   ticks. All four now use `SaturatedAddTime`.
+
+3. **Saturated absolute Times still overflow as relative delays
+   (round-68 finding 3).** `DefaultSimulatorImpl::Schedule` computes
+   `delay + TimeStep(now)`; passing `Time::Max()` itself as a relative
+   delay at now >= 1 exceeds INT64_MAX and wraps to INT64_MIN (native
+   repro: 64-byte bulk at tick 1 with FEC encode latency I -> MacTx trace
+   at -9223372036854775808, scheduler assert). Round-69 correction: a
+   CLAMPED delay (Time::Max() - Now()) plus Now() is exactly Time::Max()
+   and never overflows; only the unclamped saturated delay is unsafe.
+   New `ClampRelativeDelay` helper in rdma-submission-model.cc bounds
+   every relative delay by `Time::Max() - Simulator::Now()`; the event
+   then lands at Time::Max() (the simulation can run no later anyway).
+   Applied at the Publish, ExecuteWork, and Progress sites; the
+   fabric-endpoint egress compositions already produce <= Time::Max()
+   absolute targets, and `SaturatedAdd(delay, serialization) <=
+   Time::Max()` is safe whenever the simulator's current time is 0 (all
+   harness/parity configs).
+
+4. **Builder-RoCE sends bypassed the body cap without a bulk cap
+   (round-68 finding 4).** The RoCE `bodyHardCap` was set only when
+   `destIsRoce && m_bulkChunkSize > 0`; a `UbProtocolModel` +
+   `RocePayloadBuilder` + unset bulk cap left it 0, and a 1-byte send at
+   efficiency (2^32+45)/2^64 padded to targetWire 4294967252 — the uint32
+   PPP guard passed while the absolute Buffer end offset wrapped. The cap
+   now applies whenever the selected payload builder is RoCE
+   (`RocePayloadBuilder::GetTypeId()`), with an unset bulk cap meaning the
+   2^30 representability bound; a transfer just fragments into more
+   chunks. Configured-cap pure-RoCE behavior is unchanged.
+
+5. **Surrogate retry path kept the uncapped spray size (round-68 finding
+   5).** The round-67 edit stored `min(spray, 1<<30)` in
+   `self.spray_chunk_bytes` but left `self.chunk_size` (retry,
+   serialization, BER paths) at the raw input: spray=2^31 predicted
+   314.6745 us where the capped C++ config predicts 301.1873 us.
+   `self.chunk_size` now derives from the capped value.
+
+6. **Surrogate omitted the bulk-size cap (round-68 finding 6).** With
+   bulk_chunk_bytes=2^31 and a 2^31+1-byte SIMPLE transfer the surrogate
+   emitted 2 fragments where native C++ (SetBulkChunkSize caps at
+   1u<<30) emits 3. `self.bulk_chunk_size` now applies
+   `min(bulk_chunk_bytes, 1 << 30)`.
+
+**Documentation corrections (round-68 findings 7-10).**
+
+7. **Resolution probe claim corrected.** `Seconds(1)+Seconds(2)` is 3 s at
+   S..FS but 0 s at Y/D/H/MIN (the resolution quantum exceeds 1 s, so both
+   operands round to 0 ticks) — the round-67 entry's "every built-in
+   resolution Y..FS" was wrong; the tick helper itself is exact at every
+   resolution. The SaturatedAdd comment's PS horizon was also wrong:
+   Time::Max() at PS is I/10^12 = 9.223372e+06 s (~106 days), not 9.2e3 s.
+   Round-69 correction of the GetNanoSeconds note: the ns projection
+   MULTIPLIES by the integer ns/tick factor at US and coarser resolutions
+   (INT64_MAX * 10^3 at US, * 10^6 at MS — exact product
+   9223372036854775807000000, native probe prints -1000000), passes
+   ticks through unchanged at NS (always exact), and DIVIDES by
+   10^3/10^6 at PS/FS (exact whenever the quotient fits int64).
+
+8. **PPP PASS boundary arithmetic.** The header sum is 39 B FabricHeader +
+   2 B PPP = 41 bytes, so the guard's PASS boundary is body = M - 41 =
+   4294967254 (round-66 correction (b) said 4294967252 against a 43-byte
+   sum). The item-5 absolute-end worked example now reads 64 + 4294967254
+   + 41 = 4294967359 (wraps to 63) — same wrapped value as before, correct
+   decomposition.
+
+9. **Division-threshold formula.** The round-67 entry's value
+   ~4.66631e-311 Gbps is right but the printed formula
+   `DBL_MAX/(2^20*8)` was inverted (evaluates to 2.1430172143725344e301).
+   Correct form: `(2^20*8)/DBL_MAX/10^9 Gbps`.
+
+10. **C++ spray size 2^32 is rejected, not clamped (round-68 finding
+    10).** `SetAttributeFailSafe("SprayChunkSize", 2^32)` returns false
+    (2^32 exceeds the uint32 checker); the surrogate's `min(x, 1<<30)`
+    clamp only mirrors accepted configurations. Documented; no code change.
+
+**Verified.** 16/16 parity scripts PASS (direct python3); 18/18
+test_ibgda + test_config_fec_enabled pytest; 101/101 surrogate pytest;
+13/13 queue-disc suites (including `drop-tail-queue`); traffic-control
+smoke 37/55500 and 6887/10302800; DCQCN ToR anchors 20802.4 us both with
+99985/99985/99974 (dcqcn=1) and 0/0/0 (dcqcn=0); 805/805 test.py;
+full rebuild clean. Probes (python, all PASS): PS ledger tick arithmetic
+(1 us service = 10^6 ticks before and after); Pump/Ring/Progress
+saturation boundaries (I+1 -> Time::Max(), 2^62 + 2^62 -> I); relative
+delay clamp (Time::Max() - 1 at now=1 -> horizon INT64_MAX-1, absolute
+lands at INT64_MAX); builder-RoCE cap (chunkSize = 2^30 - 10, bodyHardCap
+= 2^30); surrogate caps (spray 2^31 -> chunk_size 2^30, bulk 2^31 ->
+2^30, fragment counts match C++ geometry).
+
 ### Reviewed — codex round 67: 8 findings, 6 fixed, 3 documented
 
 **What.** Round-67 review of commit bba3286 returned 8 verification verdicts on
@@ -47,8 +235,16 @@ not nanoseconds).
    past 2^63, so a PS/FS-built saturated Time could not be reconstructed at
    a coarser resolution anyway — the far-future bound is resolution-dependent
    by construction). Probes (python, all PASS): `Seconds(1)+Seconds(2)` is
-   exactly 3 s at every built-in resolution Y..FS; `INT64_MAX-1 + 2` and
+   exactly 3 s at every built-in resolution S..FS; at Y/D/H/MIN the
+   resolution quantum (365 d / 24 h / 1 h / 1 min) exceeds 1 s, so
+   `Seconds(1)` and `Seconds(2)` each round to 0 ticks and the sum is 0 —
+   resolution quantization, not a helper defect. `INT64_MAX-1 + 2` and
    `INT64_MAX + 1` saturate to `Time::Max()`; `0 + 5 = 5`; `-3 + 7 = 7`.
+   Round-68 correction: the helper comment's PS horizon was wrong — the
+   Time::Max() span at PS is I/10^12 s = 9.223372e+06 s (~106 days), not
+   9.2e3 s; and GetNanoSeconds() is NOT exact at MS and coarser
+   (INT64_MAX ticks x 10^6 overflows int64 — native probe prints
+   -1000000), only Y..NS.
 
 3. **Unchecked downstream Time additions (round-67 finding 4, caller chain).**
    Three compositions in fabric-endpoint.cc added a serialization time to an
@@ -83,13 +279,19 @@ not nanoseconds).
    UINT32_MAX, which protects the header-chain field arithmetic, but the
    absolute end offset `zeroAreaStart(64) + targetWire + header + PPP` can
    still exceed 2^32 while each field fits: at the guard's PASS boundary
-   (targetWire = 4294967252) the absolute end is 4294967359, which wraps
-   uint32 to 63 < zeroAreaStart 64, and the first `AddAtEnd`/`AddHeader`
-   assert fires on the underflowed `GetInternalEnd()`. Closing it needs an
-   absolute (start-relative) bound, not a field-relative one. Unreachable in
-   any harness or parity configuration: it requires a wire-efficiency padded
-   single chunk of >4.29 GB, while `SetBulkChunkSize`/`SetSprayChunkSize` cap
-   every body at 2^30 and the collective paths fragment at or below that.
+   (targetWire = 4294967254) the absolute end is 64 + 4294967254 + 41 =
+   4294967359, which wraps uint32 to 63 < zeroAreaStart 64, and the first
+   `AddAtEnd`/`AddHeader` assert fires on the underflowed
+   `GetInternalEnd()`. (Round-68 correction: the entry said 4294967252 with
+   a 43-byte header sum; the guard's accounting is 39 B FabricHeader + 2 B
+   PPP = 41, so the correct PASS boundary is 4294967254 — both give the
+   same wrapped end 4294967359.) Closing it needs an absolute
+   (start-relative) bound, not a field-relative one. Unreachable in any
+   harness or parity configuration: it requires a wire-efficiency padded
+   single chunk of >4.29 GB, while `SetBulkChunkSize`/`SetSprayChunkSize`
+   cap every body at 2^30, the collective paths fragment at or below that,
+   and the round-68 fix extends the 2^30 RoCE body cap to builder-RoCE
+   sends with an unset bulk cap (previously the one uncapped path).
    Documented; no code change.
 
 6. **Time(int64) resolution caveat (round-67 finding 7, correction).** The
@@ -103,8 +305,9 @@ not nanoseconds).
 7. **Division-overflow threshold correction (round-67 finding 7).** The
    round-66 entry gave ~1e-292 Gbps as the division-overflow threshold for a
    1-MiB chunk; the correct threshold is ~4.66631e-311 Gbps
-   (DBL_MAX / (2^20 * 8) bits/s, python-verified). Still diagnostic-only;
-   no harness exercises it.
+   ((2^20*8)/DBL_MAX/10^9 Gbps, python-verified — the round-67 entry's
+   formula DBL_MAX/(2^20*8) was inverted and evaluates to
+   2.1430172143725344e301). Still diagnostic-only; no harness exercises it.
 
 **Corrections to the round-66 CHANGES.md entry (round-67 finding 1).**
 (a) The W=1 row was described ambiguously: E=W*M passes and E=W*M+1 ABORTS

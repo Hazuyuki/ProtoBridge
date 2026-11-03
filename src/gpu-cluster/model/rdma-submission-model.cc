@@ -517,6 +517,19 @@ RdmaSubmissionModel::SetObserver(Observer observer)
     m_observer = std::move(observer);
 }
 
+// Round 68 (codex finding 3): a large RELATIVE delay wraps inside
+// DefaultSimulatorImpl::Schedule's `delay + TimeStep(now)` — Time::Max()
+// at now >= 1 exceeds INT64_MAX. Clamp every relative delay to the safe
+// horizon Time::Max() - now; the event then lands at Time::Max(), the
+// latest timestamp the simulator can represent (a delay beyond it is the
+// same modeling outcome as saturation: effectively never).
+static Time
+ClampRelativeDelay(Time delay)
+{
+    const Time horizon = Time::Max() - Simulator::Now();
+    return delay > horizon ? horizon : delay;
+}
+
 void
 RdmaSubmissionModel::Schedule(Time delay, std::function<void()> fn)
 {
@@ -524,7 +537,11 @@ RdmaSubmissionModel::Schedule(Time delay, std::function<void()> fn)
                                   m_events.end(),
                                   [](const EventId& e) { return e.IsExpired(); }),
                    m_events.end());
-    m_events.push_back(Simulator::Schedule(delay, [this, fn = std::move(fn)] {
+    // Round 69 (codex finding 1): clamp inside the common wrapper so no
+    // call site can pass a saturated delay that wraps in Schedule's
+    // `delay + TimeStep(now)` (a saturated Time::Max() delay at now >= 1
+    // exceeds INT64_MAX). The clamped event lands at Time::Max().
+    m_events.push_back(Simulator::Schedule(ClampRelativeDelay(delay), [this, fn = std::move(fn)] {
         if (!m_disposed)
         {
             fn();
@@ -556,6 +573,14 @@ SaturatedAddTime(Time a, Time b)
     return Time(aTicks + bTicks);
 }
 
+// (the Schedule-wrapper clamp lives above with the wrapper itself).
+static Time
+ClampRelativeDelay(Time delay)
+{
+    const Time horizon = Time::Max() - Simulator::Now();
+    return delay > horizon ? horizon : delay;
+}
+
 Time
 RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earliest)
 {
@@ -572,24 +597,25 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
     if (gbps > 0)
     {
         const double sec = static_cast<double>(bytes) * 8 / (gbps * 1e9);
-        // Round 67 (codex finding 5): 9.223372036854776e9 is one ULP too
-        // high — (double)INT64_MAX rounds UP to 2^63, so sec = 2^63/1e9
-        // passes this comparison but overflows int64 inside Seconds()
-        // (2^63 ns is exactly representable in binary64, hence passes
-        // "<= 2^63"). Reachable at wqeBytes=64, pcieReadGbps=2^-54
-        // (probe). One ULP down (9.223372036854775e9) has product
-        // 9223372036854774784 = INT64_MAX - 1023, safely in range.
-        // The !(x <= y) form also catches a NaN gbps here (NaN never
-        // reaches the inner comparison: gbps > 0 is false at the NaN
-        // configuration which is rejected at config validation anyway).
-        if (!(sec <= 9.223372036854775e9))
-        {
-            service = Time(std::numeric_limits<int64_t>::max());
-        }
-        else
-        {
-            service = Seconds(sec);
-        }
+        // Round 69 (codex finding 2): convert the service into CURRENT-
+        // RESOLUTION TICKS before the ledger update, not into seconds
+        // against a nanosecond guard. The seconds guard was correct only
+        // at the NS default: at PS a service of 16777216.0 s (probe:
+        // bytes=125000000, gbps=2^-24) passes the guard but needs
+        // 16777216000000000000 ticks > INT64_MAX, aborting inside
+        // Seconds(); at MS a service of 17179869184.0 s (gbps=2^-34)
+        // needs exactly 17179869184000 representable ticks yet the guard
+        // rejects it. The tick guard is exact at every resolution: scale
+        // the seconds value by the current resolution's ticks-per-second,
+        // saturating when the product exceeds INT64_MAX (the far-future
+        // bound; ~545 years per fetch at NS, proportionally longer at
+        // finer resolutions). The round-67 ULP note below applies to the
+        // old Seconds() path only.
+        const double ticksNeeded = sec * static_cast<double>(Time::Max().GetTimeStep()) /
+                                   (Time::Max().GetNanoSeconds() / 1e9);
+        service = ticksNeeded > static_cast<double>(std::numeric_limits<int64_t>::max())
+                      ? Time(std::numeric_limits<int64_t>::max())
+                      : Time(static_cast<int64_t>(ticksNeeded));
     }
     // Round 65 (codex finding 8): saturate the free ledger instead of
     // wrapping. The saturating bound is a no-op for every realistic service
@@ -597,11 +623,20 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
     // pcieReadGbps=2^-32), but a degenerate gbps pins the ledger at the
     // far-future bound below instead of wrapping it past Time(0).
     // wqeBytes=125000000 @ pcieReadGbps=2^-32 is the probe.
-    const int64_t startNs = start.GetNanoSeconds();
-    const int64_t serviceNs = service.GetNanoSeconds();
-    free = Time(std::numeric_limits<int64_t>::max() - serviceNs < startNs
+    // Round 68 (codex finding 1): the ledger must be saturated in RAW TICKS,
+    // not nanoseconds. The round-65/66 ns-based ledger was correct only at
+    // the NS default resolution: GetNanoSeconds() divides by 10^3 per
+    // coarser step, so at PS a 1 us service (10^6 ticks) collapsed to
+    // 10^3 ns and free was reconstructed 10^3x too small
+    // (ReserveSourceRead(1000) @ pcieReadGbps=8 returned 1000 ticks
+    // instead of 10^6 — a negative Publish delay). The tick form is exact
+    // at every resolution; GetNanoSeconds() itself overflows at MS and
+    // coarser (INT64_MAX ticks x 10^6), which the tick form never touches.
+    const int64_t startTicks = start.GetTimeStep();
+    const int64_t serviceTicks = service.GetTimeStep();
+    free = Time(std::numeric_limits<int64_t>::max() - serviceTicks < startTicks
                     ? std::numeric_limits<int64_t>::max()
-                    : startNs + serviceNs);
+                    : startTicks + serviceTicks);
     return free;
 }
 
@@ -1010,15 +1045,26 @@ RdmaSubmissionModel::Pump(const QpKey& key)
         qp.outstanding.push_back(id);
         w.time.reserved = Simulator::Now();
         Time buildStart = std::max(Simulator::Now(), m_producerFree[w.time.producer]);
+        // Round 68 (codex finding 2): saturate the producer/publish/doorbell
+        // ledgers — wqeBuild=INT64_MAX (publish=1) wrapped buildEnd past
+        // INT64_MAX and Schedule() aborted on the negative delay.
         Time buildEnd =
-            buildStart + (m_config.initiator == "cpu" ? m_config.cpuWqeBuild : m_config.wqeBuild);
+            SaturatedAddTime(buildStart,
+                             m_config.initiator == "cpu" ? m_config.cpuWqeBuild
+                                                         : m_config.wqeBuild);
         m_producerFree[w.time.producer] = buildEnd;
         // A NIC sees only the contiguous published SQ prefix, even when different
         // producers build different WQEs in parallel.
-        Time publishEnd = std::max(buildEnd, qp.publishFree) +
-                          (m_config.initiator == "cpu" ? m_config.cpuPublish : m_config.publish);
+        Time publishEnd = SaturatedAddTime(
+            std::max(buildEnd, qp.publishFree),
+            m_config.initiator == "cpu" ? m_config.cpuPublish : m_config.publish);
         qp.publishFree = publishEnd;
-        Schedule(publishEnd - Simulator::Now(), [this, key, id] { Publish(key, id); });
+        // Round 68 (codex finding 3): publishEnd can be the saturated
+        // Time::Max(); the relative form exceeds INT64_MAX and wraps
+        // inside DefaultSimulatorImpl::Schedule — clamp to the safe
+        // horizon (lands at Time::Max(), never executes anyway).
+        Schedule(ClampRelativeDelay(publishEnd - Simulator::Now()),
+                 [this, key, id] { Publish(key, id); });
         m_stats.peakQpOutstanding = std::max<uint64_t>(m_stats.peakQpOutstanding, qp.occupied);
         uint64_t occupied = 0;
         for (const auto& [k, q] : m_qps)
@@ -1041,7 +1087,8 @@ RdmaSubmissionModel::Publish(const QpKey& key, uint64_t id)
     }
     else if (!qp.batchEvent.IsPending())
     {
-        qp.batchEvent = Simulator::Schedule(m_config.batchTimeout, [this, key] {
+        qp.batchEvent =
+            Simulator::Schedule(ClampRelativeDelay(m_config.batchTimeout), [this, key] {
             if (!m_disposed)
             {
                 Ring(key);
@@ -1063,8 +1110,12 @@ RdmaSubmissionModel::Ring(const QpKey& key)
         return;
     }
     ++m_stats.doorbells;
-    Time ringEnd = std::max(Simulator::Now(), m_doorbellFree) +
-                   (m_config.initiator == "cpu" ? m_config.cpuDoorbell : m_config.doorbell);
+    // Round 68 (codex finding 2): saturate the doorbell ledger (two WQEs
+    // with doorbell=2^62 ticks both executed at 2^62; the second must
+    // saturate at INT64_MAX, not wrap).
+    Time ringEnd = SaturatedAddTime(
+        std::max(Simulator::Now(), m_doorbellFree),
+        m_config.initiator == "cpu" ? m_config.cpuDoorbell : m_config.doorbell);
     m_doorbellFree = ringEnd;
     while (!qp.published.empty())
     {
@@ -1090,19 +1141,20 @@ RdmaSubmissionModel::Ring(const QpKey& key)
                 std::max(fetched,
                          Reserve(m_config.wqeBytes, m_config.hbmReadGbps, m_hbmReadFree, earliest));
         }
-        // Round 66 (codex finding 6): saturate the fetch ledger instead of
-        // overflowing it. A positive wqeFetch at the far-future end of the
-        // reservation chain (three 2^32-second services at pcieReadGbps
-        // 2^-32, wqeFetch = 1 ns) wraps fetched past INT64_MAX and the
-        // signed overflow feeds Schedule() and every later
-        // std::max(ringEnd, qp.fetchFree) comparison.
-        const int64_t fetchedNs = fetched.GetNanoSeconds();
-        const int64_t fetchNs = m_config.wqeFetch.GetNanoSeconds();
-        fetched = Time(fetchNs > std::numeric_limits<int64_t>::max() - fetchedNs
+        // Round 68 (codex finding 2): saturate in ticks — GetNanoSeconds()
+        // divides by 10^3 per coarser resolution step, so at PS the fetch
+        // ledger collapsed 10^3x (same defect as Reserve(), see above);
+        // GetNanoSeconds() also overflows at MS and coarser.
+        const int64_t fetchedTicks = fetched.GetTimeStep();
+        const int64_t fetchTicks = m_config.wqeFetch.GetTimeStep();
+        fetched = Time(fetchTicks > std::numeric_limits<int64_t>::max() - fetchedTicks
                            ? std::numeric_limits<int64_t>::max()
-                           : fetchedNs + fetchNs);
+                           : fetchedTicks + fetchTicks);
         qp.fetchFree = fetched;
-        Schedule(fetched - Simulator::Now(), [this, id] { ExecuteWork(id); });
+        // Round 68 (codex finding 3): fetched can be the saturated
+        // Time::Max() — clamp the relative delay (see Pump above).
+        Schedule(ClampRelativeDelay(fetched - Simulator::Now()),
+                 [this, id] { ExecuteWork(id); });
     }
 }
 
@@ -1200,7 +1252,11 @@ RdmaSubmissionModel::Progress(const QpKey& key)
     {
         qp.outstanding.pop_front();
     }
-    Schedule(m_config.cqWrite + (m_config.initiator == "cpu" ? m_config.cpuPoll : m_config.gpuPoll),
+    // Round 68 (codex finding 2): saturate — cqWrite=INT64_MAX (gpuPoll=1)
+    // wrapped the relative delay past INT64_MAX and Schedule() aborted.
+    Schedule(SaturatedAddTime(m_config.cqWrite,
+                              m_config.initiator == "cpu" ? m_config.cpuPoll
+                                                          : m_config.gpuPoll),
              [this, key, through] { Observe(key, through); });
 }
 

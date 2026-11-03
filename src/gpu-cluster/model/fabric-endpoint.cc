@@ -51,11 +51,18 @@ namespace
 //    blows past 2^63, so a PS/FS-built SaturatedAdd result could not be
 //    reconstructed at a coarser resolution anyway — the far-future bound is
 //    resolution-dependent by construction (Time::Max() is INT64_MAX ticks,
-//    9.2e9 s at NS but 9.2e3 s at PS).
-//  - Time::Max().GetNanoSeconds() is exact at every built-in resolution
-//    (Y..S: integer ns/tick divide; MS..NS: factor multiply with <= INT64_MAX
-//    product; PS/FS: no harness or parity path changes the resolution from
-//    the NS default, so the PS/FS projection overflow is unreachable here).
+//    9.2e9 s at NS but 9.223372e+6 s at PS — round-68 correction; the
+//    previous 9.2e3 s was the FS span divided wrong).
+//  - Time::Max().GetNanoSeconds() (round-69 correction of the round-68
+//    note, which itself corrected a round-67 overclaim): the ns projection
+//    MULTIPLIES by the integer ns/tick factor at US and coarser
+//    resolutions, where INT64_MAX * factor overflows int64 (native probe at
+//    MS prints -1000000; the exact product is
+//    9223372036854775807*1000000); at NS the factor is 1 so ticks pass
+//    through unchanged (always exact); at PS/FS the projection DIVIDES by
+//    10^3/10^6 — exact whenever the quotient fits int64. No harness or
+//    parity path changes the resolution from the NS default, so the
+//    US-and-coarser overflow is unreachable here.
 Time
 SaturatedAdd(Time a, Time b)
 {
@@ -70,6 +77,20 @@ SaturatedAdd(Time a, Time b)
         return Time::Max();
     }
     return Time(aTicks + bTicks);
+}
+
+// Round 69 (codex finding 3): a saturated far-future delay passed directly
+// to Simulator::Schedule wraps inside DefaultSimulatorImpl's `delay +
+// TimeStep(now)` — Time::Max() at now >= 1 exceeds INT64_MAX (native
+// repro: 64-byte bulk at tick 1 with FEC encode latency Time::Max() ->
+// MacTx at INT64_MIN). Clamp every relative delay to the safe horizon
+// Time::Max() - Now(); the event then lands at Time::Max(), the latest
+// timestamp the simulator can represent.
+static Time
+ClampEgressDelay(Time delay)
+{
+    const Time horizon = Time::Max() - Simulator::Now();
+    return delay > horizon ? horizon : delay;
 }
 
 } // unnamed namespace
@@ -3574,9 +3595,13 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 // before a deferred egress fires (codex round 28, finding 1).
                 const bool retransmit = m_isRetransmitting;
                 m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, retransmit]() {
-                        SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
-                    }));
+                    // Round 69 (codex finding 3): clamp the saturated
+                    // far-future delay to Time::Max() - Now(); Schedule
+                    // adds Now() and Time::Max() + 1 wraps past INT64_MAX.
+                    Simulator::Schedule(ClampEgressDelay(totalDelay),
+                                        [this, packet, deviceIndex, dest, retransmit]() {
+                                            SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
+                                        }));
                 // Decrement backlog after packet finishes transmission
                 // (serialization). Tracked like the deferred send itself:
                 // the lambda captures raw `this`, so DoDispose must cancel
@@ -3592,7 +3617,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 // saturated far-future bound; adding serialization to it
                 // overflows the signed Time storage. Saturate the sum.
                 Time txDone = SaturatedAdd(totalDelay, serialization);
-                EventId decrEv = Simulator::Schedule(txDone, [model, tc]() {
+                EventId decrEv = Simulator::Schedule(ClampEgressDelay(txDone), [model, tc]() {
                     if (model)
                     {
                         model->DecrementBacklog(tc);
@@ -3618,8 +3643,9 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             // Capture the retransmit flag (codex round 28, finding 1).
             const bool retransmit = m_isRetransmitting;
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(delay, [this, packet, deviceIndex, dest, retransmit]() {
-                    SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
+                Simulator::Schedule(ClampEgressDelay(delay),
+                                    [this, packet, deviceIndex, dest, retransmit]() {
+                                        SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
                 }));
             // Decrement backlog after serialization. Tracked for DoDispose
             // like the deferred send above (raw-`this` capture; codex round
@@ -3631,13 +3657,14 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
                 // Round 67 (codex finding 4): saturate — delay can be the
                 // saturated far-future bound (see the WFQ branch above).
-                EventId decrEv = Simulator::Schedule(SaturatedAdd(delay, serialization),
-                                                     [model, tc]() {
-                                                         if (model)
-                                                         {
-                                                             model->DecrementBacklog(tc);
-                                                         }
-                                                     });
+                EventId decrEv = Simulator::Schedule(
+                    ClampEgressDelay(SaturatedAdd(delay, serialization)),
+                    [model, tc]() {
+                        if (model)
+                        {
+                            model->DecrementBacklog(tc);
+                        }
+                    });
                 m_deferredEgressEvents.push_back(decrEv);
                 TrackBacklogDecrement(decrEv, model, tc);
             }
@@ -3672,7 +3699,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
         // Round 67 (codex finding 4): saturate — shapingDelay can be the
         // saturated far-future bound (see the WFQ branch above).
-        EventId decrEv = Simulator::Schedule(SaturatedAdd(shapingDelay, serialization),
+        EventId decrEv = Simulator::Schedule(ClampEgressDelay(SaturatedAdd(shapingDelay, serialization)),
                                              [model, tc]() {
                                                  if (model)
                                                  {

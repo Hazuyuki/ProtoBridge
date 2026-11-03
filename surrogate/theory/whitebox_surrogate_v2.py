@@ -150,14 +150,19 @@ class TheoryDerivedSurrogate:
         self.lat = link_latency_us
         self.credit_bdp_ring = credit_bdp_ring_packets
         self.credit_bdp_tree = credit_bdp_tree_packets
-        self.chunk_size = spray_chunk_bytes
-        # Round 67 (codex finding 5): mirror FabricEndpoint::SetSprayChunkSize
-        # (fabric-endpoint.cc), which caps the spray chunk at 1u << 30. The
-        # surrogate previously accepted any value, so a config that the C++
-        # endpoint would clamp (e.g. 2 GiB) produced a different fragment
-        # count here than on the wire.
+        # Round 68 (codex finding 5): derive every spray-dependent quantity
+        # from the CAPPED value — the round-67 edit stored
+        # `min(spray_chunk_bytes, 1 << 30)` in self.spray_chunk_bytes but
+        # left self.chunk_size (the retry/serialization path) at the raw
+        # input, so spray=2^31 predicted 314.67 us where the capped C++
+        # config (spray=2^30) predicts 301.19 us.
         self.spray_chunk_bytes = min(spray_chunk_bytes, 1 << 30)
-        self.bulk_chunk_size = bulk_chunk_bytes
+        self.chunk_size = self.spray_chunk_bytes
+        # Round 68 (codex finding 6): mirror the C++ bulk-chunk cap
+        # (FabricEndpoint::SetBulkChunkSize caps at 1u << 30). Without it
+        # bulk_chunk_bytes=2^31 emitted 2 fragments where native C++ (cap
+        # 2^30) emitted 3 for a 2^31+1-byte SIMPLE transfer.
+        self.bulk_chunk_size = min(bulk_chunk_bytes, 1 << 30)
         self.num_lanes = num_lanes
         self.T_min_switch = t_min_switch_us
         # Compatibility alias used by an older diagnostic script.

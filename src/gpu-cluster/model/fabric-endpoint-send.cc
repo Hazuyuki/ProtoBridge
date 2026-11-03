@@ -1217,11 +1217,33 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
     // bodies over a 10-B cap.
     uint64_t chunkSize;
     uint64_t bodyHardCap = 0; // 0 = unbounded (non-RoCE or no bulk cap)
-    if (destIsRoce && m_bulkChunkSize > 0)
+    // Round 68 (codex finding 4): apply the RoCE body cap whenever the RoCE
+    // payload builder will frame this send, even if the destination model
+    // is NOT RoceProtocolModel — a UbProtocolModel + RocePayloadBuilder +
+    // unset bulk cap sent an uncapped 4.29 GB padded body (bodyHardCap
+    // stayed 0 because destIsRoce was false, and the uint32 PPP guard
+    // passed targetWire 4294967252 while the absolute Buffer end offset
+    // wrapped). The per-chunk wire-byte cap is the same 2^30
+    // representability bound the non-RoCE arm uses below; a transfer just
+    // fragments into more chunks. Pure-RoCE-dest sends keep the configured
+    // bulk cap when there is one (unchanged behavior).
+    const bool builderIsRoce = GetPayloadBuilderForRank(destRank)->GetInstanceTypeId()
+                               == RocePayloadBuilder::GetTypeId();
+    if ((destIsRoce && m_bulkChunkSize > 0) || builderIsRoce)
     {
         const uint32_t soHdr = SoHeader().GetSerializedSize();
-        bodyHardCap = std::max<uint64_t>(m_bulkChunkSize, soHdr + 1);
-        if (m_bulkChunkSize > soHdr)
+        // Round 68: an unset bulk cap (0) means "the representability cap
+        // only" — do NOT clamp up to soHdr+1 here (that would force every
+        // uncapped RoCE send through one giant chunk); the max() runs on
+        // the configured cap below when it is nonzero.
+        bodyHardCap = m_bulkChunkSize > 0 ? std::max<uint64_t>(m_bulkChunkSize, soHdr + 1)
+                                          : (1ull << 30);
+        if (m_bulkChunkSize == 0)
+        {
+            // Uncapped RoCE bulk: fragment at the 2^30 wire-byte bound.
+            chunkSize = std::max<uint64_t>((1ull << 30) - soHdr, 1);
+        }
+        else if (m_bulkChunkSize > soHdr)
         {
             const double roceEff = destModel->GetEfficiency(protocolId);
             uint64_t dataCap;
