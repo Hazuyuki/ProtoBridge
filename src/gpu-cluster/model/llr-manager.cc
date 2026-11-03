@@ -14,6 +14,7 @@
 #include "ns3/enum.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace ns3
@@ -39,6 +40,23 @@ bool
 IsUnrepresentableTimeout(Time timeout)
 {
     return timeout >= Time::Max() - Simulator::Now();
+}
+
+// Saturating add for Time (raw-tick) ledgers: a sum that would pass
+// INT64_MAX clamps to Time::Max() instead of wrapping negative (round 74
+// codex finding 3 — the source-reload service/availability/cumulative
+// ledgers and the returned readyDelay otherwise wrap and the caller's
+// readyDelay > 0 test fails open, bypassing the reload hold).
+Time
+SaturatedAddTime(Time a, Time b)
+{
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
 }
 
 } // unnamed namespace
@@ -817,14 +835,23 @@ LlrManager::ReserveSourceReload(uint32_t bytes)
         transferTime = Seconds(static_cast<double>(bytes) /
                                static_cast<double>(m_sourceReloadBandwidth));
     }
-    Time serviceTime = m_sourceReloadLatency + transferTime;
+    // Round 74 (codex finding 3): saturate every time addition so the
+    // ledgers and the returned readyDelay cannot wrap (probe: 64 B evicted
+    // entry, SourceReloadLatency = Time::Max(), bandwidth = 1e9 B/s at tick
+    // 7 -> service wraps to -9223372036854775745 ticks, the caller's
+    // readyDelay > 0 test fails open and the retransmission fires
+    // immediately instead of waiting for the reload service).
+    Time serviceTime = SaturatedAddTime(m_sourceReloadLatency, transferTime);
     Time now = Simulator::Now();
     Time start = std::max(now, m_sourceReloadAvailable);
-    m_sourceReloadAvailable = start + serviceTime;
+    m_sourceReloadAvailable = SaturatedAddTime(start, serviceTime);
 
     m_sourceReloadCount++;
     m_sourceReloadBytes += bytes;
-    m_sourceReloadServiceTime += serviceTime;
+    m_sourceReloadServiceTime = SaturatedAddTime(m_sourceReloadServiceTime, serviceTime);
+    // readyDelay below is relative to now and cannot be negative: start is
+    // max(now, available) >= now and SaturatedAddTime pins every sum at
+    // Time::Max(), so available >= now always.
     return m_sourceReloadAvailable - now;
 }
 

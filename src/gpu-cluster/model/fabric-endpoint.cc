@@ -2665,7 +2665,15 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
             // latency must drop the response entirely rather than emit it
             // past the representable horizon, so skip scheduling when the
             // clamp saturated at Time::Max().
-            if (m_memoryLatency < Time::Max())
+            // Round 74 (codex finding 2): the boundary above is off by the
+            // remaining horizon — a finite latency that merely saturates the
+            // deadline still produces a Time::Max() schedule (probe: read at
+            // tick 7, m_memoryLatency = Time::Max()-1 -> deferred deadline
+            // INT64_MAX, response tx at Max, rx at -9223372036854775807).
+            // Reject ANY latency whose deadline lands at Time::Max(), i.e.
+            // latency >= Time::Max() - Now() (the same
+            // IsUnrepresentableTimeout rule used by the LLR retry arm).
+            if (m_memoryLatency < Time::Max() - Simulator::Now())
             {
                 m_deferredEgressEvents.push_back(
                     Simulator::Schedule(ClampEgressDelay(m_memoryLatency),

@@ -6,6 +6,211 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 74: 15 findings, all 15 fixed
+
+Reviewed commit 614b74c (round-73 fixes). All 15 findings are instances of
+one root cause family: `Simulator::Schedule(delay, ...)` with a degenerate
+config/attribute/ledger Time — a raw `Time::Max()` config value, a uint64
+config latency above INT64_MAX, or a saturated ledger — whose
+`delay + TimeStep(now)` deadline wraps to a negative/past timestamp and
+fires immediately with a corrupted timeline (or, at clamp-to-Max, EXECUTES
+at the end of time), plus three arithmetic-overflow sites that overflow
+before any guard runs. Policy (established round 73): an action at or
+beyond the remaining horizon `Time::Max() - Simulator::Now()` is dropped /
+left unarmed — never clamped to Time::Max(). Findings:
+
+1. **Reserve service-time saturation still wraps to a NEGATIVE Time at
+   MIN/H/D/Y resolution for a large finite binary64 sec (round-74 finding
+   1, high).** The round-73 fix bounded the divide (`!(gbps >
+   saturateGbps)`) and clamped `sec < (0x1p63 - 0x1p11)/ticksPerSecond`,
+   but the surviving `Seconds(sec)` conversion still feeds the sec to
+   ns-3's int64x64(double) ctor: for sec in [2^63, (2^63-2^11)/scale) at
+   MIN/H/D/Y the float-to-int conversion is out of range and hi truncates
+   to INT64_MIN, and the Q64.64 compose emits a negative tick count
+   (int64x64-128.h:94-121 mechanism). The negative service then wrapped
+   the free-ledger subtraction (round-72 UBSan signature). Fixed: the
+   post-divide check now saturates on `!(sec < maxSec)` with
+   `maxSec = min((0x1p63 - 0x1p11)/ticksPerSecond, 0x1p63)`, applied at
+   BOTH the reserve and completion service conversions; non-positive and
+   NaN sec map to Time(0). Verified with the trap-mode probe
+   (reserve public MIN 64 B @ 0x1.12e0be826d695p-85 ->
+   ticks = INT64_MAX = 9223372036854775807, FE_OVERFLOW/FE_INVALID/
+   FE_DIVBYZERO clear, rc 0; public NS 500000002 @ 0x1.000000112e0bfp-1022
+   -> ticks = INT64_MAX with only the expected inexact flag).
+
+2. **FabricEndpoint memory-semantic egress bypasses the round-73 horizon
+   guard for near-Max latencies (round-74 finding 2, high).** The
+   round-73 fix dropped responses only at exactly `>= Time::Max()`;
+   configured latencies in (Time::Max() - serialization, Time::Max())
+   still scheduled a transmit whose downstream serialization wrapped past
+   INT64_MAX. Fixed: the egress completion now goes through the canonical
+   horizon guard (`delay < Time::Max() - Simulator::Now()`), so any
+   completion that cannot fire within the representable horizon is
+   dropped. Verified with the memory probe: near-Max latency schedules
+   nothing; ordinary latency unchanged.
+
+3. **LLR source-reload ready/available ledgers overflow on repeated
+   saturated adds (round-74 finding 3, medium).** The round-73 guard
+   covered the reload SCHEDULE, but `readyDelay = SaturatedAddTime(now,
+   sourceReloadAvailable) + service` and the `sourceReloadAvailable`
+   advance were raw `Time` additions: once the ledger saturated at
+   Time::Max(), the next `+ service` / `+ reload` wrapped to a negative
+   tick and the SACK-reply path re-armed reloads in the past. Fixed: both
+   additions route through SaturatedAddTime (raw-tick saturating add);
+   the horizon-guarded schedule then sees a saturated (>= horizon) ledger
+   and stays unarmed. Verified with the reload probe: ledger and service
+   non-negative, saturated, and no past firing.
+
+4. **RdmaOperationEngine passes raw config Times to Schedule, and the
+   receive-post ledger is an unsaturated Time add (round-74 finding 4,
+   medium).** `Schedule(delay, ...)` had no horizon guard (probe:
+   signalPoll = Time::Max() at tick 7 -> the WaitSignal callback fired at
+   -9223372036854775802), and `m_receivePostFree = max(now, ledger) +
+   receivePost` was a raw add that wrapped to -9223372036854775802 once
+   receivePost saturated the ledger. Fixed: the engine's private
+   Schedule() wrapper refuses `delay.IsStrictlyNegative() || delay >=
+   Time::Max() - Simulator::Now()` (unreachable actions stay unarmed);
+   PostReceive composes the ledger with SaturatedAddTime, so the relative
+   delay below cannot wrap. Verified with the worktree-layout probes
+   (`timing_probe engine`: wait registered at tick 7, no signal callback;
+   a stable-layout native verifier driving the real engine's
+   PostReceive(receivePost = Time::Max()) path: no immediate completion,
+   run ends at the scheduled horizon tick).
+
+5. **DCQCN recovery timers arm wrapped deadlines (round-74 finding 5,
+   medium).** OnCnp scheduled T_FAST / T_AI recovery cycles from
+   configured Time attributes without a horizon guard; T_FAST =
+   Time::Max() (or any value >= horizon) wrapped the deadline. Fixed: all
+   four arm sites use the canonical guard (`timer < Time::Max() -
+   Simulator::Now()`); a degenerate timer is not armed. Verified with the
+   dcqcn probe: cnp at tick 7 with T_FAST = Time::Max() arms no timer,
+   run ends at tick 7.
+
+6. **DCQCN/RTTCC pacing ledgers go negative at PS/FS resolution
+   (round-74 finding 6, medium).** ClampedNanoSeconds correctly mapped
+   its int64 ns input to Time::Max(), but the nextSendNs ledger was
+   advanced with a raw `+= delayNs` in ns (int64): two saturated delays
+   pushed the ledger past INT64_MAX and wrapped it negative, after which
+   every subsequent delay computed from it went negative. Fixed: the
+   ledger advance is `nextSendNs = (delayNs > INT64_MAX - nextSendNs) ?
+   INT64_MAX : nextSendNs + delayNs` (raw-tick/ns saturating add; the
+   downstream `ledger - now` cannot go negative once saturated).
+   Verified with the pacer probe at PS resolution: both first and second
+   ShapingDelay non-negative and equal to the saturated horizon.
+
+7. **NVSwitch multicast FEC latency wraps and total delay overflows
+   (round-74 finding 7, medium).** SendMulticastResultOnPort composed
+   `encode + decode + serialization + propagation` with raw Time adds; a
+   saturated encode latency wrapped the sum negative and the deferred
+   send fired in the past. Fixed: the FEC latency is a SaturatedAddTime
+   pair; the deferred arm uses the canonical horizon guard with the
+   `> Seconds(0)` / `<= Seconds(0)` immediate-send split preserved.
+   Verified with the multicast probe: no negative-tick send, deferred
+   send dropped at saturation.
+
+8. **NVSwitch cut-through/forwarding Time arithmetic overflows
+   (round-74 finding 8, medium).** ForwardPacket composed `startTime +
+   serialization + coding + propagation` and advanced
+   `m_outputBusyUntil[outPort] = startTime + serializationTime` with raw
+   adds; saturated components wrapped the busy-until ledger and the
+   schedule deadline negative. Fixed: both compositions route through
+   SaturatedAddTime and the schedule is horizon-guarded. Verified with
+   the forwarding probe: busy-until non-negative/saturated, no negative
+   deadline.
+
+9. **SYNC/ASYNC memory-semantic completion timers bypass the clamp
+   (round-74 finding 9, medium).** The two NotifyMemorySemanticComplete
+   schedule sites in fabric-endpoint-send.cc took the raw uint64
+   attribute latency: values above INT64_MAX wrap negative in
+   NanoSeconds(int64) (and any converted Time outside [0, horizon]
+   scheduled a past/end-of-time firing). Fixed: new
+   ClampedSemanticLatencyNs(uint64_t) maps > INT64_MAX ns to the horizon
+   and clamps the converted Time (negative or > horizon -> horizon);
+   both sites then horizon-guard the schedule. Verified with the
+   semantic probe: no completion outside the horizon for
+   UINT64_MAX-configured latency.
+
+10. **Contention-model serialization service aborts at FS/PS resolution
+    (round-74 finding 10, medium).** GetSerializationTime and the WFQ
+    penalty path fed `Seconds(size / m_bandwidth)` with a binary64 sec
+    that Seconds() rejects ("overflow detected" at int64x64-128.cc:106
+    for representable-but-out-of-Q64.64-range values; probe: FS
+    resolution, 16384 B @ 1 bps -> SIGABRT). Fixed: new
+    ClampedSerializationSeconds(double) with the resolution-aware
+    `maxSec = min((0x1p63 - 0x1p11)/ticksPerSecond, 0x1p63)` switch over
+    Time::S..Time::Y; `!(sec < maxSec)` returns Time::Max() and
+    non-positive/NaN returns Time(0). Verified with the serialization
+    probe: no abort, saturated Time::Max() at FS/PS, exact ticks at
+    coarser resolutions.
+
+11. **FecModel encoded-bit product wraps uint64 (round-74 finding 11,
+    medium).** The round-63 divide-first ceiling protected the final
+    byte conversion, but the triple product `numCodewords * m_n *
+    RS_SYMBOL_BITS` itself wrapped: SetFecParams(2147483647, 1, 0) with
+    a 2^30-B payload gives numCodewords = 858,993,460 and a product of
+    2^64 + 8,589,934,584 bits -> uint64 dropped 2^64 and the encoded
+    size came back as payload - 1, defeating the caller's
+    encoded > payload padding gate. Fixed: the product and the byte
+    ceiling are computed in __uint128_t (the codebase's established wide
+    type) and narrowed AFTER the /8: the exact product can exceed uint64
+    while the exact byte ceiling still fits it (that case returns
+    ceil(product/8) = 2,305,843,010,287,435,775 bytes); the return
+    saturates only when the exact byte count exceeds UINT64_MAX. Exact-
+    arithmetic verified (python): product = 18446744082299486200 >
+    2^64 - 1, ceil(product/8) = 2305843010287435775 == the review's
+    expected value. Probe: payload=1073741824 encoded=2305843010287435775
+    rc 0.
+
+12. **GatewayEndpoint forwards without a horizon guard (round-74 finding
+    12, medium).** ScheduleForwarding pushed the configured GatewayDelay
+    straight into Simulator::Schedule; GatewayDelay = Time::Max()
+    wrapped the deadline (probe: TX at -9223372036854775802). Fixed: the
+    canonical horizon guard wraps the schedule. Verified with the gateway
+    probe: no forwarding outside the representable horizon.
+
+13. **Protocol-transaction DELAY node completes at a negative time
+    (round-74 finding 13, medium).** The DELAY runtime arm scheduled the
+    raw node.delay; Time::Max() (or near-horizon) wrapped the deadline
+    and the transaction graph completed at -9223372036854775802. Fixed:
+    the arm is horizon-guarded and, on drop, the node stays ACTIVE with
+    no event — the graph neither completes nor corrupts the timeline.
+    Verified with the transaction probe: no negative-tick completion.
+
+14. **LinkDegradationModel delay + duration overflows (round-74 finding
+    14, medium).** ApplyDegradation scheduled recovery at `delay +
+    duration` with raw adds; both saturated configs wrapped the recovery
+    deadline negative. Fixed: SaturatedAddTime composes the recovery
+    delay; the recovery arm is separately horizon-guarded and the whole
+    apply is wrapped in the canonical guard with an NS_LOG_WARN drop.
+    Verified with the degradation probe: no negative recovery deadline.
+
+15. **DCQCN/RTTCC bandwidth arithmetic overflows BEFORE the guard runs
+    (round-74 finding 15, high).** ShapingDelay computed
+    `chunkBytes / rateBps` with feenableexcept(FE_OVERFLOW) armed by the
+    caller: a subnormal rate (probe: denorm_min) raised FE_OVERFLOW in
+    the divide itself and SIGFPE'd (rc -8) before any bound check ran;
+    the ceiling-product `PerQpCeilingGbps * 1.25e8` (probe: 1e301 Gbps)
+    overflowed the same way. Fixed: a pre-guard
+    `!(chunkBytes <= rateBps * (DBL_MAX_INT64_NS / 1e9))` skips the
+    divide for rates whose exact slot must exceed the horizon (the
+    pre-multiplied bound is representable for every finite rateBps), a
+    ceiling-product guard `<= DBL_MAX / 1.25e8` caps the attribute, and
+    the surviving divide's result goes through the slot-sec horizon
+    bound and ClampedNanoSeconds. Verified with the trap-mode probes:
+    pacer-overflow-high (1e301 Gbps), pacer-overflow-low (denorm_min),
+    rtt-overflow-low (RTTCC path) all rc 0 with FE_OVERFLOW clear; the
+    ordinary pacer sweep unchanged.
+
+Verified: all 26 review probe cases re-run against the fixed library
+(pre-fix SIGFPE x3, SIGABRT x2, negative-ticket firings across
+switch/gateway/transaction/semantic/degradation, wrapped FEC size, and
+negative reload/post-receive ledgers all eliminated; the four probes
+that instantiate RdmaSubmissionModel were rebuilt with the worktree
+include tree only, matching the library's PCIe-era class layout);
+test.py gpu-cluster suite PASS; parity pytest suite 221 passed;
+surrogate pytest suite 101 passed; gpu-cluster-ibgda C++ suite PASS;
+drop-tail-queue (qdisc2) C++ suite PASS.
+
 ### Reviewed — codex round 73: 4 findings, all 4 fixed
 
 Reviewed commit 966e925 (round-72 fixes). Findings:

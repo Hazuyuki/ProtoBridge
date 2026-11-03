@@ -612,7 +612,20 @@ FecModel::GetEncodedSize(uint32_t payloadSize) const
     // wrapped for payloads in the top per-codeword range of 2^64.
     uint64_t numCodewords = payloadBits / dataBitsPerCodeword +
                             (payloadBits % dataBitsPerCodeword != 0 ? 1 : 0);
-    uint64_t encodedBits = numCodewords * m_n * RS_SYMBOL_BITS;
+    // Round 74 (codex finding 11): the triple product itself wraps
+    // uint64 — SetFecParams(2147483647, 1, 0) with a 2^30-B payload
+    // gives numCodewords = 858,993,460 and encodedBits wraps to
+    // payload−1 bit, silently shrinking the parity expansion below the
+    // payload it protects (and a wrap to a value < payloadBits makes the
+    // caller skip padding entirely). Compute in __uint128_t — the
+    // codebase's established wide type — and divide by 8 BEFORE
+    // narrowing: the exact product can exceed uint64 while the exact
+    // byte ceiling still fits it (that case returns
+    // ceil(product / 8) = 2,305,843,010,287,435,775 bytes).
+    const uint64_t bitsPerCodewordOut = static_cast<uint64_t>(m_n) * RS_SYMBOL_BITS;
+    const __uint128_t encodedBits = static_cast<__uint128_t>(numCodewords) * bitsPerCodewordOut;
+    const uint64_t encodedBytes =
+        static_cast<uint64_t>(encodedBits / 8 + (encodedBits % 8 != 0 ? 1 : 0));
     // uint64 return (codex round 51, finding 2): the encoded size of a
     // ~4-GB payload crosses UINT32_MAX; the old uint32 return narrowed it
     // below the payload size, and the padding site's `encoded > payload`
@@ -623,8 +636,12 @@ FecModel::GetEncodedSize(uint32_t payloadSize) const
     // 1,532,423,903-B payload yields encodedBits = 2^64 - 6, +7 wraps the
     // numerator to 1, and the function returned 0 instead of
     // 2^61 = 2,305,843,009,213,693,952. Divide first, then bump on a
-    // nonzero remainder.
-    return encodedBits / 8 + (encodedBits % 8 != 0 ? 1 : 0);
+    // nonzero remainder. The byte ceiling is now computed on the
+    // __uint128_t encodedBits above (round 74), which covers both the
+    // old uint64 top-7-bits wrap and products that overflow uint64
+    // outright: it saturates the return only when the exact byte count
+    // exceeds UINT64_MAX.
+    return encodedBytes;
 }
 
 uint32_t

@@ -817,7 +817,22 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
             // Seconds() window 2^63 s <= sec < bound (at MIN that window
             // spans [2^63, 60*(2^63-2^11)) s; at S/MS/US/NS/PS/FS the
             // window is empty because Seconds() asserts before 2^63).
-            service = (sec >= (0x1p63 - 0x1p11) / ticksPerSecond)
+            // Round 74 (codex finding 1): Seconds() accepts any sec < the
+            // tick bound above, but at coarse resolutions (MIN/H/D/Y) the
+            // bound is >> 2^63 and ns-3's int64x64(double) constructor
+            // wraps its hi = (int64)trunc(sec) conversion modulo 2^128 for
+            // sec >= 2^63 (out-of-range float-to-int conversion): sec =
+            // 2^64 returns EXACTLY ZERO ticks (probe: MIN, 64 B @
+            // 0x1.12e0be826d695p-85 -> sec = 2^64 -> ticks = 0), and the
+            // IsStrictlyNegative clamp below accepts zero, so a degenerate
+            // nonzero rate yields ZERO service instead of Time::Max().
+            // Other sec >= 2^63 wrap to arbitrary-sign garbage (probe: 3e19
+            // -> negative). Only sec < 2^63 converts sanely. Tighten the
+            // bound to min(tickBound, 2^63): at S..FS the tick bound is
+            // already < 2^63 so this is a no-op; at MIN/H/D/Y every sec in
+            // [2^63, tickBound) now saturates, covering both the zero-wrap
+            // and the positive-garbage windows.
+            service = (sec >= std::min((0x1p63 - 0x1p11) / ticksPerSecond, 0x1p63))
                           ? Time::Max()
                           : Seconds(sec);
             if (service.IsStrictlyNegative())

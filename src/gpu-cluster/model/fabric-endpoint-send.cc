@@ -23,6 +23,36 @@
 namespace ns3
 {
 
+namespace
+{
+
+// Round 74 (codex finding 9): m_syncMemLatencyNs / m_asyncMemLatencyNs are
+// uint64_t config values fed to NanoSeconds(latencyNs). NanoSeconds takes
+// int64_t, so a configured latency above INT64_MAX wraps the count negative
+// BEFORE the ×1e3/×1e6 resolution multiply — and a count below INT64_MAX
+// but above INT64_MAX/1e3 wraps at PS/FS — producing a negative Time the
+// completion callback then schedules in the past. Clamp the converted
+// Time against the remaining horizon the same way the rate machines do;
+// an unreachable completion stays unscheduled (the request was already
+// sent / queued, so the transfer's wire side is unaffected).
+Time
+ClampedSemanticLatencyNs(uint64_t latencyNs)
+{
+    const Time horizon = Time::Max() - Simulator::Now();
+    if (latencyNs > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    {
+        return horizon;
+    }
+    const Time t = NanoSeconds(static_cast<int64_t>(latencyNs));
+    if (t.IsStrictlyNegative() || t > horizon)
+    {
+        return horizon;
+    }
+    return t;
+}
+
+} // unnamed namespace
+
 NS_LOG_COMPONENT_DEFINE("FabricEndpointSend");
 
 void
@@ -1088,10 +1118,21 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
         // retained one expired EventId per completed request forever
         // (codex round 30, finding 3).
         PruneDeferredEgressEvents();
-        m_deferredEgressEvents.push_back(
-            Simulator::Schedule(NanoSeconds(latencyNs),
-                                &FabricEndpoint::NotifyMemorySemanticComplete,
-                                this, destRank, address, accessType));
+        // Round 74 (codex finding 9): clamp the uint64 config latency —
+        // raw NanoSeconds(latencyNs) wraps past INT64_MAX (and past
+        // INT64_MAX/1e3 at PS/FS resolution) into a past-dated
+        // completion.
+        const Time completionDelay = ClampedSemanticLatencyNs(latencyNs);
+        if (completionDelay < Time::Max() - Simulator::Now())
+        {
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(completionDelay,
+                                    &FabricEndpoint::NotifyMemorySemanticComplete,
+                                    this, destRank, address, accessType));
+        }
+        // else: completion beyond the horizon — the request is queued;
+        // its wire send happens when credits arrive, but the completion
+        // callback is dropped (same far-future policy as elsewhere).
         return;
     }
 
@@ -1111,10 +1152,15 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     // rationale as the credit-blocked path above — codex round 17,
     // finding 2). Pruned before each append (codex round 30, finding 3).
     PruneDeferredEgressEvents();
-    m_deferredEgressEvents.push_back(
-        Simulator::Schedule(NanoSeconds(latencyNs),
-                            &FabricEndpoint::NotifyMemorySemanticComplete,
-                            this, destRank, address, accessType));
+    // Round 74 (codex finding 9): same clamp as the credit-blocked path.
+    const Time completionDelay = ClampedSemanticLatencyNs(latencyNs);
+    if (completionDelay < Time::Max() - Simulator::Now())
+    {
+        m_deferredEgressEvents.push_back(
+            Simulator::Schedule(completionDelay,
+                                &FabricEndpoint::NotifyMemorySemanticComplete,
+                                this, destRank, address, accessType));
+    }
 }
 
 void

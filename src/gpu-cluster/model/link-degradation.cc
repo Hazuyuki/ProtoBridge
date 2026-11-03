@@ -13,11 +13,34 @@
 #include "ns3/enum.h"
 
 #include <algorithm>
+#include <limits>
 
 #include <cmath>
 
 namespace ns3
 {
+
+namespace
+{
+
+// Round 74 (codex finding 14): delay + duration is a raw Time sum — a
+// saturated duration makes the recovery deadline wrap mod 2^64 to a
+// negative/past firing (the recovery runs before the degradation even
+// fires). Saturate the raw tick sum like every other ledger addition in
+// this model.
+Time
+SaturatedAddTime(Time a, Time b)
+{
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
+}
+
+} // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("LinkDegradationModel");
 
@@ -511,17 +534,38 @@ LinkDegradationModel::ScheduleDegradation(Time delay, DegradationTrigger trigger
     m_scheduledTrigger = trigger;
     m_scheduledSeverity = severity;
 
-    // Schedule degradation
-    m_degradationEvent = Simulator::Schedule(delay,
-                                              &LinkDegradationModel::OnDegradationEvent,
-                                              this);
-
-    // Schedule recovery if duration is specified
-    if (duration > Time(0))
+    // Round 74 (codex finding 14): a delay at/beyond the remaining horizon
+    // wraps the scheduled deadline to a negative/past firing, so the
+    // degradation "starts" immediately. An unreachable degradation is
+    // dropped (no event armed), and its recovery is dropped too — the
+    // same far-future policy every other guarded Schedule site uses.
+    if (delay < Time::Max() - Simulator::Now())
     {
-        m_recoveryEvent = Simulator::Schedule(delay + duration,
-                                              &LinkDegradationModel::OnRecoveryEvent,
-                                              this);
+        // Schedule degradation
+        m_degradationEvent = Simulator::Schedule(delay,
+                                                 &LinkDegradationModel::OnDegradationEvent,
+                                                 this);
+
+        // Schedule recovery if duration is specified. The deadline is a
+        // saturated sum so a degenerate duration cannot wrap the recovery
+        // before the degradation fires; a recovery that would land at or
+        // beyond the horizon is also dropped.
+        if (duration > Time(0))
+        {
+            const Time recoveryDelay = SaturatedAddTime(delay, duration);
+            if (recoveryDelay < Time::Max() - Simulator::Now())
+            {
+                m_recoveryEvent = Simulator::Schedule(recoveryDelay,
+                                                      &LinkDegradationModel::OnRecoveryEvent,
+                                                      this);
+            }
+        }
+    }
+    else
+    {
+        NS_LOG_WARN("LinkDegradationModel: degradation delay beyond the "
+                    "representable horizon — event dropped (trigger="
+                    << static_cast<int>(trigger) << ")");
     }
 }
 

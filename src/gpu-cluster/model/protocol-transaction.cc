@@ -636,11 +636,23 @@ ProtocolTransactionExecutor::Advance()
                 break;
             case ProtocolTransactionNodeType::DELAY:
                 runtime.state = ProtocolTransactionNodeState::ACTIVE;
-                runtime.delayEvent = Simulator::Schedule(
-                    node.delay,
-                    &ProtocolTransactionExecutor::OnDelayExpired,
-                    this,
-                    id);
+                // Round 74 (codex finding 13): node.delay is a validated
+                // Time that accepts Time::Max(); Now()+Max wraps the
+                // scheduled deadline to a negative/past firing, completing
+                // the DELAY node immediately (and, worse, treating an
+                // explicit "wait forever" delay as zero). A delay at or
+                // beyond the remaining horizon leaves the node ACTIVE with
+                // no armed event — the node stays pending until the
+                // executor is disposed/restarted, matching the policy that
+                // far-future events are dropped, never clamped.
+                if (node.delay < Time::Max() - Simulator::Now())
+                {
+                    runtime.delayEvent = Simulator::Schedule(
+                        node.delay,
+                        &ProtocolTransactionExecutor::OnDelayExpired,
+                        this,
+                        id);
+                }
                 break;
             case ProtocolTransactionNodeType::COMPLETE:
                 MarkCompleted(id);

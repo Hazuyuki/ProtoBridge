@@ -31,6 +31,22 @@ TxKey(const FabricHeader& h)
                            h.GetSequenceNumber());
 }
 
+// Saturating add for Time (raw-tick) ledgers: a sum that would pass
+// INT64_MAX clamps to Time::Max() instead of wrapping negative (round 74
+// codex finding 4 — the receive-post free ledger addition wrapped to
+// -9223372036854775802, so PostReceive scheduled at that negative tick).
+Time
+SaturatedAddTime(Time a, Time b)
+{
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
+}
+
 bool
 Compare(uint64_t actual, RdmaComparison comparison, uint64_t expected)
 {
@@ -101,6 +117,17 @@ RdmaOperationEngine::Schedule(Time delay, std::function<void()> action)
                                       m_events.end(),
                                       [](const auto& event) { return event.IsExpired(); }),
                        m_events.end());
+    }
+    // Round 74 (codex finding 4): a configured delay at or beyond the
+    // remaining horizon (delay >= Time::Max() - Now()) wraps
+    // DefaultSimulatorImpl's `delay + TimeStep(now)` to a negative deadline
+    // that fires immediately (probe: signalPoll = Time::Max() at tick 7 ->
+    // callback at -9223372036854775802), and clamping to Time::Max() still
+    // EXECUTES the event at the end of time (same policy as the round-73/74
+    // endpoint and LLR fixes). An unreachable action stays unarmed.
+    if (delay.IsStrictlyNegative() || delay >= Time::Max() - Simulator::Now())
+    {
+        return;
     }
     m_events.push_back(Simulator::Schedule(delay, [this, action = std::move(action)] {
         if (!m_disposed)
@@ -327,7 +354,9 @@ RdmaOperationEngine::PostReceive(uint64_t id,
     auto receive = std::make_shared<PostedReceive>(
         PostedReceive{id, address, bytes, key, qp, peer, std::move(complete)});
     m_receivePostFree =
-        std::max(Simulator::Now(), m_receivePostFree) + m_model->GetConfig().receivePost;
+        SaturatedAddTime(std::max(Simulator::Now(), m_receivePostFree),
+                         m_model->GetConfig().receivePost);
+    // The ledger is saturated, so the relative delay below cannot wrap.
     Schedule(m_receivePostFree - Simulator::Now(),
              [this, receive] { m_receives.push_back(receive); });
 }
@@ -1090,8 +1119,17 @@ RdmaOperationEngine::RunAtomic(std::shared_ptr<Responder> responder)
         }
         else
         {
-            Time service = m_model->ReserveSourceRead(8) + m_model->ReserveDestinationWrite(8) +
-                           m_model->GetConfig().atomicService;
+            // Each Reserve* call returns a delay relative to now whose
+            // internal ledger already saturates at Time::Max() (see
+            // rdma-submission-model.cc). The composed `a + b + c` sum of
+            // relative delays still overflows int64 when two terms each
+            // hold ~INT64_MAX ticks (round 74 codex finding 4), so compose
+            // through SaturatedAddTime; the Schedule wrapper's horizon
+            // guard then drops the unreachable compose.
+            const Time service = SaturatedAddTime(
+                SaturatedAddTime(m_model->ReserveSourceRead(8),
+                                 m_model->ReserveDestinationWrite(8)),
+                m_model->GetConfig().atomicService);
             Schedule(service, std::move(execute));
         }
     };

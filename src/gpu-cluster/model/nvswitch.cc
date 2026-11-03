@@ -24,6 +24,29 @@
 namespace ns3
 {
 
+namespace
+{
+
+// Round 74 (codex findings 7+8): degenerate time sums must never reach
+// Simulator::Schedule. Time + Time wraps mod 2^64, so
+// encode=Time::Max()+decode=0 yields a NEGATIVE codingLatency that passes
+// the `> Seconds(0)` check and sends immediately, and startTime +
+// serializationTime wraps a saturated ledger into a past that re-runs
+// serialization "in the past". Saturate raw tick sums at INT64_MAX.
+Time
+SaturatedAddTime(Time a, Time b)
+{
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
+}
+
+} // unnamed namespace
+
 NS_LOG_COMPONENT_DEFINE("NvSwitch");
 
 NS_OBJECT_ENSURE_REGISTERED(NvSwitch);
@@ -1142,7 +1165,8 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
             wireSize = header.GetSerializedSize()
                        + m_fecModel->GetEncodedSize(header.GetPayloadSize());
         }
-        codingLatency = m_fecModel->GetEncodeLatency() + m_fecModel->GetDecodeLatency();
+        codingLatency = SaturatedAddTime(m_fecModel->GetEncodeLatency(),
+                                         m_fecModel->GetDecodeLatency());
     }
     m_txTrace(packet);
     m_txPackets++;
@@ -1171,7 +1195,11 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
     // 1000-B chunk on 400G = 2.0x derate). The pipeline term still appears
     // per packet in the arrival delay below.
     Time startTime = std::max(Simulator::Now(), m_outputBusyUntil[outPort]);
-    m_outputBusyUntil[outPort] = startTime + serializationTime;
+    // Round 74 (codex finding 8): the busy-until ledger is a raw Time sum —
+    // a degenerate serializationTime (or a start already near Max) wraps
+    // the ledger negative, after which every later packet on this port
+    // serializes "in the past" (startTime collapses to Now). Saturate.
+    m_outputBusyUntil[outPort] = SaturatedAddTime(startTime, serializationTime);
 
     // Egress serialization + cut-through pipeline + propagation delay
     // models the full packet traversal including per-port contention.
@@ -1207,22 +1235,37 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
 
             // Schedule Receive() at completion time:
             // startTime + pipeline + serialization + propagation
-            Time totalDelay = (startTime - Simulator::Now())
-                            + NanoSeconds(m_cutThroughDelayNs)
-                            + serializationTime
-                            + codingLatency
-                            + propDelay;
+            // Round 74 (codex finding 8): every term is a raw Time sum —
+            // any one of them (or the chain) can wrap mod 2^64 to a
+            // deadline in the past. Saturate each addition so an
+            // unreachable arrival lands at Time::Max() and is dropped by
+            // the horizon guard below instead of firing immediately.
+            Time totalDelay = SaturatedAddTime(
+                SaturatedAddTime(
+                    SaturatedAddTime(
+                        SaturatedAddTime(startTime - Simulator::Now(),
+                                         NanoSeconds(m_cutThroughDelayNs)),
+                        serializationTime),
+                    codingLatency),
+                propDelay);
 
-            PppHeader ppp;
-            ppp.SetProtocol(0x0021);
-            Ptr<Packet> pppPacket = packet->Copy();
-            pppPacket->AddHeader(ppp);
+            if (totalDelay < Time::Max() - Simulator::Now())
+            {
+                PppHeader ppp;
+                ppp.SetProtocol(0x0021);
+                Ptr<Packet> pppPacket = packet->Copy();
+                pppPacket->AddHeader(ppp);
 
-            Simulator::ScheduleWithContext(dstDevice->GetNode()->GetId(),
-                                           totalDelay,
-                                           &PointToPointNetDevice::Receive,
-                                           dstDevice,
-                                           pppPacket);
+                Simulator::ScheduleWithContext(dstDevice->GetNode()->GetId(),
+                                               totalDelay,
+                                               &PointToPointNetDevice::Receive,
+                                               dstDevice,
+                                               pppPacket);
+            }
+            // else: arrival beyond the representable horizon — drop the
+            // scheduled receive (the packet was already counted in
+            // m_txPackets/m_txBytes above, matching every other
+            // far-future-delay policy in this model).
             return;
         }
     }
@@ -2150,15 +2193,23 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
                 pkt->AddAtEnd(Create<Packet>(static_cast<uint32_t>(padding)));
                 wireSize = header.GetSerializedSize() + encodedPayloadSize;
             }
-            codingLatency = m_fecModel->GetEncodeLatency()
-                            + m_fecModel->GetDecodeLatency();
+            // Round 74 (codex finding 7): raw Time+Time wraps mod 2^64 —
+            // encode=Time::Max()+decode=0 yields a NEGATIVE sum that passes
+            // the `> Seconds(0)` check below and then schedules the send at
+            // a wrapped deadline in the past (immediate TX, probe showed
+            // -9223372036854775802). Saturate the codec-latency ledger.
+            codingLatency = SaturatedAddTime(m_fecModel->GetEncodeLatency(),
+                                             m_fecModel->GetDecodeLatency());
         }
     }
     m_txTrace(pkt);
     m_txPackets++;
     m_txBytes += wireSize;
 
-    if (codingLatency > Seconds(0))
+    // Round 74 (codex finding 7): also drop an unrepresentable deferred
+    // send — a latency at/beyond the remaining horizon wraps the schedule
+    // the same way as a wrapped sum does.
+    if (codingLatency > Seconds(0) && codingLatency < Time::Max() - Simulator::Now())
     {
         // Prune fired events at every append: this site fires once per FEC
         // result fragment and its lambda captures pkt BY VALUE — without
@@ -2174,10 +2225,12 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
                 }
             }));
     }
-    else
+    else if (codingLatency <= Seconds(0))
     {
         m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
     }
+    // else: unrepresentable horizon — the result fragment is dropped, which
+    // matches every other far-future-delay policy in this model.
 }
 
 void

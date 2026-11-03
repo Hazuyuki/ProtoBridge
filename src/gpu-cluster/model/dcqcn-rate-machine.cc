@@ -19,6 +19,38 @@
 namespace ns3
 {
 
+namespace
+{
+
+// Round 74 (codex findings 5+6): a configured recovery interval or a pacer
+// ledger nanosecond count at or beyond the remaining horizon wraps
+// DefaultSimulatorImpl's `delay + TimeStep(now)` to a negative deadline
+// that fires immediately (probe: TFast = Time::Max() at tick 7 -> timer
+// armed at -9223372036854775802 and alpha shrunk past the horizon), and at
+// PS/FS resolution NanoSeconds(int64_t) multiplies by 1e3/1e6 first, so a
+// nanosecond count below INT64_MAX but above INT64_MAX/1e3 still wraps to
+// a negative Time. Unreachable timers stay unarmed; a wrapped nanosecond
+// count saturates at Time::Max().
+bool
+IsUnrepresentableDelay(Time delay)
+{
+    return delay >= Time::Max() - Simulator::Now();
+}
+
+Time
+ClampedNanoSeconds(int64_t delayNs)
+{
+    const Time horizon = Time::Max() - Simulator::Now();
+    const Time t = NanoSeconds(delayNs);
+    if (t.IsStrictlyNegative() || t > horizon)
+    {
+        return horizon;
+    }
+    return t;
+}
+
+} // unnamed namespace
+
 NS_LOG_COMPONENT_DEFINE("DcqcnRateMachine");
 
 NS_OBJECT_ENSURE_REGISTERED(DcqcnRateMachine);
@@ -172,12 +204,21 @@ DcqcnRateMachine::OnCnp(FlowKey flowKey)
     }
 
     // Arm fast recovery (re-arm if already pending so the timer resets).
+    // Round 74 (codex finding 5): a degenerate interval at or beyond the
+    // remaining horizon wraps the schedule to a negative deadline and the
+    // timer fires immediately, shrinking alpha past the horizon — no timer
+    // is armed for an unreachable interval.
     if (s.fastArmed)
     {
         Simulator::Cancel(s.fastTimer);
+        s.fastArmed = false;
     }
-    s.fastTimer = Simulator::Schedule(m_tFast, &DcqcnRateMachine::FastRecovery, this, flowKey);
-    s.fastArmed = true;
+    if (!IsUnrepresentableDelay(m_tFast))
+    {
+        s.fastTimer =
+            Simulator::Schedule(m_tFast, &DcqcnRateMachine::FastRecovery, this, flowKey);
+        s.fastArmed = true;
+    }
 }
 
 void
@@ -198,13 +239,18 @@ DcqcnRateMachine::FastRecovery(FlowKey flowKey)
 
     if (s.fastCycles < m_fastRecoveryMaxCycles)
     {
-        s.fastTimer = Simulator::Schedule(m_tFast, &DcqcnRateMachine::FastRecovery, this, flowKey);
-        s.fastArmed = true;
+        // Same horizon guard as OnCnp: an unreachable interval arms no timer.
+        if (!IsUnrepresentableDelay(m_tFast))
+        {
+            s.fastTimer =
+                Simulator::Schedule(m_tFast, &DcqcnRateMachine::FastRecovery, this, flowKey);
+            s.fastArmed = true;
+        }
     }
     else
     {
         // Fast cycles spent: hand off to additive increase until the floor.
-        if (s.alpha > m_alphaFloor)
+        if (s.alpha > m_alphaFloor && !IsUnrepresentableDelay(m_tAi))
         {
             s.aiTimer =
                 Simulator::Schedule(m_tAi, &DcqcnRateMachine::AdditiveIncrease, this, flowKey);
@@ -226,7 +272,7 @@ DcqcnRateMachine::AdditiveIncrease(FlowKey flowKey)
         s.alpha = m_alphaFloor;
     }
 
-    if (s.alpha > m_alphaFloor)
+    if (s.alpha > m_alphaFloor && !IsUnrepresentableDelay(m_tAi))
     {
         s.aiTimer = Simulator::Schedule(m_tAi, &DcqcnRateMachine::AdditiveIncrease, this, flowKey);
         s.aiArmed = true;
@@ -261,8 +307,21 @@ DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     if (m_perQpCeilingGbps > 0.0)
     {
         // 1 Gbps = 1e9 bit/s = 1.25e8 B/s (matches MaxRateBps 50e9 == 400 G).
-        double ceilingBps = m_perQpCeilingGbps * 1.25e8;
-        rateBps = (rateBps > 0.0) ? std::min(rateBps, ceilingBps) : ceilingBps;
+        // Round 74 (codex finding 15): a finite configured ceiling can
+        // still overflow this product (ceiling = 1e301 Gbps -> 1.25e309,
+        // past DBL_MAX -> SIGFPE under feenableexcept(FE_OVERFLOW)).
+        // Guard the product before it is formed: a ceiling that cannot fit
+        // binary64 as bytes-per-second means "no finite ceiling", i.e.
+        // every chunk is un-paced on this branch — the rateBps from the
+        // alpha path (or 0) is used unchanged, which is the correct
+        // effective rate for a ceiling that exceeds every representable
+        // rate anyway.
+        if (m_perQpCeilingGbps <= 9223372036854775807.0 / 1.25e8)
+        {
+            double ceilingBps = m_perQpCeilingGbps * 1.25e8;
+            rateBps = (rateBps > 0.0) ? std::min(rateBps, ceilingBps) : ceilingBps;
+        }
+        // else: unbounded ceiling — leave rateBps as the alpha path set it.
     }
     if (rateBps <= 0.0)
     {
@@ -283,15 +342,25 @@ DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     // pre-check on the seconds quotient; the guarded product is bit-identical
     // to the historical (bytes / rate) * 1e9 on every non-overflow input. A
     // NaN rate saturates too: !(NaN <= x) is true.
-    const double slotSec = static_cast<double>(chunkBytes) / rateBps;
+    // Round 74 (codex finding 15): the same must hold for the DIVISION
+    // itself — a subnormal rateBps (e.g. double::denorm_min() after the
+    // rounding of m_perQpCeilingGbps * 1.25e8) makes chunkBytes / rateBps
+    // overflow to +inf, which is a FE_OVERFLOW FP exception before the
+    // bound check runs. Pre-check the division: chunkBytes <= rateBps *
+    // (INT64_MAX / 1e9) keeps the quotient inside the nanosecond bound the
+    // second guard already enforces. Any slower or NaN rate saturates.
+    const double maxSlotSec = 9223372036854775807.0 / 1e9;
     double slotNsD;
-    if (!(slotSec <= 9223372036854775807.0 / 1e9))
+    if (!(static_cast<double>(chunkBytes) <= rateBps * maxSlotSec))
     {
+        // chunkBytes/rateBps overflows, is +inf, or is NaN — the slot is
+        // unrepresentable either way.
         slotNsD = 9223372036854775807.0;
     }
     else
     {
-        slotNsD = slotSec * 1e9;
+        const double slotSec = static_cast<double>(chunkBytes) / rateBps;
+        slotNsD = (slotSec <= maxSlotSec) ? slotSec * 1e9 : 9223372036854775807.0;
     }
     if (!(slotNsD <= 9223372036854775807.0))
     {
@@ -320,7 +389,13 @@ DcqcnRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     s.nextSendNs = (slotNs > std::numeric_limits<int64_t>::max() - (nowNs + delayNs))
                        ? std::numeric_limits<int64_t>::max()
                        : (nowNs + delayNs) + slotNs;
-    return (delayNs > 0) ? NanoSeconds(delayNs) : Time(0);
+    // Round 74 (codex finding 6): NanoSeconds(delayNs) multiplies the
+    // count by 1e3 at PS and 1e6 at FS before Schedule sees the result,
+    // so a delayNs below INT64_MAX but above INT64_MAX/1e3 wraps to a
+    // negative Time and bypasses the endpoint shaping gate (probe: PS,
+    // 1-MiB chunks, 2^-40-Gbps floor/ceiling -> second chunk paced at
+    // -1000 ticks). Saturate at the remaining horizon instead.
+    return (delayNs > 0) ? ClampedNanoSeconds(delayNs) : Time(0);
 }
 
 double
