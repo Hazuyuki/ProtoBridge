@@ -6,6 +6,149 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 67: 8 findings, 6 fixed, 3 documented
+
+**What.** Round-67 review of commit bba3286 returned 8 verification verdicts on
+the round-66 claims plus 3 standing-sweep gaps. Every numerical claim was
+re-verified with exact python arithmetic (replicating the binary64 evaluation
+order of each C++ expression) before any change: the round-66 CHANGES.md entry
+contained documentation errors (corrected below), the Reserve seconds
+pre-guard boundary was one ULP too high (fixed), and the round-66 SaturatedAdd
+introduced a resolution-dependent regression (fixed by saturating in ticks,
+not nanoseconds).
+
+**Fixed (P1).**
+
+1. **Reserve seconds pre-guard boundary was one ULP too high (round-67 finding
+   5).** The round-66 guard compared `sec <= 9.223372036854776e9`, but
+   `(double)INT64_MAX` rounds UP to 2^63 in binary64, so a seconds quotient of
+   exactly 2^63/1e9 = 9223372036.854776 passes the comparison and then
+   overflows int64 inside `Seconds()` (the checked multiplication asserts).
+   Reachable at wqeBytes=64, pcieReadGbps=2^-54. The bound is now one ULP
+   down: `9.223372036854775e9` (product 9223372036854774784 = INT64_MAX-1023,
+   1023 ns of headroom; python-verified). Probe: `OLD bound 9.223372036854776e9:
+   bytes=64 gbps=2^-54 -> sec=9223372036.854776 saturated=True` (the OLD guard
+   took the Seconds() branch at exactly 2^63/1e9 — the probe confirms the
+   boundary failure); `NEW bound product: 9.223372036854775e9 * 1e9 =
+   9223372036854774784 fits=True headroom=1023`; `NEW bound 125MB @ 2^-34 ->
+   sec=17179869184.0 saturated=True` (exact-2^63 probe still saturates).
+
+2. **SaturatedAdd regressed at PS resolution (round-67 finding 4).** The
+   round-66 helper converted both operands to nanoseconds and reconstructed
+   the sum via `Time(int64)`. `GetNanoSeconds()` is correct at any
+   resolution, but `Time(int64)` interprets its argument as ticks in the
+   CURRENT resolution: at PS (10^12 ticks/s) `Time(3e9)` is 3e9 ticks =
+   0.003 s, so `Seconds(1)+Seconds(2)` returned 0.003 s instead of 3 s
+   (python-verified). The helper now saturates against the ACTUAL tick
+   storage (`GetTimeStep()`) and constructs the saturated result via
+   `Time::Max()` — never `Time(int64)` or `Seconds()` on a large value
+   (Seconds routes value*tpsPerSecond through the 128-bit fixed-point
+   multiply, which asserts on overflow: at MS the INT64_MAX-ns product blows
+   past 2^63, so a PS/FS-built saturated Time could not be reconstructed at
+   a coarser resolution anyway — the far-future bound is resolution-dependent
+   by construction). Probes (python, all PASS): `Seconds(1)+Seconds(2)` is
+   exactly 3 s at every built-in resolution Y..FS; `INT64_MAX-1 + 2` and
+   `INT64_MAX + 1` saturate to `Time::Max()`; `0 + 5 = 5`; `-3 + 7 = 7`.
+
+3. **Unchecked downstream Time additions (round-67 finding 4, caller chain).**
+   Three compositions in fabric-endpoint.cc added a serialization time to an
+   already-saturated delay with a plain `+`:
+   `totalDelay + serialization` (WFQ backlog decrement, ~line 3572),
+   `delay + serialization` (FEC branch, ~3610) and
+   `shapingDelay + serialization` (immediate branch, ~3648). With a saturated
+   pacer slot the sum overflows the signed tick storage before
+   `Simulator::Schedule()` runs. All three now wrap the addition in
+   `SaturatedAdd` (probes: saturated totalDelay + serialization ->
+   `Time::Max()`). The RDMA model's four caller sites had the same shape —
+   `std::max(memory, pcie) + m_config.dmaReadLatency - now` in
+   ReserveSourceRead/DestinationWrite and the D2h/H2d variants — and now use
+   a local `SaturatedAddTime` (same tick-based saturation) before the `- now`
+   subtraction, which runs on a non-negative remainder.
+
+4. **Surrogate spray chunk size did not mirror the C++ 2^30 cap (round-67
+   standing sweep).** `FabricEndpoint::SetSprayChunkSize` caps the spray
+   chunk at `1u << 30` (fabric-endpoint.cc), but the surrogate accepted any
+   value, so a config the C++ endpoint would clamp (spray=2^31 or 2^32)
+   produced a different fragment geometry than the wire. The surrogate
+   `__init__` now applies the same `min(spray_chunk_bytes, 1 << 30)` cap.
+   Probes (python): `spray 2^31 -> capped to 1073741824`; `data=2^36` with
+   the cap gives (64, 2^30) chunks, matching the C++ geometry
+   `numChunks=max(lanes=18, ceil(2^36/2^30))=64`; the round-66 probe
+   `data=2^53+1` still returns (8388609, 1073741697).
+
+**Documented (P2).**
+
+5. **RoCE absolute Buffer-offset bound (round-67 finding 1, standing sweep).**
+   The round-66 PPP-inclusive guard bounds `targetWire + header + 2` at
+   UINT32_MAX, which protects the header-chain field arithmetic, but the
+   absolute end offset `zeroAreaStart(64) + targetWire + header + PPP` can
+   still exceed 2^32 while each field fits: at the guard's PASS boundary
+   (targetWire = 4294967252) the absolute end is 4294967359, which wraps
+   uint32 to 63 < zeroAreaStart 64, and the first `AddAtEnd`/`AddHeader`
+   assert fires on the underflowed `GetInternalEnd()`. Closing it needs an
+   absolute (start-relative) bound, not a field-relative one. Unreachable in
+   any harness or parity configuration: it requires a wire-efficiency padded
+   single chunk of >4.29 GB, while `SetBulkChunkSize`/`SetSprayChunkSize` cap
+   every body at 2^30 and the collective paths fragment at or below that.
+   Documented; no code change.
+
+6. **Time(int64) resolution caveat (round-67 finding 7, correction).** The
+   round-66 entry called the small-N NVL72 stall and this caveat
+   "unreachable in any harness/parity test configuration" — inaccurate for
+   the NVL72 case: `scratch/gpu-cluster-sim.cc:2199` reaches the single-group
+   repair for `--numGpus<6` by construction. The caveat stands as a
+   representation property (Time stores int64 ticks; the far-future bound is
+   resolution-dependent), now with correct reachability wording.
+
+7. **Division-overflow threshold correction (round-67 finding 7).** The
+   round-66 entry gave ~1e-292 Gbps as the division-overflow threshold for a
+   1-MiB chunk; the correct threshold is ~4.66631e-311 Gbps
+   (DBL_MAX / (2^20 * 8) bits/s, python-verified). Still diagnostic-only;
+   no harness exercises it.
+
+**Corrections to the round-66 CHANGES.md entry (round-67 finding 1).**
+(a) The W=1 row was described ambiguously: E=W*M passes and E=W*M+1 ABORTS
+like every other W (the geometry is one chunk, E*W/W=E<=M, so E=M+1 is the
+first failing value) — the entry's "except W=1" phrasing was wrong.
+(b) The PPP probe row claimed body=4294967255 PASSES; the sum
+4294967255+39+2 = 4294967296 > UINT32_MAX ABORTS. The correct PASS boundary
+is body=4294967254 (sum 4294967295 = UINT32_MAX).
+(c) The lane-pad asymmetry at W=3 was labeled "not a false positive"; the
+anchored shares at E=6442450943 are [4294967295, 2147483648], both
+representable — the guard is conservative there, not exact. The closed-form
+boundary B(W) = floor(2*M*W/(W+1))+1 <= W*M+1 holds for all odd W=3..8191
+with links=2, spray=4096 (codex's 26,334,400-interval sweep found no false
+aborts).
+(d) The round-66 "Verified" section listed the suite name `drop-tail-queue-disc`;
+the correct registered name is `drop-tail-queue`.
+(e) The NaN-saturation claim was wrong: NaN never reaches the inner
+comparison because the outer `gbps > 0` is false for NaN; NaN rates are
+rejected at config validation.
+(f) The "wqeBytes=125000000 @ 2^-34 quotient ~4.3e18" figure was wrong; the
+quotient is exactly 2^34 s.
+(g) The 10149.7/10401.0 DCQCN "anchor" in the round-66 Verified section was
+re-measured: at the documented tor-flags configuration both dcqcn=1 and
+dcqcn=0 give simTimeUs=20802.4 (ecn 99985/99985/99974 vs 0/0/0); the
+10401.0 figure only appears WITHOUT `--interNodeTopology=tor`.
+
+**Verified.** (a) Build clean. (b) Parity scripts (16) PASS, plus
+test_ibgda.py / test_config_fec_enabled.py under pytest (18 passed).
+(c) Surrogate pytest 101 passed. (d) Round-67 python probes: Reserve
+boundary (headroom 1023 ns), SaturatedAdd at every built-in resolution
+(3 s exact at Y..FS), surrogate 2^30 cap, RoCE absolute-offset wrap
+(63 < 64) — all PASS. (e) DCQCN anchors at the documented tor
+configuration: `--bulkChunkSize=1000 --dcqcn=1` simTimeUs=20802.4,
+ecnMarkedPackets=99985, cnpPacketsSent=99985, cnpPacketsReceived=99974;
+`--dcqcn=0` simTimeUs=20802.4, counters 0/0/0. (f) Traffic-control smoke:
+Unforced drop 37/55500, Packets/Bytes sent 6887/10302800 (exact, matches
+the round-64 pin). (g) 13 queue-disc suites PASS with the correct
+registered names (adaptive-red-queue-disc, cobalt-queue-disc,
+codel-queue-disc, drop-tail-queue, fifo-queue-disc, fq-cobalt-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, pfifo-fast-queue-disc,
+pie-queue-disc, prio-queue-disc, queue-disc-traces, red-queue-disc).
+(h) Full `./test.py` at this commit: 805 of 805 tests passed (0 skipped,
+0 failed, 0 crashed), exit 0.
+
 ### Reviewed — codex round 66: 8 findings, 6 fixed, 3 documented
 
 **What.** Round-66 review of commit 643b304 returned 8 findings (3 P1, 5 P2).
@@ -14,7 +157,13 @@ the binary64 evaluation order of each C++ expression) before any change.
 Findings 1–3, 6, 7 and the round-65 deferred caller-addition chain (finding 4)
 are fixed; findings 4 (small-N NVL72 single-group stall), 5 (Time(int64)
 resolution caveat) and 8 (division overflow at chunkBytes > rateBps*DBL_MAX)
-are documented.
+are documented. **Round-67 corrections to this entry's Verified section and
+finding texts are recorded in the round-67 entry above (PPP PASS boundary is
+body=4294967254 not 4294967255; the W=1 row aborts at E=M+1 like all W; the
+lane-pad asymmetry at W=3 is conservative, not exact; the suite name is
+drop-tail-queue; NaN never reaches the inner comparison; the 2^-34 quotient is
+exactly 2^34 s; the 1-MiB division-overflow threshold is ~4.66631e-311 Gbps;
+the 10401.0/10149.7 DCQCN figures belong to the non-tor configuration).**
 
 **Fixed (P1).**
 

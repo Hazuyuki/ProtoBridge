@@ -532,6 +532,30 @@ RdmaSubmissionModel::Schedule(Time delay, std::function<void()> fn)
     }));
 }
 
+// Saturated Time addition (round 67, codex finding 4): the Reserve()
+// ledger can pin `free` at Time::Max() (a degenerate configured rate with
+// a multi-byte WQE: wqeBytes=64, pcieReadGbps=2^-54 saturates the service
+// seconds pre-guard), and adding a positive configured DMA latency to it
+// overflows the signed Time storage. Saturate against the tick storage and
+// construct the saturated result via Time::Max() — never Time(int64) or
+// Seconds() on a large value (see the SaturatedAdd comment in
+// fabric-endpoint.cc for the full reasoning; the same constraints apply).
+static Time
+SaturatedAddTime(Time a, Time b)
+{
+    if (a <= Time(0) || b <= Time(0))
+    {
+        return (a <= Time(0)) ? b : a;
+    }
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
+}
+
 Time
 RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earliest)
 {
@@ -548,9 +572,18 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
     if (gbps > 0)
     {
         const double sec = static_cast<double>(bytes) * 8 / (gbps * 1e9);
-        if (!(sec <= 9.223372036854776e9))
+        // Round 67 (codex finding 5): 9.223372036854776e9 is one ULP too
+        // high — (double)INT64_MAX rounds UP to 2^63, so sec = 2^63/1e9
+        // passes this comparison but overflows int64 inside Seconds()
+        // (2^63 ns is exactly representable in binary64, hence passes
+        // "<= 2^63"). Reachable at wqeBytes=64, pcieReadGbps=2^-54
+        // (probe). One ULP down (9.223372036854775e9) has product
+        // 9223372036854774784 = INT64_MAX - 1023, safely in range.
+        // The !(x <= y) form also catches a NaN gbps here (NaN never
+        // reaches the inner comparison: gbps > 0 is false at the NaN
+        // configuration which is rejected at config validation anyway).
+        if (!(sec <= 9.223372036854775e9))
         {
-            // !(x <= y) also catches a NaN gbps.
             service = Time(std::numeric_limits<int64_t>::max());
         }
         else
@@ -588,7 +621,10 @@ RdmaSubmissionModel::ReserveSourceRead(uint64_t bytes)
         memory = Reserve(bytes, m_config.hostReadGbps, m_hostMemory->readFree, now);
     }
     Time pcie = Reserve(bytes, m_config.pcieReadGbps, m_pcieReadFree, now);
-    return std::max(memory, pcie) + m_config.dmaReadLatency - now;
+    // Round 67 (codex finding 4): saturate the composed latency — `free` may
+    // be pinned at Time::Max() (see Reserve() above), and the configured
+    // dmaReadLatency addition would overflow the signed Time storage.
+    return SaturatedAddTime(std::max(memory, pcie), m_config.dmaReadLatency) - now;
 }
 
 Time
@@ -607,7 +643,8 @@ RdmaSubmissionModel::ReserveDestinationWrite(uint64_t bytes)
         memory = Reserve(bytes, m_config.hostWriteGbps, m_hostMemory->writeFree, now);
     }
     Time pcie = Reserve(bytes, m_config.pcieWriteGbps, m_pcieWriteFree, now);
-    return std::max(memory, pcie) + m_config.dmaWriteLatency - now;
+    // Round 67 (codex finding 4): saturate — see ReserveSourceRead above.
+    return SaturatedAddTime(std::max(memory, pcie), m_config.dmaWriteLatency) - now;
 }
 
 Time
@@ -620,7 +657,8 @@ RdmaSubmissionModel::ReserveSourceD2h(uint64_t bytes)
     Time hbm = Reserve(bytes, m_config.hbmReadGbps, m_hbmReadFree, now);
     Time host = Reserve(bytes, m_config.hostWriteGbps, m_hostMemory->writeFree, now);
     Time copy = Reserve(bytes, m_config.d2hGbps, m_d2hFree, now);
-    return std::max({hbm, host, copy}) + m_config.d2hLatency - now;
+    // Round 67 (codex finding 4): saturate — see ReserveSourceRead above.
+    return SaturatedAddTime(std::max({hbm, host, copy}), m_config.d2hLatency) - now;
 }
 
 Time
@@ -633,7 +671,8 @@ RdmaSubmissionModel::ReserveDestinationH2d(uint64_t bytes)
     Time host = Reserve(bytes, m_config.hostReadGbps, m_hostMemory->readFree, now);
     Time hbm = Reserve(bytes, m_config.hbmWriteGbps, m_hbmWriteFree, now);
     Time copy = Reserve(bytes, m_config.h2dGbps, m_h2dFree, now);
-    return std::max({host, hbm, copy}) + m_config.h2dLatency - now;
+    // Round 67 (codex finding 4): saturate — see ReserveSourceRead above.
+    return SaturatedAddTime(std::max({host, hbm, copy}), m_config.h2dLatency) - now;
 }
 
 void

@@ -33,12 +33,29 @@ namespace
 {
 
 // Saturated Time addition (round 66, codex finding 4): the pacer machines
-// can return a saturated INT64_MAX-ns delay (a tiny configured rate with a
+// can return a saturated INT64_MAX-tick delay (a tiny configured rate with a
 // multi-MiB chunk), and adding any positive component to it overflows the
 // signed Time storage. Saturate at Time::Max() — a saturated component
 // already means "no earlier than the far-future bound". Normal inputs take
 // the plain addition (each positive component is far below the horizon, so
 // the pairwise-saturated sum is exact).
+//
+// Round 67 (codex finding 4): saturate against the ACTUAL tick storage, not
+// the nanosecond projection, and construct the saturated result via
+// Time::Max() — never Time(int64) or Seconds() on a large value:
+//  - Time(int64) interprets its argument as ticks in the CURRENT resolution,
+//    so a ns sum stored that way comes back 10^3x wrong at PS and 10^6x
+//    wrong at FS (Seconds(1)+Seconds(2) = 0.003 s at PS).
+//  - Seconds(x) routes x * ticksPerSecond through the 128-bit fixed-point
+//    multiply, which asserts on overflow: at MS/NS the INT64_MAX-ns product
+//    blows past 2^63, so a PS/FS-built SaturatedAdd result could not be
+//    reconstructed at a coarser resolution anyway — the far-future bound is
+//    resolution-dependent by construction (Time::Max() is INT64_MAX ticks,
+//    9.2e9 s at NS but 9.2e3 s at PS).
+//  - Time::Max().GetNanoSeconds() is exact at every built-in resolution
+//    (Y..S: integer ns/tick divide; MS..NS: factor multiply with <= INT64_MAX
+//    product; PS/FS: no harness or parity path changes the resolution from
+//    the NS default, so the PS/FS projection overflow is unreachable here).
 Time
 SaturatedAdd(Time a, Time b)
 {
@@ -46,11 +63,13 @@ SaturatedAdd(Time a, Time b)
     {
         return (a <= Time(0)) ? b : a;
     }
-    const int64_t aNs = a.GetNanoSeconds();
-    const int64_t bNs = b.GetNanoSeconds();
-    return Time(bNs > std::numeric_limits<int64_t>::max() - aNs
-                    ? std::numeric_limits<int64_t>::max()
-                    : aNs + bNs);
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
 }
 
 } // unnamed namespace
@@ -3569,7 +3588,10 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 // a replacement model gets debited for backlog it never
                 // accrued.
                 Ptr<ContentionModel> model = m_contentionModel;
-                Time txDone = totalDelay + serialization;
+                // Round 67 (codex finding 4): totalDelay can be the
+                // saturated far-future bound; adding serialization to it
+                // overflows the signed Time storage. Saturate the sum.
+                Time txDone = SaturatedAdd(totalDelay, serialization);
                 EventId decrEv = Simulator::Schedule(txDone, [model, tc]() {
                     if (model)
                     {
@@ -3607,12 +3629,15 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             {
                 Ptr<ContentionModel> model = m_contentionModel;
                 Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-                EventId decrEv = Simulator::Schedule(delay + serialization, [model, tc]() {
-                    if (model)
-                    {
-                        model->DecrementBacklog(tc);
-                    }
-                });
+                // Round 67 (codex finding 4): saturate — delay can be the
+                // saturated far-future bound (see the WFQ branch above).
+                EventId decrEv = Simulator::Schedule(SaturatedAdd(delay, serialization),
+                                                     [model, tc]() {
+                                                         if (model)
+                                                         {
+                                                             model->DecrementBacklog(tc);
+                                                         }
+                                                     });
                 m_deferredEgressEvents.push_back(decrEv);
                 TrackBacklogDecrement(decrEv, model, tc);
             }
@@ -3645,12 +3670,15 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // increment ran on (codex round 20, finding 7 — see the WFQ branch).
         Ptr<ContentionModel> model = m_contentionModel;
         Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-        EventId decrEv = Simulator::Schedule(shapingDelay + serialization, [model, tc]() {
-            if (model)
-            {
-                model->DecrementBacklog(tc);
-            }
-        });
+        // Round 67 (codex finding 4): saturate — shapingDelay can be the
+        // saturated far-future bound (see the WFQ branch above).
+        EventId decrEv = Simulator::Schedule(SaturatedAdd(shapingDelay, serialization),
+                                             [model, tc]() {
+                                                 if (model)
+                                                 {
+                                                     model->DecrementBacklog(tc);
+                                                 }
+                                             });
         m_deferredEgressEvents.push_back(decrEv);
         TrackBacklogDecrement(decrEv, model, tc);
     }

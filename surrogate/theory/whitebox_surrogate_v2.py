@@ -151,7 +151,12 @@ class TheoryDerivedSurrogate:
         self.credit_bdp_ring = credit_bdp_ring_packets
         self.credit_bdp_tree = credit_bdp_tree_packets
         self.chunk_size = spray_chunk_bytes
-        self.spray_chunk_bytes = spray_chunk_bytes
+        # Round 67 (codex finding 5): mirror FabricEndpoint::SetSprayChunkSize
+        # (fabric-endpoint.cc), which caps the spray chunk at 1u << 30. The
+        # surrogate previously accepted any value, so a config that the C++
+        # endpoint would clamp (e.g. 2 GiB) produced a different fragment
+        # count here than on the wire.
+        self.spray_chunk_bytes = min(spray_chunk_bytes, 1 << 30)
         self.bulk_chunk_size = bulk_chunk_bytes
         self.num_lanes = num_lanes
         self.T_min_switch = t_min_switch_us
