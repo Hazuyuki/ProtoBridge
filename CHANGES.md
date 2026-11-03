@@ -6,6 +6,92 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 71: 5 findings, all 5 fixed
+
+Reviewed commit 00b9909 (round-70 fixes). Findings:
+
+1. **Reserve()'s per-resolution multiply overflowed before the saturation
+   bound could fire (round-71 finding 1, medium).** The round-70 guard
+   compared the PRODUCT `sec * tps` against 2^63, but the multiply itself
+   ran first: at FS the product overflows binary64 (FE_OVERFLOW, SIGFPE
+   under traps) for finite sec as small as ~5.12e293 (exact-arithmetic
+   probe: 64 B @ gbps = 1e-300 -> sec = 5.1200000000000005e+293,
+   sec * 1e15 = inf). The round-70 claim "overflow bound far beyond any
+   finite sec" was wrong. Fixed: the bound check now compares `sec`
+   itself against `(2^63 - 2^11) / ticksPerSecond` BEFORE any multiply,
+   so no overflowable multiply remains; the one-ULP margin absorbs
+   double-rounding of the `bytes * 8 / (gbps * 1e9)` division so
+   Seconds() can never reach the checked 2^63 multiply inside ns-3.
+
+2. **Double-multiply + llround double-rounded against ns-3's int64x64
+   conversion (round-71 finding 2, medium).** `llround(sec * tps)`
+   rounds the binary64 product, not the real value; ns-3's Seconds()
+   converts through 64.64 fixed point and rounds that, and the two
+   disagree by one tick for inputs where the binary64 product lands
+   exactly on a half-integer (exact-arithmetic probe at NS: 64 B @
+   204.8 Gbps -> double product 2.5 exactly -> llround gives 3, while
+   the fixed-point value 2.499999999985153... rounds to 2). Fixed: the
+   conversion now delegates every in-range service to Seconds() itself,
+   so ReserveSourceRead matches ns-3's tick count exactly (native probe
+   post-fix: ReserveSourceRead_ticks == Seconds(sec)_ticks for all
+   in-range probes).
+
+3. **Y/D/H/MIN silently fell through to the FS branch (round-71 finding
+   3, medium).** The round-70 switch handled S/MS/US/NS/PS and let
+   default take FS — but ns-3's Time::Y/D/H/MIN also fall into default,
+   where the FS scale is wildly wrong (native probe at MIN: 7.5e9 B @
+   1 Gbps, sec = 60 s -> 6e16 FS ticks where Seconds(60) = 1 tick of
+   60 s). Fixed: all ten units are explicit, with MIN/H/D/Y
+   ticks-per-second derived from ns-3's Scale() coefficients
+   (1/60, 1/3600, 1/86400, 1/31536000). Native probes post-fix: MIN
+   7.5e9 B @ 1 Gbps -> 1 tick (matches Seconds), H/D/Y equivalents ->
+   0 ticks (matches Seconds, since 60 s < 1 tick at those resolutions).
+
+4. **Round-70 comment + CHANGES.md numbers were partly wrong (round-71
+   finding 4, low).** Codex native probes contradicted round-70's text:
+   US Time::Max().GetNanoSeconds() wraps to -1000 (NOT INT64_MAX as
+   round 70 claimed; verified by wraparound: I*10^3 mod 2^64 interpreted
+   signed = -1000); the PS old-formula probe value was 1000000 ticks
+   (not 1000000000000084); PS Time::Max().GetSeconds() = 9223372.0368547756
+   and FS = 9223.3720368547765 (native probes); the 2^63-guard-bypass
+   input 64 B @ gbps ~= 5.55e-14 reaches exactly 2^63 at PS (sec*1e12 ==
+   2^63), not at NS (where sec*1e9 = 9.223372036854776e+18 < 2^63).
+   Fixed: the round-70 comment block in rdma-submission-model.cc is
+   annotated with the corrected values, and this entry records them.
+
+5. **"16/16 parity scripts" exceeded the actual inventory (round-71
+   finding 5, low).** The round-70 entry claimed 16 standalone parity
+   scripts, but only 15 test_*.py files carry a `__main__` guard
+   (`rg -l '^if __name__ == "__main__":' test/parity/test_*.py | wc -l`
+   -> 15); 18 parity modules exist in total, of which 3
+   (test_ibgda, test_rdma_modes, test_config_fec_enabled) run only
+   under pytest. Fixed: this entry and the Verified section below
+   state the counts as 15 standalone + 3 pytest-only.
+
+**Verified.** All findings confirmed by independent probes before
+fixing: exact binary64 replication of the F1 overflow (sec = 5.12e293,
+sec * 1e15 = inf) and the F2 double-rounding (int64x64 emulation:
+hi=2, lo=9223372036580896768 -> rounds to 2, vs llround(2.5) = 3);
+exact wraparound of the F4 US GetNanoSeconds() = -1000; exact
+comparison of the F4 PS-boundary product sec*1e12 == 2^63 vs the NS
+product sec*1e9 < 2^63; exact F5 inventory count (15 with __main__
+guards, 18 total modules). Native probe post-fix (reserve_probe
+rebuilt against the patched libns3.47-gpu-cluster-debug.so):
+- F1 probes no longer overflow: FS 64 B @ 1e-300 -> ticks = 9223372036854775807, FE_OVERFLOW = 0; NS 64 B @ 1e-307 -> same, FE_OVERFLOW = 0; both under `feenableexcept(FE_OVERFLOW)` trap mode run to completion without SIGFPE.
+- F2 probes match Seconds() exactly: NS 64 B @ 204.8 -> 2 ticks (was 3); US 1000 B @ 8 -> 1 tick (round-70 had 999999999999); NS 32 B @ 400 -> 1 tick (round-70 had 0).
+- F3 probes: MIN 7.5e9 B @ 1 -> 1 tick (was 6e16); H/D/Y -> 0 ticks; MIN 60e9 B @ 8 -> 1 tick.
+- Boundary: PS 64 B @ 5.551115123125783e-14 (sec*1e12 == 2^63 exactly) -> saturates to 9223372036854775807 with FE_OVERFLOW = 0; NS same input -> 9223372036854776 ticks (matches Seconds).
+- Ordinary services unchanged: NS 1000 B @ 8 -> 1000 ticks; S 1000 B @ 8 -> 0 ticks.
+
+Post-fix full battery: test.py 805/805; 15/15 standalone parity scripts
+PASS (direct python3) plus 18/18 test_ibgda + test_config_fec_enabled
+under pytest; 101/101 surrogate pytest; 13/13 queue-disc suites
+(drop-tail-queue, adaptive-red-queue-disc, cobalt-queue-disc,
+codel-queue-disc, pie-queue-disc, prio-queue-disc, queue-disc-traces,
+tbf-queue-disc, fq-cobalt-queue-disc, fq-codel-queue-disc,
+fq-pie-queue-disc, pfifo-fast-queue-disc, red-queue-disc);
+libns3.47-gpu-cluster-debug.so rebuilt clean.
+
 ### Reviewed — codex round 70: 7 findings, all 7 fixed
 
 Reviewed commit 1acac31 (round-69 fixes). Findings:
@@ -25,7 +111,9 @@ Reviewed commit 1acac31 (round-69 fixes). Findings:
    is negative and an ordinary service becomes a huge negative Time
    (probe: 32 B @ 400 Gbps at MS -> -5.9e24 ticks; 1 s service at S ->
    -9.2e27 ticks);
-   (b) at US (where GetNanoSeconds() == INT64_MAX), the derived tps is
+   (b) at US (where GetNanoSeconds() == INT64_MAX [CORRECTED in round 71:
+   it actually wraps to -1000; the conclusion — the projection is
+   meaningless at US — stands]), the derived tps is
    999999999.9999999 — 1 ULP below the true 1e6 — so a 1 s service
    truncates to 999999999999 ticks where Seconds() rounds to 10^12;
    (c) at NS the same 1-ULP deficit appears (tps = 999999999.9999999)
@@ -34,10 +122,12 @@ Reviewed commit 1acac31 (round-69 fixes). Findings:
    I/1e9 seconds, not by 1e9 ticks-per-second; the 1 s probe still
    lands on 10^12 ticks only because both errors cancel at NS exactly);
    (d) at PS/FS the integer division inside GetNanoSeconds() truncates
-   I/10^3 and I/10^6 first, so the derived scale is wrong (probe at PS:
-   1000 B @ 8 Gbps -> 1000000000000084 ticks = 10^6 s of service where
-   1 tick = 1 ps and the true service is 10^3 s). Fixed: ticks per
-   second are derived from the resolution directly via
+   I/10^3 and I/10^6 first, so the derived scale is wrong [CORRECTED
+   in round 71: the native probe at PS is 1000 B @ 8 Gbps -> 1000000
+   ticks with the round-69 formula; Seconds(1e-6 s) at PS = 10^6 ticks
+   = the correct answer, so this sub-item conflated the old formula's
+   output with the correct one — the formula mixed tick scales].
+   Fixed: ticks per second are derived from the resolution directly via
    `Time::GetResolution()` (1 tick = 10^(9-k) ns at 10^-k s resolution),
    not from a Time::Max() projection.
 
@@ -45,7 +135,10 @@ Reviewed commit 1acac31 (round-69 fixes). Findings:
    (round-70 finding 3, medium).** The round-69 guard used strict `>`
    against `(double)INT64_MAX`, but binary64 rounds INT64_MAX up to
    exactly 2^63, so a service whose product rounds to exactly 2^63
-   (probe: 64 B at gbps ~= 5.55e-14, sec = 9223372.036854776 s at NS)
+   (probe: 64 B at gbps ~= 5.55e-14, sec = 9223372.036854776 s at NS
+   [CORRECTED in round 71: the product reaches exactly 2^63 at PS,
+   sec*1e12 == 2^63; at NS the product sec*1e9 = 9223372036854776 <
+   2^63, which is in range])
    passed the guard into `static_cast<int64_t>(2^63)` —
    float-cast-overflow UB. Fixed: the guard is `>= 0x1p63` (inclusive).
 
@@ -63,11 +156,11 @@ Reviewed commit 1acac31 (round-69 fixes). Findings:
    (round-70 finding 5, medium).** `sec * static_cast<double>(I)`
    overflows to +inf (raising FE_OVERFLOW, SIGFPE under floating-point
    traps) for finite sec as small as ~5.12e293 (probe: 64 B at
-   gbps = 1e-300: sec = 5.12e293, sec * 2^63 = inf). Fixed: the new
-   code multiplies sec by the resolution scale (10^3..10^15), whose
-   overflow bound is far beyond any finite sec that reaches it, and the
-   inclusive 2^63 saturation bound catches every product that exceeds
-   int64.
+   gbps = 1e-300: sec = 5.12e293, sec * 2^63 = inf). Fixed [SUPERSEDED
+   in round 71]: the round-70 fix multiplied by the resolution scale
+   (10^3..10^15) but STILL before any bound check, so the overflow
+   recurred at FS for the same probe (sec * 1e15 = inf); round 71
+   moved the bound check before the multiply.
 
 6. **The FEC receive continuation scheduled an unclamped configured
    delay (round-70 finding 6, medium).** fabric-endpoint.cc:1689 passed
@@ -87,7 +180,12 @@ Reviewed commit 1acac31 (round-69 fixes). Findings:
    count I represents LESS wall time (PS: I ps = 9223.37 s, FS: I fs =
    9.22 s), never more. Fixed: the rewritten conversion comment states
    the saturation bound in ticks (INT64_MAX) and no longer asserts a
-   wrong wall-clock figure.
+   wrong wall-clock figure. [Wall-clock horizon figures CORRECTED in
+   round 71 by native probes: Time::Max().GetSeconds() = 9223372.0368547756
+   s at PS and 9223.3720368547765 s at FS; round 70's "PS: I ps = 9223.37 s"
+   swapped the two finer-resolution values — I ps = 9223372.04 s and
+   I fs = 9223.37 s. The direction of the claim (less wall time at
+   finer resolutions) was correct.]
 
 **Verified.** All findings confirmed by independent probes before
 fixing: exact binary64 replication of the round-69 formula at S/MS/US/
@@ -97,7 +195,7 @@ gbps = 5.551115123125783e-14 -> ticksNeeded == 2^63 exactly, guard
 false), the FE_OVERFLOW trap probe (64 B @ 1e-300 gbps -> sec*2^63 =
 inf), the truncation probes (32 B @ 400 G -> 0 vs Seconds()' 1 tick;
 1000 B @ 8 G at US -> 999999999999 vs 10^12), and the FEC receive wrap
-probe (decodeLatency = Time::Max(), callback at INT64_MIN). Post-fix: test.py 805/805; 16/16 parity scripts PASS (direct python3) plus 18/18
+probe (decodeLatency = Time::Max(), callback at INT64_MIN). Post-fix: test.py 805/805; 15/15 standalone parity scripts PASS (direct python3; CORRECTED in round 71 from "16/16" — only 15 files carry __main__ guards) plus 18/18
 test_ibgda + test_config_fec_enabled under pytest; 101/101 surrogate
 pytest; 13/13 queue-disc suites (drop-tail-queue, adaptive-red,
 cobalt, codel, pie, prio, queue-disc-traces, tbf, fq-cobalt, fq-codel,
@@ -279,7 +377,8 @@ schedule boundary one step downstream.
     (2^32 exceeds the uint32 checker); the surrogate's `min(x, 1<<30)`
     clamp only mirrors accepted configurations. Documented; no code change.
 
-**Verified.** 16/16 parity scripts PASS (direct python3); 18/18
+**Verified.** 15/15 standalone parity scripts PASS (direct python3;
+corrected in round 71 — only 15 carry __main__ guards); 18/18
 test_ibgda + test_config_fec_enabled pytest; 101/101 surrogate pytest;
 13/13 queue-disc suites (including `drop-tail-queue`); traffic-control
 smoke 37/55500 and 6887/10302800; DCQCN ToR anchors 20802.4 us both with

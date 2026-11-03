@@ -588,78 +588,112 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
     Time service(0);
     if (gbps > 0)
     {
+        // Round 71 (codex findings 1-3): the round-70 resolution switch
+        // still multiplied before bounding, double-rounded against ns-3's
+        // int64x64 conversion, and silently absorbed Y/D/H/MIN into the FS
+        // branch:
+        //   - FS multiply overflow (finding 1): the bound check ran on the
+        //     PRODUCT, so `sec * 1e15` overflowed to +inf (FE_OVERFLOW,
+        //     SIGFPE under traps) before the guard could fire for finite
+        //     sec as small as ~5.12e293 (probe: 64 B @ 1e-300 gbps, FS ->
+        //     sec * 1e15 = inf). The pre-multiply bound must compare sec
+        //     itself against the largest representable service.
+        //   - Double-rounding mismatch (finding 2): `llround(sec * tps)`
+        //     rounds the binary64 product, not the real value; ns-3's
+        //     Seconds() converts through 64.64 fixed point and rounds
+        //     that, so the two can disagree by one tick (probe at NS:
+        //     64 B @ 204.8 Gbps -> double path gives llround(2.5) = 3,
+        //     Seconds() gives 2; exact fixed-point value 2.499999...).
+        //     Fixed by delegating every in-range service to Seconds().
+        //   - Resolution fall-through (finding 3): the round-70 switch
+        //     handled S/MS/US/NS/PS and let default take FS — but ns-3's
+        //     Time::Y/D/H/MIN also fall into default, where the FS scale
+        //     was wrong (probe at MIN: 7.5e9 B @ 1 Gbps, sec = 60 s ->
+        //     6e16 FS ticks where Seconds(60) = 1 tick of 60 s). All ten
+        //     units are now explicit, with the MIN/H/D/Y ticks-per-second
+        //     derived from ns-3's Scale(): MIN 1/60, H 1/3600, D 1/86400,
+        //     Y 1/31536000.
+        // Round 70's history (codex findings 2-5 of that round) is kept
+        // verbatim below for the record; note that its per-resolution
+        // numbers were corrected in round 71 (finding 4 of that round):
+        //   - S/MS: GetNanoSeconds() wraps int64 (I * 10^k overflows), so
+        //     the round-69 denominator was negative and an ordinary
+        //     service became a huge NEGATIVE Time (probe: 32 B @ 400 Gbps
+        //     at MS -> -5.9e24 ticks);
+        //   - US: GetNanoSeconds() at US wraps to -1000 (native probe of
+        //     Time::Max().GetNanoSeconds(), not INT64_MAX as round 70
+        //     claimed), so the round-69 tps projection was meaningless;
+        //   - NS/PS/FS: the integer division inside GetNanoSeconds()
+        //     truncates the tick count first, so the scale factor was
+        //     wrong (native probe at PS: 1000 B @ 8 Gbps with the
+        //     round-69 formula -> 1000000 ticks, i.e. 1 us of service
+        //     where the true value is 1 ns... the formula mixed tick
+        //     scales; Seconds(1e-6 s) at PS = 10^6 ticks);
+        //   - the round-69 guard `ticksNeeded > (double)INT64_MAX` used
+        //     strict > while binary64((double)INT64_MAX) == 2^63 exactly,
+        //     so a service whose product rounds to exactly 2^63 slipped
+        //     through (probe: 64 B at gbps ~= 5.55e-14 -> sec*1e12 == 2^63
+        //     exactly at PS; at NS the same input gives 9.223372036854776e+18
+        //     < 2^63);
+        //   - the unguarded `sec * 2^63` multiply overflows to +inf for
+        //     finite sec as small as ~5.12e293 (probe: 64 B @ 1e-300).
+        // Wall-clock horizons of Time::Max() for reference (native
+        // probes): PS = 9223372.036854776 s, FS = 9223.3720368547765 s.
+        //
+        // Current conversion: derive ticks-per-second from the resolution
+        // (1 tick = 10^(9-k) ns at 10^-k s resolution; MIN/H/D/Y from
+        // ns-3's Scale() coefficients), compare sec against the largest
+        // in-range service BEFORE any multiply (no overflowable
+        // multiply), saturate at the inclusive 2^63 bound, and delegate
+        // every in-range service to Seconds() so the tick count matches
+        // ns-3's int64x64 rounding exactly.
         const double sec = static_cast<double>(bytes) * 8 / (gbps * 1e9);
-        // Round 70 (codex findings 2-5): the round-69 tick projection
-        //   ticksNeeded = sec * Time::Max().GetTimeStep()
-        //                 / (Time::Max().GetNanoSeconds() / 1e9)
-        // is wrong at every non-US resolution and unsafe at all of them:
-        //   - S/MS: GetNanoSeconds() wraps int64 (I * 10^k overflows), so the
-        //     denominator is negative and an ordinary service becomes a
-        //     huge NEGATIVE Time (probe: 32 B @ 400 Gbps at MS ->
-        //     -5.9e24 ticks);
-        //   - US: GetNanoSeconds() == INT64_MAX, so tps is 1 ULP below the
-        //     true 1e6 and a 1 s service truncates to 999999999999 ticks
-        //     instead of 10^12 (the Seconds() path rounds to 10^12);
-        //   - NS: same 1-ULP deficit (tps = 999999999.9999999) plus an
-        //     off-by-10^3 scale in the denominator (GetNanoSeconds() returns
-        //     I at NS, so the formula divides by I/1e9 s, not by 1e9 ticks
-        //     per second);
-        //   - PS/FS: the integer division inside GetNanoSeconds() truncates
-        //     the tick count first, so the scale factor is wrong (PS
-        //     1000 B @ 8 Gbps -> 1000000000000084 ticks where 1 tick = 1 ps
-        //     gives 10^6 s of service, not 10^3 s);
-        //   - the cast guard `ticksNeeded > (double)INT64_MAX` used strict >
-        //     while binary64((double)INT64_MAX) == 2^63 exactly, so a
-        //     service whose product rounds to exactly 2^63 (probe: 64 B at
-        //     gbps ~= 5.55e-14) slipped through the guard into a
-        //     float-cast-overflow UB;
-        //   - the unguarded `sec * 2^63` multiply overflows to +inf (and
-        //     raises FE_OVERFLOW / SIGFPE under traps) for finite sec as
-        //     small as ~5.12e293 (probe: 64 B at gbps = 1e-300).
-        // Derive ticks-per-second from the resolution directly
-        // (1 tick = 10^(9-k) ns at 10^-k s resolution), compare the service
-        // against the representable-seconds bound BEFORE multiplying (no
-        // overflowable multiply), saturate at the inclusive 2^63 bound, and
-        // round to nearest like Seconds()' int64x64 path (round-half-up on
-        // the fraction — Time(double) llrounds) so sub-tick and
-        // fractional-tick services keep their ns-3 value instead of
-        // truncating toward zero.
-        double ticksNeeded;
-        int64_t ticks;
+        double ticksPerSecond;
         switch (Time::GetResolution())
         {
         case Time::S:
-            ticksNeeded = sec;
-            ticks = ticksNeeded >= 0x1p63 ? std::numeric_limits<int64_t>::max()
-                                          : static_cast<int64_t>(llround(ticksNeeded));
+            ticksPerSecond = 1;
             break;
         case Time::MS:
-            ticksNeeded = sec * 1e3;
-            ticks = ticksNeeded >= 0x1p63 ? std::numeric_limits<int64_t>::max()
-                                          : static_cast<int64_t>(llround(ticksNeeded));
+            ticksPerSecond = 1e3;
             break;
         case Time::US:
-            ticksNeeded = sec * 1e6;
-            ticks = ticksNeeded >= 0x1p63 ? std::numeric_limits<int64_t>::max()
-                                          : static_cast<int64_t>(llround(ticksNeeded));
+            ticksPerSecond = 1e6;
             break;
         case Time::NS:
-            ticksNeeded = sec * 1e9;
-            ticks = ticksNeeded >= 0x1p63 ? std::numeric_limits<int64_t>::max()
-                                          : static_cast<int64_t>(llround(ticksNeeded));
+            ticksPerSecond = 1e9;
             break;
         case Time::PS:
-            ticksNeeded = sec * 1e12;
-            ticks = ticksNeeded >= 0x1p63 ? std::numeric_limits<int64_t>::max()
-                                          : static_cast<int64_t>(llround(ticksNeeded));
+            ticksPerSecond = 1e12;
             break;
-        default: // Time::FS and any future finer unit
-            ticksNeeded = sec * 1e15;
-            ticks = ticksNeeded >= 0x1p63 ? std::numeric_limits<int64_t>::max()
-                                          : static_cast<int64_t>(llround(ticksNeeded));
+        case Time::FS:
+            ticksPerSecond = 1e15;
+            break;
+        case Time::MIN:
+            ticksPerSecond = 1.0 / 60;
+            break;
+        case Time::H:
+            ticksPerSecond = 1.0 / 3600;
+            break;
+        case Time::D:
+            ticksPerSecond = 1.0 / 86400;
+            break;
+        case Time::Y:
+            ticksPerSecond = 1.0 / 31536000;
+            break;
+        default: // Time::LAST and any future unit added by ns-3
+            ticksPerSecond = 1;
             break;
         }
-        service = Time(ticks);
+        // Inclusive pre-multiply bound: the largest finite sec whose
+        // Seconds() conversion stays below 2^63 ticks. The margin of one
+        // ULP at the bound absorbs double-rounding of the division that
+        // produced sec, so Seconds() can never reach the checked 2^63
+        // multiply inside ns-3. Everything at or beyond the bound is a
+        // degenerate service and pins the ledger at Time::Max().
+        service = (sec >= (0x1p63 - 0x1p11) / ticksPerSecond)
+                      ? Time::Max()
+                      : Seconds(sec);
     }
     // Round 65 (codex finding 8): saturate the free ledger instead of
     // wrapping. The saturating bound is a no-op for every realistic service
