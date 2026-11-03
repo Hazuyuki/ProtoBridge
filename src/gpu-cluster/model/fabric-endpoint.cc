@@ -1685,8 +1685,15 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
             // append-site convention as SendDeferredEgressInternal and the
             // switch result-event ledger (codex round 29, finding 2).
             PruneDeferredEgressEvents();
+            // Round 70 (codex finding 6): clamp the configured decode
+            // latency through ClampEgressDelay like every other egress
+            // schedule site — an unclamped Time::Max()-scale latency wraps
+            // inside DefaultSimulatorImpl's `delay + TimeStep(now)` and the
+            // continuation fires at INT64_MIN (native repro: decodeLatency =
+            // Time::Max(), MacRx at tick 104, callback at tick
+            // -9223372036854775705).
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(decodeLatency,
+                Simulator::Schedule(ClampEgressDelay(decodeLatency),
                                     &FabricEndpoint::ContinueReceiveAfterFec,
                                     this, pkt, header));
             return true;

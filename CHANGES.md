@@ -6,6 +6,104 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 70: 7 findings, all 7 fixed
+
+Reviewed commit 1acac31 (round-69 fixes). Findings:
+
+1. **Duplicate `ClampRelativeDelay` definition prevented compilation
+   (round-70 finding 1, high).** The round-69 refactor left the helper
+   defined twice in rdma-submission-model.cc (line 527 and again at
+   lines 577-582 after `SaturatedAddTime`); the translation unit fails
+   with a redefinition error. Fixed: the second definition is deleted.
+
+2. **Reserve()'s tick projection was wrong at every non-US resolution
+   (round-70 finding 2, high).** The round-69 formula
+   `sec * Time::Max().GetTimeStep() / (Time::Max().GetNanoSeconds()/1e9)`
+   breaks four ways, each verified with exact binary64 replication:
+   (a) at S and MS, `GetNanoSeconds()` multiplies INT64_MAX ticks by
+   10^6/10^3 in int64 and wraps (-1000000 / -1000), so the denominator
+   is negative and an ordinary service becomes a huge negative Time
+   (probe: 32 B @ 400 Gbps at MS -> -5.9e24 ticks; 1 s service at S ->
+   -9.2e27 ticks);
+   (b) at US (where GetNanoSeconds() == INT64_MAX), the derived tps is
+   999999999.9999999 — 1 ULP below the true 1e6 — so a 1 s service
+   truncates to 999999999999 ticks where Seconds() rounds to 10^12;
+   (c) at NS the same 1-ULP deficit appears (tps = 999999999.9999999)
+   plus an off-by-10^3 scale error in the denominator
+   (GetNanoSeconds() returns I at NS, so the formula divides by
+   I/1e9 seconds, not by 1e9 ticks-per-second; the 1 s probe still
+   lands on 10^12 ticks only because both errors cancel at NS exactly);
+   (d) at PS/FS the integer division inside GetNanoSeconds() truncates
+   I/10^3 and I/10^6 first, so the derived scale is wrong (probe at PS:
+   1000 B @ 8 Gbps -> 1000000000000084 ticks = 10^6 s of service where
+   1 tick = 1 ps and the true service is 10^3 s). Fixed: ticks per
+   second are derived from the resolution directly via
+   `Time::GetResolution()` (1 tick = 10^(9-k) ns at 10^-k s resolution),
+   not from a Time::Max() projection.
+
+3. **The cast guard permitted an out-of-range float->int64 conversion
+   (round-70 finding 3, medium).** The round-69 guard used strict `>`
+   against `(double)INT64_MAX`, but binary64 rounds INT64_MAX up to
+   exactly 2^63, so a service whose product rounds to exactly 2^63
+   (probe: 64 B at gbps ~= 5.55e-14, sec = 9223372.036854776 s at NS)
+   passed the guard into `static_cast<int64_t>(2^63)` —
+   float-cast-overflow UB. Fixed: the guard is `>= 0x1p63` (inclusive).
+
+4. **Ordinary services truncated toward zero instead of ns-3 rounding
+   (round-70 finding 4, medium).** The round-69 path cast the double
+   product with C truncation; the Seconds() path it replaced converts
+   through int64x64 fixed point and rounds to nearest, so Time(double)
+   semantics (llround) were lost: 32 B @ 400 Gbps at NS gave 0 ticks
+   where Seconds() gives 1, and 1000 B @ 8 Gbps at US gave 999...9
+   where Seconds() gives 10^12. Fixed: the conversion applies
+   `llround` before the cast, matching int64x64 rounding for every
+   representable service.
+
+5. **The unguarded multiply could trap before saturation
+   (round-70 finding 5, medium).** `sec * static_cast<double>(I)`
+   overflows to +inf (raising FE_OVERFLOW, SIGFPE under floating-point
+   traps) for finite sec as small as ~5.12e293 (probe: 64 B at
+   gbps = 1e-300: sec = 5.12e293, sec * 2^63 = inf). Fixed: the new
+   code multiplies sec by the resolution scale (10^3..10^15), whose
+   overflow bound is far beyond any finite sec that reaches it, and the
+   inclusive 2^63 saturation bound catches every product that exceeds
+   int64.
+
+6. **The FEC receive continuation scheduled an unclamped configured
+   delay (round-70 finding 6, medium).** fabric-endpoint.cc:1689 passed
+   `decodeLatency` directly to Simulator::Schedule; a Time::Max()-scale
+   configured decode latency wrapped inside `delay + TimeStep(now)`
+   (native two-node 200-Gbps P2P probe: MacRx at tick 104, receive
+   callback at tick -9223372036854775705). Fixed: the site now clamps
+   through the existing `ClampEgressDelay` helper like the other five
+   egress schedule sites.
+
+7. **The horizon comment reversed the resolution relationship
+   (round-70 finding 7, low).** The round-69 comment claimed "~545
+   years per fetch at NS, proportionally longer at finer resolutions".
+   The true wall-clock horizon of Time::Max() is ~292.27 years at US/NS
+   (9223372036.854776 s); the S/MS GetNanoSeconds() wrap makes the
+   projection meaningless there, and at finer resolutions the same tick
+   count I represents LESS wall time (PS: I ps = 9223.37 s, FS: I fs =
+   9.22 s), never more. Fixed: the rewritten conversion comment states
+   the saturation bound in ticks (INT64_MAX) and no longer asserts a
+   wrong wall-clock figure.
+
+**Verified.** All findings confirmed by independent probes before
+fixing: exact binary64 replication of the round-69 formula at S/MS/US/
+NS/PS/FS (negative ticks at S/MS; 1-ULP-deficit tps at US/NS;
+truncated-quotient scale at PS/FS), the 2^63 guard bypass (64 B @
+gbps = 5.551115123125783e-14 -> ticksNeeded == 2^63 exactly, guard
+false), the FE_OVERFLOW trap probe (64 B @ 1e-300 gbps -> sec*2^63 =
+inf), the truncation probes (32 B @ 400 G -> 0 vs Seconds()' 1 tick;
+1000 B @ 8 G at US -> 999999999999 vs 10^12), and the FEC receive wrap
+probe (decodeLatency = Time::Max(), callback at INT64_MIN). Post-fix: test.py 805/805; 16/16 parity scripts PASS (direct python3) plus 18/18
+test_ibgda + test_config_fec_enabled under pytest; 101/101 surrogate
+pytest; 13/13 queue-disc suites (drop-tail-queue, adaptive-red,
+cobalt, codel, pie, prio, queue-disc-traces, tbf, fq-cobalt, fq-codel,
+fq-pie, pfifo-fast, red); libns3.47-gpu-cluster-debug.so rebuilt clean
+(duplicate-definition error gone).
+
 ### Reviewed — codex round 69: 5 findings, 3 fixed, 2 documentation errors corrected
 
 Reviewed commit 1294a2d (round-68 fixes). Findings:
