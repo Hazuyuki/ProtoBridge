@@ -577,7 +577,7 @@ class TheoryDerivedSurrogate:
             # threshold: one packet carries the entire transfer.
             return 1, math.ceil(data_bytes)
         num_chunks = max(min_chunks,
-                         math.ceil(data_bytes / self.spray_chunk_bytes))
+                         _iceil(data_bytes, self.spray_chunk_bytes))
         # ... but the C++ spray loop SKIPS trailing lane-pad fragments whose
         # offset is past the wire end (fabric-endpoint-send.cc: `offset >=
         # wireSize -> continue`): chunkSize = ceil(wire/numChunks), so a
@@ -588,7 +588,7 @@ class TheoryDerivedSurrogate:
         # BER 2.2e-4 / retry 0, crossing the strict-reliability threshold).
         sent_fragments = sum(
             1 for i in range(num_chunks)
-            if i * math.ceil(data_bytes / num_chunks) < data_bytes
+            if i * _iceil(data_bytes, num_chunks) < data_bytes
         )
         # Large-transfer coalescing (codex round 14, finding 2): above
         # 512 MiB the C++ caps the event count by coalescing into

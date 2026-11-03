@@ -395,19 +395,45 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
     // one; it is strictly stronger whenever numChunks > 1.
     constexpr uint64_t maxServicableEffectiveShare = std::numeric_limits<uint32_t>::max();
     {
-        // Same geometry as the fragmentation block below: at least one
-        // chunk per link, coalescing only above 512 MiB (the coalesced
-        // branch raises numChunks, which only SHRINKS chunkSize, so the
-        // guard taken with the pre-coalescing numChunks is the
-        // conservative one). The fragment-body cap is not applied here:
-        // it only raises numChunks further.
-        const uint64_t guardMinChunks = sendDevices.size();
-        const uint64_t guardSizeBasedChunks =
+        // Same geometry as the fragmentation block below — ALL of it,
+        // including the coalescing and fragment-body clamps: the send can
+        // COALESCE the spray into far larger chunks than the raw
+        // size-based count implies (2^30 wire bytes, 2 links, spray 4096:
+        // guard-only geometry is 262144 x 4096 B, but the send coalesces
+        // above 512 MiB into 128 x 8 MiB — round 66, codex finding 1:
+        // E=2^39 then anchors a 2^32 effective share that narrows the
+        // header field to 0 while the pre-coalescing guard admits it).
+        // Coalescing SHRINKS numChunks, which RAISES chunkSize and the
+        // per-fragment share; the conservative pre-coalescing comment
+        // round 65 carried was exactly backwards.
+        uint64_t guardMinChunks = sendDevices.size();
+        uint64_t guardSizeBasedChunks =
             (wireSize + m_sprayChunkSize - 1) / m_sprayChunkSize;
         uint64_t guardNumChunks = std::max(guardMinChunks, guardSizeBasedChunks);
         guardNumChunks = std::min(guardNumChunks, std::max<uint64_t>(wireSize, 1));
-        const uint64_t guardChunkSize =
+        constexpr uint64_t guardMaxChunkBytes = 8ull * 1024 * 1024;
+        constexpr uint64_t guardCoalesceThreshold = 512ull * 1024 * 1024;
+        const uint64_t guardCoalescedChunks =
+            (wireSize + guardMaxChunkBytes - 1) / guardMaxChunkBytes;
+        if (wireSize > guardCoalesceThreshold && guardCoalescedChunks > guardMinChunks)
+        {
+            const uint64_t guardPathBalancedChunks =
+                ((guardCoalescedChunks + guardMinChunks - 1) / guardMinChunks) *
+                guardMinChunks;
+            guardNumChunks =
+                std::max(guardMinChunks,
+                         std::min(guardSizeBasedChunks, guardPathBalancedChunks));
+        }
+        uint64_t guardChunkSize =
             (wireSize + guardNumChunks - 1) / guardNumChunks;
+        constexpr uint64_t guardMaxFragmentBody = 1ull << 30;
+        if (guardChunkSize > guardMaxFragmentBody)
+        {
+            const uint64_t guardMinChunksForBody =
+                (wireSize + guardMaxFragmentBody - 1) / guardMaxFragmentBody;
+            guardNumChunks = std::max(guardNumChunks, guardMinChunksForBody);
+            guardChunkSize = (wireSize + guardNumChunks - 1) / guardNumChunks;
+        }
         // 128-bit intermediate: E*chunkSize overflows uint64 exactly like
         // the anchored split's E*offset products below.
         const __uint128_t guardShareNum =
@@ -1431,12 +1457,21 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                     // end offset to 38 (probe: zero-area order inversion
                     // in the cold-buffer path). Abort past the complete-
                     // packet bound.
+                    // Round 66 (codex finding 2): the RoCE fabric in this
+                    // module is point-to-point NetDevices, whose Send()
+                    // prepends a 2-B PPP header AFTER the FabricHeader is
+                    // on the packet (PointToPointNetDevice::Send) — the
+                    // complete-packet bound must leave uint32 room for
+                    // 39 B + 2 B. At efficiency (2^32+41)/2^64 a 1-B
+                    // body pads to exactly UINT32_MAX - 39 (the round-65
+                    // guard admits it), and PPP then wraps Buffer's uint32
+                    // end offset to 1.
                     NS_ABORT_MSG_IF(targetWire > std::numeric_limits<uint32_t>::max() ||
-                                        targetWire + FabricHeader().GetSerializedSize() >
+                                        targetWire + FabricHeader().GetSerializedSize() + 2 >
                                             std::numeric_limits<uint32_t>::max(),
                                     "RoCE per-chunk padded packet " << targetWire
                                         << " B body + " << FabricHeader().GetSerializedSize()
-                                        << " B FabricHeader (pad "
+                                        << " B FabricHeader + 2 B PPP (pad "
                                         << (targetWire - pkt->GetSize())
                                         << " B over an existing " << pkt->GetSize()
                                         << "-B body) is not representable in the"

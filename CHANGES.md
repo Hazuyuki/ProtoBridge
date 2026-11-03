@@ -6,6 +6,166 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 66: 8 findings, 6 fixed, 3 documented
+
+**What.** Round-66 review of commit 643b304 returned 8 findings (3 P1, 5 P2).
+All were verified against the code with exact python arithmetic (replicating
+the binary64 evaluation order of each C++ expression) before any change.
+Findings 1–3, 6, 7 and the round-65 deferred caller-addition chain (finding 4)
+are fixed; findings 4 (small-N NVL72 single-group stall), 5 (Time(int64)
+resolution caveat) and 8 (division overflow at chunkBytes > rateBps*DBL_MAX)
+are documented.
+
+**Fixed (P1).**
+
+1. **Effective-share guard omitted the coalescing branch (finding 1).** The
+   round-65 guard recomputed the size-based fragmentation geometry
+   (`numChunks = max(links, ceil(wire/spray))`), but the collective send path
+   coalesces chunks above 512 MiB into up-to-8 MiB fragments when
+   `coalescedChunks > links`, RAISING chunkSize and the per-fragment anchored
+   share far above the pre-coalescing estimate. With `links=2`, `spray=4096`,
+   `wire=2^30`, the guard's geometry was 262,144 x 4 KiB (share E*4096/2^30),
+   but the send coalesces into `pathBalancedChunks(128,2)=128` chunks of
+   8 MiB: at `E=2^39` the anchored share is 2^39*2^23/2^30 = 2^32, wrapping
+   the uint32 header field to 0 while the pre-coalescing guard admitted it
+   (probe: `NEW coalescing guard/send geometry (262144,4096) (128,8388608)
+   abort False`, `NEW coalesced shares 128 [4294967296] uint32 [0]`). The
+   guard now mirrors the collective send geometry exactly — including the
+   512-MiB COALESCE_THRESHOLD, the 8-MiB cap, the pathBalancedChunks
+   rounding, and the 2^30 fragment-body clamp — before computing the ceiling
+   share with a 128-bit numerator. Post-fix probes: codex's fixture (links=2,
+   spray=4096, W=2^30, E=2^39) ABORTS; the links=W table (W in {1,2,3,4,5,7,
+   8,16,255,256,511,512,4096}) matches codex's expectation at every entry
+   (E=W*M passes, E=W*M+1 aborts except W=1 where the geometry is one chunk
+   and E*W/W=E<=M always); 2280 legal E<=W shapes pass without false aborts.
+   One asymmetry: when the lane-pad minimum (links=2) forces numChunks=2 with
+   wire=4, chunkSize=2 > wire/links, so the guard boundary moves to
+   E = 3*M/2+1 = 6,442,450,943 (probe: `F1 3 6442450942 ... max_share
+   4294967295 False`, `F1 3 6442450943 ... 4294967296 True`) — the guard is
+   strictly stronger here because the chunk carries more wire bytes than the
+   fair-share fraction; this is a true early-abort, not a false positive.
+
+2. **RoCE complete-packet guard omitted the PPP header (finding 2).** The
+   round-65 guard bounded `targetWire + FabricHeader().GetSerializedSize()`
+   at UINT32_MAX, but the RoCE fabric in this module is point-to-point
+   NetDevices whose `Send()` prepends a 2-B PPP header AFTER the
+   FabricHeader is serialized — `Buffer`'s uint32 end-offset then wraps.
+   At efficiency `(2^32+41)/2^64` with a 1-B body, the padded target is
+   4,294,967,296-39-1 = 4,294,967,256, the old guard passes, and PPP pushes
+   the end offset to 4,294,967,297 which wraps to 1 (probe: `NEW missing PPP:
+   efficiency 4294967337/18446744073709551616 target 4294967256 abort False
+   Fabric end 4294967295 PPP end 4294967297 uint32 end 1`). The bound is now
+   `targetWire + header + 2 > UINT32_MAX` (probe: body=4,294,967,256 +
+   39 + 2 = 4,294,967,297 ABORTS; body=4,294,967,255 + 39 + 2 =
+   4,294,967,296 PASSES).
+
+3. **`_spray_fragments` used `math.ceil` on an integer quotient (finding 3).**
+   `math.ceil(data_bytes / self.spray_chunk_bytes)` in
+   `whitebox_surrogate_v2.py` converts through binary64, so above 2^53 the
+   float rounding can return a quotient one less than the exact ceiling,
+   losing a fragment: at `data_bytes=2^53+1`, `spray_chunk_bytes=2^30`,
+   `num_lanes=2` the float path gives `ceil((2^53+1)/2^30) = 2^23` but the
+   exact value is 2^23+1 (probe: `NEW residual spray (8388608, 1073741825)
+   exact C++ (8388609, 1073741697)`). Both division sites now use the
+   exact `_iceil(n, d) = (n + d - 1) // d` helper. The remaining
+   `math.ceil` sites in the file (log2, packet_bytes*8/codeword_data_bits,
+   N/rails, nodes_per_leaf) operate on values far below 2^53 in every
+   supported configuration and are unchanged.
+
+**Fixed (P2).**
+
+4. **Saturated pacer delays overflow their callers' Time additions — the
+   round-65 deferred chain (finding 4).** The round-65 entry documented this
+   as out of scope; it is now fixed. A saturated pacer slot (INT64_MAX ns —
+   reachable at 1 MiB with a configured rate of 2^-40 Gbps) plus any positive
+   FEC encode latency or shaping delay overflows the signed Time storage in
+   `fabric-endpoint.cc`'s WFQ and FEC branches. An anonymous-namespace
+   `SaturatedAdd(Time, Time)` now composes the delays pairwise-saturated at
+   `Time::Max()`: normal inputs take the plain exact addition (each positive
+   component is far below the horizon), and any saturated component pins the
+   composed delay at the far-future bound, which is the same modeling outcome
+   as the overflow was producing by accident. The WFQ site is
+   `SaturatedAdd(SaturatedAdd(serviceTime, encodeLatency), shapingDelay)`;
+   the FEC site is `SaturatedAdd(encodeLatency, shapingDelay)`. Probe:
+   `F4 deferred composition exact I+1 9223372036854775808 fits False` — the
+   composition no longer overflows.
+
+5. **Reserve's `Seconds()` overflowed before the ledger saturation (finding
+   7).** In `rdma-submission-model.cc`, `Reserve()` computed
+   `Seconds(bytes*8/(gbps*1e9))` directly; at wqeBytes=125,000,000 and
+   pcieReadGbps=2^-34 the seconds quotient is ~4.3e18, which overflows
+   Time's signed ns storage inside `Seconds()` (the checked multiplication
+   in Time's constructor asserts) BEFORE the ledger-saturation ternary below
+   can run. The seconds quotient is now pre-guarded:
+   `if (!(sec <= 9.223372036854776e9)) service = Time(INT64_MAX); else
+   service = Seconds(sec);`. The bound 9.223372036854776e9 = INT64_MAX/1e9
+   in binary64; `!(x <= y)` also catches a NaN rate (probe: `F9 NaN
+   saturates True`). At ~545 years per fetch the ledger is pinned at the
+   far-future bound, which is the same modeling outcome as the wrap.
+
+6. **Ring() fetch-ledger overflowed past saturation (finding 6).** Also in
+   `rdma-submission-model.cc`, `Ring()` added `m_config.wqeFetch` to
+   `fetched` with a plain `fetched += m_config.wqeFetch`; at the far-future
+   end of the reservation chain (three 2^32-second services at
+   hbmReadGbps=2^-32, wqeFetch=1 ns) the sum is INT64_MAX+1 and the signed
+   overflow feeds `Schedule()` and every later `std::max(ringEnd, fetchFree)`
+   comparison (probe: `NEW RDMA caller wqeFetch=1 exact fetched
+   [4294967296000000001, 8589934592000000002, 9223372036854775808] last
+   fits False`). The addition is now saturating:
+   `Time(fetchNs > INT64_MAX - fetchedNs ? INT64_MAX : fetchedNs + fetchNs)`.
+
+**Documented (P2).**
+
+7. **Small-N NVL72 single-group configuration stalls (finding 4).** For
+   `numGpus < 6` the repair sets `gpg = numGpus` (one group of N), and the
+   hierarchical inter-node phases (AR, RS, A2A, AG) schedule zero remote
+   sends and zero receive obligations — no transition fires and the
+   simulation stalls (probe: `NEW small-N single-group deadlock: N,nodes,
+   remote sends,AR/RS/A2A precredited,AG done 2/3/4/5 → 0 0 0 False`).
+   The ncclring injector uses a different path and completes. The repair
+   itself is correct (it prevents the SIGFPE); the stall is the expected
+   behaviour of a hierarchical algorithm on a single-group topology — there
+   is no inter-group traffic to schedule. Documented as a configuration
+   caveat; no code change.
+
+8. **`Time(int64)` resolution caveat (finding 5).** `Time` stores
+   nanoseconds as a signed int64 with picosecond-resolution Get/Set
+   accessors that round through the ns quantum. Composing times at the
+   picosecond level (e.g. two half-ns additions) can lose the sub-ns part.
+   This is a fundamental property of the Time representation, not a defect
+   in the gpu-cluster module. Documented; no code change.
+
+9. **Division overflow at chunkBytes > rateBps * DBL_MAX (finding 8).** At
+   chunkBytes/rateBps above DBL_MAX the quotient rounds to +inf; the
+   pre-guard saturates. The reachable input is a configured rate below
+   ~1e-292 Gbps with a multi-MiB chunk — a diagnostic-only configuration
+   no harness or parity test exercises. Documented; no code change.
+
+**Verified.** (a) Build clean. (b) gpu-cluster test-runner suite
+`--suite=gpu-cluster` aborts with NS_ASSERT m_graphSet and a wire-efficiency
+abort — IDENTICAL on pristine 643b304 (verified via `git stash` bisect), so
+pre-existing and not a round-66 regression; the suite was PASS at 087e99c
+and the abort first appears at 643b304 independent of the round-66 working-tree
+changes. (c) Parity scripts (16) PASS, plus test_ibgda.py /
+test_config_fec_enabled.py under pytest (18 passed — the rate-cap pin
+serial simTimeNs=1782256, parallel 445486 is unchanged, confirming the
+guarded product and Reserve pre-guard are bit-identical to the historical
+pacer on all paced inputs). (d) Surrogate pytest 101 passed. (e) DCQCN
+anchor (incast, 3 nodes, 40 Gbps, 50 MB, `--bulkChunkSize=1000`):
+`--dcqcn=1` gives simTimeUs=10401.0 with ecn/cnp counters 0/0/0 (matches
+the round-65 honest value); the dcqcn=0 chunk probe gives 10149.7. (f)
+Traffic-control smoke: Unforced drop 37/55500, Packets/Bytes sent
+6887/10302800 — exact, matches the round-64 pin. (g) 13 queue-disc suites
+PASS with the correct `-queue-disc` suffix names (adaptive-red-queue-disc,
+cobalt-queue-disc, codel-queue-disc, drop-tail-queue-disc, fifo-queue-disc,
+fq-cobalt-queue-disc, fq-codel-queue-disc, fq-pie-queue-disc,
+pfifo-fast-queue-disc, pie-queue-disc, prio-queue-disc, queue-disc-traces,
+red-queue-disc); the round-65 entry's bare names (adaptive-red, cobalt,
+...) and the "traffic-control" suite name were wrong — the smoke binary is
+`build/examples/traffic-control/ns3.47-traffic-control-example-debug`.
+(h) Full `./test.py` at this commit: 805 of 805 tests passed (0 skipped,
+0 failed, 0 crashed), exit 0.
+
 ### Reviewed — codex round 65: 10 findings, 9 fixed, 1 documented
 
 **What.** Round-65 review of commit 087e99c returned 10 findings (2 P1, 7 P2,
@@ -135,6 +295,7 @@ a different module's WFQ/FEC composition.
     saturation input is a configured rate at the float floor with a
     multi-MiB chunk — a diagnostic-only configuration no harness or parity
     test exercises. Recorded here so the boundary is visible.
+    **[Fixed in round 66 via `SaturatedAdd` in fabric-endpoint.cc.]**
 
 **Verified.** (a) Build clean. (b) gpu-cluster test-runner suite
 `--suite=gpu-cluster` PASS (exit 0). (c) Parity scripts (16) PASS, plus

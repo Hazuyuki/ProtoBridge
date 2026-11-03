@@ -536,13 +536,34 @@ Time
 RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earliest)
 {
     Time start = std::max(earliest, free);
-    Time service = gbps > 0 ? Seconds(static_cast<double>(bytes) * 8 / (gbps * 1e9)) : Time(0);
+    // Round 66 (codex finding 7): an individually oversized service
+    // overflows Time's signed ns storage inside Seconds() (the checked
+    // multiplication asserts, and under floating-point diagnostics the
+    // conversion is undefined) BEFORE the ledger saturation below can run:
+    // wqeBytes=125000000 at pcieReadGbps=2^-34 already exceeds INT64_MAX
+    // ns. Saturate the service at Time::Max() — at ~545 years per fetch the
+    // ledger is pinned at the far-future bound anyway, which is the same
+    // modeling outcome the saturation produces.
+    Time service(0);
+    if (gbps > 0)
+    {
+        const double sec = static_cast<double>(bytes) * 8 / (gbps * 1e9);
+        if (!(sec <= 9.223372036854776e9))
+        {
+            // !(x <= y) also catches a NaN gbps.
+            service = Time(std::numeric_limits<int64_t>::max());
+        }
+        else
+        {
+            service = Seconds(sec);
+        }
+    }
     // Round 65 (codex finding 8): saturate the free ledger instead of
     // wrapping. The saturating bound is a no-op for every realistic service
     // (start + service wrapping needs ~292 years of queued PCIe service at
-    // pcieReadGbps=2^-32), but a degenerate gbps makes Seconds() overflow the
-    // int64 nanosecond count and the addition would wrap the ledger past
-    // Time(0). wqeBytes=125000000 @ pcieReadGbps=2^-32 is the probe.
+    // pcieReadGbps=2^-32), but a degenerate gbps pins the ledger at the
+    // far-future bound below instead of wrapping it past Time(0).
+    // wqeBytes=125000000 @ pcieReadGbps=2^-32 is the probe.
     const int64_t startNs = start.GetNanoSeconds();
     const int64_t serviceNs = service.GetNanoSeconds();
     free = Time(std::numeric_limits<int64_t>::max() - serviceNs < startNs
@@ -1030,7 +1051,17 @@ RdmaSubmissionModel::Ring(const QpKey& key)
                 std::max(fetched,
                          Reserve(m_config.wqeBytes, m_config.hbmReadGbps, m_hbmReadFree, earliest));
         }
-        fetched += m_config.wqeFetch;
+        // Round 66 (codex finding 6): saturate the fetch ledger instead of
+        // overflowing it. A positive wqeFetch at the far-future end of the
+        // reservation chain (three 2^32-second services at pcieReadGbps
+        // 2^-32, wqeFetch = 1 ns) wraps fetched past INT64_MAX and the
+        // signed overflow feeds Schedule() and every later
+        // std::max(ringEnd, qp.fetchFree) comparison.
+        const int64_t fetchedNs = fetched.GetNanoSeconds();
+        const int64_t fetchNs = m_config.wqeFetch.GetNanoSeconds();
+        fetched = Time(fetchNs > std::numeric_limits<int64_t>::max() - fetchedNs
+                           ? std::numeric_limits<int64_t>::max()
+                           : fetchedNs + fetchNs);
         qp.fetchFree = fetched;
         Schedule(fetched - Simulator::Now(), [this, id] { ExecuteWork(id); });
     }

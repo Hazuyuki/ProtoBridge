@@ -29,6 +29,32 @@
 namespace ns3
 {
 
+namespace
+{
+
+// Saturated Time addition (round 66, codex finding 4): the pacer machines
+// can return a saturated INT64_MAX-ns delay (a tiny configured rate with a
+// multi-MiB chunk), and adding any positive component to it overflows the
+// signed Time storage. Saturate at Time::Max() — a saturated component
+// already means "no earlier than the far-future bound". Normal inputs take
+// the plain addition (each positive component is far below the horizon, so
+// the pairwise-saturated sum is exact).
+Time
+SaturatedAdd(Time a, Time b)
+{
+    if (a <= Time(0) || b <= Time(0))
+    {
+        return (a <= Time(0)) ? b : a;
+    }
+    const int64_t aNs = a.GetNanoSeconds();
+    const int64_t bNs = b.GetNanoSeconds();
+    return Time(bNs > std::numeric_limits<int64_t>::max() - aNs
+                    ? std::numeric_limits<int64_t>::max()
+                    : aNs + bNs);
+}
+
+} // unnamed namespace
+
 NS_LOG_COMPONENT_DEFINE("FabricEndpoint");
 
 NS_OBJECT_ENSURE_REGISTERED(FabricEndpoint);
@@ -3509,7 +3535,16 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                                      ? m_fecModel->GetEncodeLatency()
                                      : Time(0);
             Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-            Time totalDelay = serviceTime + encodeLatency + shapingDelay;
+            // Round 66 (codex finding 4, deferred chain from round 65): a
+            // saturated pacer slot (INT64_MAX ns — reachable at 1 MiB with a
+            // 2^-40 Gbps configured rate) overflows the signed Time storage
+            // in these sums. Saturate the composed delay at Time::Max():
+            // any saturated component already means "never" for scheduling
+            // purposes, and the far-future bound keeps the addition in range.
+            // Normal inputs are untouched (each positive component is well
+            // below the horizon, so the pairwise-saturated sum is exact).
+            const Time totalDelay = SaturatedAdd(SaturatedAdd(serviceTime, encodeLatency),
+                                                 shapingDelay);
             if (totalDelay > Time(0))
             {
                 NS_LOG_DEBUG("WFQ contention: class=" << static_cast<int>(tc)
@@ -3552,7 +3587,10 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     if (LinkUsesFec())
     {
         Time encodeLatency = m_fecModel->GetEncodeLatency();
-        Time delay = encodeLatency + shapingDelay;
+        // Round 66 (codex finding 4): same saturated-pacer composition as
+        // the WFQ branch above — saturate at Time::Max() instead of
+        // overflowing the signed Time addition.
+        const Time delay = SaturatedAdd(encodeLatency, shapingDelay);
         if (delay > Seconds(0))
         {
             // Capture the retransmit flag (codex round 28, finding 1).
