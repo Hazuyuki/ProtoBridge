@@ -2648,8 +2648,16 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
             // lifetime of the stream. Prune here so every append site owns
             // its own expired-entry removal.
             PruneDeferredEgressEvents();
+            // Round 72 (codex finding 2): clamp the schedule delay exactly
+            // like the six other egress schedule sites. A Time::Max()
+            // configured memory latency is a degenerate-but-accepted value;
+            // passed raw, DefaultSimulatorImpl::Schedule's
+            // `delay + TimeStep(now)` wraps past INT64_MAX (probe:
+            // m_memoryLatency = Time::Max(), now = 7 -> response fires at
+            // tick -9223372036854775799) and the response goes out
+            // immediately with a corrupted timestamp instead of never.
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(m_memoryLatency,
+                Simulator::Schedule(ClampEgressDelay(m_memoryLatency),
                                     &FabricEndpoint::SendMemoryResponse,
                                     this, header.GetSourceRank(),
                                     dataPtr, availSize));

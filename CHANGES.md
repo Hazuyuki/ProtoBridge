@@ -6,6 +6,97 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 72: 3 findings, all 3 fixed
+
+Reviewed commit 74bf16f (round-71 fixes). NOTE: codex's formal report was
+lost to a 403 Forbidden block at the end of its run; the findings below
+were reconstructed from the round-72 log's probe artifacts (native probes
+under /tmp/protobridge-r72-review, 523-invocation boundary sweep,
+stress/UBSan/fec probe outputs) together with codex's narrative messages.
+Findings:
+
+1. **Seconds() returns a NEGATIVE Time at MIN/H/D/Y for a large finite
+   sec, and the ledger subtraction then overflows signed int64 (round-72
+   finding 1, medium).** ns-3's int64x64(double) builds hi = (int64)sec
+   (truncation) and lo = (uint64)((sec - hi) * 2^64); the 2^64 multiply
+   overflows binary64 for sec >= 2^972, so lo becomes INT64_MIN.
+   Multiplying by Scale(MIN) = 6e16 (INT64X64_USE_128 build) computes
+   lo * 6e16 in signed __int128: negative x positive wraps to a large
+   positive 128-bit value whose low 64 bits are a NEGATIVE tick count, so
+   the checked 2^63 multiply passes and Round() emits negative ticks.
+   UBSan probe (pre-fix): MIN 64 B @ gbps = 5.551115123125783e-26 ->
+   service = -153722867280912930 ticks -> "signed integer overflow:
+   9223372036854775807 - -153722867280912930" in the free-ledger
+   subtraction; H same input -> service = -2562047788015216. The affected
+   window 2^972 s <= sec < (2^63-2^11)/ticksPerSecond exists only at
+   MIN/H/D/Y (at S/MS/US/NS/PS/FS Seconds() asserts before 2^972); at MIN
+   it spans [2^972, 60*(2^63-2^11)) s, while 60 s < sec < 2^972 still
+   converts correctly to 1 tick. Fixed: after the existing bound check,
+   any strictly-negative service (Time::Max() is always positive, so this
+   can only be the coarse-unit Seconds() window) is clamped to
+   Time::Max(), pinning the ledger at the far-future bound instead of
+   wrapping it past Time(0).
+
+2. **Finite gbps = 1e300 made `gbps * 1e9` overflow to inf before any
+   guard (round-72 finding 2, medium).** The bandwidth validation only
+   rejects !isfinite(bw) || bw < 0, and 1e300 is finite, but the sec
+   computation's `gbps * 1e9` = inf raised FE_OVERFLOW (probe rc = -8,
+   SIGFPE under `feenableexcept(FE_OVERFLOW)` trap mode) before the
+   round-71 bound check ever ran. Fixed: reassociated the division as
+   `(bytes * 8 / 1e9) / gbps`. bytes <= 2^64-1 so bytes*8 <= 2^67 is
+   exact in binary64, 1e9 is exactly representable, the intermediate
+   bitRatio <= ~2^38, and the final divide by any finite gbps cannot
+   overflow; the result is a finite sec, or +inf only for gbps = 0 or
+   subnormal gbps (sec = inf saturates at the inclusive bound, already
+   covered). The FE_OVERFLOW that round-71 documented for subnormal
+   division is gone as a side effect.
+
+3. **SendMemoryResponse was scheduled with the UNCLAMPED m_memoryLatency
+   (round-72 finding 3, medium).** fabric-endpoint.cc scheduled the
+   memory-read response with `Simulator::Schedule(m_memoryLatency, ...)`
+   while the six other egress schedule sites (and the round-70 FEC
+   receive clamp) route through ClampEgressDelay. Probe with
+   m_memoryLatency = Time::Max(): DefaultSimulatorImpl::Schedule's
+   `delay + TimeStep(now)` wrapped past INT64_MAX and the response fired
+   at tick -9223372036854775799 (immediately, corrupted timestamp)
+   instead of never. Fixed: route the delay through ClampEgressDelay
+   like every other egress site.
+
+**Verified.** Findings confirmed against the round-72 log probes and
+re-verified post-fix with native probes rebuilt against the patched
+libns3.47-gpu-cluster-debug.so:
+- F1 probes now saturate: MIN/H/D/Y 64 B @ 5.551115123125783e-26 ->
+  9223372036854775807 ticks (was -153722867280912930 / -2562047788015216
+  etc.), FE_OVERFLOW = 0; the UBSan signed-overflow repro is gone. The
+  sub-window inputs stay exact: MIN/Y 64 B @ 2.7755575615628915e-26 ->
+  0 ticks; MIN 7.5e9 B @ 1 -> 1 tick (matches Seconds()).
+- F2: NS 64 B @ 1e300 -> 0 ticks with FE_OVERFLOW = 0, and the trap-mode
+  run completes (was rc = -8 SIGFPE). Ledger stays stable at
+  INT64_MAX - 7 across all ten units under trap mode; gbps = 0 /
+  subnormal / 4.94e-324 no longer raise any fenv flag; NaN / inf / -inf /
+  -1 gbps still abort with "bandwidth must be finite and nonnegative"
+  (rc 134).
+- F3: fec_memory_probe ordinary case -> memory_response_tx at tick 23
+  (was 13/23 pattern intact, now with clamp the ordinary value holds);
+  m_memoryLatency = Time::Max() -> response scheduled at
+  9223372036854775807 (was -9223372036854775799).
+- Regression sweeps: 60 ordinary cases (6 byte/rate combos x 10 units)
+  all match Seconds() tick-for-tick; exact-arithmetic boundary scan at
+  +/- 6 ULP around the round-71 bound across all ten units shows no
+  escape below the bound under the new division association; the
+  codex 523-invocation boundary sweep results stand (no final-multiply
+  escape below the guard at any resolution).
+
+Post-fix full battery: test.py 806/806; 15/15 standalone parity scripts
+PASS (direct python3) plus 18/18 test_ibgda + test_config_fec_enabled
+under pytest; 101/101 surrogate pytest; 13/13 queue-disc suites
+(drop-tail-queue, adaptive-red-queue-disc, cobalt-queue-disc,
+codel-queue-disc, pie-queue-disc, prio-queue-disc, queue-disc-traces,
+tbf-queue-disc, fq-cobalt-queue-disc, fq-codel-queue-disc,
+fq-pie-queue-disc, pfifo-fast-queue-disc, red-queue-disc);
+libns3.47-gpu-cluster-debug.so rebuilt clean.
+
+
 ### Reviewed — codex round 71: 5 findings, all 5 fixed
 
 Reviewed commit 00b9909 (round-70 fixes). Findings:
