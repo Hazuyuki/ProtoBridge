@@ -2656,11 +2656,23 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
             // m_memoryLatency = Time::Max(), now = 7 -> response fires at
             // tick -9223372036854775799) and the response goes out
             // immediately with a corrupted timestamp instead of never.
-            m_deferredEgressEvents.push_back(
-                Simulator::Schedule(ClampEgressDelay(m_memoryLatency),
-                                    &FabricEndpoint::SendMemoryResponse,
-                                    this, header.GetSourceRank(),
-                                    dataPtr, availSize));
+            // Round 73 (codex finding 2): ClampEgressDelay only fixes the
+            // SCHEDULE instant — at absolute Time::Max() the simulator
+            // still executes the event (probe: read at tick 7, memory
+            // latency Time::Max(), 200 Gbps link -> tx at
+            // 9223372036854775807, downstream serialization wraps and the
+            // response is DELIVERED at -9223372036854775807). A degenerate
+            // latency must drop the response entirely rather than emit it
+            // past the representable horizon, so skip scheduling when the
+            // clamp saturated at Time::Max().
+            if (m_memoryLatency < Time::Max())
+            {
+                m_deferredEgressEvents.push_back(
+                    Simulator::Schedule(ClampEgressDelay(m_memoryLatency),
+                                        &FabricEndpoint::SendMemoryResponse,
+                                        this, header.GetSourceRank(),
+                                        dataPtr, availSize));
+            }
         }
     }
     else if (!duplicate && type == FabricPacketType::MEMORY_WRITE)
