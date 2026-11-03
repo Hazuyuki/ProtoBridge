@@ -6,6 +6,95 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 73: 4 findings, all 4 fixed
+
+Reviewed commit 966e925 (round-72 fixes). Findings:
+
+1. **Round-72's reassociated division still overflows binary64 for a
+   representable exact sec (round-73 finding 1, high).** Rewriting the
+   service-time division as `(bytes * 8 / 1e9) / gbps` removed the
+   `gbps * 1e9` inf, but the rounded intermediate bitRatio keeps ~2^-29
+   relative rounding: for bytes = 500000002 and
+   gbps = 0x1.000000112e0bfp-1022 (smallest normal + 8 ULP), the exact
+   quotient is DBL_MAX * (1 + 2.1e-18) — representable — while the
+   rounded intermediate pushes the binary64 quotient to
+   DBL_MAX * (1 + 1.1e-16), past the overflow threshold; under
+   `feenableexcept(FE_OVERFLOW)` the probe died with SIGFPE (rc -8)
+   before any bound check ran. Fixed: precompute the saturation
+   threshold in gbps units,
+   `saturateGbps = bitRatio / ((2^63 - 2^11) / ticksPerSecond)`, and
+   skip the divide entirely when `!(gbps > saturateGbps)` (gbps <= 0 is
+   validated above, so the branch covers zero, subnormal, and
+   small-enough-that-the-exact-sec-is-unrepresentable); only an
+   in-range gbps performs `sec = bitRatio / gbps`, which then cannot
+   overflow. The threshold uses the same inclusive bound as the
+   post-divide check, so the sec >= bound arm still saturates the
+   near-bound representable cases. Verified with the trap-mode probe
+   (rc 0, ticks = INT64_MAX, FE_OVERFLOW clear), a 60-case sweep across
+   6 byte/rate combos x 10 resolutions matching Seconds() tick-for-tick
+   (MIN 7.5e9 B @ 1 -> 1 tick; NS 64 B @ 204.8 -> 2 ticks; NS 64 B @
+   1e300 -> 0 ticks with FE_OVERFLOW clear; MIN 64 B @
+   5.551115123125783e-26 -> MAX ticks), plus exact-arithmetic
+   confirmation (60-digit Decimal) that the probe input's exact quotient
+   is representable while the rounded-intermediate quotient is not.
+
+2. **The round-72 memory-response clamp fires the response AT
+   Time::Max() and the downstream serialization wraps the tick past
+   INT64_MAX (round-73 finding 2, medium).** ClampEgressDelay only fixes
+   the SCHEDULE instant: DefaultSimulatorImpl executes events scheduled
+   at absolute Time::Max(), and the probe (memory read at tick 7,
+   m_memoryLatency = Time::Max(), 200 Gbps link) showed the response
+   transmitted at tick 9223372036854775807 and DELIVERED at
+   -9223372036854775807 — DefaultSimulatorImpl::Schedule's
+   `delay + TimeStep(now)` wraps on the downstream serialization
+   schedule. A degenerate "infinite" memory latency cannot produce a
+   meaningful response inside the representable horizon. Fixed:
+   ProcessMemoryPacket now skips the deferred response entirely when
+   `m_memoryLatency >= Time::Max()` (Time::Max() means "drop the
+   deferred action", not "run it at Time::Max()"); ordinary latencies
+   keep the round-72 ClampEgressDelay route. Verified with the rebuilt
+   probe: Max mode schedules nothing (deferred = 0, final tick = 7);
+   ordinary mode unchanged (deadline 17, tx 17, response 19, rx 19).
+
+3. **LLR retry timeout passes m_retryTimeout unclamped to Schedule, and
+   the deadline arithmetic adds it without saturation (round-73 finding
+   3, medium).** ArmRetryTimeoutAtTransmission scheduled
+   `Simulator::Schedule(m_retryTimeout, ...)` directly; the probe
+   (RetryTimeout = Time::Max(), armed at tick 7) fired at
+   -9223372036854775802 (7 + INT64_MAX wrapped), and clamping to
+   Time::Max() would not help because DefaultSimulatorImpl executes
+   events at absolute Time::Max() — the timeout callback would
+   retransmit at the end of time. The sourceReload refresh in
+   StorePacket had the same raw schedule. Fixed: both Schedule sites
+   and the arm entry now go through IsUnrepresentableTimeout()
+   (`timeout >= Time::Max() - Simulator::Now()`); a degenerate
+   far-future timeout arms NO timer — the stored entry survives until an
+   ACK, a NACK (which re-arms a plain timeout), or teardown, matching
+   the round-73 memory-response policy. With the arm entry guarded, the
+   deadline comparison `pending + Now() >= deadline` can no longer wrap.
+   Verified with the rebuilt probe: Max mode arms nothing (no timeout
+   line, run ends at tick 7); ordinary mode unchanged (armed at 7,
+   timeout fires at 17).
+
+4. **Round-72's CHANGES.md/code comment claimed a 2^972 binary64 window
+   that cannot exist (round-73 finding 4, low).** The claimed mechanism
+   — "(sec - hi) * 2^64 overflows binary64 for sec >= 2^972, so lo
+   becomes INT64_MIN" — is arithmetically impossible: any sec >= 2^972
+   has hi = (int64)sec already saturated at INT64_MIN by the out-of-range
+   C++ float-to-int conversion, so the lo multiply starts from garbage
+   and its binary64 range is irrelevant. The actual negative-tick window
+   is 2^63 <= sec < (2^63 - 2^11)/ticksPerSecond at MIN/H/D/Y only.
+   Fixed: the comment above the negative-service clamp in
+   rdma-submission-model.cc and this entry's finding-1 prose now describe
+   the Q64.64 input-range-loss mechanism; codex's 624,576-case sweep
+   across the six coarse units found zero negative results for
+   2^63 <= sec < 2^972, consistent with the corrected window.
+
+Verified: reserve probe trap-mode + 60-case sweep (finding 1);
+memory probe Max/ordinary modes (finding 2); llr probe Max/ordinary
+modes (finding 3); full test.py battery, parity suites, and pytest
+suites — all green.
+
 ### Reviewed — codex round 72: 3 findings, all 3 fixed
 
 Reviewed commit 74bf16f (round-71 fixes). NOTE: codex's formal report was
@@ -18,8 +107,9 @@ Findings:
 1. **Seconds() returns a NEGATIVE Time at MIN/H/D/Y for a large finite
    sec, and the ledger subtraction then overflows signed int64 (round-72
    finding 1, medium).** ns-3's int64x64(double) builds hi = (int64)sec
-   (truncation) and lo = (uint64)((sec - hi) * 2^64); the 2^64 multiply
-   overflows binary64 for sec >= 2^972, so lo becomes INT64_MIN.
+   by C++ float-to-int conversion; that conversion is out of range for
+   sec >= 2^63, so hi truncates to INT64_MIN, and
+   lo = (uint64)((sec - hi) * 2^64) is then built from that garbage hi.
    Multiplying by Scale(MIN) = 6e16 (INT64X64_USE_128 build) computes
    lo * 6e16 in signed __int128: negative x positive wraps to a large
    positive 128-bit value whose low 64 bits are a NEGATIVE tick count, so
@@ -28,11 +118,12 @@ Findings:
    service = -153722867280912930 ticks -> "signed integer overflow:
    9223372036854775807 - -153722867280912930" in the free-ledger
    subtraction; H same input -> service = -2562047788015216. The affected
-   window 2^972 s <= sec < (2^63-2^11)/ticksPerSecond exists only at
-   MIN/H/D/Y (at S/MS/US/NS/PS/FS Seconds() asserts before 2^972); at MIN
-   it spans [2^972, 60*(2^63-2^11)) s, while 60 s < sec < 2^972 still
-   converts correctly to 1 tick. Fixed: after the existing bound check,
-   any strictly-negative service (Time::Max() is always positive, so this
+   window 2^63 s <= sec < (2^63-2^11)/ticksPerSecond exists only at
+   MIN/H/D/Y (at S/MS/US/NS/PS/FS the Seconds() fixed-point multiply
+   asserts before the window is reached); at MIN it spans
+   [2^63, 60*(2^63-2^11)) s, while 60 s < sec < 2^63 still converts
+   correctly to 1 tick. Fixed: after the existing bound check, any
+   strictly-negative service (Time::Max() is always positive, so this
    can only be the coarse-unit Seconds() window) is clamped to
    Time::Max(), pinning the ledger at the far-future bound instead of
    wrapping it past Time(0).

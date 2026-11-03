@@ -652,10 +652,21 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
         // gbps * 1e9 = inf, raising FE_OVERFLOW -> SIGFPE under fenv traps
         // before any guard sees it). Dividing by 1e9 first makes the
         // expression overflow-free for every finite gbps: bitRatio <=
-        // 0x1p+64, 1e9 is exact, so bitRatio / 1e9 <= 0x1p+38 and the
-        // remaining divide by gbps yields a finite or infinite sec (inf only
-        // when gbps is 0 or subnormal, cases already covered below).
-        const double sec = (static_cast<double>(bytes) * 8 / 1e9) / gbps;
+        // 0x1p+64, 1e9 is exact, so bitRatio / 1e9 <= 0x1p+38.
+        // Round 73 (codex finding 1): the reassociated division still
+        // overflows binary64 when the ROUNDED intermediate bitRatio pushes
+        // the quotient past DBL_MAX even though the exact quotient is
+        // representable (bytes = 500000002, gbps = 0x1.000000112e0bfp-1022:
+        // exact sec = DBL_MAX*(1+2.1e-18) is representable, but bitRatio's
+        // ~2^-29 relative rounding makes the binary64 quotient exceed
+        // DBL_MAX*(1+2^-53) -> FE_OVERFLOW -> SIGFPE under fenv traps
+        // before the bound check runs). Pre-divide the saturation
+        // threshold into gbps units and skip the divide entirely when the
+        // rate is at or below it (gbps <= 0 is validated above, so the
+        // branch covers zero, subnormal, and small-enough-that-the-exact-
+        // sec-exceeds-every-representable-bound rates); only an in-range
+        // gbps reaches `bitRatio / gbps`, which then cannot overflow.
+        const double bitRatio = static_cast<double>(bytes) * 8 / 1e9;
         double ticksPerSecond;
         switch (Time::GetResolution())
         {
@@ -699,33 +710,48 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
         // produced sec, so Seconds() can never reach the checked 2^63
         // multiply inside ns-3. Everything at or beyond the bound is a
         // degenerate service and pins the ledger at Time::Max().
-        // Round 72 (codex finding 1): at coarse resolutions (MIN/H/D/Y)
-        // Seconds() can return a NEGATIVE Time for a large finite sec.
-        // ns-3's int64x64(double) builds hi = (int64)sec (truncation) and
-        // lo = (uint64)((sec - hi) * 2^64); the 2^64 multiply overflows
-        // binary64 for sec >= 2^972, so lo becomes INT64_MIN. Multiplying
-        // by Scale(MIN) = 6e16 (INT64X64_USE_128 build) then computes
-        // lo * 6e16 in signed __int128: a negative lo times a positive
-        // factor wraps to a large POSITIVE 128-bit value whose low 64
-        // bits are the low bits of a NEGATIVE tick count, so the checked
-        // 2^63 multiply passes and Round() emits negative ticks
-        // (UBSan probe: MIN 64 B @ gbps = 5.551115123125783e-26 ->
-        // service = -153722867280912930 ticks, then the ledger
-        // subtraction INT64_MAX - serviceTicks overflows signed int64).
-        // The clamp below pins a negative service at Time::Max() as
-        // well: a degenerate rate should pin the ledger at the far-future
-        // bound, not wrap it past Time(0). The bound already compares sec
-        // itself, so the clamp only fires for the coarse-unit Seconds()
-        // window 2^972 s <= sec < bound (at MIN that window spans
-        // [2^972, 60*(2^63-2^11)) s; at S/MS/US/NS/PS/FS the window is
-        // empty because Seconds() asserts before 2^972).
-        service = (sec >= (0x1p63 - 0x1p11) / ticksPerSecond)
-                      ? Time::Max()
-                      : Seconds(sec);
-        if (service.IsStrictlyNegative())
+        const double saturateGbps =
+            bitRatio / ((0x1p63 - 0x1p11) / ticksPerSecond);
+        if (!(gbps > saturateGbps))
         {
-            // Zero is valid when a small memory access rounds below one tick.
+            // gbps <= 0 (validated above), subnormal, or small enough
+            // that the exact sec exceeds every representable bound:
+            // saturate without performing the overflowing divide.
             service = Time::Max();
+        }
+        else
+        {
+            const double sec = bitRatio / gbps;
+            // Round 72 (codex finding 1): at coarse resolutions (MIN/H/D/Y)
+            // Seconds() can return a NEGATIVE Time for a large finite sec.
+            // ns-3's int64x64(double) builds hi = (int64)sec by C++
+            // float-to-int conversion; that conversion is out of range for
+            // sec >= 2^63, so hi truncates to INT64_MIN, and
+            // lo = (uint64)((sec - hi) * 2^64) is then built from that
+            // garbage hi. Multiplying by Scale(MIN) = 6e16
+            // (INT64X64_USE_128 build) computes lo * 6e16 in signed
+            // __int128: negative x positive wraps to a large positive
+            // 128-bit value whose low 64 bits are a NEGATIVE tick count,
+            // so the checked 2^63 multiply passes and Round() emits
+            // negative ticks (UBSan probe: MIN 64 B @
+            // gbps = 5.551115123125783e-26 -> service = -153722867280912930
+            // ticks, then the ledger subtraction
+            // INT64_MAX - serviceTicks overflows signed int64). The clamp
+            // below pins a negative service at Time::Max() as well: a
+            // degenerate rate should pin the ledger at the far-future
+            // bound, not wrap it past Time(0). The bound already compares
+            // sec itself, so the clamp only fires for the coarse-unit
+            // Seconds() window 2^63 s <= sec < bound (at MIN that window
+            // spans [2^63, 60*(2^63-2^11)) s; at S/MS/US/NS/PS/FS the
+            // window is empty because Seconds() asserts before 2^63).
+            service = (sec >= (0x1p63 - 0x1p11) / ticksPerSecond)
+                          ? Time::Max()
+                          : Seconds(sec);
+            if (service.IsStrictlyNegative())
+            {
+                // Zero is valid when a small memory access rounds below one tick.
+                service = Time::Max();
+            }
         }
     }
     // Round 65 (codex finding 8): saturate the free ledger instead of

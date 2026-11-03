@@ -19,6 +19,30 @@
 namespace ns3
 {
 
+namespace
+{
+
+// Round 73 (codex finding 3): a degenerate far-future RetryTimeout
+// (Time::Max(), or any value within RetryTimeout of Time::Max()) passed
+// directly to Simulator::Schedule wraps inside DefaultSimulatorImpl's
+// `delay + TimeStep(now)` — at tick 7 the event lands at
+// -9223372036854775802 and fires immediately. DefaultSimulatorImpl also
+// EXECUTES events scheduled at absolute Time::Max(), so "clamp to
+// Time::Max()" is not "never": the timeout callback would retransmit at
+// the end of time. A stored packet whose configured backstop can never
+// fire within the representable horizon has no timer at all — the entry
+// survives until an ACK, a NACK (which re-arms a plain timeout), or
+// teardown. Same policy as the round-73 memory-response fix
+// (FabricEndpoint::ProcessMemoryPacket): Time::Max() means "drop the
+// deferred action", not "run it at Time::Max()".
+bool
+IsUnrepresentableTimeout(Time timeout)
+{
+    return timeout >= Time::Max() - Simulator::Now();
+}
+
+} // unnamed namespace
+
 NS_LOG_COMPONENT_DEFINE("LlrManager");
 
 NS_OBJECT_ENSURE_REGISTERED(LlrManager);
@@ -198,8 +222,10 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     }
     // A re-store after a timeout fired (event expired, wireArmed true) is a
     // reload refresh: re-arm the plain timeout so the un-ACKed reload keeps
-    // its backstop.
-    else if (m_retryTimeout > Time(0))
+    // its backstop. A degenerate far-future timeout gets no timer: it could
+    // only fire at a wrapped (already-past) tick or at Time::Max() itself,
+    // which DefaultSimulatorImpl executes (see IsUnrepresentableTimeout).
+    else if (m_retryTimeout > Time(0) && !IsUnrepresentableTimeout(m_retryTimeout))
     {
         sourceIt->second.timeoutEvent = Simulator::Schedule(
             m_retryTimeout, &LlrManager::OnRetryTimeout,
@@ -245,6 +271,12 @@ LlrManager::ArmRetryTimeoutAtTransmission(uint32_t seqNum, uint16_t destRank,
 {
     NS_LOG_FUNCTION(this << seqNum << destRank << flowId << static_cast<int>(vcId));
     if (m_retryTimeout <= Time(0))
+    {
+        return;
+    }
+    // A degenerate far-future timeout gets no timer (see
+    // IsUnrepresentableTimeout): nothing reachable can arm one.
+    if (IsUnrepresentableTimeout(m_retryTimeout))
     {
         return;
     }
