@@ -131,6 +131,7 @@ class RdmaOperationEngine : public Object
     };
 
     void Schedule(Time delay, std::function<void()> action);
+    std::function<void()> Guard(std::function<void()> action);
     bool InRegion(uint32_t key, uint64_t address, uint64_t bytes) const;
     bool InAnyRegion(uint64_t address, uint64_t bytes) const;
     Ptr<Packet> Payload(uint64_t address, uint32_t bytes, bool& zero) const;
@@ -161,6 +162,7 @@ class RdmaOperationEngine : public Object
     void FailSource(uint64_t id);
     uint16_t m_rank{0};
     bool m_disposed{false};
+    std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     Ptr<RdmaSubmissionModel> m_model;
     Transmit m_transmit;
     Ack m_ack;

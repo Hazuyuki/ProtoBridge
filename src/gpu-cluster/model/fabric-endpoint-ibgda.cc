@@ -199,6 +199,18 @@ FabricEndpoint::PrepareIbgdaPacket(Ptr<Packet> packet, uint32_t deviceIndex, con
                            std::make_pair(tag.workId, header.GetEffectiveDataSize()));
     tag.sourceReady = true;
     packet->ReplacePacketTag(tag);
+    if (m_ibgda->GetConfig().pcieModel == "tlp")
+    {
+        tag.dmaOffset = m_ibgda->TakeSourceDmaOffset(tag.workId, header.GetEffectiveDataSize());
+        packet->ReplacePacketTag(tag);
+        m_ibgda->SourceRead(
+            header.GetEffectiveDataSize(),
+            [this, packet, deviceIndex, dest] { SendPacketOnDevice(packet, deviceIndex, dest); },
+            tag.dmaOffset + (m_ibgda->GetConfig().dataPath == "staged"
+                                 ? 0
+                                 : m_ibgda->GetConfig().localAddress));
+        return true;
+    }
     Time delay = m_ibgda->ReserveSourceRead(header.GetEffectiveDataSize());
     if (delay.IsZero())
     {
@@ -257,6 +269,18 @@ FabricEndpoint::DeferIbgdaReceive(Ptr<Packet> packet, const FabricHeader& header
         return true;
     }
     packet->ReplacePacketTag(tag);
+    if (m_ibgda->GetConfig().pcieModel == "tlp")
+    {
+        m_ibgda->DestinationWrite(
+            header.GetEffectiveDataSize(),
+            [this, packet, header, ackKey] {
+                m_rdmaPendingAck.erase(ackKey);
+                m_ibgda->NotifyDataReady();
+                OnPacketDelivered(packet, header.GetSequenceNumber(), header);
+            },
+            m_ibgda->GetConfig().remoteAddress + tag.dmaOffset);
+        return true;
+    }
     Time delay = m_ibgda->ReserveDestinationWrite(header.GetEffectiveDataSize());
     if (delay.IsZero())
     {
@@ -278,35 +302,38 @@ FabricEndpoint::StartRdmaHostWrite(const RdmaReceiveKey& key,
                                    Ptr<Packet> packet,
                                    FabricHeader header)
 {
-    Time delay = m_ibgda->ReserveDestinationWrite(header.GetEffectiveDataSize());
-    m_deferredEgressEvents.push_back(Simulator::Schedule(delay, [this, key, work, packet, header] {
-        m_rdmaPendingAck.erase({header.GetSourceRank(),
-                                header.GetVirtualChannel(),
-                                header.GetFlowId(),
-                                header.GetSequenceNumber()});
-        SendLlrAckPacket(header, false); // Transport completes at registered HOST memory.
-        work->received += header.GetEffectiveDataSize();
-        work->ready.push_back({packet, header});
-        NS_ABORT_MSG_IF(work->received > work->bytes, "Receive staging byte ledger overflow");
-        if (work->received != work->bytes)
-        {
-            return;
-        }
-        Time copy = m_ibgda->ReserveDestinationH2d(work->bytes);
-        m_deferredEgressEvents.push_back(Simulator::Schedule(copy, [this, key, work] {
-            m_ibgda->NotifyDataReady();
-            m_ibgda->ReleaseReceiveStaging(work->bytes);
-            m_rdmaReceiveWork.erase(key);
-            for (auto& piece : work->ready)
+    IbgdaPacketTag tag;
+    packet->PeekPacketTag(tag);
+    m_ibgda->DestinationWrite(
+        header.GetEffectiveDataSize(),
+        [this, key, work, packet, header] {
+            m_rdmaPendingAck.erase({header.GetSourceRank(),
+                                    header.GetVirtualChannel(),
+                                    header.GetFlowId(),
+                                    header.GetSequenceNumber()});
+            SendLlrAckPacket(header, false); // Transport completes at registered HOST memory.
+            work->received += header.GetEffectiveDataSize();
+            work->ready.push_back({packet, header});
+            NS_ABORT_MSG_IF(work->received > work->bytes, "Receive staging byte ledger overflow");
+            if (work->received != work->bytes)
             {
-                if (!m_ibgda)
-                {
-                    return;
-                }
-                OnPacketDelivered(piece.packet, piece.header.GetSequenceNumber(), piece.header);
+                return;
             }
-        }));
-    }));
+            m_ibgda->DestinationH2d(work->bytes, [this, key, work] {
+                m_ibgda->NotifyDataReady();
+                m_ibgda->ReleaseReceiveStaging(work->bytes);
+                m_rdmaReceiveWork.erase(key);
+                for (auto& piece : work->ready)
+                {
+                    if (!m_ibgda)
+                    {
+                        return;
+                    }
+                    OnPacketDelivered(piece.packet, piece.header.GetSequenceNumber(), piece.header);
+                }
+            });
+        },
+        tag.dmaOffset);
 }
 
 void

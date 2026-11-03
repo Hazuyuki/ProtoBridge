@@ -153,6 +153,8 @@ OPTION_GROUPS = [
         field("rdmaCqModeration", "CQ moderation · WQEs", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="rdma"),
         field("rdmaMtu", "RDMA packet body limit · bytes", target="stack", scope="multi", default=4096, minimum=1, maximum=1048576, when="rdma"),
         field("rdmaWqeBytes", "WQE fetch size · bytes", target="stack", scope="multi", default=64, minimum=1, maximum=4096, when="rdma"),
+        field("rdmaDoorbellBytes", "Doorbell size · bytes", target="stack", scope="multi", default=8, minimum=1, maximum=4096, when="rdma-pcie"),
+        field("rdmaCqeBytes", "CQ entry size · bytes", target="stack", scope="multi", default=64, minimum=1, maximum=4096, when="rdma-pcie"),
         field("rdmaMapQpByProducer", "QP assignment", target="stack", scope="multi", default=1, choices=[("1", "Map by producer"), ("0", "Round robin per request")], when="rdma"),
         field("rdmaStagingChunkBytes", "Staging chunk · bytes", target="stack", scope="multi", default=65536, minimum=1, maximum=67108864, when="rdma-staged"),
         field("rdmaStagingBufferBytes", "Staging buffer per direction · bytes", target="stack", scope="multi", default=131072, minimum=1, maximum=1073741824, when="rdma-staged"),
@@ -174,7 +176,8 @@ OPTION_GROUPS = [
             ("rdmaD2hNs", "GPU-to-host copy latency · ns",0,"rdma-staged"),
             ("rdmaH2dNs", "Host-to-GPU copy latency · ns",0,"rdma-staged"),
         ]],
-        *[field(key,label,target="stack",scope="multi",default=0,kind="float",maximum=1000000,when="rdma") for key,label in [
+        *[field(key,label,target="stack",scope="multi",default=0,kind="float",maximum=1000000,
+                when="rdma-bandwidth" if key.startswith("rdmaPcie") else "rdma") for key,label in [
             ("rdmaPcieReadGbps", "PCIe read bandwidth · Gb/s"),
             ("rdmaPcieWriteGbps", "PCIe write bandwidth · Gb/s"),
             ("rdmaHbmReadGbps", "HBM read bandwidth · Gb/s"),
@@ -186,6 +189,45 @@ OPTION_GROUPS = [
             ("rdmaD2hGbps", "GPU-to-host copy bandwidth · Gb/s"),
             ("rdmaH2dGbps", "Host-to-GPU copy bandwidth · Gb/s"),
         ]],
+    ]},
+    {"id": "pcie", "title": "Local PCIe", "subtitle": "TLP / credits / read window",
+     "hint": "The TLP model uses error-free Gen3–5 links and VC0. GPU copies, NIC DMA and control traffic share their actual PCIe paths.", "fields": [
+        field("pcieModel", "PCIe model", target="stack", scope="multi", default="bandwidth",
+              choices=[("bandwidth", "Bandwidth and latency"), ("tlp", "TLP packets · no errors")], when="rdma"),
+        field("pcieTopology", "PCIe topology", target="stack", scope="multi", default="switch",
+              choices=[("switch", "Shared PCIe switch"), ("root", "P2P through root complex")], when="rdma-pcie"),
+        field("pcieGeneration", "PCIe generation", target="stack", scope="multi", default=4,
+              choices=[("3", "Gen3"), ("4", "Gen4"), ("5", "Gen5")], when="rdma-pcie"),
+        field("pcieLanes", "PCIe lanes per link", target="stack", scope="multi", default=16,
+              choices=[(str(n), f"x{n}") for n in [1, 2, 4, 8, 16, 32]], when="rdma-pcie"),
+        *[field(key, label, target="stack", scope="multi", default=default,
+                choices=[(str(n), str(n)) for n in [128, 256, 512, 1024, 2048, 4096]], when="rdma-pcie")
+          for key, label, default in [("pcieMps", "Maximum payload · bytes", 256),
+                                      ("pcieMrrs", "Maximum read request · bytes", 512)]],
+        field("pcieRcb", "Read completion boundary · bytes", target="stack", scope="multi", default=128,
+              choices=[("64", "64"), ("128", "128")], when="rdma-pcie"),
+        *[field(key, label, target="stack", scope="multi", default=default, minimum=minimum,
+                maximum=maximum, when="rdma-pcie") for key, label, default, minimum, maximum in [
+            ("pcieTags", "PCIe read tags per requester", 32, 1, 256),
+            ("pcieMaxReadBytes", "Outstanding PCIe read bytes", 16384, 4, 1073741824),
+            ("pcieCompletionBufferBytes", "Reserved completion space · bytes", 32768, 4, 1073741824),
+            ("pcieQueuePackets", "Output queue capacity · TLPs", 64, 1, 65536),
+            ("pciePostedHeaderCredits", "Posted header credits", 32, 1, 16777216),
+            ("pciePostedDataCredits", "Posted data credits · 16 B", 512, 1, 16777216),
+            ("pcieNonPostedHeaderCredits", "Non-posted header credits", 32, 1, 16777216),
+            ("pcieNonPostedDataCredits", "Non-posted data credits · 16 B", 32, 0, 16777216),
+            ("pcieCompletionHeaderCredits", "Completion header credits", 32, 1, 16777216),
+            ("pcieCompletionDataCredits", "Completion data credits · 16 B", 512, 1, 16777216),
+            ("pcieReplayBufferBytes", "Link replay buffer · bytes", 65536, 152, 1073741824),
+            ("pcieAckEvery", "TLPs per link ACK", 8, 1, 65536),
+            ("pcieLinkLatencyNs", "PCIe propagation latency · ns", 10, 0, 1000000000),
+            ("pcieSwitchLatencyNs", "PCIe forwarding latency · ns", 20, 0, 1000000000),
+            ("pcieRootLatencyNs", "Root complex forwarding latency · ns", 50, 0, 1000000000),
+            ("pcieCreditUpdateNs", "Credit update delay · ns", 50, 0, 1000000000),
+            ("pcieAckDelayNs", "Link ACK tail delay · ns", 50, 0, 1000000000),
+        ]],
+        field("pcieRelaxedOrdering", "PCIe relaxed ordering", target="stack", scope="multi", default=0,
+              choices=[("0", "Disabled"), ("1", "Enabled")], when="rdma-pcie"),
     ]},
     {"id": "flow", "title": "流控与拥塞控制", "subtitle": "Credit / 发送窗口 / PFC", "hint": "Credit 控制每个 VC 的可发分片数；So 窗口控制跨节点在途分片数。PFC 和拥塞控制可同时使用。", "fields": [
         field("vcCredits", "每 VC 信用额度 · 分片数", target="credits", minimum=1, maximum=1073741824),
@@ -333,7 +375,7 @@ def validate_value(key, value, rule):
             raise ValueError(f"{key} 范围为 {rule['min']}–{rule['max']}。")
 
 
-PROFILE_SOURCED.update(item["key"] for group in OPTION_GROUPS if group["id"] == "rdma" for item in group["fields"])
+PROFILE_SOURCED.update(item["key"] for group in OPTION_GROUPS if group["id"] in {"rdma", "pcie"} for item in group["fields"])
 
 def validate_configuration(op, resolved, cli, request):
     """Return actual rank count, effective settings and compatibility notes."""
@@ -525,6 +567,15 @@ def validate_configuration(op, resolved, cli, request):
             raise ValueError("RDMA batching requires a positive tail timeout.")
         if integer("rdmaStagingBufferBytes") < integer("rdmaStagingChunkBytes"):
             raise ValueError("The staging buffer must hold at least one staging chunk.")
+    if settings.get("pcieModel") == "tlp":
+        if not multi or settings.get("rdmaSubmission") not in {"detailed", "ibgda"}:
+            raise ValueError("The PCIe TLP model requires multi-node detailed RDMA or IBGDA.")
+        if min(integer("pciePostedDataCredits"), integer("pcieCompletionDataCredits")) * 16 < integer("pcieMps"):
+            raise ValueError("PCIe Posted and Completion data credits must each hold a maximum-sized payload.")
+        if integer("pcieReplayBufferBytes") < integer("pcieMps") + 24:
+            raise ValueError("The PCIe replay buffer must hold a maximum-sized TLP including its 24-byte overhead.")
+        if float(settings["rdmaPcieReadGbps"]) or float(settings["rdmaPcieWriteGbps"]):
+            notices.append("The TLP model derives PCIe bandwidth from generation and lane count; the legacy PCIe bandwidth inputs are ignored.")
     if multi:
         if integer("failedOpticalLink") >= 0 or enabled("failureAwareRouting"):
             raise ValueError("当前光链路故障选项用于单节点统一拓扑构建器；请选择单节点 Leaf–spine。")

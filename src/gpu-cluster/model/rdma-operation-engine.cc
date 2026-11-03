@@ -110,6 +110,17 @@ RdmaOperationEngine::Schedule(Time delay, std::function<void()> action)
     }));
 }
 
+std::function<void()>
+RdmaOperationEngine::Guard(std::function<void()> action)
+{
+    return [alive = m_alive, action = std::move(action)] {
+        if (*alive)
+        {
+            action();
+        }
+    };
+}
+
 const RdmaOperationStats&
 RdmaOperationEngine::GetStats() const
 {
@@ -500,10 +511,11 @@ RdmaOperationEngine::SendPayload(uint16_t peer,
                                  : 0;
         m_stats.wireDataBytes += count;
         m_stats.wireControlBytes += immediate;
-        Time delay = m_model->ReserveSourceRead(count);
-        Schedule(delay, [this, peer, packet, piece, qp, flow, vc, immediate] {
-            m_transmit(peer, packet, piece, qp, flow, vc, immediate);
-        });
+        m_model->SourceRead(count,
+                            Guard([this, peer, packet, piece, qp, flow, vc, immediate] {
+                                m_transmit(peer, packet, piece, qp, flow, vc, immediate);
+                            }),
+                            m_model->GetConfig().dataPath == "staged" ? offset : address + offset);
         offset += count;
     }
 }
@@ -801,46 +813,49 @@ RdmaOperationEngine::StartPiece(Key key, std::shared_ptr<Incoming> incoming, Pie
     NS_ABORT_MSG_IF(piece.tag.fragmentOffset > incoming->tag.bytes ||
                         bytes > incoming->tag.bytes - piece.tag.fragmentOffset,
                     "RDMA payload exceeds its work request");
-    Schedule(m_model->ReserveDestinationWrite(bytes), [this, key, incoming, piece, bytes] {
-        if (m_model->GetConfig().dataPath == "staged")
-        {
-            incoming->staged.push_back(piece);
-        }
-        else
-        {
-            Store(incoming->address + piece.tag.fragmentOffset,
-                  piece.packet,
-                  bytes,
-                  piece.tag.zeroPayload);
-        }
-        incoming->received += bytes;
-        NS_ABORT_MSG_IF(incoming->received > incoming->tag.bytes,
-                        "RDMA receive byte ledger overflow");
-        if (incoming->received < incoming->tag.bytes)
-        {
-            Acknowledge(piece.header);
-            return;
-        }
-        if (m_model->GetConfig().dataPath == "staged")
-        {
-            Schedule(m_model->ReserveDestinationH2d(incoming->tag.bytes),
-                     [this, key, incoming, piece] {
-                         for (auto& saved : incoming->staged)
-                         {
-                             Store(incoming->address + saved.tag.fragmentOffset,
-                                   saved.packet,
-                                   saved.header.GetEffectiveDataSize(),
-                                   saved.tag.zeroPayload);
-                         }
-                         m_model->ReleaseReceiveStaging(incoming->tag.bytes);
-                         CompleteIncoming(key, incoming, piece);
-                     });
-        }
-        else
-        {
-            CompleteIncoming(key, incoming, piece);
-        }
-    });
+    m_model->DestinationWrite(
+        bytes,
+        Guard([this, key, incoming, piece, bytes] {
+            if (m_model->GetConfig().dataPath == "staged")
+            {
+                incoming->staged.push_back(piece);
+            }
+            else
+            {
+                Store(incoming->address + piece.tag.fragmentOffset,
+                      piece.packet,
+                      bytes,
+                      piece.tag.zeroPayload);
+            }
+            incoming->received += bytes;
+            NS_ABORT_MSG_IF(incoming->received > incoming->tag.bytes,
+                            "RDMA receive byte ledger overflow");
+            if (incoming->received < incoming->tag.bytes)
+            {
+                Acknowledge(piece.header);
+                return;
+            }
+            if (m_model->GetConfig().dataPath == "staged")
+            {
+                m_model->DestinationH2d(incoming->tag.bytes, Guard([this, key, incoming, piece] {
+                                            for (auto& saved : incoming->staged)
+                                            {
+                                                Store(incoming->address + saved.tag.fragmentOffset,
+                                                      saved.packet,
+                                                      saved.header.GetEffectiveDataSize(),
+                                                      saved.tag.zeroPayload);
+                                            }
+                                            m_model->ReleaseReceiveStaging(incoming->tag.bytes);
+                                            CompleteIncoming(key, incoming, piece);
+                                        }));
+            }
+            else
+            {
+                CompleteIncoming(key, incoming, piece);
+            }
+        }),
+        m_model->GetConfig().dataPath == "staged" ? piece.tag.fragmentOffset
+                                                  : incoming->address + piece.tag.fragmentOffset);
 }
 
 void
@@ -887,13 +902,11 @@ RdmaOperationEngine::CompleteIncoming(Key key,
                 tag.opcode == RdmaOpcode::SEND_IMM || tag.opcode == RdmaOpcode::WRITE_IMM;
             result.immediate = tag.immediate;
             auto cb = incoming->receive->complete;
-            const auto& config = m_model->GetConfig();
-            Schedule(config.cqWrite + (config.initiator == "cpu" ? config.cpuPoll : config.gpuPoll),
-                     [this, cb, result]() mutable {
-                         ++m_stats.receiveCompletions;
-                         result.observed = Simulator::Now();
-                         cb(result);
-                     });
+            m_model->WriteCompletion(Guard([this, cb, result]() mutable {
+                ++m_stats.receiveCompletions;
+                result.observed = Simulator::Now();
+                cb(result);
+            }));
         }
     }
 }
@@ -972,9 +985,7 @@ void
 RdmaOperationEngine::RunAtomic(std::shared_ptr<Responder> responder)
 {
     auto run = [this, responder] {
-        Time service = m_model->ReserveSourceRead(8) + m_model->ReserveDestinationWrite(8) +
-                       m_model->GetConfig().atomicService;
-        Schedule(service, [this, responder] {
+        auto execute = [this, responder] {
             auto tag = responder->tag;
             uint64_t address =
                 tag.opcode == RdmaOpcode::SIGNAL ? tag.signalAddress : tag.remoteAddress;
@@ -1015,7 +1026,7 @@ RdmaOperationEngine::RunAtomic(std::shared_ptr<Responder> responder)
                     reply.zeroPayload = old == 0;
                     m_stats.wireDataBytes += 8;
                     auto packet = Create<Packet>(data.data(), 8);
-                    Schedule(m_model->ReserveSourceRead(8), [this, responder, reply, packet] {
+                    auto send = [this, responder, reply, packet] {
                         m_transmit(reply.owner,
                                    packet,
                                    reply,
@@ -1023,7 +1034,16 @@ RdmaOperationEngine::RunAtomic(std::shared_ptr<Responder> responder)
                                    responder->flow,
                                    responder->vc,
                                    0);
-                    });
+                    };
+                    if (m_model->GetConfig().pcieModel == "tlp")
+                    {
+                        // The NIC already holds the fetched old value.
+                        Schedule(Time(0), std::move(send));
+                    }
+                    else
+                    {
+                        m_model->SourceRead(8, Guard(std::move(send)));
+                    }
                 }
                 auto found = m_atomics.find(address);
                 found->second.pop_front();
@@ -1039,17 +1059,41 @@ RdmaOperationEngine::RunAtomic(std::shared_ptr<Responder> responder)
             if (m_model->GetConfig().dataPath == "staged")
             {
                 m_model->AcquireReceiveStaging(8, [this, commit] {
-                    Schedule(m_model->ReserveDestinationH2d(8), [this, commit] {
-                        m_model->ReleaseReceiveStaging(8);
-                        commit();
-                    });
+                    m_model->DestinationH2d(8, Guard([this, commit] {
+                                                m_model->ReleaseReceiveStaging(8);
+                                                commit();
+                                            }));
                 });
             }
             else
             {
                 commit();
             }
-        });
+        };
+        if (m_model->GetConfig().pcieModel == "tlp")
+        {
+            uint64_t address = responder->tag.opcode == RdmaOpcode::SIGNAL
+                                   ? responder->tag.signalAddress
+                                   : responder->tag.remoteAddress;
+            if (m_model->GetConfig().dataPath == "staged")
+            {
+                address = 0;
+            }
+            m_model->SourceRead(
+                8,
+                Guard([this, execute, address] {
+                    Schedule(m_model->GetConfig().atomicService, [this, execute, address] {
+                        m_model->DestinationWrite(8, Guard(execute), address);
+                    });
+                }),
+                address);
+        }
+        else
+        {
+            Time service = m_model->ReserveSourceRead(8) + m_model->ReserveDestinationWrite(8) +
+                           m_model->GetConfig().atomicService;
+            Schedule(service, std::move(execute));
+        }
     };
     if (m_model->GetConfig().dataPath == "staged")
     {
@@ -1084,6 +1128,7 @@ void
 RdmaOperationEngine::DoDispose()
 {
     m_disposed = true;
+    *m_alive = false;
     for (auto& event : m_events)
     {
         if (event.IsPending())

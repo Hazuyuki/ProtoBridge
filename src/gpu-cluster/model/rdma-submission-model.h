@@ -2,6 +2,7 @@
 #ifndef RDMA_SUBMISSION_MODEL_H
 #define RDMA_SUBMISSION_MODEL_H
 
+#include "pcie-fabric.h"
 #include "rdma-operation.h"
 
 #include "ns3/event-id.h"
@@ -13,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +30,8 @@ class CommandLine;
  */
 struct RdmaConfig
 {
+    std::string pcieModel{"bandwidth"}; ///< bandwidth (legacy) or tlp (error-free PCIe)
+    PcieConfig pcie;
     std::string initiator{"gpu"};      ///< cpu or gpu; independent of payload location
     std::string dataPath{"gpudirect"}; ///< host, staged, or gpudirect
     uint32_t cpuWorkers{1};
@@ -38,6 +42,7 @@ struct RdmaConfig
     uint32_t cqModeration{1};
     uint32_t mtuBytes{4096};
     uint32_t wqeBytes{64};
+    uint32_t doorbellBytes{8}, cqeBytes{64};
     bool mapQpByProducer{true};
     Time wqeBuild{NanoSeconds(0)};
     Time publish{NanoSeconds(0)};
@@ -125,6 +130,7 @@ class RdmaPacketTag : public Tag
     void Print(std::ostream& os) const override;
     uint64_t workId{0};
     uint64_t workBytes{0};
+    uint64_t dmaOffset{0};
     uint32_t qp{0};
     bool sourceReady{false};
     bool destinationReady{false};
@@ -132,9 +138,20 @@ class RdmaPacketTag : public Tag
 };
 
 /// Share this object between NIC endpoints attached to the same host DRAM.
+struct RdmaMemoryChannels
+{
+    Time readFree, writeFree;
+};
+
 struct RdmaHostMemoryResources
 {
     Time readFree, writeFree;
+    // Separate ownership from the fabric: in-flight TLPs can drain after a
+    // runtime is disposed, without a fabric -> host -> fabric reference cycle.
+    std::shared_ptr<RdmaMemoryChannels> pcieMemory{std::make_shared<RdmaMemoryChannels>()};
+    Ptr<PcieFabric> pcie;
+    uint16_t pcieHost{0}, pcieSwitch{0};
+    double pcieHostReadGbps{0}, pcieHostWriteGbps{0};
 };
 
 class RdmaSubmissionModel : public Object
@@ -174,6 +191,15 @@ class RdmaSubmissionModel : public Object
     void NotifyPacketAck(uint64_t workId, uint64_t bytes);
     void NotifyFirstWire(uint64_t workId);
     void NotifyFailure(uint64_t workId);
+    using Ready = std::function<void()>;
+    /// Asynchronous memory paths; use these with either PCIe model.
+    void SourceRead(uint64_t bytes, Ready ready, uint64_t address = 0);
+    void DestinationWrite(uint64_t bytes, Ready ready, uint64_t address = 0);
+    uint64_t TakeSourceDmaOffset(uint64_t workId, uint64_t bytes);
+    void DestinationH2d(uint64_t bytes, Ready ready);
+    void WriteCompletion(Ready ready);
+    /// Builds the local topology lazily. Call on every runtime before traffic.
+    Ptr<PcieFabric> GetPcieFabric();
     Time ReserveSourceRead(uint64_t bytes);
     Time ReserveDestinationWrite(uint64_t bytes);
     Time ReserveDestinationH2d(uint64_t bytes);
@@ -197,6 +223,7 @@ class RdmaSubmissionModel : public Object
         Execute execute;
         Completion complete;
         uint64_t acknowledgedBytes{0};
+        uint64_t sourceDmaBytes{0};
         uint64_t fenceThrough{0};
         bool acked{false};
         bool failed{false};
@@ -230,8 +257,14 @@ class RdmaSubmissionModel : public Object
     void PumpSourceStaging();
     void PumpReceiveStaging();
     Time ReserveSourceD2h(uint64_t bytes);
+    void SourceD2h(uint64_t bytes, Ready ready);
+    void EnsurePcie();
+    Ready Guard(Ready ready);
+    void PcieCopy(bool toGpu, uint64_t bytes, Ready ready);
+    void FetchPublished(const QpKey& key, const std::vector<uint64_t>& ids);
+    void PumpPcieFetch(const QpKey& key);
     void Schedule(Time delay, std::function<void()> fn);
-    Time Reserve(uint64_t bytes, double gbps, Time& free, Time earliest);
+    static Time Reserve(uint64_t bytes, double gbps, Time& free, Time earliest);
     bool BlockedByFence(const Work& work) const;
     RdmaConfig m_config;
     RdmaStats m_stats;
@@ -249,6 +282,12 @@ class RdmaSubmissionModel : public Object
     Time m_d2hFree, m_h2dFree;
     std::shared_ptr<RdmaHostMemoryResources> m_hostMemory{
         std::make_shared<RdmaHostMemoryResources>()};
+    std::shared_ptr<RdmaMemoryChannels> m_pcieGpuMemory{std::make_shared<RdmaMemoryChannels>()};
+    Ptr<PcieFabric> m_pcie;
+    uint16_t m_pcieHost{0}, m_pcieGpu{0}, m_pcieNic{0};
+    std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
+    std::map<QpKey, std::deque<uint64_t>> m_pcieFetched;
+    std::set<uint64_t> m_pcieReady;
     uint64_t m_sourceStagingUsed{0}, m_receiveStagingUsed{0};
 
     struct SourceStageWait

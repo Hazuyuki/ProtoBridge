@@ -421,6 +421,8 @@ class SimulationOptions {
         if (item.when === "rdma-cpu") show = show && (setting("rdmaInitiator") || "gpu") === "cpu";
         if (item.when === "rdma-gpu") show = show && (setting("rdmaInitiator") || "gpu") === "gpu";
         if (item.when === "rdma-staged") show = show && setting("rdmaDataPath") === "staged";
+        if (item.when === "rdma-pcie") show = show && setting("pcieModel") === "tlp";
+        if (item.when === "rdma-bandwidth") show = show && setting("pcieModel") !== "tlp";
       }
       if (item.when === "burst")
         show = scope && (setting("errorMode") || "independent") === "burst";

@@ -16,6 +16,7 @@ The bulk-transfer examples below retain their timing-only Write behavior.
 | `rdmaSubmission` | `startup` (default), `detailed`, `ibgda` | Legacy startup delay or explicit submission events. `ibgda` is the compatibility preset for detailed GPU submission with GPUDirect. |
 | `rdmaInitiator` | `cpu`, `gpu` (default) | Selects worker/producer count and WQE construction, publication, doorbell, and completion-observation costs. |
 | `rdmaDataPath` | `host`, `staged`, `gpudirect` (default) | Host DRAM, GPU payload copied through host DRAM, or direct NIC access to GPU memory. |
+| `pcieModel` | `bandwidth` (default), `tlp` | Legacy PCIe bandwidth/latency or shared, error-free TLP execution; see [PCIE.md](PCIE.md). |
 
 `startup` keeps the existing behavior and ignores detailed submission/memory
 parameters. `detailed` supports all six initiator/path combinations. The four
@@ -95,7 +96,7 @@ Each endpoint has separate source and destination pools, each of size
 destination pool queues accepted pieces before host writes and ACKs. This is
 abstract receive backpressure, without detailed NIC SRAM occupancy or addresses.
 
-For a copy, the maximum of memory and copy-engine bandwidth service times
+With `pcieModel=bandwidth`, the maximum of memory and copy-engine bandwidth service times
 determines readiness, followed by fixed copy latency. NIC DMA similarly uses
 the maximum of memory and PCIe service times, followed by fixed DMA latency.
 Fixed latencies can overlap; bandwidth service reserves the relevant resources.
@@ -105,7 +106,11 @@ between endpoints on the same simulated host. HBM, NIC PCIe and D2H/H2D service
 resources, CPU workers and GPU producers are per endpoint. `rdmaD2hGbps` /
 `rdmaH2dGbps` are separate effective
 copy-path limits; they do not contend with NIC PCIe resources. A shared PCIe root
-complex, caches, page mapping and TLP arbitration are outside this model.
+complex and TLP arbitration are outside the bandwidth model. With
+`pcieModel=tlp`, DMA, copies, doorbells, WQE reads and CQ writes traverse a shared
+PCIe topology with finite queues, six credit pools and finite read tags/bytes.
+The TLP mode replaces the two `rdmaPcie*Gbps` limits while retaining memory,
+copy-engine and device-service inputs. See [PCIE.md](PCIE.md) for scope and settings.
 
 ## User parameters
 

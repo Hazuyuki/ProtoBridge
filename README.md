@@ -67,6 +67,11 @@ the C++ interface, [doc/RDMA_OPERATIONS.md](doc/RDMA_OPERATIONS.md) for Read/Get
 Send/Recv, immediate notifications, atomics and PutSignal/Wait/Test, or
 [doc/IBGDA.md](doc/IBGDA.md) for GPU-specific bulk Write examples.
 
+Detailed RDMA also offers an error-free PCIe packet model with shared GPU/NIC
+paths, TLP queues, six credit pools and finite read tags. Select
+`pcieModel=tlp`; the existing bandwidth model remains the default. See
+[doc/PCIE.md](doc/PCIE.md) for examples, parameters and trace interpretation.
+
 ## What this is (and is not)
 
 **Is:** an interconnect-only simulator + a surrogate model. Credit-based flow

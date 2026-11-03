@@ -24,7 +24,24 @@ using RateFields = std::vector<std::pair<std::string, double*>>;
 UintFields
 UintOptions(RdmaConfig& c)
 {
-    return {{"rdmaGpuProducers", &c.producers},
+    return {{"pcieGeneration", &c.pcie.generation},
+            {"pcieLanes", &c.pcie.lanes},
+            {"pcieMps", &c.pcie.mps},
+            {"pcieMrrs", &c.pcie.mrrs},
+            {"pcieRcb", &c.pcie.rcb},
+            {"pcieTags", &c.pcie.tags},
+            {"pcieMaxReadBytes", &c.pcie.maxReadBytes},
+            {"pcieCompletionBufferBytes", &c.pcie.completionBufferBytes},
+            {"pcieQueuePackets", &c.pcie.queuePackets},
+            {"pciePostedHeaderCredits", &c.pcie.credits[0]},
+            {"pciePostedDataCredits", &c.pcie.credits[1]},
+            {"pcieNonPostedHeaderCredits", &c.pcie.credits[2]},
+            {"pcieNonPostedDataCredits", &c.pcie.credits[3]},
+            {"pcieCompletionHeaderCredits", &c.pcie.credits[4]},
+            {"pcieCompletionDataCredits", &c.pcie.credits[5]},
+            {"pcieReplayBufferBytes", &c.pcie.replayBufferBytes},
+            {"pcieAckEvery", &c.pcie.ackEvery},
+            {"rdmaGpuProducers", &c.producers},
             {"rdmaCpuWorkers", &c.cpuWorkers},
             {"rdmaQpsPerPeer", &c.qpsPerPeer},
             {"rdmaQueueDepth", &c.queueDepth},
@@ -32,6 +49,8 @@ UintOptions(RdmaConfig& c)
             {"rdmaCqModeration", &c.cqModeration},
             {"rdmaMtu", &c.mtuBytes},
             {"rdmaWqeBytes", &c.wqeBytes},
+            {"rdmaDoorbellBytes", &c.doorbellBytes},
+            {"rdmaCqeBytes", &c.cqeBytes},
             {"rdmaStagingChunkBytes", &c.stagingChunkBytes},
             {"rdmaStagingBufferBytes", &c.stagingBufferBytes},
             {"rdmaMaxReadAtomic", &c.maxReadAtomic},
@@ -56,18 +75,33 @@ U64Options(RdmaConfig& c)
 TimeFields
 TimeOptions(RdmaConfig& c)
 {
-    return {
-        {"rdmaGpuWqeBuildNs", &c.wqeBuild},     {"rdmaCpuWqeBuildNs", &c.cpuWqeBuild},
-        {"rdmaGpuPublishNs", &c.publish},       {"rdmaCpuPublishNs", &c.cpuPublish},
-        {"rdmaGpuDoorbellNs", &c.doorbell},     {"rdmaCpuDoorbellNs", &c.cpuDoorbell},
-        {"rdmaGpuPollNs", &c.gpuPoll},          {"rdmaCpuPollNs", &c.cpuPoll},
-        {"rdmaCpuHandoffNs", &c.cpuHandoff},    {"rdmaBatchTimeoutNs", &c.batchTimeout},
-        {"rdmaWqeFetchNs", &c.wqeFetch},        {"rdmaDmaReadNs", &c.dmaReadLatency},
-        {"rdmaDmaWriteNs", &c.dmaWriteLatency}, {"rdmaCqWriteNs", &c.cqWrite},
-        {"rdmaD2hNs", &c.d2hLatency},           {"rdmaH2dNs", &c.h2dLatency},
-        {"rdmaReadServiceNs", &c.readService},  {"rdmaAtomicServiceNs", &c.atomicService},
-        {"rdmaRnrRetryNs", &c.rnrRetry},        {"rdmaReceivePostNs", &c.receivePost},
-        {"rdmaSignalPollNs", &c.signalPoll},    {"rdmaReceivePostDelayNs", &c.receivePostDelay}};
+    return {{"pcieLinkLatencyNs", &c.pcie.linkLatency},
+            {"pcieSwitchLatencyNs", &c.pcie.switchLatency},
+            {"pcieRootLatencyNs", &c.pcie.rootLatency},
+            {"pcieCreditUpdateNs", &c.pcie.creditUpdate},
+            {"pcieAckDelayNs", &c.pcie.ackDelay},
+            {"rdmaGpuWqeBuildNs", &c.wqeBuild},
+            {"rdmaCpuWqeBuildNs", &c.cpuWqeBuild},
+            {"rdmaGpuPublishNs", &c.publish},
+            {"rdmaCpuPublishNs", &c.cpuPublish},
+            {"rdmaGpuDoorbellNs", &c.doorbell},
+            {"rdmaCpuDoorbellNs", &c.cpuDoorbell},
+            {"rdmaGpuPollNs", &c.gpuPoll},
+            {"rdmaCpuPollNs", &c.cpuPoll},
+            {"rdmaCpuHandoffNs", &c.cpuHandoff},
+            {"rdmaBatchTimeoutNs", &c.batchTimeout},
+            {"rdmaWqeFetchNs", &c.wqeFetch},
+            {"rdmaDmaReadNs", &c.dmaReadLatency},
+            {"rdmaDmaWriteNs", &c.dmaWriteLatency},
+            {"rdmaCqWriteNs", &c.cqWrite},
+            {"rdmaD2hNs", &c.d2hLatency},
+            {"rdmaH2dNs", &c.h2dLatency},
+            {"rdmaReadServiceNs", &c.readService},
+            {"rdmaAtomicServiceNs", &c.atomicService},
+            {"rdmaRnrRetryNs", &c.rnrRetry},
+            {"rdmaReceivePostNs", &c.receivePost},
+            {"rdmaSignalPollNs", &c.signalPoll},
+            {"rdmaReceivePostDelayNs", &c.receivePostDelay}};
 }
 
 RateFields
@@ -144,6 +178,13 @@ void
 AddRdmaCommandLine(CommandLine& cmd, std::string& mode, RdmaConfig& config)
 {
     cmd.AddValue("rdmaSubmission", "RDMA timing: startup, detailed, or legacy ibgda alias", mode);
+    cmd.AddValue("pcieModel",
+                 "Local PCIe model: bandwidth or tlp (error-free Gen3--5 VC0)",
+                 config.pcieModel);
+    cmd.AddValue("pcieTopology", "PCIe path: switch or root", config.pcie.topology);
+    cmd.AddValue("pcieRelaxedOrdering",
+                 "Allow relaxed ordering for PCIe requests",
+                 config.pcie.relaxedOrdering);
     cmd.AddValue("rdmaInitiator", "Request submitter: cpu or gpu", config.initiator);
     cmd.AddValue("rdmaOperation", "Opcode for collective=rdma; see doc/RDMA.md", config.operation);
     cmd.AddValue("rdmaSignalOp", "Signal update: set or add", config.signalOperation);
@@ -156,7 +197,7 @@ AddRdmaCommandLine(CommandLine& cmd, std::string& mode, RdmaConfig& config)
                  config.dataPath);
     for (auto [name, dest] : UintOptions(config))
     {
-        cmd.AddValue(name, "RDMA count/size; see doc/RDMA.md", *dest);
+        cmd.AddValue(name, "RDMA/PCIe count/size; see doc/RDMA.md and doc/PCIE.md", *dest);
         for (const auto& [alias, target] : ALIASES)
         {
             if (target == name)
@@ -218,7 +259,10 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
         values[target] = found->second;
         values.erase(alias);
     }
-    std::vector<std::string> known{"rdmaSubmission",
+    std::vector<std::string> known{"pcieModel",
+                                   "pcieTopology",
+                                   "pcieRelaxedOrdering",
+                                   "rdmaSubmission",
                                    "rdmaInitiator",
                                    "rdmaDataPath",
                                    "rdmaMapQpByProducer",
@@ -242,7 +286,8 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
     }
     for (const auto& [name, value] : values)
     {
-        NS_ABORT_MSG_IF((name.rfind("ibgda", 0) == 0 || name.rfind("rdma", 0) == 0) &&
+        NS_ABORT_MSG_IF((name.rfind("ibgda", 0) == 0 || name.rfind("rdma", 0) == 0 ||
+                         name.rfind("pcie", 0) == 0) &&
                             std::find(known.begin(), known.end(), name) == known.end(),
                         "Unknown RDMA profile option: " << name);
     }
@@ -258,6 +303,15 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
     assign("rdmaDataPath", config.dataPath);
     assign("rdmaOperation", config.operation);
     assign("rdmaSignalOp", config.signalOperation);
+    assign("pcieModel", config.pcieModel);
+    assign("pcieTopology", config.pcie.topology);
+    auto relaxed = values.find("pcieRelaxedOrdering");
+    if (relaxed != values.end())
+    {
+        NS_ABORT_MSG_IF(relaxed->second != "0" && relaxed->second != "1",
+                        "pcieRelaxedOrdering must be 0 or 1");
+        config.pcie.relaxedOrdering = relaxed->second == "1";
+    }
     for (auto [name, dest] : U64Options(config))
     {
         auto it = values.find(name);
@@ -331,6 +385,10 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
     }
     NS_ABORT_MSG_IF(mode != "startup" && !IsDetailedRdmaMode(mode),
                     "rdmaSubmission must be startup, detailed or ibgda");
+    NS_ABORT_MSG_IF(config.pcieModel != "bandwidth" && config.pcieModel != "tlp",
+                    "pcieModel must be bandwidth or tlp");
+    NS_ABORT_MSG_IF(config.pcieModel == "tlp" && !IsDetailedRdmaMode(mode),
+                    "pcieModel=tlp requires rdmaSubmission=detailed or ibgda");
     NS_ABORT_MSG_IF(mode == "ibgda" &&
                         (config.initiator != "gpu" || config.dataPath != "gpudirect"),
                     "The ibgda alias requires gpu/gpudirect; use detailed for independent choices");
@@ -343,6 +401,12 @@ ApplyRdmaProfile(const std::unordered_map<std::string, std::string>& input,
 void
 RdmaConfig::Validate() const
 {
+    NS_ABORT_MSG_IF(pcieModel != "bandwidth" && pcieModel != "tlp",
+                    "pcieModel must be bandwidth or tlp");
+    if (pcieModel == "tlp")
+    {
+        pcie.Validate();
+    }
     ParseRdmaOpcode(operation);
     NS_ABORT_MSG_IF(signalOperation != "set" && signalOperation != "add",
                     "rdmaSignalOp must be set or add");
@@ -366,6 +430,8 @@ RdmaConfig::Validate() const
                     "RDMA doorbell batch and CQ moderation must be in [1, queueDepth]");
     NS_ABORT_MSG_IF(mtuBytes == 0 || mtuBytes > (1u << 20) || wqeBytes == 0,
                     "RDMA needs MTU in [1,1048576] B and positive WQE bytes");
+    NS_ABORT_MSG_IF(doorbellBytes == 0 || doorbellBytes > 4096 || cqeBytes == 0 || cqeBytes > 4096,
+                    "RDMA doorbell/CQE size must be in [1,4096] B");
     for (Time t :
          {wqeBuild,        publish,     doorbell,   batchTimeout,    wqeFetch,    dmaReadLatency,
           dmaWriteLatency, cqWrite,     gpuPoll,    cpuWqeBuild,     cpuPublish,  cpuDoorbell,
@@ -410,7 +476,7 @@ RdmaPacketTag::GetInstanceTypeId() const
 uint32_t
 RdmaPacketTag::GetSerializedSize() const
 {
-    return 23;
+    return 31;
 }
 
 void
@@ -418,6 +484,7 @@ RdmaPacketTag::Serialize(TagBuffer b) const
 {
     b.WriteU64(workId);
     b.WriteU64(workBytes);
+    b.WriteU64(dmaOffset);
     b.WriteU32(qp);
     b.WriteU8(sourceReady);
     b.WriteU8(destinationReady);
@@ -429,6 +496,7 @@ RdmaPacketTag::Deserialize(TagBuffer b)
 {
     workId = b.ReadU64();
     workBytes = b.ReadU64();
+    dmaOffset = b.ReadU64();
     qp = b.ReadU32();
     sourceReady = b.ReadU8();
     destinationReady = b.ReadU8();
@@ -455,7 +523,8 @@ RdmaSubmissionModel::GetTypeId()
 void
 RdmaSubmissionModel::Configure(const RdmaConfig& config)
 {
-    NS_ABORT_MSG_IF(m_stats.submitted != 0, "Configure RDMA before submitting work");
+    NS_ABORT_MSG_IF(m_stats.submitted != 0 || m_pcie,
+                    "Configure RDMA before submitting work or attaching PCIe");
     config.Validate();
     m_config = config;
     m_producerFree.assign(config.ProducerCount(), Time(0));
@@ -464,9 +533,13 @@ RdmaSubmissionModel::Configure(const RdmaConfig& config)
 void
 RdmaSubmissionModel::SetHostMemoryResources(std::shared_ptr<RdmaHostMemoryResources> resources)
 {
-    NS_ABORT_MSG_IF(!resources || m_stats.submitted != 0,
+    NS_ABORT_MSG_IF(!resources || m_stats.submitted != 0 || m_pcie,
                     "Set host memory resources before RDMA work");
     m_hostMemory = std::move(resources);
+    if (m_config.pcieModel == "tlp")
+    {
+        EnsurePcie();
+    }
 }
 
 const RdmaConfig&
@@ -754,6 +827,7 @@ RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earli
 Time
 RdmaSubmissionModel::ReserveSourceRead(uint64_t bytes)
 {
+    NS_ABORT_MSG_IF(m_config.pcieModel == "tlp", "Use asynchronous SourceRead with pcieModel=tlp");
     const Time now = Simulator::Now();
     Time memory;
     if (m_config.dataPath == "gpudirect")
@@ -776,6 +850,8 @@ RdmaSubmissionModel::ReserveSourceRead(uint64_t bytes)
 Time
 RdmaSubmissionModel::ReserveDestinationWrite(uint64_t bytes)
 {
+    NS_ABORT_MSG_IF(m_config.pcieModel == "tlp",
+                    "Use asynchronous DestinationWrite with pcieModel=tlp");
     const Time now = Simulator::Now();
     Time memory;
     if (m_config.dataPath == "gpudirect")
@@ -810,6 +886,8 @@ RdmaSubmissionModel::ReserveSourceD2h(uint64_t bytes)
 Time
 RdmaSubmissionModel::ReserveDestinationH2d(uint64_t bytes)
 {
+    NS_ABORT_MSG_IF(m_config.pcieModel == "tlp",
+                    "Use asynchronous DestinationH2d with pcieModel=tlp");
     const Time now = Simulator::Now();
     m_stats.hostReadBytes += bytes;
     m_stats.hbmWriteBytes += bytes;
@@ -900,7 +978,7 @@ RdmaSubmissionModel::PumpSourceStaging()
             work.stagingAllocated = true;
             work.time.stagingAcquired = Simulator::Now();
         }
-        Schedule(ReserveSourceD2h(pending.bytes), [this, pending] {
+        SourceD2h(pending.bytes, [this, pending] {
             if (pending.id)
             {
                 auto& work = m_work.at(pending.id);
@@ -1228,6 +1306,24 @@ RdmaSubmissionModel::Ring(const QpKey& key)
         std::max(Simulator::Now(), m_doorbellFree),
         m_config.initiator == "cpu" ? m_config.cpuDoorbell : m_config.doorbell);
     m_doorbellFree = ringEnd;
+    if (m_config.pcieModel == "tlp")
+    {
+        EnsurePcie();
+        std::vector<uint64_t> ids(qp.published.begin(), qp.published.end());
+        qp.published.clear();
+        for (auto id : ids)
+        {
+            m_pcieFetched[key].push_back(id);
+        }
+        Schedule(ringEnd - Simulator::Now(), [this, key, ids] {
+            m_pcie->Write(m_config.initiator == "cpu" ? m_pcieHost : m_pcieGpu,
+                          m_pcieNic,
+                          m_config.doorbellBytes,
+                          Guard([this, key, ids] { FetchPublished(key, ids); }),
+                          PcieTraffic::DOORBELL);
+        });
+        return;
+    }
     while (!qp.published.empty())
     {
         uint64_t id = qp.published.front();
@@ -1365,10 +1461,7 @@ RdmaSubmissionModel::Progress(const QpKey& key)
     }
     // Round 68 (codex finding 2): saturate — cqWrite=INT64_MAX (gpuPoll=1)
     // wrapped the relative delay past INT64_MAX and Schedule() aborted.
-    Schedule(SaturatedAddTime(m_config.cqWrite,
-                              m_config.initiator == "cpu" ? m_config.cpuPoll
-                                                          : m_config.gpuPoll),
-             [this, key, through] { Observe(key, through); });
+    WriteCompletion([this, key, through] { Observe(key, through); });
 }
 
 void
@@ -1511,6 +1604,7 @@ void
 RdmaSubmissionModel::DoDispose()
 {
     m_disposed = true;
+    *m_alive = false;
     for (auto& [key, qp] : m_qps)
     {
         if (qp.batchEvent.IsPending())
@@ -1532,6 +1626,10 @@ RdmaSubmissionModel::DoDispose()
     m_observer = {};
     m_sourceStagingWaiting.clear();
     m_receiveStagingWaiting.clear();
+    m_pcieFetched.clear();
+    m_pcieReady.clear();
+    m_pcie = nullptr;
+    m_hostMemory.reset();
     Object::DoDispose();
 }
 } // namespace ns3

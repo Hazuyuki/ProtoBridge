@@ -147,6 +147,16 @@ Read/原子操作在途上限、响应方槽位、接收队列容量、RNR 重�
 提交方观测完成与目标数据就绪，以及拷贝字节数。参数和 C++ 集成方式见
 [RDMA 使用说明](../doc/RDMA.md)。
 
+启用详细 RDMA 或 IBGDA 后，打开“本机 PCIe”，选择“TLP 包级模型 · 无误码”。可调整
+代际、lane 数、交换机/根复合体拓扑、MPS/MRRS、读 Tag、队列容量和六类信用额度。
+数据信用额度以 16 字节为单位。GPU 拷贝、NIC DMA、WQE、doorbell 和 CQ 流量经过实际
+共享的 PCIe 路径；HBM、主机内存及拷贝引擎的限制继续生效。该模式支持 Gen3–5 和
+VC0，不注入 PCIe 误码；以太网/RoCE 的错误配置仍单独作用于网络。
+
+运行归档包含 `pcie.csv`，也可从 `/api/runs/<id>/artifacts/pcie.csv` 下载。默认最多记录
+100000 个事件，`pcieTraceTruncated` 表示是否截断；汇总计数不受影响。参数、事件含义和
+建模范围见 [PCIe 说明](../doc/PCIE.md)。
+
 ### 如何读图
 
 拓扑图表示选择的网络结构，是示意图。步骤时序图使用真实 `stepTraceFile` 记录，

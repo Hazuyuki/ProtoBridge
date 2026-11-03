@@ -84,7 +84,7 @@ CLI_FIELDS: dict[str, dict[str, Any]] = {
 }
 
 for _group in OPTION_GROUPS:
-    if _group["id"] == "rdma":
+    if _group["id"] in {"rdma", "pcie"}:
         for _field in _group["fields"]:
             CLI_FIELDS[_field["key"]] = (
                 {"choices": [choice["value"] for choice in _field["choices"]]}

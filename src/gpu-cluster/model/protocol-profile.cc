@@ -41,7 +41,7 @@ static const char* RESERVED[] = {
 static bool
 IsReserved(const std::string& k)
 {
-    if (k.rfind("rdma",0) == 0 || k.rfind("ibgda",0) == 0) return true;
+    if (k.rfind("rdma",0) == 0 || k.rfind("ibgda",0) == 0 || k.rfind("pcie",0) == 0) return true;
     for (const char* r : RESERVED)
     {
         if (k == r)

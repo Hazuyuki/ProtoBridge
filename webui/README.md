@@ -169,6 +169,18 @@ at `/api/runs/<id>/artifacts/rdma.csv`. Results distinguish logical requests fro
 chunk WRs, completion observation from destination data readiness, and report
 copy traffic. See [the RDMA guide](../doc/RDMA.md) for parameters and C++ APIs.
 
+Open **Local PCIe** and select **TLP packets · no errors** to model shared local
+PCIe links. Select Gen3/4/5, lane count, switch/root topology, MPS/MRRS, read tags,
+queue capacities and six credit pools. Posted/Completion data credits use 16-byte
+units. Legacy PCIe bandwidth inputs are hidden in this mode; HBM/host-memory and
+copy-engine limits still apply. The model supports VC0 and established links.
+It does not inject PCIe errors. Ethernet/RoCE error settings remain independent.
+
+TLP runs include `pcie.csv` in the archive and at
+`/api/runs/<id>/artifacts/pcie.csv`. The trace records at most 100000 events by
+default; `pcieTraceTruncated` reports truncation, while aggregate counters remain
+complete. See [the PCIe guide](../doc/PCIE.md) for defaults and modeling limits.
+
 The form supplies editable dimensions when selecting a topology. Torus, Mesh,
 Hypercube, and 2D full mesh derive the actual rank count from those dimensions.
 NVLS/SHARP require single-node NVSwitch; hierarchical algorithms require node

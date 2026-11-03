@@ -8,65 +8,65 @@
  * Output format: machine-parseable RESULT_START/RESULT_END block
  */
 
-#include "ns3/core-module.h"
-#include "ns3/node-list.h"
-#include "ns3/gpu-cluster-helper.h"
-#include "ns3/fabric-endpoint.h"
-#include "ns3/nvswitch.h"
-#include "ns3/ethernet-switch.h"
-#include "ns3/ring-allreduce.h"
-#include "ns3/sharp-allreduce.h"
-#include "ns3/nvls-allgather.h"
-#include "ns3/tree-allreduce.h"
-#include "ns3/fullmesh-allreduce.h"
-#include "ns3/fullmesh-allgather.h"
-#include "ns3/fullmesh-reducescatter.h"
-#include "ns3/ring-allgather.h"
-#include "ns3/ring-reducescatter.h"
-#include "ns3/ring-broadcast.h"
-#include "ns3/ring-reduce.h"
 #include "ns3/alltoall-injector.h"
-#include "ns3/hierarchical-allreduce.h"
-#include "ns3/hierarchical-allgather.h"
-#include "ns3/hierarchical-reducescatter.h"
-#include "ns3/hierarchical-alltoall.h"
-#include "ns3/nccl-ring-allreduce.h"
-#include "ns3/multi-node-topology-helper.h"
-#include "ns3/device-type.h"
-#include "ns3/fabric-type.h"
-#include "ns3/protocol-model.h"
-#include "ns3/protocol-profile.h"
-#include "ns3/protocol-config.h"
-#include "ns3/protocol-config-runner.h"
-#include "ns3/nccl-protocol-model.h"
-#include "ns3/ub-protocol-model.h"
-#include "ns3/roce-protocol-model.h"
-#include "ns3/rdma-submission-model.h"
-#include "ns3/rdma-operation-traffic.h"
-#include "ns3/ethernet-protocol-model.h"
-#include "ns3/dcqcn-rate-machine.h"
-#include "ns3/rttcc-rate-machine.h"
-#include "ns3/protocol-payload-builder.h"
-#include "ns3/nccl-protocol-payload-builder.h"
-#include "ns3/roce-payload-builder.h"
-#include "ns3/ub-payload-builder.h"
-
-#include "ns3/link-degradation.h"
-#include "ns3/fec-model.h"
-#include "ns3/llr-manager.h"
 #include "ns3/contention-model.h"
+#include "ns3/core-module.h"
+#include "ns3/dcqcn-rate-machine.h"
+#include "ns3/device-type.h"
+#include "ns3/drop-tail-queue.h"
+#include "ns3/ethernet-protocol-model.h"
+#include "ns3/ethernet-switch.h"
+#include "ns3/fabric-endpoint.h"
+#include "ns3/fabric-type.h"
+#include "ns3/fec-model.h"
+#include "ns3/fullmesh-allgather.h"
+#include "ns3/fullmesh-allreduce.h"
+#include "ns3/fullmesh-reducescatter.h"
+#include "ns3/gpu-cluster-helper.h"
+#include "ns3/hierarchical-allgather.h"
+#include "ns3/hierarchical-allreduce.h"
+#include "ns3/hierarchical-alltoall.h"
+#include "ns3/hierarchical-reducescatter.h"
+#include "ns3/link-degradation.h"
+#include "ns3/llr-manager.h"
+#include "ns3/multi-node-topology-helper.h"
+#include "ns3/nccl-protocol-model.h"
+#include "ns3/nccl-protocol-payload-builder.h"
+#include "ns3/nccl-ring-allreduce.h"
+#include "ns3/node-list.h"
+#include "ns3/nvls-allgather.h"
+#include "ns3/nvswitch.h"
 #include "ns3/p2p-traffic.h"
+#include "ns3/point-to-point-channel.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/point-to-point-net-device.h"
-#include "ns3/point-to-point-channel.h"
-#include "ns3/drop-tail-queue.h"
+#include "ns3/protocol-config-runner.h"
+#include "ns3/protocol-config.h"
+#include "ns3/protocol-model.h"
+#include "ns3/protocol-payload-builder.h"
+#include "ns3/protocol-profile.h"
+#include "ns3/rdma-operation-traffic.h"
+#include "ns3/rdma-submission-model.h"
+#include "ns3/ring-allgather.h"
+#include "ns3/ring-allreduce.h"
+#include "ns3/ring-broadcast.h"
+#include "ns3/ring-reduce.h"
+#include "ns3/ring-reducescatter.h"
+#include "ns3/roce-payload-builder.h"
+#include "ns3/roce-protocol-model.h"
+#include "ns3/rttcc-rate-machine.h"
+#include "ns3/sharp-allreduce.h"
+#include "ns3/tree-allreduce.h"
+#include "ns3/ub-payload-builder.h"
+#include "ns3/ub-protocol-model.h"
 
 #include <algorithm>
-#include <iostream>
-#include <memory>
 #include <iomanip>
+#include <iostream>
 #include <limits>
+#include <memory>
 #include <queue>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -482,11 +482,17 @@ main(int argc, char* argv[])
     uint32_t p2pIterations=1;
     std::string rdmaSubmission="startup";
     std::string rdmaTraceFile;
+    std::string pcieTraceFile;
+    uint64_t pcieTraceMaxEvents{100000};
     RdmaConfig rdmaConfig;
     CommandLine cmd;
     AddRdmaCommandLine(cmd,rdmaSubmission,rdmaConfig);
     cmd.AddValue("p2pIterations","Work requests per p2p/fanout/incast flow",p2pIterations);
     cmd.AddValue("rdmaTraceFile","Per-WR RDMA timing CSV (empty=disabled)",rdmaTraceFile);
+    cmd.AddValue("pcieTraceFile", "Per-hop PCIe TLP/credit CSV (pcieModel=tlp)", pcieTraceFile);
+    cmd.AddValue("pcieTraceMaxEvents",
+                 "PCIe CSV event limit (0=unlimited; counters remain complete)",
+                 pcieTraceMaxEvents);
     cmd.AddValue("ibgdaTraceFile","Compatibility alias for rdmaTraceFile",rdmaTraceFile);
     cmd.AddValue("topology", "Topology: ring/fullmesh/switched/fattree/railfattree/leafspine/nvl72/torus/mesh/hypercube/2dfullmesh/ndfullmesh/2dfullmeshclos", topology);
     cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce/p2p/fanout/incast", collective);
@@ -2001,6 +2007,17 @@ main(int argc, char* argv[])
     }
 
     std::shared_ptr<std::ofstream> rdmaTrace;
+    std::shared_ptr<std::ofstream> pcieTrace;
+    auto pcieTraceEvents = std::make_shared<uint64_t>(0);
+    auto pcieTraceTruncated = std::make_shared<bool>(false);
+    if (!pcieTraceFile.empty())
+    {
+        NS_ABORT_MSG_IF(rdmaConfig.pcieModel != "tlp", "pcieTraceFile requires pcieModel=tlp");
+        pcieTrace = std::make_shared<std::ofstream>(pcieTraceFile);
+        NS_ABORT_MSG_IF(!*pcieTrace, "Cannot open pcieTraceFile");
+        *pcieTrace << "host,timeNs,event,from,to,transaction,type,traffic,tag,address,bytes,"
+                      "wireBytes,ph,pd,nph,npd,cplh,cpld\n";
+    }
     if (IsDetailedRdmaMode(rdmaSubmission))
     {
         if (!rdmaTraceFile.empty())
@@ -2017,6 +2034,32 @@ main(int argc, char* argv[])
             auto& host=hostMemory[ep->GetNodeId()];
             if (!host) host=std::make_shared<RdmaHostMemoryResources>();
             model->SetHostMemoryResources(host);
+            if (pcieTrace)
+            {
+                model->GetPcieFabric()->SetObserver(
+                    [pcieTrace,
+                     pcieTraceEvents,
+                     pcieTraceTruncated,
+                     pcieTraceMaxEvents,
+                     node = ep->GetNodeId()](const PcieTraceEvent& e) {
+                        if (pcieTraceMaxEvents && *pcieTraceEvents >= pcieTraceMaxEvents)
+                        {
+                            *pcieTraceTruncated = true;
+                            return;
+                        }
+                        ++*pcieTraceEvents;
+                        *pcieTrace << node << ',' << e.time.GetNanoSeconds() << ',' << e.event
+                                   << ',' << e.from << ',' << e.to << ',' << e.transaction << ','
+                                   << (e.transaction ? PcieTlpName(e.type) : "-") << ','
+                                   << PcieTrafficName(e.traffic) << ',' << unsigned(e.tag) << ','
+                                   << e.address << ',' << e.bytes << ',' << e.wireBytes;
+                        for (auto credit : e.credits)
+                        {
+                            *pcieTrace << ',' << credit;
+                        }
+                        *pcieTrace << '\n';
+                    });
+            }
             if (rdmaTrace)
             {
                 model->SetObserver([rdmaTrace,rank=ep->GetRank(),rdmaConfig](const RdmaWorkTiming& t) {
@@ -2978,6 +3021,70 @@ main(int argc, char* argv[])
     std::cout << "p2pIterations=" << p2pIterations << std::endl;
     std::cout << "rdmaInitiator=" << rdmaConfig.initiator << std::endl;
     std::cout << "rdmaDataPath=" << rdmaConfig.dataPath << std::endl;
+    std::cout << "pcieModel=" << rdmaConfig.pcieModel << std::endl;
+    if (rdmaConfig.pcieModel == "tlp")
+    {
+        PcieStats total;
+        std::set<Ptr<PcieFabric>> seen;
+        for (auto model : g_rdmaModels)
+        {
+            auto fabric = model->GetPcieFabric();
+            if (!fabric || !seen.insert(fabric).second)
+            {
+                continue;
+            }
+            const auto& s = fabric->GetStats();
+            total.reads += s.reads;
+            total.writes += s.writes;
+            total.readRequests += s.readRequests;
+            total.writeTlps += s.writeTlps;
+            total.completionTlps += s.completionTlps;
+            total.tlpHops += s.tlpHops;
+            total.wireBytes += s.wireBytes;
+            total.flowUpdates += s.flowUpdates;
+            total.linkAcks += s.linkAcks;
+            total.creditStalls += s.creditStalls;
+            total.queueStalls += s.queueStalls;
+            total.tagStalls += s.tagStalls;
+            total.orderingStalls += s.orderingStalls;
+            total.replayStalls += s.replayStalls;
+            total.peakOutstandingReads =
+                std::max(total.peakOutstandingReads, s.peakOutstandingReads);
+            total.peakOutstandingReadBytes =
+                std::max(total.peakOutstandingReadBytes, s.peakOutstandingReadBytes);
+            total.peakQueuePackets = std::max(total.peakQueuePackets, s.peakQueuePackets);
+            total.peakReplayBytes = std::max(total.peakReplayBytes, s.peakReplayBytes);
+            for (size_t i = 0; i < total.trafficBytes.size(); ++i)
+            {
+                total.trafficBytes[i] += s.trafficBytes[i];
+            }
+        }
+        std::cout << "pcieGeneration=" << rdmaConfig.pcie.generation << std::endl;
+        std::cout << "pcieLanes=" << rdmaConfig.pcie.lanes << std::endl;
+        std::cout << "pcieTopology=" << rdmaConfig.pcie.topology << std::endl;
+        std::cout << "pcieReadRequests=" << total.readRequests << std::endl;
+        std::cout << "pcieWriteTlps=" << total.writeTlps << std::endl;
+        std::cout << "pcieCompletionTlps=" << total.completionTlps << std::endl;
+        std::cout << "pcieTlpHops=" << total.tlpHops << std::endl;
+        std::cout << "pcieWireBytes=" << total.wireBytes << std::endl;
+        std::cout << "pcieFlowUpdates=" << total.flowUpdates << std::endl;
+        std::cout << "pcieLinkAcks=" << total.linkAcks << std::endl;
+        std::cout << "pcieCreditStalls=" << total.creditStalls << std::endl;
+        std::cout << "pcieQueueStalls=" << total.queueStalls << std::endl;
+        std::cout << "pcieReadWindowStalls=" << total.tagStalls << std::endl;
+        std::cout << "pcieOrderingStalls=" << total.orderingStalls << std::endl;
+        std::cout << "pcieReplayBufferStalls=" << total.replayStalls << std::endl;
+        std::cout << "pciePeakOutstandingReads=" << total.peakOutstandingReads << std::endl;
+        std::cout << "pciePeakOutstandingReadBytes=" << total.peakOutstandingReadBytes << std::endl;
+        std::cout << "pciePeakQueuePackets=" << total.peakQueuePackets << std::endl;
+        std::cout << "pcieTraceEvents=" << *pcieTraceEvents << std::endl;
+        std::cout << "pcieTraceTruncated=" << (*pcieTraceTruncated ? 1 : 0) << std::endl;
+        for (size_t i = 0; i < total.trafficBytes.size(); ++i)
+        {
+            std::cout << "pcieBytes_" << PcieTrafficName(static_cast<PcieTraffic>(i)) << '='
+                      << total.trafficBytes[i] << std::endl;
+        }
+    }
     if(rdmaTraffic)
     {
         std::cout << "rdmaOperation=" << rdmaConfig.operation << std::endl;
