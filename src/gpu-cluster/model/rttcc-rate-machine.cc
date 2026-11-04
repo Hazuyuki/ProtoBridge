@@ -17,6 +17,30 @@
 namespace ns3
 {
 
+namespace
+{
+
+// Round 74 (codex findings 6+15): the pacer ledger's nanosecond count
+// saturates at INT64_MAX, but NanoSeconds(count) multiplies by 1e3 at PS
+// and 1e6 at FS before Schedule sees the result, so a count above
+// INT64_MAX/1e3 wraps to a negative Time and bypasses the endpoint
+// shaping gate (probe: PS, 1-MiB chunks, 2^-40-Gbps floor -> second
+// chunk paced at -2000 ticks). Saturate at the remaining horizon
+// instead; a wrapped/negative count clamps there too.
+Time
+ClampedNanoSeconds(int64_t delayNs)
+{
+    const Time horizon = Time::Max() - Simulator::Now();
+    const Time t = NanoSeconds(delayNs);
+    if (t.IsStrictlyNegative() || t > horizon)
+    {
+        return horizon;
+    }
+    return t;
+}
+
+} // unnamed namespace
+
 NS_LOG_COMPONENT_DEFINE("RttccRateMachine");
 
 NS_OBJECT_ENSURE_REGISTERED(RttccRateMachine);
@@ -177,10 +201,51 @@ RttccRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
     // The rate slot this chunk occupies (ns); the next chunk may egress one
     // slot after this chunk's egress start (same pacer as the per-QP ceiling).
-    double slotSec = static_cast<double>(chunkBytes) / s.rateBps;
-    int64_t slotNs = std::max<int64_t>(1, static_cast<int64_t>(slotSec * 1e9));
-    s.nextSendNs = (nowNs + delayNs) + slotNs;
-    return (delayNs > 0) ? NanoSeconds(delayNs) : Time(0);
+    // Round 65 (codex finding 9): same saturated slot conversion and
+    // deadline addition as the DCQCN pacer. A positive configured rate can
+    // still make (chunkBytes / rateBps) * 1e9 overflow binary64 (rate
+    // 2^-1022 Gbps, 1-MiB chunk), raising SIGFPE under floating-point
+    // diagnostics before the saturation comparison can run, so guard the
+    // product with a pre-check on the seconds quotient; the guarded product
+    // is bit-identical to the historical (bytes / rate) * 1e9 on every
+    // non-overflow input. A NaN rate saturates too: !(NaN <= x) is true.
+    // Round 74 (codex finding 15): the same must hold for the DIVISION
+    // itself — a subnormal s.rateBps makes chunkBytes / rateBps overflow to
+    // +inf (FE_OVERFLOW under fenv traps) before the bound check runs.
+    // Pre-check the division: chunkBytes <= rateBps * (INT64_MAX / 1e9)
+    // keeps the quotient inside the nanosecond bound the second guard
+    // already enforces. Any slower or NaN rate saturates.
+    const double maxSlotSec = 9223372036854775807.0 / 1e9;
+    double slotNsD;
+    if (!(static_cast<double>(chunkBytes) <= s.rateBps * maxSlotSec))
+    {
+        // chunkBytes/rateBps overflows, is +inf, or is NaN — the slot is
+        // unrepresentable either way.
+        slotNsD = 9223372036854775807.0;
+    }
+    else
+    {
+        const double slotSec = static_cast<double>(chunkBytes) / s.rateBps;
+        slotNsD = (slotSec <= maxSlotSec) ? slotSec * 1e9 : 9223372036854775807.0;
+    }
+    if (!(slotNsD <= 9223372036854775807.0))
+    {
+        // +inf from the division itself, or a NaN rate — saturate.
+        slotNsD = 9223372036854775807.0;
+    }
+    int64_t slotNs = (slotNsD >= 9223372036854775807.0)
+                         ? std::numeric_limits<int64_t>::max()
+                         : static_cast<int64_t>(slotNsD);
+    slotNs = std::max<int64_t>(1, slotNs);
+    s.nextSendNs = (slotNs > std::numeric_limits<int64_t>::max() - (nowNs + delayNs))
+                       ? std::numeric_limits<int64_t>::max()
+                       : (nowNs + delayNs) + slotNs;
+    // Round 74 (codex finding 6): NanoSeconds(delayNs) multiplies the count
+    // by 1e3 at PS and 1e6 at FS before Schedule sees the result, so a
+    // delayNs below INT64_MAX but above INT64_MAX/1e3 wraps to a negative
+    // Time and bypasses the endpoint shaping gate. Saturate at the
+    // remaining horizon instead (same clamp as the DCQCN pacer).
+    return (delayNs > 0) ? ClampedNanoSeconds(delayNs) : Time(0);
 }
 
 double

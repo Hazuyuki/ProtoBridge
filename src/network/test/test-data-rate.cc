@@ -12,6 +12,20 @@
 #include "ns3/test.h"
 #include "ns3/tuple.h"
 
+#if !defined(_WIN32) && !defined(__CYGWIN__)
+#include <sys/wait.h>
+#include <unistd.h>
+#define NS3_TEST_HAVE_FORK_ABORT 1
+#else
+// fork/waitpid are POSIX-only; the abort-guard cases below are skipped on
+// native Windows builds (codex round 52: unconditional <sys/wait.h> and
+// <unistd.h> broke MSYS2/MinGW64 test compilation).
+#define NS3_TEST_HAVE_FORK_ABORT 0
+#endif
+
+#include <cerrno>
+#include <string>
+
 using namespace ns3;
 
 /**
@@ -257,6 +271,86 @@ DataRateTestCase2::DoRun()
     MultiplicationIntTest("4Mb/s", 1000, "4Gb/s");
     MultiplicationDoubleTest("1Gb/s", 0.001, "1Mb/s");
     MultiplicationDoubleTest("6Gb/s", 1.0 / 7.0, "857142857.14b/s");
+
+    // Range guards (codex round 51, finding 5): compound assignment and
+    // the non-assigning operators mutate or construct the rate without
+    // passing through the uint64_t constructor's >= 2^63 abort. NS_ABORT
+    // exits the process, so each guard forks and checks the child's exit
+    // status — the same pattern the ns-3 suite uses for fatal-path tests.
+    // (4e18 = 4 * 10^18 bps, below the 2^63 ~ 9.22e18 constructor bound.)
+    // POSIX-only (round 52): no fork() on native Windows builds.
+#if NS3_TEST_HAVE_FORK_ABORT
+    auto expectAbort = [this](const std::string& what, void (*fn)()) {
+        pid_t pid = fork();
+        NS_TEST_ASSERT_MSG_EQ(pid >= 0, true, "fork must succeed for " + what);
+        if (pid == 0)
+        {
+            fn(); // must abort; reaching the next line is the failure
+            _exit(0);
+        }
+        int status = 0;
+        pid_t wpid = 0;
+        // EINTR retry (round 52): an interrupted wait leaves status
+        // zero (false "did not abort") and the child unreaped.
+        while ((wpid = waitpid(pid, &status, 0)) == -1 && errno == EINTR)
+        {
+        }
+        const bool aborted = (wpid == pid)
+            && ((WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT)
+                || (WIFEXITED(status) && WEXITSTATUS(status) != 0));
+        NS_TEST_ASSERT_MSG_EQ(aborted, true, what + " must abort past 2^63 bps");
+    };
+
+    expectAbort("DataRate += past 2^63", []() {
+        DataRate dr(static_cast<uint64_t>(4e18));
+        dr += DataRate(static_cast<uint64_t>(8e18));
+    });
+    expectAbort("DataRate operator+ past 2^63", []() {
+        const DataRate sum = DataRate(static_cast<uint64_t>(4e18)) + DataRate(static_cast<uint64_t>(8e18));
+        (void)sum;
+    });
+    expectAbort("DataRate *= (uint64_t) past 2^63", []() {
+        DataRate dr(static_cast<uint64_t>(4e18));
+        dr *= static_cast<uint64_t>(3);
+    });
+    expectAbort("DataRate * (double) past 2^63", []() {
+        const DataRate prod = DataRate(static_cast<uint64_t>(4e18)) * 3.0;
+        (void)prod;
+    });
+    expectAbort("DataRate *= (double) past 2^63", []() {
+        DataRate dr(static_cast<uint64_t>(4e18));
+        dr *= 3.0;
+    });
+    expectAbort("DataRate * (uint64_t) past 2^63", []() {
+        const DataRate prod = DataRate(static_cast<uint64_t>(4e18)) * static_cast<uint64_t>(3);
+        (void)prod;
+    });
+
+    // Boundary (codex round 52): exactly 2^63 - 1 must NOT abort —
+    // the guard bound is exclusive.
+    {
+        constexpr uint64_t kMax = (1ull << 63) - 1;
+        DataRate a(kMax);
+        DataRate b(0);
+        const DataRate sum = a + b;
+        NS_TEST_EXPECT_MSG_EQ(sum.GetBitRate(), kMax, "MAX + 0 must not abort");
+        DataRate c(1);
+        c += DataRate(kMax - 1);
+        NS_TEST_EXPECT_MSG_EQ(c.GetBitRate(), kMax, "1 += MAX-1 must not abort");
+
+        // Boundary (codex round 53): the guard bound is exclusive. In
+        // double precision (double)(2^63 - 1) rounds to 2^63, so an
+        // inclusive >= bound — and even a guard written against the
+        // literal 9223372036854775807.0, which rounds the same way —
+        // spuriously aborted the identity product MAX * 1.0. The range
+        // check runs in long double where 2^63 - 1 is exact.
+        const DataRate prodMax = DataRate(kMax) * 1.0;
+        NS_TEST_EXPECT_MSG_EQ(prodMax.GetBitRate(), kMax, "MAX * 1.0 must not abort");
+        DataRate d(kMax);
+        d *= 1.0;
+        NS_TEST_EXPECT_MSG_EQ(d.GetBitRate(), kMax, "MAX *= 1.0 must not abort");
+    }
+#endif
 }
 
 /**

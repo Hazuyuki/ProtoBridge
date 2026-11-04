@@ -116,6 +116,52 @@ same matched fabric parameters (40 Gbps, 1 µs links, 1000-B packets,
    a correctness requirement, not a tuning knob — and that Go-Back-N
    ARQ composes badly with it.
 
+9. **The 1.079× systematic error is fully decomposable and removable.**
+   With the expanded matrix (3:1 and 6:1 added on both simulators:
+   ns3-rdma 30.44/60.88 ms, PB 32.84/65.69 ms) the PB−ns3-rdma gap is
+   strictly linear at 16.02–16.07 ns/packet across all five ratios,
+   confirming a pure per-packet accounting difference. Decomposition:
+
+   - PB's `RoceProtocolModel::WireEfficiency` defaults to **0.95**
+     (Eth+IP+UDP+BTH+aETH framing amortization): a 50-MB transfer is
+     serialized as 52632 chunks of 1000 B on the wire.
+   - PB additionally serializes a **39-B FabricHeader per chunk**
+     (chunk+39 B wire per 1000 B effective).
+   - ns3-rdma's nominal wire size is **1020 B per 1000-B packet**
+     (UdpClient: `m_size−14−10` = 976 B payload + SeqTs 14 + UDP 8 +
+     IP 20 + PPP 2), but its *effective* serialized cost is **1015 B**:
+     the ns-3.18 `Time` Q64.64 conversion truncates the per-packet
+     tx time (1020 B at 40 Gbps = 204 ns → 203 ns; verified by
+     instrumenting `QbbNetDevice::TransmitStart`, `txTimeNs=203`), and
+     trace-side measurement confirms 203.0 ns/packet pacing at both the
+     switch and the receiver (payload 900 → 183 ns, same −1 ns). The
+     amortized cost implied by the measured FCTs is 1014.5 B/pkt
+     (20.290 ms × 40 Gbps ÷ 8 ÷ 2 flows ÷ 50000 pkt/flow), within
+     0.05% of the 1015-B serial figure; the last-switch→receiver
+     observation gap (10–30 µs at 2:1–8:1) is queue-tail drainage, not
+     a per-packet term, so no extra per-packet constant is derived from
+     it.
+
+   Bytes-on-wire per effective byte: PB = (1039/1000)/0.95 = **1.0937**,
+   ns3-rdma = 1015/1000 = **1.015** (effective); predicted FCT ratio
+   1.0937/1.015 = **1.0776** vs measured 1.079. Neither term is a
+   congestion-behavior difference — both are header-accounting
+   conventions. Neutralizing them aligns the simulators:
+
+   | Configuration | 2:1 | 4:1 | 8:1 | PB/ns3-rdma |
+   |---|---|---|---|---|
+   | ns3-rdma | 20.290 | 40.585 | 81.170 | — |
+   | PB default | 21.897 | 43.792 | 87.580 | 1.079 |
+   | PB eff=1.0, wire 1014 B | 20.823 | 41.644 | 83.285 | 1.026 |
+   | PB eff=1.0, chunk 2690 | 20.300 | 40.598 | 81.192 | **1.0003–1.0005** |
+
+   The aligned configuration sets `--soRoceWireEfficiency=1.0` (new knob;
+   default −1 keeps the model's 0.95) and `--bulkChunkSize=2690` so that
+   (2690+39)/2690 = 1.0145 ≈ ns3-rdma's effective amortized ratio of
+   1015/1000 = 1.015. Residual gap: +10–22 µs (0.03–0.05%), a fixed
+   startup/RTT-scale pipeline offset, not a per-packet term. After
+   alignment the two simulators agree at every convergence ratio.
+
 ## Reproduction
 
 - ns3-rdma (from `/tmp/ns3rdma-build`, cwd `/tmp/scaleout/ns3rdma`):
@@ -126,3 +172,12 @@ same matched fabric parameters (40 Gbps, 1 µs links, 1000-B packets,
   `--interNodeTopology` ∈ {tor,host,leafspine}, `--switchPfcMode` ∈
   {0,1,2,3}, `--bulkChunkSize` ∈ {1000,9000}, optionally
   `--pfcHeadroomChunks`.
+- Systematic-error elimination (finding 9): same command with
+  `--soRoceWireEfficiency=1.0 --bulkChunkSize=2690`; the expanded
+  3:1/6:1 points use `--numNodes` ∈ {4,7} (tor's shared switch is not
+  counted) and ns3-rdma `topo_3to1.txt`/`topo_6to1.txt` in
+  `/tmp/scaleout/matrix`.
+- Further ProtoBridge-side characterization on this same matched fabric
+  (data-size linearity, random-traffic injection-rate saturation, message
+  size, node scaling, chunk size — all with DCQCN):
+  `examples/gpu-cluster/datasize_injection_sweeps/`.

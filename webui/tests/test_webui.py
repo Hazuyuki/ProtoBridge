@@ -78,7 +78,7 @@ def submit(client, **values):
 
 def test_catalog_and_real_parameter_preview(client):
     catalog = client.get("/api/catalog").json()
-    assert len(catalog["configs"]) == 11
+    assert len(catalog["configs"]) == 19
     assert client.get("/").status_code == 200
     assert client.get("/static/app.js").status_code == 200
     body = {"stack_overrides": {"bandwidthGbps": 85}, "num_nodes": 2, "gpus_per_node": 4}
@@ -95,6 +95,28 @@ def test_form_catalog_only_lists_native_algorithms_and_topologies(client):
     assert "2dfullmeshclos" not in {item["value"] for item in options["topologies"]}
     allreduce = next(item for item in options["collectives"] if item["value"] == "allreduce")
     assert {"tree", "ncclring", "nvls", "hierarchical"} <= set(allreduce["algorithms"])
+
+
+def test_rdma_form_validates_independent_choices_and_staging_capacity(client):
+    body = {"config_id": "rdma-host-p2p.cfg", "num_nodes": 2, "gpus_per_node": 2,
+            "stack_overrides": {"rdmaInitiator": "gpu", "rdmaDataPath": "staged",
+                                "rdmaStagingChunkBytes": 1024, "rdmaStagingBufferBytes": 2048}}
+    response = client.post("/api/preview", json=body)
+    assert response.status_code == 200, response.text
+    settings = response.json()["summary"]["settings"]
+    assert settings["rdmaInitiator"] == "gpu" and settings["rdmaDataPath"] == "staged"
+    body["stack_overrides"]["rdmaStagingBufferBytes"] = 512
+    assert client.post("/api/preview", json=body).status_code == 422
+
+
+def test_operation_controls_validate_credits_and_alignment(client):
+    body = {"config_id": "rdma-read.cfg", "num_nodes": 2, "gpus_per_node": 2,
+            "stack_overrides": {"rdmaMaxReadAtomic": 0}}
+    assert client.post("/api/preview", json=body).status_code == 422
+    body["stack_overrides"] = {"rdmaOperation": "fetch_add", "rdmaRemoteAddress": 3}
+    assert client.post("/api/preview", json=body).status_code == 422
+    body["stack_overrides"] = {"rdmaOperation": "send_imm", "rdmaImmediate": 4294967295}
+    assert client.post("/api/preview", json=body).status_code == 200
 
 
 def test_page_loads_versioned_scripts_with_revalidation(client):
@@ -327,10 +349,15 @@ def test_shutdown_interrupts_active_process_and_persists_status(tmp_path, execut
 
 
 def test_exposed_cli_fields_exist_in_native_entry_point():
-    source = (REPO/"scratch/gpu-cluster-sim.cc").read_text()
     import re
+    import subprocess
+    from webui.simulation import find_binary
 
-    actual_flags = set(re.findall(r'cmd\.AddValue\("(\w+)"', source))
+    binary = find_binary(REPO)
+    if binary is None:
+        pytest.skip("Build gpu-cluster-sim to inspect its command-line interface.")
+    result = subprocess.run([str(binary), "--PrintHelp"], capture_output=True, text=True, check=True)
+    actual_flags = set(re.findall(r"--(\w+)", result.stdout + result.stderr))
     assert set(CLI_FIELDS) <= actual_flags
 
 

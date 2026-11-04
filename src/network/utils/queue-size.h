@@ -245,7 +245,14 @@ operator+(const QueueSize& lhs, const Ptr<Item>& rhs)
     }
     if (lhs.GetUnit() == QueueSizeUnit::BYTES)
     {
-        return QueueSize(lhs.GetUnit(), lhs.GetValue() + rhs->GetSize());
+        // 64-bit intermediate: a queue holding multiple ~1-GiB packets
+        // overflows the uint32 sum before the admission comparison runs
+        // (codex round 48, finding 2). The result is truncated back to
+        // uint32 by the QueueSize constructor like GetCurrentSize().
+        return QueueSize(lhs.GetUnit(),
+                         static_cast<uint32_t>(
+                             static_cast<uint64_t>(lhs.GetValue())
+                             + rhs->GetSize()));
     }
     NS_FATAL_ERROR("Unknown queue size mode");
 }
@@ -260,7 +267,11 @@ operator+(const Ptr<Item>& lhs, const QueueSize& rhs)
     }
     if (rhs.GetUnit() == QueueSizeUnit::BYTES)
     {
-        return QueueSize(rhs.GetUnit(), rhs.GetValue() + lhs->GetSize());
+        // 64-bit intermediate, same as operator+ above.
+        return QueueSize(rhs.GetUnit(),
+                         static_cast<uint32_t>(
+                             static_cast<uint64_t>(rhs.GetValue())
+                             + lhs->GetSize()));
     }
     NS_FATAL_ERROR("Unknown queue size mode");
 }

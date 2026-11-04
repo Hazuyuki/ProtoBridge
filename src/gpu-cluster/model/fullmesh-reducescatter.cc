@@ -7,6 +7,7 @@
  */
 
 #include "fullmesh-reducescatter.h"
+#include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "nccl-protocol.h"
@@ -65,6 +66,8 @@ void
 FullMeshReduceScatter::Initialize(uint16_t numGpus, uint64_t dataSize,
                                   const std::vector<Ptr<FabricEndpoint>>& endpoints)
 {
+    // Round 63 (codex finding 17): zero GPUs divides by zero in the chunk/step math below. Fail loudly instead.
+    NS_ABORT_MSG_IF(numGpus == 0, "FullMeshReduceScatter::Initialize requires at least one GPU");
     m_numGpus = numGpus;
     m_dataSize = dataSize;
     m_endpoints = endpoints;

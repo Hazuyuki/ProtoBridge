@@ -189,7 +189,12 @@ PieQueueDisc::DoEnqueue(Ptr<QueueDiscItem> item)
         }
     }
 
-    if (nQueued + item > GetMaxSize())
+    // 64-bit admission (codex round 50, finding 6): the truncating
+    // QueueSize sum wrapped for >4 GiB byte limits, pushing the rejection
+    // into the internal queue's own drop path — which skipped the
+    // m_accuProb reset and recorded INTERNAL_QUEUE_DROP instead of
+    // FORCED_DROP.
+    if (WouldOverflow(item->GetSize()))
     {
         // Drops due to queue limit: reactive
         DropBeforeEnqueue(item, FORCED_DROP);

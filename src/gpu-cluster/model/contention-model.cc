@@ -7,11 +7,82 @@
 #include "fabric-header.h"
 
 #include "ns3/log.h"
+
+#include <algorithm>
+#include <limits>
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
 
 namespace ns3
 {
+
+namespace
+{
+
+// Round 74 (codex finding 10): Seconds(sec) constructs an int64x64 from a
+// long double and wraps mod 2^128 once sec >= 2^63 — at FS resolution a
+// 16384-B packet on a 1-B/s contention model already gives sec = 16384,
+// and the *tick* bound is 2^63/1e15 ≈ 9.2 seconds, so every packet past a
+// few seconds of serialization aborts inside int64x64-128.cc:106 (the
+// 2^63 multiply check) or silently wraps to a negative/past deadline.
+// Same bound shape as the round-74 rdma-submission-model guard: at S the
+// only representable seconds are below 2^63 anyway, so the cap is a no-op
+// for sane inputs; at coarser units (MIN..Y) every sec >= 2^63 saturates.
+Time
+ClampedSerializationSeconds(double sec)
+{
+    if (!(sec > 0.0))
+    {
+        return Time(0); // zero, negative, NaN — no serialization
+    }
+    double ticksPerSecond;
+    switch (Time::GetResolution())
+    {
+    case Time::S:
+        ticksPerSecond = 1;
+        break;
+    case Time::MS:
+        ticksPerSecond = 1e3;
+        break;
+    case Time::US:
+        ticksPerSecond = 1e6;
+        break;
+    case Time::NS:
+        ticksPerSecond = 1e9;
+        break;
+    case Time::PS:
+        ticksPerSecond = 1e12;
+        break;
+    case Time::FS:
+        ticksPerSecond = 1e15;
+        break;
+    case Time::MIN:
+        ticksPerSecond = 1.0 / 60;
+        break;
+    case Time::H:
+        ticksPerSecond = 1.0 / 3600;
+        break;
+    case Time::D:
+        ticksPerSecond = 1.0 / 86400;
+        break;
+    case Time::Y:
+        ticksPerSecond = 1.0 / 31536000;
+        break;
+    default:
+        ticksPerSecond = 1;
+        break;
+    }
+    // Largest finite sec whose Seconds() conversion stays below 2^63
+    // ticks AND below the int64x64 ctor's own 2^63 wrap threshold.
+    const double maxSec = std::min((0x1p63 - 0x1p11) / ticksPerSecond, 0x1p63);
+    if (!(sec < maxSec))
+    {
+        return Time::Max();
+    }
+    return Seconds(sec);
+}
+
+} // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("ContentionModel");
 
@@ -78,11 +149,25 @@ ContentionModel::DoDispose()
 }
 
 void
-ContentionModel::SetCollectiveWeight(double w) { m_weights[0] = w; }
+ContentionModel::SetCollectiveWeight(double w)
+{
+    // Round 63: clamp to the attribute checker's [0,1] bounds (codex
+    // finding 14). The attribute routes through this setter, but direct
+    // callers could pass -1 and later drive the uint64 cast in
+    // GetEffectiveBandwidth out of range from below (product < 0 passes
+    // the upper saturation guard).
+    m_weights[0] = std::max(0.0, std::min(1.0, w));
+}
 void
-ContentionModel::SetMemoryWeight(double w) { m_weights[1] = w; }
+ContentionModel::SetMemoryWeight(double w)
+{
+    m_weights[1] = std::max(0.0, std::min(1.0, w));
+}
 void
-ContentionModel::SetP2pWeight(double w) { m_weights[2] = w; }
+ContentionModel::SetP2pWeight(double w)
+{
+    m_weights[2] = std::max(0.0, std::min(1.0, w));
+}
 double
 ContentionModel::GetCollectiveWeight() const { return m_weights[0]; }
 double
@@ -94,10 +179,15 @@ void
 ContentionModel::SetWeight(TrafficClass trafficClass, double weight)
 {
     NS_LOG_FUNCTION(this << static_cast<int>(trafficClass) << weight);
+    // Round 64 (codex finding 3): the generic setter used to store the
+    // weight unclamped while only the three named setters clamped to
+    // [0, 1] — SetWeight(COLLECTIVE, 2) with a 100 B/s link reported a
+    // 200 B/s class rate and negative service-time penalties. Route the
+    // generic setter through the same clamp as the named setters.
     int idx = static_cast<int>(trafficClass);
     if (idx >= 0 && idx < static_cast<int>(TrafficClass::NUM_CLASSES))
     {
-        m_weights[idx] = weight;
+        m_weights[idx] = std::max(0.0, std::min(1.0, weight));
     }
 }
 
@@ -168,7 +258,10 @@ ContentionModel::ComputeServiceTime(uint32_t size, TrafficClass trafficClass) co
     double fullBwTime = static_cast<double>(size) / static_cast<double>(m_bandwidth);
     double wfqBwTime = static_cast<double>(size) / (weight * static_cast<double>(m_bandwidth));
     double penalty = wfqBwTime - fullBwTime;
-    return Seconds(penalty);
+    // Round 74 (codex finding 10): bound the Seconds() conversion — a
+    // degenerate weight/bandwidth pair produces a penalty whose tick
+    // conversion aborts or wraps (same conversion as GetSerializationTime).
+    return ClampedSerializationSeconds(penalty);
 }
 
 void
@@ -243,7 +336,24 @@ ContentionModel::GetEffectiveBandwidth(TrafficClass trafficClass) const
 
     // Otherwise, get weighted share
     double weight = GetWeight(trafficClass);
-    return static_cast<uint64_t>(weight * static_cast<double>(m_bandwidth));
+    // Round 62: saturation guard (codex finding 11). With bandwidth near
+    // UINT64_MAX and 2+ active classes the weighted product rounds up to
+    // 2^64 in double precision and the static_cast is out of range
+    // (floating-point diagnostics halt the process under
+    // -fsanitize=float-cast-overflow). Saturate like the protocol-model
+    // helpers (round 51, finding 8). Round 63: a weight below 0 (now
+    // clamped in the setters, but belt-and-braces) or any negative
+    // product also cannot reach the cast — floor at zero.
+    const double product = weight * static_cast<double>(m_bandwidth);
+    if (product <= 0.0)
+    {
+        return 0;
+    }
+    if (!(product < 18446744073709551616.0)) // >= 2^64
+    {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return static_cast<uint64_t>(product);
 }
 
 Time
@@ -253,7 +363,11 @@ ContentionModel::GetSerializationTime(uint32_t size) const
     {
         return Time(0);
     }
-    return Seconds(static_cast<double>(size) / static_cast<double>(m_bandwidth));
+    // Round 74 (codex finding 10): same bounded Seconds() conversion as
+    // the WFQ penalty path — a 0-bandwidth or degenerate size/bandwidth
+    // pair aborts inside the int64x64 constructor at coarse resolutions.
+    return ClampedSerializationSeconds(static_cast<double>(size) /
+                                       static_cast<double>(m_bandwidth));
 }
 
 } // namespace ns3

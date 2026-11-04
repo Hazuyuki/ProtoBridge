@@ -7,6 +7,7 @@
 #include "ns3/log.h"
 
 #include <cmath>
+#include <limits>
 
 namespace ns3
 {
@@ -93,7 +94,22 @@ NcclProtocolModel::GetWireSize(uint64_t dataSize, uint8_t protocolId) const
     const auto protocol = static_cast<NcclProtocol>(protocolId);
     if (protocol == NcclProtocol::SIMPLE)
     {
-        return static_cast<uint64_t>(std::ceil(dataSize / m_simpleWireEfficiency));
+        // Checked conversion (codex round 51, finding 8): at dataSize =
+        // UINT64_MAX even efficiency 1.0 rounds the double quotient to
+        // 2^64, and the direct static_cast is undefined behavior (the
+        // build silently yields 0). Efficiency 1.0 is exact — return the
+        // input; otherwise saturate on an out-of-range quotient.
+        if (m_simpleWireEfficiency == 1.0)
+        {
+            return dataSize;
+        }
+        const double quotient =
+            std::ceil(static_cast<double>(dataSize) / m_simpleWireEfficiency);
+        if (quotient >= 18446744073709551615.0) // >= 2^64 - 1
+        {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return static_cast<uint64_t>(quotient);
     }
     return GetWireSize(dataSize, protocol);
 }
@@ -104,7 +120,23 @@ NcclProtocolModel::GetDataSize(uint64_t wireSize, uint8_t protocolId) const
     const auto protocol = static_cast<NcclProtocol>(protocolId);
     if (protocol == NcclProtocol::SIMPLE)
     {
-        return static_cast<uint64_t>(wireSize * m_simpleWireEfficiency);
+        // Round 62: inverse-direction guard, mirroring the checked
+        // GetWireSize forward form (codex round 51, finding 8). At
+        // SimpleWireEfficiency 1.0 the forward helper returns the input
+        // unconverted, but here double(UINT64_MAX) rounds up to 2^64 and
+        // the static_cast is UB on any platform. Efficiency 1.0 is exact
+        // — return the input; otherwise saturate on an out-of-range
+        // product.
+        if (m_simpleWireEfficiency == 1.0)
+        {
+            return wireSize;
+        }
+        const double product = static_cast<double>(wireSize) * m_simpleWireEfficiency;
+        if (!(product < 18446744073709551616.0)) // >= 2^64
+        {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return static_cast<uint64_t>(product);
     }
     return GetDataSize(wireSize, protocol);
 }
@@ -182,9 +214,31 @@ NcclProtocolModel::GetWireSize(uint64_t dataSize, NcclProtocol protocol)
     switch (protocol)
     {
         case NcclProtocol::LL:
-            return ((dataSize + LL_DATA_PER_LINE - 1) / LL_DATA_PER_LINE) * LL_LINE_SIZE;
-        case NcclProtocol::LL128:
-            return ((dataSize + LL128_DATA_PER_LINE - 1) / LL128_DATA_PER_LINE) * LL128_LINE_SIZE;
+        case NcclProtocol::LL128: {
+            // Checked framing (codex round 50, finding 2): the line count
+            // times the line size wraps in uint64 for dataSize near 2^63
+            // (LL: 2^63 data -> true 2^64 wire, returned 0), and a wrapped
+            // zero ledger emitted a header-only "successful" transfer.
+            // Saturate instead: the send paths abort on ledgers above the
+            // serviceable bound, which a saturated value always exceeds.
+            const uint64_t dataPerLine = (protocol == NcclProtocol::LL)
+                ? LL_DATA_PER_LINE : LL128_DATA_PER_LINE;
+            const uint64_t lineSize = (protocol == NcclProtocol::LL)
+                ? LL_LINE_SIZE : LL128_LINE_SIZE;
+            // Wrap-free ceiling (codex round 51, finding 7): the last
+            // dataPerLine - 1 input values overflowed the ceil ADDITION
+            // (dataSize + dataPerLine - 1) before the division, returning
+            // a small line count — zero for dataSize = UINT64_MAX — that
+            // bypassed the multiplication saturation below. Divide first,
+            // then bump on a nonzero remainder.
+            const uint64_t lines =
+                dataSize / dataPerLine + (dataSize % dataPerLine != 0 ? 1 : 0);
+            if (lines > std::numeric_limits<uint64_t>::max() / lineSize)
+            {
+                return std::numeric_limits<uint64_t>::max();
+            }
+            return lines * lineSize;
+        }
         case NcclProtocol::SIMPLE:
         case NcclProtocol::NONE:
         default:

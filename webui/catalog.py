@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .options import (ALGORITHMS, COLLECTIVES, OPTION_GROUPS, TOPOLOGIES,
-                      TOPOLOGY_FIELDS, validate_configuration, validate_value)
+                      TOPOLOGY_FIELDS, validate_configuration, validate_value, RDMA_ALIASES, normalize_rdma_values)
 
 
 class RunRequest(BaseModel):
@@ -75,12 +75,25 @@ CLI_FIELDS: dict[str, dict[str, Any]] = {
     "bgP2pSizeBytes": {"type": "int", "min": 1, "max": 67108864},
     "bgP2pIntervalNs": {"type": "int", "min": 0, "max": 1000000000},
     "bgP2pStartTimeNs": {"type": "int", "min": 0, "max": 1000000000},
+    "p2pIterations": {"type": "int", "min": 1, "max": 1000000},
     "randTraffic": {"type": "bool"},
     "randInjectionRate": {"type": "float", "min": 0.001, "max": 1},
     "randMsgBytes": {"type": "int", "min": 1, "max": 16777216},
     "randWarmupNs": {"type": "int", "min": 0, "max": 10000000},
     "randMeasureNs": {"type": "int", "min": 1, "max": 10000000},
 }
+
+for _group in OPTION_GROUPS:
+    if _group["id"] in {"rdma", "pcie"}:
+        for _field in _group["fields"]:
+            CLI_FIELDS[_field["key"]] = (
+                {"choices": [choice["value"] for choice in _field["choices"]]}
+                if "choices" in _field else
+                {"type": _field["type"], "min": _field["min"], "max": _field["max"]}
+            )
+
+for _alias, _canonical in RDMA_ALIASES.items():
+    CLI_FIELDS[_alias] = CLI_FIELDS[_canonical]
 
 # The same controls and ranges drive the browser and HTTP validation.
 for _field in [*TOPOLOGY_FIELDS, *[item for group in OPTION_GROUPS for item in group["fields"] if item["target"] == "cli"]]:
@@ -107,6 +120,14 @@ PRESETS = {
     "p2p-single.cfg": ("点对点传输", "同节点 GPU 0 → GPU 1", "stencil", {}),
     "p2p-eth.cfg": ("Ethernet 点对点", "两个节点之间的 DATA 传输", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "ETH", "interNodeTopology": "host"}}),
     "p2p-eth-incast.cfg": ("Ethernet Incast", "两个发送端向同一目标发送", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "ETH", "interNodeTopology": "host"}}),
+    "rdma-read.cfg": ("RDMA Read / Get", "Fetch remote memory into the local buffer", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "detailed", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
+    "rdma-send.cfg": ("RDMA Send / Recv", "Posted receives, immediate notifications and RNR retries", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "detailed", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
+    "rdma-atomic.cfg": ("RDMA atomics", "64-bit fetch-and-add and compare-and-swap", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "detailed", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
+    "rdma-put-signal.cfg": ("RDMA Put with signal", "Copy payload before updating a remote signal", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "detailed", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
+    "rdma-host-p2p.cfg": ("CPU RDMA · host memory", "RDMA between host-memory buffers", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "detailed", "rdmaInitiator": "cpu", "rdmaDataPath": "host", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
+    "rdma-staged-p2p.cfg": ("CPU RDMA · GPU staging", "GPU payload copied through host DRAM", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "detailed", "rdmaInitiator": "cpu", "rdmaDataPath": "staged", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
+    "rdma-gpudirect-p2p.cfg": ("CPU RDMA · GPUDirect", "CPU submits RDMA directly to GPU memory", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "detailed", "rdmaInitiator": "cpu", "rdmaDataPath": "gpudirect", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
+    "ibgda-p2p.cfg": ("IBGDA point-to-point", "GPU-initiated RC RDMA over RoCE", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"rdmaSubmission": "ibgda", "interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
     "p2p-roce.cfg": ("RoCE 点对点", "节点间 RoCE 传输", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
     "p2p-roce-lossy.cfg": ("RoCE · Go-back-N", "启用链路重试的 RoCE 场景", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
     "p2p-roce-lossy-sack.cfg": ("RoCE · SACK", "选择重传的 RoCE 场景", "multinode", {"num_nodes": 2, "gpus_per_node": 2, "stack_overrides": {"interNodeFabricType": "RoCE", "interNodeTopology": "host"}}),
@@ -191,7 +212,7 @@ class Catalog:
         return {"configs": configs, "cli_fields": CLI_FIELDS,
                 "options": {"collectives": COLLECTIVES, "algorithms": ALGORITHMS,
                             "topologies": TOPOLOGIES, "topology_fields": TOPOLOGY_FIELDS,
-                            "groups": OPTION_GROUPS},
+                            "groups": OPTION_GROUPS, "rdma_aliases": RDMA_ALIASES},
                 "profiles": [{"id": p.name, "text": p.read_text()} for p in sorted(self.profile_dir.glob("*.profile"))]}
 
     def prepare(self, request: RunRequest) -> dict[str, Any]:
@@ -206,7 +227,8 @@ class Catalog:
             if "collective" not in config["op"] and set(request.op_overrides) & {"collective", "algorithm"}:
                 raise ValueError("传输 stencil 请保留 transfer.*；修改 collective 算法请先选择集合通信模板。")
             config["op"].update({key: scalar(value) for key, value in request.op_overrides.items()})
-        stack = config["stack"]
+        stack = normalize_rdma_values(config["stack"])
+        config["stack"] = stack
         profile_path = (self.repo/stack["profile"]).resolve()
         if request.profile_text is None:
             if profile_path.parent != self.profile_dir.resolve() or not profile_path.is_file():
@@ -217,11 +239,11 @@ class Catalog:
         profile = parse_values(profile_text)[""]
         if not profile:
             raise ValueError("profile 不能为空。")
-        for key, value in request.stack_overrides.items():
+        for key, value in normalize_rdma_values(request.stack_overrides).items():
             if key == "profile" or not re.fullmatch(r"[A-Za-z][\w]*", key):
                 raise ValueError("profile 引用请在配置源码中修改。")
             stack[key] = scalar(value)
-        resolved = {**profile, **{k: v for k, v in stack.items() if k != "profile"}}
+        resolved = {**normalize_rdma_values(profile), **normalize_rdma_values({k: v for k, v in stack.items() if k != "profile"})}
         for key in ["bandwidthGbps", "interNodeBandwidthGbps", "numLanes", "linksPerGpu", "sprayChunkSize"]:
             if key in resolved and (not resolved[key].isdigit() or int(resolved[key]) < 1):
                 raise ValueError(f"{key} 需要正整数。")
@@ -232,7 +254,7 @@ class Catalog:
             raise ValueError("interNodeFabricType 需要 ETH、RoCE 或 NVLink。")
         if resolved.get("interNodeTopology", "fullmesh") not in CLI_FIELDS["interNodeTopology"]["choices"]:
             raise ValueError("interNodeTopology 不是支持的节点间拓扑。")
-        cli = validate_cli(request.cli_overrides)
+        cli = normalize_rdma_values(validate_cli(request.cli_overrides))
         if len(request.stack_overrides) > 80 or len(request.cli_overrides) > 80:
             raise ValueError("单次实验最多支持 80 项覆盖参数。")
         ranks, settings, notices, topology_params = validate_configuration(config["op"], resolved, cli, request)

@@ -38,6 +38,22 @@ Key derivations (see WHITEBOX_SURROGATE.md for the complete equations):
 import math
 from dataclasses import dataclass
 
+def _iceil(a, b):
+    """Integer ceiling division (round 65, codex finding 7).
+
+    math.ceil(a / b) converts the ratio to binary64 first, which can
+    absorb a remainder before the ceiling: at payload 2^53+1 LL lines,
+    (2^53+1)/64 rounds to 2^47 exactly and the ceiling loses the last
+    line (18014398509481984 vs the exact 18014398509482112 wire bytes).
+    ``-(-a // b)`` is exact integer ceiling division, matching the C++
+    (a + b - 1) / b / divide-first forms bit-for-bit for every input.
+    The result is coerced with ``int(...)`` so a float input (e.g. a
+    fractional per-rank share) yields an int, not a float that would
+    later trip ``range()`` / ``max()`` int-only consumers.
+    """
+    return int(-(-a // b))
+
+
 
 @dataclass
 class Topology:
@@ -134,9 +150,19 @@ class TheoryDerivedSurrogate:
         self.lat = link_latency_us
         self.credit_bdp_ring = credit_bdp_ring_packets
         self.credit_bdp_tree = credit_bdp_tree_packets
-        self.chunk_size = spray_chunk_bytes
-        self.spray_chunk_bytes = spray_chunk_bytes
-        self.bulk_chunk_size = bulk_chunk_bytes
+        # Round 68 (codex finding 5): derive every spray-dependent quantity
+        # from the CAPPED value — the round-67 edit stored
+        # `min(spray_chunk_bytes, 1 << 30)` in self.spray_chunk_bytes but
+        # left self.chunk_size (the retry/serialization path) at the raw
+        # input, so spray=2^31 predicted 314.67 us where the capped C++
+        # config (spray=2^30) predicts 301.19 us.
+        self.spray_chunk_bytes = min(spray_chunk_bytes, 1 << 30)
+        self.chunk_size = self.spray_chunk_bytes
+        # Round 68 (codex finding 6): mirror the C++ bulk-chunk cap
+        # (FabricEndpoint::SetBulkChunkSize caps at 1u << 30). Without it
+        # bulk_chunk_bytes=2^31 emitted 2 fragments where native C++ (cap
+        # 2^30) emitted 3 for a 2^31+1-byte SIMPLE transfer.
+        self.bulk_chunk_size = min(bulk_chunk_bytes, 1 << 30)
         self.num_lanes = num_lanes
         self.T_min_switch = t_min_switch_us
         # Compatibility alias used by an older diagnostic script.
@@ -415,9 +441,9 @@ class TheoryDerivedSurrogate:
         header per 128 B line; SIMPLE: payload as-is (efficiency 1.0).
         """
         if protocol == 'LL':
-            return math.ceil(payload_bytes / 64) * 128
+            return _iceil(payload_bytes, 64) * 128
         if protocol == 'LL128':
-            return math.ceil(payload_bytes / 120) * 128
+            return _iceil(payload_bytes, 120) * 128
         return payload_bytes
 
     def _wire_bytes_per_transfer(self, data_bytes, num_gpus, algo,
@@ -444,6 +470,10 @@ class TheoryDerivedSurrogate:
                 per_rank = data_bytes
             protocol = self._nccl_protocol_for(per_rank)
             return self._nccl_wire_bytes(data_bytes, protocol)
+        # Per-rank share D/N: the protocol selection sees the (possibly
+        # fractional) share, and `_nccl_wire_bytes` plus the fragmentation
+        # ceilings below it apply integer ceiling division internally
+        # (`_iceil` coerces its result to int — round 65, codex finding 7).
         transfer_bytes = (data_bytes if collective == 'sendrecv'
                           else data_bytes / max(1, num_gpus))
         if algo == 'nvls':
@@ -477,10 +507,10 @@ class TheoryDerivedSurrogate:
         if wire_bytes <= 0:
             return 1
         num_chunks = max(self.num_lanes,
-                         math.ceil(wire_bytes / self.bulk_chunk_size))
-        wire_chunk = math.ceil(wire_bytes / num_chunks)
-        sent_chunks = math.ceil(wire_bytes / wire_chunk)
-        data_chunk = math.ceil(data_bytes / max(1, sent_chunks))
+                         _iceil(wire_bytes, self.bulk_chunk_size))
+        wire_chunk = _iceil(wire_bytes, num_chunks)
+        sent_chunks = _iceil(wire_bytes, wire_chunk)
+        data_chunk = _iceil(data_bytes, max(1, sent_chunks))
         emitted = 0
         for i in range(num_chunks):
             if i * wire_chunk >= wire_bytes:
@@ -512,15 +542,15 @@ class TheoryDerivedSurrogate:
         coalesce_threshold = 512 * 1024 * 1024
         min_chunks = max(1, self.num_lanes)  # ports per GPU
         num_chunks = max(min_chunks,
-                         math.ceil(data_bytes / spray_chunk))
-        coalesced = math.ceil(data_bytes / max_chunk)
+                         _iceil(data_bytes, spray_chunk))
+        coalesced = _iceil(data_bytes, max_chunk)
         if data_bytes > coalesce_threshold and coalesced > min_chunks:
-            path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
+            path_balanced = _iceil(coalesced, min_chunks) * min_chunks
             num_chunks = max(min_chunks,
                              min(num_chunks, path_balanced))
         sent = sum(1 for i in range(num_chunks)
-                   if i * math.ceil(data_bytes / num_chunks) < data_bytes)
-        frag_bytes = math.ceil(data_bytes / num_chunks) if num_chunks else 1
+                   if i * _iceil(data_bytes, num_chunks) < data_bytes)
+        frag_bytes = _iceil(data_bytes, num_chunks) if num_chunks else 1
         return max(1, sent), max(1, frag_bytes)
 
     def _spray_fragments(self, data_bytes):
@@ -557,7 +587,7 @@ class TheoryDerivedSurrogate:
             # threshold: one packet carries the entire transfer.
             return 1, math.ceil(data_bytes)
         num_chunks = max(min_chunks,
-                         math.ceil(data_bytes / self.spray_chunk_bytes))
+                         _iceil(data_bytes, self.spray_chunk_bytes))
         # ... but the C++ spray loop SKIPS trailing lane-pad fragments whose
         # offset is past the wire end (fabric-endpoint-send.cc: `offset >=
         # wireSize -> continue`): chunkSize = ceil(wire/numChunks), so a
@@ -568,7 +598,7 @@ class TheoryDerivedSurrogate:
         # BER 2.2e-4 / retry 0, crossing the strict-reliability threshold).
         sent_fragments = sum(
             1 for i in range(num_chunks)
-            if i * math.ceil(data_bytes / num_chunks) < data_bytes
+            if i * _iceil(data_bytes, num_chunks) < data_bytes
         )
         # Large-transfer coalescing (codex round 14, finding 2): above
         # 512 MiB the C++ caps the event count by coalescing into
@@ -589,18 +619,18 @@ class TheoryDerivedSurrogate:
         # returned infinity for a config ns-3 completes in 4,251.879 us
         # with zero permanent losses).
         if data_bytes > coalesce_threshold:
-            coalesced = math.ceil(data_bytes / max_chunk_bytes)
+            coalesced = _iceil(data_bytes, max_chunk_bytes)
             if coalesced > min_chunks:
-                path_balanced = math.ceil(coalesced / min_chunks) * min_chunks
+                path_balanced = _iceil(coalesced, min_chunks) * min_chunks
                 num_chunks = max(min_chunks,
                                  min(num_chunks, path_balanced))
                 # Recompute after coalescing changes numChunks: the skip rule
                 # (offset >= wire end) applies to the FINAL chunk geometry.
                 sent_fragments = sum(
                     1 for i in range(num_chunks)
-                    if i * math.ceil(data_bytes / num_chunks) < data_bytes
+                    if i * _iceil(data_bytes, num_chunks) < data_bytes
                 )
-        frag_bytes = math.ceil(data_bytes / num_chunks)
+        frag_bytes = _iceil(data_bytes, num_chunks)
         return sent_fragments, frag_bytes
 
     def _packets_per_transfer(self, data_bytes, num_gpus, algo, collective=None):

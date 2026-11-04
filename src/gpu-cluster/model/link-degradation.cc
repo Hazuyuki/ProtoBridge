@@ -13,11 +13,34 @@
 #include "ns3/enum.h"
 
 #include <algorithm>
+#include <limits>
 
 #include <cmath>
 
 namespace ns3
 {
+
+namespace
+{
+
+// Round 74 (codex finding 14): delay + duration is a raw Time sum — a
+// saturated duration makes the recovery deadline wrap mod 2^64 to a
+// negative/past firing (the recovery runs before the degradation even
+// fires). Saturate the raw tick sum like every other ledger addition in
+// this model.
+Time
+SaturatedAddTime(Time a, Time b)
+{
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
+}
+
+} // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("LinkDegradationModel");
 
@@ -65,7 +88,8 @@ LinkDegradationModel::GetTypeId()
                             .AddAttribute("CodewordSize",
                                           "Codeword size in bytes for burst error granularity",
                                           UintegerValue(256),
-                                          MakeUintegerAccessor(&LinkDegradationModel::m_codewordSize),
+                                          MakeUintegerAccessor(&LinkDegradationModel::GetCodewordSize,
+                                                               &LinkDegradationModel::SetCodewordSize),
                                           MakeUintegerChecker<uint32_t>())
                             .AddAttribute("BurstLength",
                                           "Mean burst length in codewords",
@@ -253,7 +277,14 @@ void
 LinkDegradationModel::SetCodewordSize(uint32_t sizeBytes)
 {
     NS_LOG_FUNCTION(this << sizeBytes);
-    m_codewordSize = sizeBytes;
+    // Round 62: a zero codeword size divides by zero at the burst-mode
+    // codeword-count step (codex probe: SetCodewordSize(0) then any
+    // packet in BURST mode evaluated numCodewords = 0/0), and values
+    // near UINT32_MAX wrapped the (packetSize + size - 1) ceiling
+    // addition to 0 so a small packet was treated as zero codewords —
+    // it survived burst mode untouched even at BER 500. Floor at one
+    // byte (the attribute accessor routes through this setter too).
+    m_codewordSize = std::max(1u, sizeBytes);
 }
 
 uint32_t
@@ -503,17 +534,38 @@ LinkDegradationModel::ScheduleDegradation(Time delay, DegradationTrigger trigger
     m_scheduledTrigger = trigger;
     m_scheduledSeverity = severity;
 
-    // Schedule degradation
-    m_degradationEvent = Simulator::Schedule(delay,
-                                              &LinkDegradationModel::OnDegradationEvent,
-                                              this);
-
-    // Schedule recovery if duration is specified
-    if (duration > Time(0))
+    // Round 74 (codex finding 14): a delay at/beyond the remaining horizon
+    // wraps the scheduled deadline to a negative/past firing, so the
+    // degradation "starts" immediately. An unreachable degradation is
+    // dropped (no event armed), and its recovery is dropped too — the
+    // same far-future policy every other guarded Schedule site uses.
+    if (delay < Time::Max() - Simulator::Now())
     {
-        m_recoveryEvent = Simulator::Schedule(delay + duration,
-                                              &LinkDegradationModel::OnRecoveryEvent,
-                                              this);
+        // Schedule degradation
+        m_degradationEvent = Simulator::Schedule(delay,
+                                                 &LinkDegradationModel::OnDegradationEvent,
+                                                 this);
+
+        // Schedule recovery if duration is specified. The deadline is a
+        // saturated sum so a degenerate duration cannot wrap the recovery
+        // before the degradation fires; a recovery that would land at or
+        // beyond the horizon is also dropped.
+        if (duration > Time(0))
+        {
+            const Time recoveryDelay = SaturatedAddTime(delay, duration);
+            if (recoveryDelay < Time::Max() - Simulator::Now())
+            {
+                m_recoveryEvent = Simulator::Schedule(recoveryDelay,
+                                                      &LinkDegradationModel::OnRecoveryEvent,
+                                                      this);
+            }
+        }
+    }
+    else
+    {
+        NS_LOG_WARN("LinkDegradationModel: degradation delay beyond the "
+                    "representable horizon — event dropped (trigger="
+                    << static_cast<int>(trigger) << ")");
     }
 }
 
@@ -535,11 +587,22 @@ LinkDegradationModel::CancelScheduledDegradation()
 double
 LinkDegradationModel::CalculatePacketErrorProbability(uint32_t packetSize) const
 {
-    // P(error) = 1 - (1 - BER)^(bits)
-    // For small BER, approximately P(error) ≈ BER * bits
+    // P(error) = 1 - (1 - BER)^(bits), via expm1/log1p for accuracy at
+    // both ends. BER >= 1 is saturated at probability 1: ApplyDegradation
+    // scales m_baseBer by up to (1 + severity * 999) with only the
+    // attribute input checker-bounded to [0,1], so m_ber can exceed 1
+    // (codex round 54, finding 4) — the raw std::pow(1 - m_ber, bits)
+    // form then computed pow(negative, bits): even bit counts silently
+    // returned prob 0 (packets survive a BER-2 link), odd counts raised
+    // FE_INVALID, and large negative bases overflowed (FE_OVERFLOW).
+    if (m_ber >= 1.0)
+    {
+        return 1.0;
+    }
     uint64_t bits = static_cast<uint64_t>(packetSize) * 8;
-    double probNoError = std::pow(1.0 - m_ber, bits);
-    return 1.0 - probNoError;
+    const double logNoError = static_cast<double>(bits) * std::log1p(-m_ber);
+    // 1 - exp(logNoError) computed without cancellation at either end.
+    return -std::expm1(logNoError);
 }
 
 void
@@ -562,7 +625,12 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
     NS_LOG_FUNCTION(this << packet);
 
     uint32_t packetSize = packet->GetSize();
-    uint32_t numCodewords = (packetSize + m_codewordSize - 1) / m_codewordSize;
+    // Round 62: wrap-free ceiling division (codex finding 4). The old
+    // (packetSize + size - 1) addition wrapped in uint32 for
+    // m_codewordSize near UINT32_MAX, counting a small packet as zero
+    // codewords so it dodged burst mode entirely; dividing first then
+    // bumping on a nonzero remainder cannot overflow.
+    uint32_t numCodewords = packetSize / m_codewordSize + (packetSize % m_codewordSize != 0 ? 1 : 0);
 
     for (uint32_t i = 0; i < numCodewords; i++)
     {
@@ -589,8 +657,21 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
         {
             // Not in burst: check if a new burst starts
             // Also apply independent BER for codewords outside bursts
-            double codewordBits = static_cast<double>(m_codewordSize) * 8.0;
-            double codewordErrorProb = 1.0 - std::pow(1.0 - m_ber, codewordBits);
+            double codewordErrorProb;
+            if (m_ber >= 1.0)
+            {
+                // BER >= 1 (degradation scaling past the attribute bound):
+                // every codeword certainly fails — saturating avoids the
+                // pow(negative, bits) domain error of the raw form (codex
+                // round 54, finding 4).
+                codewordErrorProb = 1.0;
+            }
+            else
+            {
+                double codewordBits = static_cast<double>(m_codewordSize) * 8.0;
+                codewordErrorProb =
+                    -std::expm1(codewordBits * std::log1p(-m_ber));
+            }
 
             if (ShouldStartBurst())
             {
@@ -598,18 +679,39 @@ LinkDegradationModel::ProcessPacketBurstMode(Ptr<Packet> packet)
                 m_inBurst = true;
                 // Geometric distribution for burst length with mean m_burstLength
                 double u = GetRandomValue();
-                if (u < 1.0 / (1.0 + static_cast<double>(m_burstLength)))
+                if (m_burstLength == 0 || u < 1.0 / (1.0 + static_cast<double>(m_burstLength)))
                 {
+                    // BurstLength == 0 (round 56): the geometric formula
+                    // below has denominator log(0 / 1) = log(0) ->
+                    // FE_DIVBYZERO; a zero-length burst means every
+                    // affected codeword stands alone.
                     m_burstRemaining = 1;
                 }
                 else
                 {
-                    m_burstRemaining = static_cast<uint32_t>(
-                        std::log(1.0 - u) / std::log(static_cast<double>(m_burstLength) /
-                                                      (1.0 + static_cast<double>(m_burstLength)))
-                    ) + 1;
+                    // Geometric burst length: samples come from the
+                    // injectable random stream, whose values can sit at
+                    // the closed endpoint u == 1 even though the default
+                    // uniform generator never produces it. log1p(-u)
+                    // would be log(0) (FE_DIVBYZERO / -inf -> uint32
+                    // conversion is UB), so clamp into the open domain.
+                    // Round 55: the 1000-codeword cap must apply to the
+                    // DOUBLE quotient BEFORE the uint32 conversion — for
+                    // BurstLength near UINT32_MAX the quotient reaches
+                    // ~1.2e11, and a direct static_cast<uint32_t> of an
+                    // out-of-range double is undefined behavior (UBSan)
+                    // that executes before the old post-conversion cap.
+                    // Round 56: the clamped bound is 999, not 1000, so
+                    // the trailing +1 yields at most 1000 — the old
+                    // min(quot, 1000) + 1 could emit a 1001-codeword
+                    // burst. Ordinary (uncapped) inputs are unchanged.
+                    double uClamped = std::min(u, 1.0 - 1e-12);
+                    double length = std::log1p(-uClamped) /
+                                    std::log(static_cast<double>(m_burstLength) /
+                                             (1.0 + static_cast<double>(m_burstLength)));
+                    length = std::min(length, 999.0);
+                    m_burstRemaining = static_cast<uint32_t>(length) + 1;
                     if (m_burstRemaining < 1) m_burstRemaining = 1;
-                    if (m_burstRemaining > 1000) m_burstRemaining = 1000;
                 }
                 m_totalBursts++;
                 m_burstTrace(m_burstRemaining, m_burstRemaining);

@@ -7,7 +7,10 @@
 
 #include "nvswitch.h"
 
+#include "so-header.h"
+
 #include <algorithm>
+#include <limits>
 
 #include "ns3/log.h"
 #include "ns3/simulator.h"
@@ -20,6 +23,29 @@
 
 namespace ns3
 {
+
+namespace
+{
+
+// Round 74 (codex findings 7+8): degenerate time sums must never reach
+// Simulator::Schedule. Time + Time wraps mod 2^64, so
+// encode=Time::Max()+decode=0 yields a NEGATIVE codingLatency that passes
+// the `> Seconds(0)` check and sends immediately, and startTime +
+// serializationTime wraps a saturated ledger into a past that re-runs
+// serialization "in the past". Saturate raw tick sums at INT64_MAX.
+Time
+SaturatedAddTime(Time a, Time b)
+{
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
+}
+
+} // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("NvSwitch");
 
@@ -924,6 +950,22 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
         m_dropTrace(entry.packet);
         m_droppedPackets++;
         m_voqDrops++;
+        // A hard-cap drop in a lossless fabric is unrecoverable unless the
+        // source learns of it: NACK back so the LLR/SACK path retransmits,
+        // mirroring the tail-drop / headroom-exhaustion NACKs in
+        // EthernetSwitch::OnPacketEnqueue (codex round 35, finding 1 — with
+        // finite PFC headroom and a small switchVoqDepth the hard cap binds
+        // BEFORE the headroom budget exhausts, and the silent drop stalls
+        // the transfer). EmitNackBack no-ops unless m_llrEnabled, so the
+        // default LLR-off configuration is byte-identical; control/retry
+        // packets are exempt like every other congestion hook (a NACK about
+        // feedback is meaningless).
+        FabricHeader capHeader;
+        if (entry.packet && entry.packet->PeekHeader(capHeader)
+            && !capHeader.IsControlPacket() && !capHeader.IsRetryPacket())
+        {
+            EmitNackBack(capHeader, entry.inPort, capHeader.GetSourceMac());
+        }
         return;
     }
 
@@ -1123,7 +1165,8 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
             wireSize = header.GetSerializedSize()
                        + m_fecModel->GetEncodedSize(header.GetPayloadSize());
         }
-        codingLatency = m_fecModel->GetEncodeLatency() + m_fecModel->GetDecodeLatency();
+        codingLatency = SaturatedAddTime(m_fecModel->GetEncodeLatency(),
+                                         m_fecModel->GetDecodeLatency());
     }
     m_txTrace(packet);
     m_txPackets++;
@@ -1152,7 +1195,11 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
     // 1000-B chunk on 400G = 2.0x derate). The pipeline term still appears
     // per packet in the arrival delay below.
     Time startTime = std::max(Simulator::Now(), m_outputBusyUntil[outPort]);
-    m_outputBusyUntil[outPort] = startTime + serializationTime;
+    // Round 74 (codex finding 8): the busy-until ledger is a raw Time sum —
+    // a degenerate serializationTime (or a start already near Max) wraps
+    // the ledger negative, after which every later packet on this port
+    // serializes "in the past" (startTime collapses to Now). Saturate.
+    m_outputBusyUntil[outPort] = SaturatedAddTime(startTime, serializationTime);
 
     // Egress serialization + cut-through pipeline + propagation delay
     // models the full packet traversal including per-port contention.
@@ -1188,22 +1235,37 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
 
             // Schedule Receive() at completion time:
             // startTime + pipeline + serialization + propagation
-            Time totalDelay = (startTime - Simulator::Now())
-                            + NanoSeconds(m_cutThroughDelayNs)
-                            + serializationTime
-                            + codingLatency
-                            + propDelay;
+            // Round 74 (codex finding 8): every term is a raw Time sum —
+            // any one of them (or the chain) can wrap mod 2^64 to a
+            // deadline in the past. Saturate each addition so an
+            // unreachable arrival lands at Time::Max() and is dropped by
+            // the horizon guard below instead of firing immediately.
+            Time totalDelay = SaturatedAddTime(
+                SaturatedAddTime(
+                    SaturatedAddTime(
+                        SaturatedAddTime(startTime - Simulator::Now(),
+                                         NanoSeconds(m_cutThroughDelayNs)),
+                        serializationTime),
+                    codingLatency),
+                propDelay);
 
-            PppHeader ppp;
-            ppp.SetProtocol(0x0021);
-            Ptr<Packet> pppPacket = packet->Copy();
-            pppPacket->AddHeader(ppp);
+            if (totalDelay < Time::Max() - Simulator::Now())
+            {
+                PppHeader ppp;
+                ppp.SetProtocol(0x0021);
+                Ptr<Packet> pppPacket = packet->Copy();
+                pppPacket->AddHeader(ppp);
 
-            Simulator::ScheduleWithContext(dstDevice->GetNode()->GetId(),
-                                           totalDelay,
-                                           &PointToPointNetDevice::Receive,
-                                           dstDevice,
-                                           pppPacket);
+                Simulator::ScheduleWithContext(dstDevice->GetNode()->GetId(),
+                                               totalDelay,
+                                               &PointToPointNetDevice::Receive,
+                                               dstDevice,
+                                               pppPacket);
+            }
+            // else: arrival beyond the representable horizon — drop the
+            // scheduled receive (the packet was already counted in
+            // m_txPackets/m_txBytes above, matching every other
+            // far-future-delay policy in this model).
             return;
         }
     }
@@ -1580,7 +1642,13 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
                 ((coalescedChunks + minChunks - 1) / minChunks) * minChunks;
             numChunks = std::max(minChunks, std::min(sizeBasedChunks, pathBalancedChunks));
         }
-        uint64_t chunkSize = (wirePartitionSize + numChunks - 1) / numChunks;
+        // Round 63 (codex finding 18): wrap-free ceiling. The old
+        // (wirePartitionSize + numChunks - 1) addition wrapped for large
+        // partitions — W = 2^32 * (2^32 - 128) with numChunks =
+        // 2,199,023,190,016 wrapped the numerator to 1,649,267,376,127 and
+        // yielded chunkSize 0 instead of 8,388,608. Divide first, then bump.
+        uint64_t chunkSize = wirePartitionSize / numChunks +
+                             (wirePartitionSize % numChunks != 0 ? 1 : 0);
 
         uint64_t bytesRemaining = wirePartitionSize;
         uint64_t offset = 0;
@@ -2061,22 +2129,87 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
         if (pkt->PeekHeader(header))
         {
             uint32_t payloadSize = pkt->GetSize() - header.GetSerializedSize();
-            uint32_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
+            // uint64 encoded size (codex round 51, finding 2): mirrors the
+            // endpoint egress guard — an over-UINT32_MAX parity pad is a
+            // configuration error, not a truncatable expansion. Bound the
+            // complete encoded packet, not the pad alone (round 52: the
+            // padding itself can fit uint32 while payload + padding wraps
+            // the 32-bit packet accounting). The bound must leave room
+            // for the 39-B header the fragment already carries (round 53:
+            // reject AT the boundary) and for a worst-case send-path
+            // prefix that precedes the fragment in the same Buffer —
+            // Packet::AddHeader grows the buffer with AddAtStart before
+            // the FEC pad is appended, so a warm prefix shrinks the room
+            // left at the top of the 32-bit offset space (round 54: a
+            // 51-B prefix plus an encoded body of UINT32_MAX - 45 still
+            // overflowed Buffer offsets even though the body alone fit
+            // the round-53 bound). Round 55 doubled the margin after a
+            // probe reproduced the overflow AT kMaxPayload - 1: Buffer's
+            // recommended starting offset is a process-global high-water
+            // mark (buffer.cc: g_recommendedStart), so any earlier large
+            // Packet(bytes, N) constructor call raises it — at 8 the
+            // wrap happens 8 B sooner, and any encoded size >= the guard
+            // boundary can then overflow. Round 57: the round-56 fixed-margin reasoning was unsound
+            // — SendData's single-packet path constructs bodies up to
+            // 128 MiB (MEM_SAFE_THRESHOLD), so g_recommendedStart can
+            // drift arbitrarily high and Buffer::AddAtEnd(Buffer) then
+            // reuses a recycled oversized Data whose absolute offsets
+            // wrap the uint32 end computation. The only sound guard is
+            // a live read of g_recommendedStart plus the packet's own
+            // header prefix.
+            uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
             if (encodedPayloadSize > payloadSize)
             {
-                uint32_t padding = encodedPayloadSize - payloadSize;
-                pkt->AddAtEnd(Create<Packet>(padding));
+                // Absolute-offset guard (codex round 57): read the live
+                // Buffer::g_recommendedStart (process-global high-water
+                // mark raised by ANY Packet construction) and this
+                // fragment's own serialized header prefix so the bound
+                // tracks the real offset space instead of a fixed slack.
+                // Round 59: also reserve Buffer::Allocate's 100-B
+                // ALLOC_OVER_PROVISION (plus the Buffer::Data header)
+                // — the append below re-enters Allocate on the
+                // shared-buffer path, and a request within 100 of
+                // UINT32_MAX would wrap the uint32 allocation size.
+                const uint32_t headerPrefix =
+                    header.GetSerializedSize() + SoHeader().GetSerializedSize() + 2;
+                const uint64_t headroom =
+                    static_cast<uint64_t>(Buffer::GetRecommendedStart()) + headerPrefix +
+                    Buffer::GetAllocationOverProvision() + Buffer::GetDataHeaderSize();
+                NS_ABORT_MSG_IF(encodedPayloadSize + headroom >=
+                                    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
+                                "FEC parity expansion of a " << payloadSize
+                                                           << "-B result fragment encodes to "
+                                                           << encodedPayloadSize
+                                                           << " B; with the current Buffer "
+                                                              "recommended-start "
+                                                           << Buffer::GetRecommendedStart()
+                                                           << " B and " << headerPrefix
+                                                           << " B of header prefix there is no "
+                                                              "uint32 offset space left "
+                                                              "— reduce the fragment size, "
+                                                              "disable FEC, or lower the "
+                                                              "preceding packet sizes");
+                const uint64_t padding = encodedPayloadSize - payloadSize;
+                pkt->AddAtEnd(Create<Packet>(static_cast<uint32_t>(padding)));
                 wireSize = header.GetSerializedSize() + encodedPayloadSize;
             }
-            codingLatency = m_fecModel->GetEncodeLatency()
-                            + m_fecModel->GetDecodeLatency();
+            // Round 74 (codex finding 7): raw Time+Time wraps mod 2^64 —
+            // encode=Time::Max()+decode=0 yields a NEGATIVE sum that passes
+            // the `> Seconds(0)` check below and then schedules the send at
+            // a wrapped deadline in the past (immediate TX, probe showed
+            // -9223372036854775802). Saturate the codec-latency ledger.
+            codingLatency = SaturatedAddTime(m_fecModel->GetEncodeLatency(),
+                                             m_fecModel->GetDecodeLatency());
         }
     }
     m_txTrace(pkt);
     m_txPackets++;
     m_txBytes += wireSize;
 
-    if (codingLatency > Seconds(0))
+    // Round 74 (codex finding 7): also drop an unrepresentable deferred
+    // send — a latency at/beyond the remaining horizon wraps the schedule
+    // the same way as a wrapped sum does.
+    if (codingLatency > Seconds(0) && codingLatency < Time::Max() - Simulator::Now())
     {
         // Prune fired events at every append: this site fires once per FEC
         // result fragment and its lambda captures pkt BY VALUE — without
@@ -2092,10 +2225,12 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
                 }
             }));
     }
-    else
+    else if (codingLatency <= Seconds(0))
     {
         m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
     }
+    // else: unrepresentable horizon — the result fragment is dropped, which
+    // matches every other far-future-delay policy in this model.
 }
 
 void

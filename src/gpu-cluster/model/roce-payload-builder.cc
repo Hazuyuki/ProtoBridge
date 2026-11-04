@@ -9,11 +9,13 @@
 #include "roce-payload-builder.h"
 
 #include "roce-protocol-model.h" // RoceProtocol::SIMPLE
+#include "ns3/abort.h"
 #include "ns3/log.h"
 #include "ns3/packet.h"
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace ns3
 {
@@ -51,6 +53,13 @@ RocePayloadBuilder::BuildChunks(const uint8_t* data,
     for (uint64_t offset = 0; offset < dataSize; offset += chunkSize)
     {
         uint64_t size = std::min(chunkSize, dataSize - offset);
+        // Round 61: same uint32 narrowing as McclPayloadBuilder above —
+        // the Packet constructor and the SoHeader data-size field are
+        // both uint32. In-tree endpoint paths cap chunks at 1 GiB; fail
+        // loudly for direct callers that bypass those caps.
+        NS_ABORT_MSG_IF(size > std::numeric_limits<uint32_t>::max(),
+                        "RocePayloadBuilder::BuildChunks chunk of " << size << " B "
+                                                                  << "exceeds the uint32 packet size");
         Ptr<Packet> pkt = Create<Packet>(data + offset, static_cast<uint32_t>(size));
         SoHeader header;
         header.SetProtocolId(static_cast<uint8_t>(RoceProtocol::SIMPLE));

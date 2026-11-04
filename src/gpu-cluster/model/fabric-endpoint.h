@@ -23,6 +23,8 @@
 #include "flow-control-policy.h"
 #include "dcqcn-rate-machine.h"
 #include "rttcc-rate-machine.h"
+#include "ibgda-submission-model.h"
+#include "rdma-operation-engine.h"
 
 #include "ns3/application.h"
 #include "ns3/net-device.h"
@@ -138,6 +140,7 @@ class FabricEndpoint : public Application
     void SetSprayingEnabled(bool enable);
     bool GetSprayingEnabled() const;
     void SetSprayChunkSize(uint32_t chunkSize);  // Chunk size for spraying (bytes)
+    uint32_t GetSprayChunkSize() const;          // Chunk size for spraying (bytes)
 
     // Neighbor MAC table
     void SetNeighborMac(uint16_t rank, Mac48Address addr);
@@ -214,6 +217,35 @@ class FabricEndpoint : public Application
                               uint8_t protocolId, uint16_t flowId, uint8_t vcId = 0);
     void SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                                   uint8_t protocolId, uint16_t flowId, uint8_t vcId = 0);
+
+    /// Null (default) retains the StartupDelay-only path. A mounted model
+    /// submits remote bulk transfers as RC work requests before packetization.
+    void SetIbgdaSubmissionModel(Ptr<IbgdaSubmissionModel> model);
+    Ptr<IbgdaSubmissionModel> GetIbgdaSubmissionModel() const;
+    void SetRdmaSubmissionModel(Ptr<RdmaSubmissionModel> model) { SetIbgdaSubmissionModel(model); }
+    Ptr<RdmaSubmissionModel> GetRdmaSubmissionModel() const { return GetIbgdaSubmissionModel(); }
+    Ptr<RdmaOperationEngine> GetRdmaOperationEngine() const { return m_rdmaOperations; }
+    uint64_t SubmitRdmaOperation(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaRead(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaSend(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaFetchAdd(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaCompareSwap(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    uint64_t SubmitRdmaPutSignal(const RdmaRequest& request,RdmaOperationEngine::Completion complete = {});
+    void RegisterRdmaMemory(uint64_t address,uint64_t bytes,uint32_t key = 1);
+    void PostRdmaReceive(uint64_t id,uint64_t address,uint64_t bytes,
+                         RdmaOperationEngine::ReceiveCompletion complete,
+                         uint16_t peer = UINT16_MAX,uint32_t qp = UINT32_MAX,uint32_t key = 1);
+    /// Submit at request/data-ready time. Returns a logical request ID; the
+    /// callback fires once after all child WR completions are observed.
+    /// Staged completion acknowledges remote host DRAM, before optional H2D.
+    uint64_t SubmitRdmaWrite(uint16_t destRank, uint64_t bytes, uint8_t protocolId,
+                             uint16_t flowId, uint8_t vcId = 0,
+                             uint32_t producer = UINT32_MAX,
+                             RdmaSubmissionModel::Completion complete = {});
+    uint64_t SubmitIbgdaWrite(uint16_t destRank, uint64_t bytes, uint8_t protocolId,
+                              uint16_t flowId, uint8_t vcId = 0,
+                              uint32_t producer = UINT32_MAX,
+                              IbgdaSubmissionModel::Completion complete = {});
 
     /** size is uint64: collective volumes reach multi-GiB and the 64-bit
      *  path sends dummy bytes, so a narrowed parameter truncates 4-GiB
@@ -328,7 +360,7 @@ class FabricEndpoint : public Application
     void SetBulkChunkSize(uint32_t bytes);
     /**
      * @brief Bound the number of in-flight bulk chunks to a remote (So) rank,
-     *        modeling a NIC send-queue depth (perftest tx_depth). 0 (default)
+     *        independent of logical-WR depth (IBGDA queueDepth). 0 (default)
      *        keeps the legacy unbounded synchronous dispatch. The window is
      *        ACK-clocked: a slot is released when the receiver's per-packet
      *        ACK proves delivery (or on permanent loss) — with or without
@@ -902,7 +934,7 @@ class FabricEndpoint : public Application
     uint64_t m_launchDelayNs;                       ///< NCCL launch delay
     uint32_t m_bulkChunkSize;                       ///< Maximum packet size for bulk transfers
 
-    // So TX window (NIC send-queue depth, perftest tx_depth analog).
+    // So TX window (packet/chunk slots; distinct from logical WR depth).
     // 0 = legacy unbounded synchronous bulk dispatch (parity default).
     struct BulkTxChunk
     {
@@ -915,6 +947,7 @@ class FabricEndpoint : public Application
         uint32_t chunkIndex;        ///< index within the bulk transfer (SoHeader)
         uint32_t deviceIndex;       ///< egress device chosen at enqueue (spray order)
         bool stamp;                 ///< stamp SoHeader (RoCE Seam B)
+        uint64_t ibgdaWorkId{0};     ///< Logical WR identity, independent of packet window
     };
     uint32_t m_soTxWindow{0};                       ///< Max in-flight bulk chunks to remote ranks (0=off)
     uint32_t m_bulkTxInflight{0};                   ///< Chunks dispatched but not yet ACK-purged
@@ -932,6 +965,47 @@ class FabricEndpoint : public Application
     std::set<std::tuple<uint16_t, uint8_t, uint16_t, uint32_t>> m_bulkTxWindowSeqs;
     void PumpBulkTxWindow();                        ///< Dispatch queued chunks while window has room
     void ReleaseBulkTxSlot();                       ///< Free one window slot and pump
+
+    Ptr<IbgdaSubmissionModel> m_ibgda;
+    uint64_t m_activeIbgdaWork{0};
+    using IbgdaPacketKey = std::tuple<uint16_t,uint8_t,uint16_t,uint32_t>;
+    std::map<IbgdaPacketKey,std::pair<uint64_t,uint64_t>> m_ibgdaPackets;
+    std::vector<Ptr<NetDevice>> m_ibgdaTraceDevices;
+    Ptr<RdmaOperationEngine> m_rdmaOperations;
+    struct RdmaPendingPacket
+    {
+        uint16_t peer;
+        Ptr<Packet> packet;
+        RdmaOperationTag tag;
+        uint32_t qp;
+        uint16_t flow;
+        uint8_t vc;
+        uint32_t overhead;
+    };
+    std::deque<RdmaPendingPacket> m_rdmaTxQueue;
+    void QueueRdmaOperationPacket(uint16_t peer,Ptr<Packet> packet,const RdmaOperationTag& tag,
+                                   uint32_t qp,uint16_t flow,uint8_t vc,uint32_t overhead);
+    void PumpRdmaOperationPackets();
+    struct RdmaReceivePiece { Ptr<Packet> packet; FabricHeader header; };
+    struct RdmaReceiveWork
+    {
+        uint64_t bytes{0}, received{0};
+        bool allocated{false};
+        std::vector<RdmaReceivePiece> waiting, ready;
+    };
+    using RdmaReceiveKey = std::pair<uint16_t,uint64_t>;
+    std::map<RdmaReceiveKey,std::shared_ptr<RdmaReceiveWork>> m_rdmaReceiveWork;
+    std::set<IbgdaPacketKey> m_rdmaPendingAck;
+    void StartRdmaHostWrite(const RdmaReceiveKey& key,std::shared_ptr<RdmaReceiveWork> work,
+                             Ptr<Packet> packet,FabricHeader header);
+    void SendBulkWireTransferSizeImpl(uint16_t destRank, uint64_t bytes,
+                                      uint8_t protocolId, uint16_t flowId, uint8_t vcId);
+    bool PrepareIbgdaPacket(Ptr<Packet> packet, uint32_t deviceIndex, const Address& dest);
+    bool DeferIbgdaReceive(Ptr<Packet> packet, const FabricHeader& header);
+    void OnIbgdaPhyTxBegin(Ptr<const Packet> packet);
+    uint16_t GetIbgdaRateFlow(Ptr<const Packet> packet, const FabricHeader& header) const;
+    void ConnectIbgdaDevice(Ptr<NetDevice> device);
+    void DisposeIbgda();
 
     // Strict So go-back-N receive semantics (opt-in, see SetSoGbnStrict)
     bool m_soGbnStrict{false};                      ///< In-order-only So receive in GOBACKN mode

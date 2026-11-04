@@ -344,7 +344,7 @@ TraceMark(std::ofstream* ofStream, Ptr<const QueueDiscItem> item, const char* re
 }
 
 void
-TraceQueueLength(std::ofstream* ofStream, DataRate linkRate, uint32_t oldVal, uint32_t newVal)
+TraceQueueLength(std::ofstream* ofStream, DataRate linkRate, uint64_t oldVal, uint64_t newVal)
 {
     // output in units of ms
     *ofStream << Simulator::Now().GetSeconds() << " " << std::fixed

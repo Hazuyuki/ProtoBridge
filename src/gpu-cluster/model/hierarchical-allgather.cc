@@ -6,6 +6,9 @@
  */
 
 #include "hierarchical-allgather.h"
+#include <algorithm>
+#include <limits>
+#include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/nccl-protocol.h"
@@ -66,8 +69,20 @@ HierarchicalAllGather::HierarchicalAllGather()
 HierarchicalAllGather::~HierarchicalAllGather()
 {}
 
-void HierarchicalAllGather::SetGpusPerNode(uint32_t gpusPerNode) { m_gpusPerNode = gpusPerNode; }
-void HierarchicalAllGather::SetNumNodes(uint32_t numNodes) { m_numNodes = numNodes; }
+void HierarchicalAllGather::SetGpusPerNode(uint32_t gpusPerNode)
+{
+    // Round 63 (codex finding 17): zero divides by zero at the intra-node
+    // grid (hierarchical-allreduce.cc:192 et al.). Fail loudly at the setter.
+    NS_ABORT_MSG_IF(gpusPerNode == 0, "HierarchicalAllGather::SetGpusPerNode requires at least one GPU per node");
+    m_gpusPerNode = gpusPerNode;
+}
+void HierarchicalAllGather::SetNumNodes(uint32_t numNodes)
+{
+    // Round 63 (codex finding 17): zero divides by zero at the inter-node
+    // step count. Fail loudly at the setter.
+    NS_ABORT_MSG_IF(numNodes == 0, "HierarchicalAllGather::SetNumNodes requires at least one node");
+    m_numNodes = numNodes;
+}
 void HierarchicalAllGather::SetIntraNodeAlgorithm(const std::string& algo) { m_intraNodeAlgorithm = algo; }
 void HierarchicalAllGather::SetInterNodeStartupDelay(Time delay) { m_interNodeStartupDelayNs = delay.GetNanoSeconds(); }
 void HierarchicalAllGather::SetInterNodeStartupDelays(Time ll, Time ll128, Time simple)
@@ -78,6 +93,8 @@ void HierarchicalAllGather::SetInterNodeStartupDelays(Time ll, Time ll128, Time 
 }
 uint64_t HierarchicalAllGather::GetInterNodeStartupDelayNs(uint64_t chunkSize) const
 {
+    if (!m_endpoints.empty() && m_endpoints.front()->GetIbgdaSubmissionModel()) return 0;
+
     if (m_interNodeStartupLLNs > 0 || m_interNodeStartupLL128Ns > 0 || m_interNodeStartupSIMPLENs > 0)
     {
         if (chunkSize < m_llThreshold)
@@ -127,7 +144,22 @@ void HierarchicalAllGather::SetInterNodeBwRamp(Time rampDelay, uint64_t rampThre
 uint64_t HierarchicalAllGather::GetInterNodeRampDelayNs(uint64_t chunkSize) const
 {
     if (m_interNodeBwRampDelayNs == 0 || m_interNodeBwRampThreshold == 0) return 0;
-    return m_interNodeBwRampDelayNs / (1 + chunkSize / m_interNodeBwRampThreshold);
+        // Round 63 (codex finding 17): the old 1 + chunkSize/threshold wrap
+    // made the denominator zero for chunkSize at the top of uint64
+    // (hierarchical-allreduce.cc:192 et al.). Divide first, then bump.
+    // Round 64 (codex finding 2): ceil(chunkSize/threshold) changes the
+    // delay law at every positive exact multiple (C==T: old 1+floor gave
+    // delay/2, ceil gives delay/1). Preserve the old 1 + floor quotient
+    // — the wrapped-denominator defect it fixed only occurs when the
+    // quotient itself is UINT64_MAX (chunkSize/threshold at the top of
+    // uint64), where a zero delay is the documented saturation anyway.
+    // Round 65 (codex finding 3): the ternary must surround the DIVISION
+    // — a zero literal denominator still raises SIGFPE. Return 0 directly
+    // at the saturation boundary (C=UINT64_MAX, T=1: 1200/0 -> DIV0).
+    const uint64_t rampQuotient = chunkSize / m_interNodeBwRampThreshold;
+    return rampQuotient == std::numeric_limits<uint64_t>::max()
+               ? 0
+               : m_interNodeBwRampDelayNs / (rampQuotient + 1);
 }
 void HierarchicalAllGather::SetFullmeshPerStepStartupDelays(Time ll, Time ll128, Time simple)
 {
@@ -182,6 +214,8 @@ void
 HierarchicalAllGather::Initialize(uint16_t numGpus, uint64_t dataSize,
                                    const std::vector<Ptr<FabricEndpoint>>& endpoints)
 {
+    // Round 63 (codex finding 17): zero GPUs divides by zero in the chunk/step math below. Fail loudly instead.
+    NS_ABORT_MSG_IF(numGpus == 0, "HierarchicalAllGather::Initialize requires at least one GPU");
     NS_LOG_FUNCTION(this << numGpus << dataSize);
     m_numGpus = numGpus;
     m_dataSize = dataSize;

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <limits>
 
 namespace ns3
 {
@@ -39,17 +40,17 @@ FecModel::GetTypeId()
                             .AddAttribute("N",
                                           "Total codeword length (data + parity symbols)",
                                           UintegerValue(544),
-                                          MakeUintegerAccessor(&FecModel::m_n),
+                                          MakeUintegerAccessor(&FecModel::GetN, &FecModel::SetNAttribute),
                                           MakeUintegerChecker<uint32_t>())
                             .AddAttribute("K",
                                           "Data symbols per codeword",
                                           UintegerValue(514),
-                                          MakeUintegerAccessor(&FecModel::m_k),
+                                          MakeUintegerAccessor(&FecModel::GetK, &FecModel::SetKAttribute),
                                           MakeUintegerChecker<uint32_t>())
                             .AddAttribute("T",
                                           "Error correction capability in symbols",
                                           UintegerValue(15),
-                                          MakeUintegerAccessor(&FecModel::m_t),
+                                          MakeUintegerAccessor(&FecModel::GetT, &FecModel::SetTAttribute),
                                           MakeUintegerChecker<uint32_t>())
                             .AddAttribute("EncodeLatency",
                                           "FEC encode latency per codeword",
@@ -104,11 +105,87 @@ void
 FecModel::SetFecParams(uint32_t n, uint32_t k, uint32_t t)
 {
     NS_LOG_FUNCTION(this << n << k << t);
+    // Round 61: K == 0 passes the two assertions below but makes
+    // dataBitsPerCodeword zero, so DecodePacket / GetEncodedSize divide
+    // by zero at the codeword-count step (codex probe: SetFecParams(544,
+    // 0, 15) then DecodePacket(1e-6, 1) evaluates 7 / 0 even with
+    // assertions enabled). K >= 1 is also the MDS code precondition
+    // (a zero-data codeword carries no symbols).
+    NS_ASSERT_MSG(k >= 1, "K must be at least 1");
     NS_ASSERT_MSG(n > k, "N must be greater than K");
-    NS_ASSERT_MSG(2 * t <= n - k, "T must satisfy 2T <= N-K for MDS codes");
+    // Round 62: widen 2 * t to uint64 before the comparison — at
+    // t > 2^31 the uint32 multiplication wrapped to 0 and the assert
+    // passed for any (n, k) (codex probe: SetFecParams(2, 1, 2147483648)
+    // satisfied every round-61 assertion).
+    NS_ASSERT_MSG(static_cast<uint64_t>(2) * t <= n - k,
+                  "T must satisfy 2T <= N-K for MDS codes");
     m_n = n;
     m_k = k;
     m_t = t;
+}
+
+void
+FecModel::SetNAttribute(uint32_t n)
+{
+    // Round 62: attribute setter re-validation (codex finding 2). The
+    // direct member binding used to let SetAttribute("N", ...) install
+    // values that violate the MDS relation or zero a divisor. Re-check
+    // against the current siblings, then run the full assert suite so
+    // any attribute write lands on the same valid triple SetFecParams
+    // would produce.
+    uint32_t k = m_k;
+    uint32_t t = m_t;
+    if (n <= k)
+    {
+        n = k + 1;
+    }
+    if (static_cast<uint64_t>(2) * t > n - k)
+    {
+        n = k + static_cast<uint32_t>(std::min<uint64_t>(
+            std::numeric_limits<uint32_t>::max() - k,
+            static_cast<uint64_t>(2) * t));
+    }
+    SetFecParams(n, k, t);
+}
+
+void
+FecModel::SetKAttribute(uint32_t k)
+{
+    // Round 62: attribute setter re-validation (codex finding 2).
+    // K >= 1 keeps dataBitsPerCodeword nonzero and K < N preserves the
+    // code-rate precondition; both are repaired against the current N
+    // before the full assert suite runs.
+    uint32_t n = m_n;
+    uint32_t t = m_t;
+    if (k < 1)
+    {
+        k = 1;
+    }
+    if (k >= n)
+    {
+        k = n - 1;
+    }
+    if (static_cast<uint64_t>(2) * t > n - k)
+    {
+        k = n - static_cast<uint32_t>(std::min<uint64_t>(
+            n - 1, static_cast<uint64_t>(2) * t));
+    }
+    SetFecParams(n, k, t);
+}
+
+void
+FecModel::SetTAttribute(uint32_t t)
+{
+    // Round 62: attribute setter re-validation (codex finding 2). The
+    // uint64 widening below matches SetFecParams — a T > 2^31 wrapped
+    // 2 * t to 0 under the old uint32 assert and passed unchecked.
+    uint32_t n = m_n;
+    uint32_t k = m_k;
+    if (static_cast<uint64_t>(2) * t > n - k)
+    {
+        t = static_cast<uint32_t>((n - k) / 2);
+    }
+    SetFecParams(n, k, t);
 }
 
 uint32_t
@@ -176,9 +253,64 @@ FecModel::GetEffectiveRateMultiplier() const
 double
 FecModel::ComputeSymbolErrorProbability(double ber) const
 {
-    // RS symbol = 10 bits (GF(2^10)), matching Python surrogate
-    // P(symbol error) = 1 - (1 - BER)^10
-    return 1.0 - std::pow(1.0 - ber, 10.0);
+    // Round 59: this helper is PUBLIC, so the caller-side NaN guards in
+    // ComputePostFecBer / DecodeCodeword do not cover a direct call.
+    // isnan must precede every ordered comparison — `ber >= 1.0` raises
+    // FE_INVALID for NaN under fenv traps, and std::isnan is an
+    // unordered quiet predicate that does not signal.
+    if (std::isnan(ber))
+    {
+        // NaN BER: no meaningful symbol error rate; degrade to the
+        // saturated-certain-corruption value the callers' pSym==1.0
+        // early-outs treat as UNCORRECTABLE.
+        return 1.0;
+    }
+    // Round 61: the helper is PUBLIC, so the caller-side `ber <= 0.0`
+    // lower-bound guards in ComputePostFecBer / DecodeCodeword /
+    // DecodePacket do not cover a direct call. A negative finite BER
+    // reaches log1p(-ber) = log1p(|ber|) and drives expm1(10 * log1p
+    // (1e31)) = expm1(713.80...) into overflow (a diagnostic halt under
+    // overflow traps), and a moderate direct value (-0.1) returns the
+    // invalid negative probability -1.5937... — an unguarded negative
+    // probability would flow straight into the callers' log-space sums.
+    // Saturate to the same certain-corruption value the NaN / >= 1.0
+    // branches return: every negative BER is non-physical, and the
+    // decoding entry points already map ber <= 0.0 to NO_ERROR, so the
+    // saturated helper policy cannot diverge on any in-tree path.
+    if (ber <= 0.0)
+    {
+        return 1.0;
+    }
+    if (ber >= 1.0)
+    {
+        return 1.0;
+    }
+    // No representable pSym at the top of the range (codex rounds 55/56):
+    // for BER above ~0.975 the true 1 - (1-BER)^10 is within 2^-53 of
+    // 1.0, so no IEEE-754 double can hold it — expm1/log1p rounds to
+    // exactly 1.0 and the callers' log(1 - pSym) raises FE_DIVBYZERO
+    // under fenv traps. Saturate at the helper boundary; the CALLERS
+    // treat pSym == 1.0 as certain corruption without evaluating
+    // log(1 - pSym) (round 56: the helper returning 1.0 is not enough —
+    // ComputePostFecBer / DecodeCodeword must skip the log-space sum).
+    if (ber >= 1.0 - 1e-13)
+    {
+        return 1.0;
+    }
+    // Near-zero endpoint (codex round 54): for BER <= ~2^-53 the true
+    // pSym is below double resolution; the raw 1 - pow form rounds to
+    // exactly 0 and the callers' log(pSym) raises FE_DIVBYZERO. expm1/
+    // log1p stay accurate down to the subnormal range.
+    // Non-finite BER: NaN is intercepted at this helper's entry (round
+    // 59 — the helper is public, so caller-side guards do not cover a
+    // direct call); negative finite BER (including -Inf) is caught by
+    // the `ber <= 0.0` saturation above (round 61 — without it a direct
+    // call reached log1p(+|ber|) = +Inf and drove expm1 into overflow).
+    // The caller-side guards in ComputePostFecBer / DecodeCodeword /
+    // DecodePacket intercept non-finite and non-positive input before
+    // the log-space sums either way, so the helper's saturated 1.0
+    // policy degrades to the UNCORRECTABLE early-out instead of a trap.
+    return -std::expm1(10.0 * std::log1p(-ber));
 }
 
 double
@@ -186,15 +318,56 @@ FecModel::ComputePostFecBer(double preFecBer) const
 {
     NS_LOG_FUNCTION(this << preFecBer);
 
+    // Round 58: the NaN guard must precede ANY ordered comparison —
+    // `preFecBer <= 0.0` raises FE_INVALID for NaN under fenv traps, and
+    // std::isnan is an unordered quiet predicate that does not signal.
+    // (The round-57 reorder kept the `<= 0.0` check first; the direct
+    // ComputePostFecBer(NaN) call with traps enabled still aborted.)
+    if (std::isnan(preFecBer))
+    {
+        // NaN BER: no meaningful symbol error rate; degrade to the clean
+        // path rather than propagate NaN into log-space sums.
+        return 0.0;
+    }
     if (preFecBer <= 0.0)
     {
         return 0.0;
     }
 
+    // BER at or above 1.0: every codeword is certainly corrupted and
+    // certainly uncorrectable (round 53). Return 1.0 directly instead of
+    // evaluating the log-space sum below: at BER = 1.0 the symbol-error
+    // probability is exactly 1, and std::log(1.0 - pSym) raises
+    // FE_DIVBYZERO under fenv traps or IEEE diagnostics; a BER > 1.0
+    // (reachable via LinkDegradationModel's severity scaling, which only
+    // bounds the attribute input at [0,1]) would further raise
+    // FE_INVALID from std::log of a negative number.
+    if (preFecBer >= 1.0)
+    {
+        return 1.0;
+    }
+
     double pSym = ComputeSymbolErrorProbability(preFecBer);
+
+    // pSym at (or indistinguishable from) 1.0 — helper saturation branch
+    // for BER >= ~0.975 where no double is representable closer to 1, or
+    // NaN input. Skip the log-space sum: std::log(1.0 - pSym) would be
+    // log(0) -> FE_DIVBYZERO (round 56; round 55's helper-side saturation
+    // alone was not enough). The codeword is certainly uncorrectable, so
+    // the post-FEC BER is 1.0.
+    if (!(pSym < 1.0))
+    {
+        return 1.0;
+    }
 
     // P(uncorrectable) = 1 - sum_{i=0}^{T} C(N,i) * p^i * (1-p)^(N-i)
     // For numerical stability with very small p, use log-space computation
+    //
+    // Rounded endpoints (codex round 54): expm1/log1p keep pSym off the
+    // exact 0/1 boundaries for BER in (0, 1), so std::log(pSym) and
+    // std::log(1 - pSym) below stay finite — both were FE_DIVBYZERO traps
+    // at BER ~1e-18 / ~0.99 respectively. The >= 1.0 early-outs above and
+    // here keep that property for the saturated top of the range too.
     double pUncorrectable = 1.0;
     double cumulativeCorrectable = 0.0;
 
@@ -244,12 +417,44 @@ FecModel::DecodeCodeword(double preFecBer) const
         return FecResult::NO_ERROR;
     }
 
+    // Round 58: isnan precedes every ordered comparison — see
+    // ComputePostFecBer. The round-57 reorder kept `<= 0.0` first, so the
+    // direct DecodeCodeword(NaN) call with traps enabled still aborted
+    // (codex probe: rc = -8 = SIGFPE).
+    if (std::isnan(preFecBer))
+    {
+        // NaN BER: degrade to the clean path.
+        return FecResult::NO_ERROR;
+    }
     if (preFecBer <= 0.0)
     {
         return FecResult::NO_ERROR;
     }
 
+    // Same BER >= 1.0 early-out as ComputePostFecBer (round 53): the
+    // log-space sum below would raise FE_DIVBYZERO (BER == 1.0) or
+    // FE_INVALID (BER > 1.0) and then deterministically conclude
+    // UNCORRECTABLE anyway, so skip the numerically invalid evaluation.
+    if (preFecBer >= 1.0)
+    {
+        m_fecDecodeTrace(0, FecResult::UNCORRECTABLE);
+        m_uncorrectableCount++;
+        return FecResult::UNCORRECTABLE;
+    }
+
     double pSym = ComputeSymbolErrorProbability(preFecBer);
+
+    // pSym at (or indistinguishable from) 1.0 — helper saturation branch
+    // for BER >= ~0.975 where no double is representable closer to 1, or
+    // NaN input. Skip the log-space sums: std::log(1.0 - pSym) would be
+    // log(0) -> FE_DIVBYZERO (round 56). The codeword is certainly
+    // uncorrectable.
+    if (!(pSym < 1.0))
+    {
+        m_fecDecodeTrace(0, FecResult::UNCORRECTABLE);
+        m_uncorrectableCount++;
+        return FecResult::UNCORRECTABLE;
+    }
 
     // Compute probability of exactly 0 errors and probability of correctable errors
     double pNoError = std::pow(1.0 - pSym, static_cast<double>(m_n));
@@ -312,15 +517,47 @@ FecModel::DecodePacket(double preFecBer, uint32_t payloadSize) const
         return FecResult::NO_ERROR;
     }
 
+    // Round 57: size-independent NaN policy. DecodeCodeword (single-codeword
+    // branch) and ComputePostFecBer both degrade NaN to the clean path, but
+    // the multi-codeword branch below recomputes pSym and reaches different
+    // comparisons, so NaN,642 -> NO_ERROR while NaN,643 -> UNCORRECTABLE.
+    // Intercept at entry to match the clean-path policy for any payload.
+    // Round 58: the entry guard also keeps NaN off the `<= 0.0` comparison
+    // below, so DecodePacket(NaN, traps) exits cleanly while the direct
+    // ComputePostFecBer / DecodeCodeword entry points needed their own
+    // isnan-first reorder (codex probe: both returned 0 / NO_ERROR with
+    // invalid=0).
+    if (std::isnan(preFecBer))
+    {
+        return FecResult::NO_ERROR;
+    }
+
     if (preFecBer <= 0.0)
     {
+        // Round 61: this early-out also covers the near-zero-BER precision
+        // floor. Below BER ~2^-53 / pSym ~5e-16, `1 - pSym` rounds to
+        // exactly 1.0 in double precision (the log1p-accurate range ends at
+        // the unit roundoff), so the multi-codeword math below would
+        // degrade to the all-clean path (post-FEC probability 0). The true
+        // binomial at (N,K,T)=(544,514,0), BER 1e-18 is ~5.44e-15 — far
+        // below any simulation-relevant loss rate, so mapping the
+        // unrepresentable range to NO_ERROR is the correct policy.
         return FecResult::NO_ERROR;
     }
 
     uint64_t payloadBits = static_cast<uint64_t>(payloadSize) * 8;
     uint64_t dataBitsPerCodeword = static_cast<uint64_t>(m_k) * RS_SYMBOL_BITS;
-    uint32_t numCodewords = static_cast<uint32_t>(
-        (payloadBits + dataBitsPerCodeword - 1) / dataBitsPerCodeword);
+    // Wrap-free ceiling in uint64 (codex round 62): the payload is a
+    // uint32, so payloadBits tops out at 2^35 and the old addition could
+    // wrap only if a future caller widened the signature; divide first,
+    // then bump on a nonzero remainder, so the count is correct for any
+    // uint64 payloadBits this function may see after such a widening.
+    uint64_t numCodewordsWide = payloadBits / dataBitsPerCodeword +
+                                (payloadBits % dataBitsPerCodeword != 0 ? 1 : 0);
+    // Narrow back to the uint32 packet-codeword count the downstream
+    // probability math uses; payloadSize is a uint32, so a payload's
+    // codeword count cannot exceed 2^35 / 10 < 2^32 for K >= 1.
+    uint32_t numCodewords = static_cast<uint32_t>(numCodewordsWide);
 
     if (numCodewords <= 1)
     {
@@ -360,7 +597,7 @@ FecModel::DecodePacket(double preFecBer, uint32_t payloadSize) const
     return result;
 }
 
-uint32_t
+uint64_t
 FecModel::GetEncodedSize(uint32_t payloadSize) const
 {
     if (!m_enabled)
@@ -370,9 +607,41 @@ FecModel::GetEncodedSize(uint32_t payloadSize) const
 
     uint64_t payloadBits = static_cast<uint64_t>(payloadSize) * 8;
     uint64_t dataBitsPerCodeword = static_cast<uint64_t>(m_k) * RS_SYMBOL_BITS;
-    uint64_t numCodewords = (payloadBits + dataBitsPerCodeword - 1) / dataBitsPerCodeword;
-    uint64_t encodedBits = numCodewords * m_n * RS_SYMBOL_BITS;
-    return static_cast<uint32_t>((encodedBits + 7) / 8);
+    // Wrap-free ceiling (codex round 62): divide first, then bump on a
+    // nonzero remainder — the uint64 (bits + per-codeword - 1) addition
+    // wrapped for payloads in the top per-codeword range of 2^64.
+    uint64_t numCodewords = payloadBits / dataBitsPerCodeword +
+                            (payloadBits % dataBitsPerCodeword != 0 ? 1 : 0);
+    // Round 74 (codex finding 11): the triple product itself wraps
+    // uint64 — SetFecParams(2147483647, 1, 0) with a 2^30-B payload
+    // gives numCodewords = 858,993,460 and encodedBits wraps to
+    // payload−1 bit, silently shrinking the parity expansion below the
+    // payload it protects (and a wrap to a value < payloadBits makes the
+    // caller skip padding entirely). Compute in __uint128_t — the
+    // codebase's established wide type — and divide by 8 BEFORE
+    // narrowing: the exact product can exceed uint64 while the exact
+    // byte ceiling still fits it (that case returns
+    // ceil(product / 8) = 2,305,843,010,287,435,775 bytes).
+    const uint64_t bitsPerCodewordOut = static_cast<uint64_t>(m_n) * RS_SYMBOL_BITS;
+    const __uint128_t encodedBits = static_cast<__uint128_t>(numCodewords) * bitsPerCodewordOut;
+    const uint64_t encodedBytes =
+        static_cast<uint64_t>(encodedBits / 8 + (encodedBits % 8 != 0 ? 1 : 0));
+    // uint64 return (codex round 51, finding 2): the encoded size of a
+    // ~4-GB payload crosses UINT32_MAX; the old uint32 return narrowed it
+    // below the payload size, and the padding site's `encoded > payload`
+    // test silently skipped the parity expansion entirely.
+    // Round 63: wrap-free byte ceiling (codex finding 12). The old
+    // (encodedBits + 7) / 8 addition wrapped for encodedBits in the top
+    // 7 bits of uint64 — SetFecParams(1504703107, 1, 0) with a
+    // 1,532,423,903-B payload yields encodedBits = 2^64 - 6, +7 wraps the
+    // numerator to 1, and the function returned 0 instead of
+    // 2^61 = 2,305,843,009,213,693,952. Divide first, then bump on a
+    // nonzero remainder. The byte ceiling is now computed on the
+    // __uint128_t encodedBits above (round 74), which covers both the
+    // old uint64 top-7-bits wrap and products that overflow uint64
+    // outright: it saturates the return only when the exact byte count
+    // exceeds UINT64_MAX.
+    return encodedBytes;
 }
 
 uint32_t

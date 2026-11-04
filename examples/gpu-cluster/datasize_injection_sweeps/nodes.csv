@@ -1,0 +1,4 @@
+num_nodes,simTime_us,ecn_marked,per_sender_gbps,aggregate_gbps
+2,10402.4,0,38.46,38.46
+4,31202.4,149989,38.46,115.38
+8,72802.4,349991,38.46,269.23

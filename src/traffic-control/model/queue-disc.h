@@ -297,7 +297,20 @@ class QueueDisc : public Object
      *
      * The requeued packet, if any, is counted.
      */
-    uint32_t GetNBytes() const;
+    uint64_t GetNBytes() const;
+
+    /**
+     * @brief Check if enqueueing one more item would overflow the queue disc.
+     *
+     * Computed entirely in 64-bit arithmetic — unlike the QueueSize
+     * operator+ path this does not truncate the running byte count to the
+     * uint32 QueueSize value range before comparing (codex round 49,
+     * finding 2).
+     *
+     * @param bytes size in bytes of the item about to be enqueued
+     * @return true if the item should be dropped instead, false otherwise.
+     */
+    bool WouldOverflow(uint32_t bytes) const;
 
     /**
      * @brief Get the maximum size of the queue disc.
@@ -681,7 +694,8 @@ class QueueDisc : public Object
     std::vector<Ptr<QueueDiscClass>> m_classes; //!< Classes
 
     TracedValue<uint32_t> m_nPackets; //!< Number of packets in the queue
-    TracedValue<uint32_t> m_nBytes;   //!< Number of bytes in the queue
+    // 64-bit like QueueBase::m_nBytes (codex round 48, finding 2)
+    TracedValue<uint64_t> m_nBytes;   //!< Number of bytes in the queue
     TracedCallback<Time> m_sojourn;   //!< Sojourn time of the latest dequeued packet
     QueueSize m_maxSize;              //!< max queue size
 

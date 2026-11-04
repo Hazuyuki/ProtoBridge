@@ -391,7 +391,7 @@ TraceQueueMark(std::ofstream* ofStream, Ptr<const QueueDiscItem> item, const cha
  * @param newVal New value.
  */
 void
-TraceQueueLength(std::ofstream* ofStream, DataRate queueLinkRate, uint32_t oldVal, uint32_t newVal)
+TraceQueueLength(std::ofstream* ofStream, DataRate queueLinkRate, uint64_t oldVal, uint64_t newVal)
 {
     // output in units of ms
     if (g_validate.empty())

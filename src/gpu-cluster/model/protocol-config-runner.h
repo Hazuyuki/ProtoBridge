@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,7 @@ class ProtocolConfigRunner
 
     /// True after the completion callback has fired.
     bool IsComplete() const;
+    uint64_t GetDeliveryDurationNs() const { return m_deliveryDurationNs; }
 
   private:
     void OnAction(const ProtocolTransactionAction& action);
@@ -90,6 +92,9 @@ class ProtocolConfigRunner
     Ptr<ProtocolTransactionExecutor> m_executor;
     uint16_t m_baseFlowId{1};
     bool m_complete{false};
+    bool m_drainingIbgda{false};
+    uint64_t m_deliveryDurationNs{0};
+    std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     int64_t m_startNs{0};
     std::function<void(uint64_t durationNs)> m_completionCallback;
 };

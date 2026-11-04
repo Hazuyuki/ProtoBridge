@@ -8,6 +8,7 @@
  */
 
 #include "alltoall-injector.h"
+#include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "nccl-protocol.h"
@@ -79,6 +80,8 @@ void
 AlltoAllInjector::Initialize(uint16_t numGpus, uint64_t dataSize,
                               const std::vector<Ptr<FabricEndpoint>>& endpoints)
 {
+    // Round 63 (codex finding 17): zero GPUs divides by zero in the chunk/step math below. Fail loudly instead.
+    NS_ABORT_MSG_IF(numGpus == 0, "AlltoAllInjector::Initialize requires at least one GPU");
     m_numGpus = numGpus;
     m_dataSize = dataSize;
     m_endpoints = endpoints;
@@ -212,6 +215,11 @@ AlltoAllInjector::SetConcurrentMode(bool concurrent)
 void
 AlltoAllInjector::SetTwoDimensionalRouting(uint32_t rows, uint32_t cols)
 {
+    // Round 63 (codex finding 17): zero rows/cols divides by zero at the
+    // 2D flow-id and per-row/col step math below (alltoall-injector.cc:215,353).
+    NS_ABORT_MSG_IF(rows == 0 || cols == 0,
+                    "2D AllToAll dimensions must be positive (got " << rows
+                    << "x" << cols << ")");
     NS_ABORT_MSG_IF(rows * cols != m_numGpus,
                     "2D AllToAll dimensions must match the number of devices");
     NS_ABORT_MSG_IF(m_numGpus >= 0x8000,

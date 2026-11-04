@@ -5,9 +5,11 @@
 
 #include "mccl-payload-builder.h"
 
+#include "ns3/abort.h"
 #include "ns3/log.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace ns3
 {
@@ -44,6 +46,16 @@ McclPayloadBuilder::BuildChunks(const uint8_t* data,
     for (uint64_t offset = 0; offset < dataSize; offset += chunkSize)
     {
         uint64_t size = std::min(chunkSize, dataSize - offset);
+        // Round 61: the Packet constructors take a uint32 size, so a
+        // chunk above UINT32_MAX narrows silently and the tail of the
+        // caller's buffer is never copied (codex probe: a direct
+        // BuildChunks with dataSize = chunkSize = 2^32 returned one
+        // empty packet and reported completion). The in-tree endpoint
+        // paths cap chunks at 1 GiB before calling here; fail loudly
+        // for any direct caller that bypasses those caps.
+        NS_ABORT_MSG_IF(size > std::numeric_limits<uint32_t>::max(),
+                        "McclPayloadBuilder::BuildChunks chunk of " << size << " B "
+                                                                  << "exceeds the uint32 packet size");
         chunks.push_back(Create<Packet>(data + offset, size));
     }
     return chunks;

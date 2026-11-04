@@ -427,8 +427,10 @@ fit record: `tree_calib.json`.
   `credit_bdp_tree_packets=35.5` credit term is untested against the new tree
   (Φ_credit = 1 at the sweep convention).
 - `make_surrogate_from_wire` derives the trunk as `eta_tree · B_agg` with
-  `eta_tree = 0.61` vs the *physical* 25000 B/µs-per-lane aggregate
-  (0.61 × 450000 = 274500, −0.3% vs the fit).
+  `eta_tree = 0.685` vs the *physical* 25000 B/µs-per-lane aggregate
+  (0.685 × 450000 = 308250, −0.02% vs the post-fix fit 308300). The
+  pre-cut-through-fix value (0.61, matching the retired 275400 B/µs fit)
+  survives only in git history.
 - Non-NVLink presets (`make_1024_optical_fattree_theory` 20725,
   `make_connectx7_p2p_perftest_theory` 24000) keep their historical tree
   constants; their tree predictions are uncalibrated placeholders (both

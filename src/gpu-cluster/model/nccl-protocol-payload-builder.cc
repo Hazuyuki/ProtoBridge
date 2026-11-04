@@ -7,8 +7,10 @@
 
 #include "nccl-protocol-payload-builder.h"
 #include "nccl-protocol-model.h"
+#include "ns3/abort.h"
 #include "ns3/log.h"
 #include <cstring>
+#include <limits>
 
 namespace ns3 {
 
@@ -207,6 +209,13 @@ NcclProtocolPayloadBuilder::BuildSimpleChunk(const uint8_t* data, uint64_t dataB
         return Create<Packet>(0);
     }
 
+    // Round 62: Create<Packet> takes a uint32 size (codex finding 6); a
+    // dataBytes at or above 2^32 narrows to a truncated/empty packet.
+    // The in-tree SIMPLE chunk paths derive dataBytes from a uint32
+    // packet fragment, so this only trips on direct callers.
+    NS_ABORT_MSG_IF(dataBytes > std::numeric_limits<uint32_t>::max(),
+                    "NcclProtocolPayloadBuilder::BuildSimpleChunk payload of "
+                        << dataBytes << " B exceeds the uint32 packet size");
     return Create<Packet>(data, dataBytes);
 }
 

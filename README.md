@@ -59,6 +59,19 @@ fast enough to sweep many designs where the packet simulator cannot. See
 [surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md) for the guide and
 [doc/CALIBRATION.md](doc/CALIBRATION.md) for the in-repo H200 calibration data.
 
+RC RDMA operations support CPU or GPU initiation and host DRAM, host staging, or
+GPUDirect payload paths with `--rdmaSubmission=detailed`. The default `startup`
+mode retains existing behavior; `ibgda` remains a GPU/GPUDirect compatibility
+preset. See [doc/RDMA.md](doc/RDMA.md) for runnable examples, WebUI controls and
+the C++ interface, [doc/RDMA_OPERATIONS.md](doc/RDMA_OPERATIONS.md) for Read/Get,
+Send/Recv, immediate notifications, atomics and PutSignal/Wait/Test, or
+[doc/IBGDA.md](doc/IBGDA.md) for GPU-specific bulk Write examples.
+
+Detailed RDMA also offers an error-free PCIe packet model with shared GPU/NIC
+paths, TLP queues, six credit pools and finite read tags. Select
+`pcieModel=tlp`; the existing bandwidth model remains the default. See
+[doc/PCIE.md](doc/PCIE.md) for examples, parameters and trace interpretation.
+
 ## What this is (and is not)
 
 **Is:** an interconnect-only simulator + a surrogate model. Credit-based flow

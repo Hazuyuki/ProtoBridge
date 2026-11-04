@@ -7,12 +7,51 @@
 
 #include "fabric-endpoint.h"
 
+#include "roce-payload-builder.h"  // RocePayloadBuilder::GetTypeId (union gate below)
+#include "roce-protocol-model.h"   // RoceProtocolModel::GetTypeId
+#include "so-header.h"             // SoHeader (wire-efficiency padding below)
+
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/packet.h"
+#include "ns3/abort.h"
+
+#include <algorithm>
+#include <limits>
+#include <cmath>
 
 namespace ns3
 {
+
+namespace
+{
+
+// Round 74 (codex finding 9): m_syncMemLatencyNs / m_asyncMemLatencyNs are
+// uint64_t config values fed to NanoSeconds(latencyNs). NanoSeconds takes
+// int64_t, so a configured latency above INT64_MAX wraps the count negative
+// BEFORE the ×1e3/×1e6 resolution multiply — and a count below INT64_MAX
+// but above INT64_MAX/1e3 wraps at PS/FS — producing a negative Time the
+// completion callback then schedules in the past. Clamp the converted
+// Time against the remaining horizon the same way the rate machines do;
+// an unreachable completion stays unscheduled (the request was already
+// sent / queued, so the transfer's wire side is unaffected).
+Time
+ClampedSemanticLatencyNs(uint64_t latencyNs)
+{
+    const Time horizon = Time::Max() - Simulator::Now();
+    if (latencyNs > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    {
+        return horizon;
+    }
+    const Time t = NanoSeconds(static_cast<int64_t>(latencyNs));
+    if (t.IsStrictlyNegative() || t > horizon)
+    {
+        return horizon;
+    }
+    return t;
+}
+
+} // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("FabricEndpointSend");
 
@@ -49,9 +88,17 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
 
         // Ensure at least one chunk per link for proper BW utilization.
         // When numChunks < numLinks, some links sit idle, causing flat latency.
+        // All count/size arithmetic widened to uint64 (codex round 51,
+        // finding 3): with size near UINT32_MAX the uint32 ceiling
+        // numerators (size + m_sprayChunkSize - 1, size + MAX_CHUNK_BYTES
+        // - 1, size + numChunks - 1) wrapped to small values — numChunks
+        // collapsed to the per-link minimum and chunkSize wrapped to zero,
+        // emitting empty data packets.
+        const uint64_t size64 = size;
         uint32_t minChunks = static_cast<uint32_t>(sendDevices.size());
-        uint32_t sizeBasedChunks = (size + m_sprayChunkSize - 1) / m_sprayChunkSize;
-        uint32_t numChunks = std::max(minChunks, sizeBasedChunks);
+        uint64_t sizeBasedChunks =
+            (size64 + m_sprayChunkSize - 1) / m_sprayChunkSize;
+        uint64_t numChunks = std::max<uint64_t>(minChunks, sizeBasedChunks);
         // Coalesce very large transfers into memory-safe chunks: tiny 128 KB
         // chunks flood the event loop at GB scale (millions of packet-events),
         // so cap each chunk at MAX_CHUNK_BYTES. Gated on memCapChunks > minChunks
@@ -60,31 +107,43 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         // Total wire bytes and path striping are unchanged. Queue and credit
         // events occur at the coalesced granularity, so this path is intended
         // for bulk-transfer timing rather than fine-grained contention tests.
-        const uint32_t MAX_CHUNK_BYTES = 8 * 1024 * 1024;
-        uint32_t memCapChunks = (size + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
+        const uint64_t MAX_CHUNK_BYTES = 8 * 1024 * 1024;
+        uint64_t memCapChunks = (size64 + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
         if (memCapChunks > minChunks)
         {
-            numChunks = std::max(minChunks, std::min(sizeBasedChunks, memCapChunks));
+            numChunks = std::max<uint64_t>(minChunks,
+                                           std::min(sizeBasedChunks, memCapChunks));
         }
         // Bound the chunk count by the transfer size: the one-chunk-per-link
         // spray can otherwise produce trailing fragments whose offset is past
         // the buffer end (size - offset underflows; Create<Packet> would read
         // out of bounds). Never more than one 1-byte chunk per data byte.
-        numChunks = std::min(numChunks, std::max<uint32_t>(size, 1));
-        uint32_t chunkSize = (size + numChunks - 1) / numChunks;
+        numChunks = std::min<uint64_t>(numChunks, std::max<uint64_t>(size64, 1));
+        // Representability guard (codex round 51, finding 1): every fragment
+        // body must stay under the 2^30 pipeline bound — a near-UINT32_MAX
+        // body overflows Buffer's grown prefix headroom before the first
+        // AddHeader. SprayChunkSize's raw attribute can still sit near
+        // UINT32_MAX (the setter caps; the attribute path bypasses it).
+        constexpr uint64_t maxFragmentBody = 1ull << 30;
+        if (numChunks * maxFragmentBody < size64)
+        {
+            numChunks = (size64 + maxFragmentBody - 1) / maxFragmentBody;
+        }
+        uint64_t chunkSize = (size64 + numChunks - 1) / numChunks;
 
         NS_LOG_INFO("Fragmenting " << size << " bytes to dest " << destRank
                     << " across " << sendDevices.size() << " links in " << numChunks << " chunks"
                     << " starting at offset " << m_globalSprayOffset);
 
-        for (uint32_t i = 0; i < numChunks; i++)
+        for (uint64_t i = 0; i < numChunks; i++)
         {
-            uint32_t offset = i * chunkSize;
-            if (offset >= size)
+            uint64_t offset = i * chunkSize;
+            if (offset >= size64)
             {
                 continue; // trailing lane-pad fragment past the buffer end
             }
-            uint32_t thisChunkSize = std::min(chunkSize, size - offset);
+            uint32_t thisChunkSize = static_cast<uint32_t>(
+                std::min<uint64_t>(chunkSize, size64 - offset));
 
             // Generate sequence number for each chunk
             uint64_t seqKey = MakeSeqKey(destRank, vcId, flowId);
@@ -129,14 +188,15 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 m_sendQueue.push_back(entry);
 
                 // Queue remaining chunks
-                for (uint32_t j = i + 1; j < numChunks; j++)
+                for (uint64_t j = i + 1; j < numChunks; j++)
                 {
-                    uint32_t remOffset = j * chunkSize;
-                    if (remOffset >= size)
+                    uint64_t remOffset = j * chunkSize;
+                    if (remOffset >= size64)
                     {
                         continue; // trailing lane-pad fragment past the buffer end
                     }
-                    uint32_t remChunkSize = std::min(chunkSize, size - remOffset);
+                    uint32_t remChunkSize = static_cast<uint32_t>(
+                        std::min<uint64_t>(chunkSize, size64 - remOffset));
                     uint64_t remSeqKey = MakeSeqKey(destRank, vcId, flowId);
                     uint32_t remSeqNum = m_nextSeqNum[remSeqKey]++;
 
@@ -187,7 +247,8 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         }
 
         // Increment global offset so next SendData call starts from different link
-        m_globalSprayOffset = (m_globalSprayOffset + numChunks) % sendDevices.size();
+        m_globalSprayOffset = static_cast<uint32_t>(
+            (m_globalSprayOffset + numChunks) % sendDevices.size());
     }
     else
     {
@@ -264,6 +325,17 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
 
     NS_ABORT_MSG_IF(effectiveSize == 0 || wireSize == 0,
                     "Collective transfers require nonzero effective and wire sizes");
+    // Unsizable-ledger guard (codex rounds 48-49): the transaction path
+    // passes GetWireSize's saturation through here unchanged, and a
+    // NEAR-saturated ledger (not just the UINT64_MAX sentinel — e.g.
+    // efficiency just above 2^-64) wraps the spray/fragmentation
+    // arithmetic below exactly like the bulk path's, or truncates a
+    // fragment's uint32 chunk size. Same bound, same loud failure.
+    constexpr uint64_t maxServicableWireLedger = 1ull << 62;
+    NS_ABORT_MSG_IF(wireSize > maxServicableWireLedger,
+                    "Collective transfer of " << effectiveSize
+                    << " B (wire ledger " << wireSize
+                    << " B) cannot be serviced: raise the efficiency");
 
     // Record flow start for latency statistics (use destRank as flowId)
     if (m_latencyStatistics)
@@ -302,6 +374,123 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
     const uint32_t OVERFLOW_THRESHOLD_COLLECTIVE = 500 * 1024 * 1024;
     bool needFragmentColl = (sendDevices.size() > 1) ||
                             (wireSize > OVERFLOW_THRESHOLD_COLLECTIVE);
+    // Round 62: in the SINGLE-PACKET arm (no fragmentation) both sizes
+    // flow into uint32 packet/header fields (codex finding 17) — an
+    // effective size that wraps the cast advertises 0 delivered bytes
+    // for a nonzero transfer. The fragmented arms split everything
+    // under the spray/coalesce caps (<= 8 MiB per chunk WIRE), so only
+    // that arm can see the wide values; abort loud rather than narrow.
+    // SendCollective's per-chunk effective split (round 25, finding 2)
+    // feeds fragments under that cap, so the wide-volume test (4 GiB
+    // in 8-MiB chunks) still passes.
+    //
+    // Round 63 (codex finding 9): the per-chunk effective SHARE can
+    // still exceed 2^32 when a caller passes effectiveSize > wireSize
+    // (the four-argument overload does not require effective <= wire;
+    // probe: effectiveSize=2^33, wireSize=2 over two lanes gives each
+    // chunk an effective share of exactly 2^32, wrapping the header
+    // field to 0).
+    //
+    // HISTORICAL BOUND (round 63), now superseded by the round-65 guard
+    // below: the claim "a chunk covering k wire bytes carries at most
+    // ceil(E/W)" was FALSE under fragmentation — a fragment spanning k
+    // wire bytes carries up to ceil(E*k/W), which exceeds ceil(E/W)
+    // whenever the fragmentation geometry (numChunks > 1) puts more
+    // than one wire byte in a chunk. The anchored split gives a chunk
+    // floor(E*end/W) - floor(E*begin/W) <= ceil(E*(end-begin)/W), and
+    // end-begin is the chunk span, not 1.
+    //
+    // Round 64 (codex finding 1): the first divide-first form tested the
+    // FLOOR ratio, but a chunk's share is the CEILING ratio — with
+    // W=2, E=2*(2^32-1)+1 the floor is 2^32-1 (guard passes) while the
+    // anchored split yields shares [2^32-1, 2^32], wrapping the second
+    // header field to 0. Use the exact ceiling test: abort when
+    // E/W > M, or E/W == M with a nonzero remainder (any remainder can
+    // push one chunk's share to M+1 == 2^32).
+    //
+    // Round 65 (codex finding 1): the ratio bound is only sufficient when
+    // a chunk can hold ALL of the wire bytes a share accumulates over —
+    // i.e. when chunkSize >= wireSize. Under fragmentation
+    // (chunkSize < wireSize) a fragment spanning multiple wire bytes can
+    // carry up to ceil(E*chunkSize/W) effective bytes, which exceeds
+    // ceil(E/W) whenever E*chunkSize/W > E/W: W=4 lanes, E=2^33,
+    // SprayChunkSize=4096 (numChunks=2, chunkSize=2) gives each fragment
+    // the share E*2/4 == 2^32 — the round-64 guard admits it and both
+    // header fields narrow to 0. Test the share the anchored split
+    // ACTUALLY produces, with the fragmentation geometry this send will
+    // use (numChunks/chunkSize recomputed below): abort when
+    // ceil(E*chunkSize/W) exceeds M, equivalently when
+    // E*chunkSize/W > M, or == M with a nonzero remainder. With
+    // chunkSize >= wireSize the new predicate reduces to the round-64
+    // one; it is strictly stronger whenever numChunks > 1.
+    constexpr uint64_t maxServicableEffectiveShare = std::numeric_limits<uint32_t>::max();
+    {
+        // Same geometry as the fragmentation block below — ALL of it,
+        // including the coalescing and fragment-body clamps: the send can
+        // COALESCE the spray into far larger chunks than the raw
+        // size-based count implies (2^30 wire bytes, 2 links, spray 4096:
+        // guard-only geometry is 262144 x 4096 B, but the send coalesces
+        // above 512 MiB into 128 x 8 MiB — round 66, codex finding 1:
+        // E=2^39 then anchors a 2^32 effective share that narrows the
+        // header field to 0 while the pre-coalescing guard admits it).
+        // Coalescing SHRINKS numChunks, which RAISES chunkSize and the
+        // per-fragment share; the conservative pre-coalescing comment
+        // round 65 carried was exactly backwards.
+        uint64_t guardMinChunks = sendDevices.size();
+        uint64_t guardSizeBasedChunks =
+            (wireSize + m_sprayChunkSize - 1) / m_sprayChunkSize;
+        uint64_t guardNumChunks = std::max(guardMinChunks, guardSizeBasedChunks);
+        guardNumChunks = std::min(guardNumChunks, std::max<uint64_t>(wireSize, 1));
+        constexpr uint64_t guardMaxChunkBytes = 8ull * 1024 * 1024;
+        constexpr uint64_t guardCoalesceThreshold = 512ull * 1024 * 1024;
+        const uint64_t guardCoalescedChunks =
+            (wireSize + guardMaxChunkBytes - 1) / guardMaxChunkBytes;
+        if (wireSize > guardCoalesceThreshold && guardCoalescedChunks > guardMinChunks)
+        {
+            const uint64_t guardPathBalancedChunks =
+                ((guardCoalescedChunks + guardMinChunks - 1) / guardMinChunks) *
+                guardMinChunks;
+            guardNumChunks =
+                std::max(guardMinChunks,
+                         std::min(guardSizeBasedChunks, guardPathBalancedChunks));
+        }
+        uint64_t guardChunkSize =
+            (wireSize + guardNumChunks - 1) / guardNumChunks;
+        constexpr uint64_t guardMaxFragmentBody = 1ull << 30;
+        if (guardChunkSize > guardMaxFragmentBody)
+        {
+            const uint64_t guardMinChunksForBody =
+                (wireSize + guardMaxFragmentBody - 1) / guardMaxFragmentBody;
+            guardNumChunks = std::max(guardNumChunks, guardMinChunksForBody);
+            guardChunkSize = (wireSize + guardNumChunks - 1) / guardNumChunks;
+        }
+        // 128-bit intermediate: E*chunkSize overflows uint64 exactly like
+        // the anchored split's E*offset products below.
+        const __uint128_t guardShareNum =
+            static_cast<__uint128_t>(effectiveSize) * guardChunkSize;
+        const uint64_t guardShareDen = std::max<uint64_t>(wireSize, 1);
+        const uint64_t guardShareQ =
+            static_cast<uint64_t>(guardShareNum / guardShareDen);
+        const uint64_t guardShareR =
+            static_cast<uint64_t>(guardShareNum % guardShareDen);
+        NS_ABORT_MSG_IF(guardShareQ > maxServicableEffectiveShare ||
+                            (guardShareR != 0 &&
+                             guardShareQ == maxServicableEffectiveShare),
+                        "Collective transfer effective size " << effectiveSize
+                        << " B over a " << wireSize
+                        << " B wire ledger on " << sendDevices.size()
+                        << " links fragments into " << guardChunkSize
+                        << " B chunks whose anchored effective share exceeds "
+                        << maxServicableEffectiveShare
+                        << " B (the uint32 header field's limit): raise the"
+                           " efficiency or enlarge the spray chunk size");
+    }
+    if (!needFragmentColl)
+    {
+        NS_ABORT_MSG_IF(effectiveSize > std::numeric_limits<uint32_t>::max(),
+                        "Collective transfer effective size " << effectiveSize
+                        << " B exceeds the uint32 header field");
+    }
 
     if (needFragmentColl)
     {
@@ -331,6 +520,23 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             numChunks = std::max(minChunks, std::min(sizeBasedChunks, pathBalancedChunks));
         }
         uint64_t chunkSize = (wireSize + numChunks - 1) / numChunks;
+        // Header headroom (codex rounds 50-51, finding 1): the fragment
+        // body must stay representable in the packet pipeline — a body near
+        // UINT32_MAX overflows Buffer's grown g_recommendedStart headroom
+        // (up to 51 B of prefix) in the uint32 end computation and asserts
+        // at the first AddHeader. The 2^30 bound matches
+        // SendDataInternal's representability cap. The SprayChunkSize
+        // attribute can still be set near UINT32_MAX directly (the setter
+        // caps, the raw attribute path bypasses it), so clamp here too: the
+        // transfer just fragments into more chunks.
+        constexpr uint64_t maxFragmentBody = 1ull << 30;
+        if (chunkSize > maxFragmentBody)
+        {
+            const uint64_t minChunksForBody =
+                (wireSize + maxFragmentBody - 1) / maxFragmentBody;
+            numChunks = std::max(numChunks, minChunksForBody);
+            chunkSize = (wireSize + numChunks - 1) / numChunks;
+        }
 
         NS_LOG_INFO("Fragmenting collective " << effectiveSize << " effective bytes ("
                     << wireSize << " wire bytes) to dest " << destRank
@@ -696,6 +902,13 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
     // Pack address prefix + data into payload
+    // Round 61: size is a uint32_t, so 8 + size wraps for size >
+    // UINT32_MAX - 8 (e.g. 4,294,967,288 wraps to 0) and the address
+    // copy below writes eight bytes into an empty vector — real
+    // out-of-bounds UB before any allocator or FEC guard can intercept.
+    NS_ABORT_MSG_IF(size > std::numeric_limits<uint32_t>::max() - 8,
+                    "SendMemoryWrite size " << size << " B leaves no uint32 room for the "
+                                            << "8-B address prefix");
     uint32_t payloadSize = 8 + size;
     std::vector<uint8_t> payload(payloadSize);
     std::memcpy(payload.data(), &address, 8);
@@ -841,6 +1054,11 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     // zeros — the receiving MEMORY endpoint applies MEMORY_WRITE payloads
     // verbatim, so a zero-padded "read" would overwrite the target with 0s.
     const bool isRead = (data == nullptr);
+    // Round 61: same wrap as SendMemoryWrite above — the 8 + size (or
+    // 12 + 0 read form) payload-size addition must stay in uint32.
+    NS_ABORT_MSG_IF(!isRead && size > std::numeric_limits<uint32_t>::max() - 8,
+                    "SendMemorySemantic write size " << size << " B leaves no uint32 room for the "
+                                                     << "8-B address prefix");
     uint64_t seqKey = MakeMemorySeqKey(destRank);
     uint32_t seqNum = m_nextSeqNum[seqKey]++;
 
@@ -900,10 +1118,21 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
         // retained one expired EventId per completed request forever
         // (codex round 30, finding 3).
         PruneDeferredEgressEvents();
-        m_deferredEgressEvents.push_back(
-            Simulator::Schedule(NanoSeconds(latencyNs),
-                                &FabricEndpoint::NotifyMemorySemanticComplete,
-                                this, destRank, address, accessType));
+        // Round 74 (codex finding 9): clamp the uint64 config latency —
+        // raw NanoSeconds(latencyNs) wraps past INT64_MAX (and past
+        // INT64_MAX/1e3 at PS/FS resolution) into a past-dated
+        // completion.
+        const Time completionDelay = ClampedSemanticLatencyNs(latencyNs);
+        if (completionDelay < Time::Max() - Simulator::Now())
+        {
+            m_deferredEgressEvents.push_back(
+                Simulator::Schedule(completionDelay,
+                                    &FabricEndpoint::NotifyMemorySemanticComplete,
+                                    this, destRank, address, accessType));
+        }
+        // else: completion beyond the horizon — the request is queued;
+        // its wire send happens when credits arrive, but the completion
+        // callback is dropped (same far-future policy as elsewhere).
         return;
     }
 
@@ -923,10 +1152,15 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     // rationale as the credit-blocked path above — codex round 17,
     // finding 2). Pruned before each append (codex round 30, finding 3).
     PruneDeferredEgressEvents();
-    m_deferredEgressEvents.push_back(
-        Simulator::Schedule(NanoSeconds(latencyNs),
-                            &FabricEndpoint::NotifyMemorySemanticComplete,
-                            this, destRank, address, accessType));
+    // Round 74 (codex finding 9): same clamp as the credit-blocked path.
+    const Time completionDelay = ClampedSemanticLatencyNs(latencyNs);
+    if (completionDelay < Time::Max() - Simulator::Now())
+    {
+        m_deferredEgressEvents.push_back(
+            Simulator::Schedule(completionDelay,
+                                &FabricEndpoint::NotifyMemorySemanticComplete,
+                                this, destRank, address, accessType));
+    }
 }
 
 void
@@ -935,17 +1169,216 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
 {
     NS_LOG_FUNCTION(this << destRank << size << static_cast<int>(protocolId) << flowId << vcId);
 
-    // Check if this protocol has no overhead (SIMPLE, NONE, or vendor single-protocol)
-    double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
-    if (efficiency >= 1.0)
+    // Check if this protocol has no overhead (SIMPLE, NONE, or vendor
+    // single-protocol). Union gate, same semantics as the bulk path's
+    // stampSoHeader (codex round 37, finding 1): efficiency alone is the
+    // wrong discriminator for the So fabric — the RoCE model's WireEfficiency
+    // is a header-accounting knob that is legitimately configured to 1.0
+    // (the ns3-rdma alignment setting), and an efficiency-only gate sent
+    // those non-bulk RoCE packets raw (no RocePayloadBuilder framing, no
+    // SoHeader): the switch ECN-mark guard (protocol==SIMPLE + fabric ROCE
+    // + SoHeader present) never fired, so congestion backoff stayed inert
+    // at exactly the aligned configuration. Route through the builder when
+    // the destination's model is RoCE OR the protocol has real framing
+    // overhead (Su NCCL LL/LL128); plain SIMPLE/NONE/Ethernet traffic
+    // (efficiency == 1.0, non-RoCE model) still takes the raw path.
+    Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
+    const bool destIsRoce = (destModel->GetInstanceTypeId()
+                             == RoceProtocolModel::GetTypeId());
+    // When the RoCE builder will frame this send (So builder mounted, OR the
+    // primary builder itself is the RoCE builder — config-mode RoCE profiles
+    // mount it globally, codex round 43 finding 3), normalize the protocol id
+    // to the dest model's own — the same re-key the bulk path applies at its
+    // builder seam (round 38, finding 1). A caller's NcclProtocol byte (e.g.
+    // SIMPLE=3) is wrong on the wire for a RoCE dest: the switch ECN-mark and
+    // receiver CNP-echo guards key on RoceProtocol::SIMPLE=1, so the outer
+    // byte 3 leaves congested explicit-protocol sends without feedback even
+    // though the inner SoHeader carries SIMPLE.
+    // RoCE-only (round 39, finding 1): a distinct So builder can also be an
+    // NCCL builder mounted for an NCCL-model remote dest — there the caller's
+    // explicit protocol choice must win (re-keying would flip an explicit
+    // SIMPLE=3 to size-based LL=1, padding 64 raw bytes into a 128-B LL
+    // line).
+    if (destIsRoce
+        && GetPayloadBuilderForRank(destRank)->GetInstanceTypeId()
+               == RocePayloadBuilder::GetTypeId())
     {
-        // No protocol overhead - use regular SendData
+        protocolId = destModel->GetProtocolId(size);
+    }
+    double efficiency = destModel->GetEfficiency(protocolId);
+    // Builder selection is protocol-family-scoped (codex round 40, finding 1):
+    //   - Su (non-RoCE) dests with framing overhead (NCCL LL 64/128, LL128
+    //     120/128) frame with their NcclProtocolPayloadBuilder — the
+    //     efficiency arm must NOT require RocePayloadBuilder (gating it on
+    //     the RoCE builder broke EgressDisposeCancelsDeferredSendsTest:
+    //     delivered 3 instead of 1, no per-flow pacing).
+    //   - RoCE dests frame ONLY with the RoCE builder. Routing a RoCE dest
+    //     through a non-RoCE (e.g. NCCL) builder — reachable at
+    //     WireEfficiency < 1.0 via the old efficiency arm, with or without a
+    //     distinct So builder — puts NCCL-framed bytes on the ROCE fabric,
+    //     and the switch ECN-mark guard (fabric ROCE + protocol byte 1) then
+    //     rewrites the first 10 payload bytes as a SoHeader: silent
+    //     application-data corruption on every congestion mark. A RoCE dest
+    //     without the RoCE builder mounted takes the raw path instead — no
+    //     ECN feedback, but no corruption.
+    const bool useBuilder = (!destIsRoce && efficiency < 1.0)
+        || (destIsRoce
+            && GetPayloadBuilderForRank(destRank)->GetInstanceTypeId()
+                == RocePayloadBuilder::GetTypeId());
+    if (!useBuilder)
+    {
+        // No protocol overhead (or no RoCE builder mounted) - use regular
+        // SendData. NB (codex round 41, finding 4): this is NOT the
+        // pre-round-37 behavior for a RoCE dest without the So builder —
+        // that path used to frame with the default NcclProtocolPayload-
+        // Builder at efficiency < 1.0 (LL lines on the RoCE fabric). The
+        // raw path is deliberate: NCCL-framed bytes on the ROCE fabric get
+        // their payload corrupted by the switch ECN-mark guard (round 40,
+        // finding 1), so unmounted-builder RoCE goes raw (protocol byte 0,
+        // no WireEfficiency expansion, no ECN feedback) rather than
+        // mis-framed. No production workload reaches this corner — the sim
+        // harness's collectives all use SendBulkWireTransferSize.
         SendData(destRank, data, size, flowId, vcId);
         return;
     }
 
-    // For protocols with overhead (LL, LL128, etc.), use payload builder
-    uint64_t chunkSize = GetProtocolModelForDest(destRank)->GetChunkSize(protocolId);
+    // For protocols with overhead (LL, LL128, etc.), use payload builder.
+    // RoCE chunk sizing (codex rounds 40-42): the non-bulk RoCE arm mirrors
+    // the bulk path's wire-byte chunk cap. m_bulkChunkSize caps WIRE bytes
+    // on the bulk path, and every RoCE chunk carries a mandatory 10-B
+    // SoHeader inside that budget, so the data-byte cap is
+    // floor((cap - SoHeaderSize) * efficiency) — a single floor, no
+    // ceil-side round trip (binary64 cap*eff then ceil(data/eff) can
+    // overshoot by one byte: cap 4050, eff 0.94 -> 4051). The loop pads
+    // each chunk's total body to ceil(chunkData/eff) (header inside).
+    // Degenerate caps (rounding to 0, or smaller than the header) clamp
+    // the data cap to 1 but ALSO clamp the padded body to the cap itself
+    // in the loop — cap 11 at eff 0.01 otherwise emitted 100-B bodies
+    // (round 43, finding 5). Caps below the minimum framable body
+    // (SoHeaderSize + 1 data byte) are clamped UP to that minimum
+    // (codex round 44, finding 4): a RoCE-framed body cannot be smaller
+    // than its mandatory header plus one data byte, so the wire-cap
+    // guarantee is "body <= max(cap, SoHeaderSize + 1)" — the previous
+    // unconditional reading was false for caps 1-10, which emitted 11-B
+    // bodies over a 10-B cap.
+    uint64_t chunkSize;
+    uint64_t bodyHardCap = 0; // 0 = unbounded (non-RoCE or no bulk cap)
+    // Round 68 (codex finding 4): apply the RoCE body cap whenever the RoCE
+    // payload builder will frame this send, even if the destination model
+    // is NOT RoceProtocolModel — a UbProtocolModel + RocePayloadBuilder +
+    // unset bulk cap sent an uncapped 4.29 GB padded body (bodyHardCap
+    // stayed 0 because destIsRoce was false, and the uint32 PPP guard
+    // passed targetWire 4294967252 while the absolute Buffer end offset
+    // wrapped). The per-chunk wire-byte cap is the same 2^30
+    // representability bound the non-RoCE arm uses below; a transfer just
+    // fragments into more chunks. Pure-RoCE-dest sends keep the configured
+    // bulk cap when there is one (unchanged behavior).
+    const bool builderIsRoce = GetPayloadBuilderForRank(destRank)->GetInstanceTypeId()
+                               == RocePayloadBuilder::GetTypeId();
+    if ((destIsRoce && m_bulkChunkSize > 0) || builderIsRoce)
+    {
+        const uint32_t soHdr = SoHeader().GetSerializedSize();
+        // Round 68: an unset bulk cap (0) means "the representability cap
+        // only" — do NOT clamp up to soHdr+1 here (that would force every
+        // uncapped RoCE send through one giant chunk); the max() runs on
+        // the configured cap below when it is nonzero.
+        bodyHardCap = m_bulkChunkSize > 0 ? std::max<uint64_t>(m_bulkChunkSize, soHdr + 1)
+                                          : (1ull << 30);
+        if (m_bulkChunkSize == 0)
+        {
+            // Uncapped RoCE bulk: fragment at the 2^30 wire-byte bound.
+            chunkSize = std::max<uint64_t>((1ull << 30) - soHdr, 1);
+        }
+        else if (m_bulkChunkSize > soHdr)
+        {
+            const double roceEff = destModel->GetEfficiency(protocolId);
+            uint64_t dataCap;
+            if (roceEff > 0.0 && roceEff < 1.0)
+            {
+                dataCap = static_cast<uint64_t>(
+                    std::floor((m_bulkChunkSize - soHdr) * roceEff));
+            }
+            else
+            {
+                dataCap = m_bulkChunkSize - soHdr;
+            }
+            chunkSize = std::max<uint64_t>(dataCap, 1);
+        }
+        else
+        {
+            chunkSize = 1; // cap smaller than the header: one minimal chunk
+        }
+    }
+    else
+    {
+        chunkSize = destModel->GetChunkSize(protocolId);
+        // Representability cap (codex round 45, finding 2): the ledger
+        // padding below expands each chunk's body to the model's
+        // GetWireSize proportion; a body larger than any uint32-sized
+        // packet can carry truncates the AddAtEnd cast (ChunkSize=43383509
+        // at WireEfficiency 0.01 padded 4,294,967,391 B down to 95 —
+        // exactly 4 GiB missing from serialization and byte accounting).
+        // Cap the DATA chunk at floor(MAX_BODY * efficiency) so every
+        // padded body stays representable: the transfer just fragments
+        // into more chunks and the wire-byte ledger is preserved. Only
+        // the non-RoCE builder path needs this — the RoCE arm already
+        // clamps targetWire to bodyHardCap (a uint32).
+        if (efficiency < 1.0 && efficiency > 0.0)
+        {
+            constexpr uint64_t maxRepresentableBody = 1ull << 30;
+            uint64_t dataCap = static_cast<uint64_t>(
+                maxRepresentableBody * efficiency);
+            // Zero-rounded cap guard (round 46, finding 3): a sub-0.01
+            // efficiency (the UB model's checker allows (0.0, 1.0), unlike
+            // the other models' 0.01 floor) can round the cap to zero —
+            // skipping the fragmention entirely and leaving the uint32
+            // truncation live (eff 1/2^32: 1 data byte "expands" to a
+            // 4-GiB body whose 4,294,967,296-B pad casts to zero). Clamp
+            // up to one data byte per chunk: the transfer fragments into
+            // one-byte chunks (slow, but the wire ledger is honest), and
+            // the padding backstop below skips any still-unrepresentable
+            // pad with a warning instead of truncating.
+            if (dataCap == 0)
+            {
+                dataCap = 1;
+            }
+            if (chunkSize > dataCap)
+            {
+                chunkSize = dataCap;
+            }
+        }
+    }
+    // Bound idle parallel links the way raw SendData does (codex round 38,
+    // finding 2): the chunk size can exceed the size, putting the whole
+    // send on one device where the raw path would have fragmented across
+    // all of them. Cap the chunk at ceil(size / numDevices) — the same
+    // ceiling-division granularity as raw SendData's spray, so a size not
+    // divisible by the device count can still leave the last link idle
+    // (64 B over 12 devices -> 11 chunks); a perfect one-packet-per-link
+    // split would need remainder-aware chunk sizing that the raw path does
+    // not attempt either (codex round 39, finding 2). NB the cap can also
+    // re-split a multi-chunk send more evenly (768 KiB over two devices
+    // with a 512-KiB chunk: 512+256 becomes 384+384 — codex round 40,
+    // finding 5); single-device sends are unchanged.
+    {
+        std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
+        if (devices.size() > 1 && chunkSize > 1)
+        {
+            uint64_t perLink = (size + devices.size() - 1) / devices.size();
+            if (perLink < chunkSize)
+            {
+                chunkSize = perLink;
+            }
+        }
+    }
+
+    // Raw SendData records the flow start for latency statistics; the builder
+    // detour must too, or delivery samples are discarded at
+    // RecordFlowComplete for lack of a start (codex round 38, finding 3).
+    if (m_latencyStatistics)
+    {
+        m_latencyStatistics->RecordFlowStart(flowId);
+    }
 
     NS_LOG_INFO("Sending " << size << " bytes with protocol "
                << static_cast<int>(protocolId) << " efficiency=" << efficiency
@@ -970,34 +1403,273 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
         std::vector<Ptr<Packet>> chunks = GetPayloadBuilderForRank(destRank)->BuildChunks(
             chunkData, thisChunkDataSize, protocolId, chunkSize);
 
+        // TRUE data counts BEFORE padding (codex round 47, finding 3): the
+        // advertised-size loop below used to extract each sub-packet's data
+        // count from the (padding-mutated) body, but the raw extractors
+        // (NCCL/MCCL SIMPLE, UB) count PADDING as data — the first padded
+        // sub-packet advertises more data than it carries and displaces
+        // real bytes from the delivered stream (MCCL 0.8 + default NCCL
+        // builder: a 1-MiB send's two 524288-B SIMPLE bodies padded by
+        // 131072 B each advertised 655360/393216 effective bytes, and
+        // 131072 original bytes arrived as padding zeros). Record every
+        // sub-packet's pre-padding extraction here and use THAT count for
+        // SetEffectiveDataSize below. UB's ExtractData derives its length
+        // from the padded packet size instead of its embedded 4-B size
+        // field too (its header field at offset 11 holds the true count),
+        // so this hoist is what keeps the advertised count honest for it.
+        // Gated on its consumers (codex round 48, finding 4): only the
+        // non-RoCE efficiency<1.0 advertised-size arm reads the vector —
+        // RoCE takes its count from the SoHeader and efficiency==1.0 takes
+        // it from the chunk-size min. The unconditional hoist cost a full
+        // body copy per chunk on every RoCE send (12x slowdown on 16-MiB
+        // bulk sends) for a result nobody consumed.
+        std::vector<uint32_t> trueDataSizes;
+        if (!destIsRoce && efficiency < 1.0)
+        {
+            trueDataSizes.reserve(chunks.size());
+            uint32_t dataAssignedBefore = 0;
+            for (const auto& pkt : chunks)
+            {
+                uint32_t dataStillNeeded = thisChunkDataSize - dataAssignedBefore;
+                std::vector<uint8_t> tmpBuf(pkt->GetSize());
+                uint64_t extracted = (pkt->GetSize() > 0)
+                    ? GetPayloadBuilderForRank(destRank)->ExtractData(
+                          pkt, protocolId, tmpBuf.data(), tmpBuf.size())
+                    : 0;
+                uint32_t count = static_cast<uint32_t>(
+                    std::min<uint64_t>(extracted, dataStillNeeded));
+                trueDataSizes.push_back(count);
+                dataAssignedBefore += count;
+            }
+        }
+
+        // Wire-efficiency expansion for builder-framed chunks (codex rounds
+        // 40-46): a builder that emits no per-chunk size expansion of its
+        // own — the RoCE builder (data + a fixed 10-B SoHeader) and, under
+        // an efficiency override, the raw NCCL/MCCL and UB builders —
+        // never expresses the model's WireEfficiency on the wire, while the
+        // bulk path sizes every chunk by GetWireSize instead. Pad each
+        // chunk's bodies to its GetWireSize ledger by padding the DEFICIT
+        // so the transmitted-byte count matches the model: byte-based
+        // pacing (DCQCN), serialization time, and switch queue accounting
+        // all key on the wire size, so an unpadded body silently understates
+        // every one of them (round 44, finding 3: NCCL SIMPLE at
+        // SimpleWireEfficiency 0.8 sent 1000 wire bytes where the model
+        // specifies 1250; round 45, finding 3: UB at 0.8 sent 1016 where
+        // the model specifies 1266 — the 16-B transaction header is
+        // additive, it does not carry the /eff expansion either).
+        // The receiver is unaffected: the advertised data count comes from
+        // the pre-padding extraction above (raw extractors would count the
+        // trailing padding as data), and framed extractors read the true
+        // count from the chunk's own header (RoCE SoHeader GetDataSize,
+        // LL128's size field), so padding bytes are never delivered.
+        if (efficiency < 1.0 && efficiency > 0.0)
+        {
+            Ptr<ProtocolPayloadBuilder> builder =
+                GetPayloadBuilderForRank(destRank);
+            const bool builderIsRoce =
+                (builder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
+            // The chunk's total wire budget from the MODEL ledger. For the
+            // RoCE arm the round-40 formula is preserved exactly (per-chunk
+            // ceil(data/eff) with the SoHeader inside, clamped by
+            // bodyHardCap) — changing it would move the calibrated
+            // non-bulk RoCE anchor numbers.
+            if (builderIsRoce)
+            {
+                for (auto& pkt : chunks)
+                {
+                    SoHeader soh;
+                    pkt->PeekHeader(soh);
+                    // Round 62: check the ceil quotient BEFORE the uint64
+                    // cast (codex finding 8). The cast used to run ahead
+                    // of the bodyHardCap clamp, and at a pathological
+                    // efficiency the double quotient reaches 2^64 —
+                    // out of range for the conversion (floating-point
+                    // diagnostics halt the process under
+                    // -fsanitize=float-cast-overflow).
+                    const double targetWireD =
+                        std::ceil(soh.GetDataSize() / efficiency);
+                    NS_ABORT_MSG_IF(!(targetWireD < 18446744073709551616.0),
+                                    "RoCE per-chunk padding target "
+                                        << targetWireD << " B is out of uint64 range");
+                    uint64_t targetWire = static_cast<uint64_t>(targetWireD);
+                    // Degenerate-cap guard (round 43, finding 5): never let
+                    // the padded body exceed the wire cap — ceil(data/eff)
+                    // can overshoot when the data cap was clamped up from a
+                    // floor-to-zero product (cap 11, eff 0.01).
+                    if (bodyHardCap > 0 && targetWire > bodyHardCap)
+                    {
+                        targetWire = bodyHardCap;
+                    }
+                    // Round 64 (codex finding 11): the padding append goes
+                    // through the uint32 Packet API, so the COMPLETE padded
+                    // body — existing bytes plus pad — must fit uint32,
+                    // not just the pad. At an exactly-representable
+                    // efficiency of (2^33-21)/2^65 a single data byte
+                    // needs a complete body of 4,294,967,307 B with a pad
+                    // of exactly 2^32: the pad alone wrapped the cast to
+                    // zero, silently transmitting an 11-byte body where
+                    // the model specifies 4,294,967,307 wire bytes (and
+                    // a body at or past 2^32 is unrepresentable even with
+                    // a zero pad). Abort on the complete-body bound;
+                    // fragmenting cannot repair a per-chunk expansion
+                    // this extreme.
+                    //
+                    // Round 65 (codex finding 5): the padded body must
+                    // ALSO leave uint32 room for the 39-B FabricHeader
+                    // prepended at the send below — Buffer's internal
+                    // end offset is uint32 and AddHeader shifts the whole
+                    // packet prefix by the header size. At efficiency
+                    // (2^32+1)/2^64 the body alone is exactly UINT32_MAX
+                    // (guard admits), but body+39 = 2^32+38 wraps the
+                    // end offset to 38 (probe: zero-area order inversion
+                    // in the cold-buffer path). Abort past the complete-
+                    // packet bound.
+                    // Round 66 (codex finding 2): the RoCE fabric in this
+                    // module is point-to-point NetDevices, whose Send()
+                    // prepends a 2-B PPP header AFTER the FabricHeader is
+                    // on the packet (PointToPointNetDevice::Send) — the
+                    // complete-packet bound must leave uint32 room for
+                    // 39 B + 2 B. At efficiency (2^32+41)/2^64 a 1-B
+                    // body pads to exactly UINT32_MAX - 39 (the round-65
+                    // guard admits it), and PPP then wraps Buffer's uint32
+                    // end offset to 1.
+                    NS_ABORT_MSG_IF(targetWire > std::numeric_limits<uint32_t>::max() ||
+                                        targetWire + FabricHeader().GetSerializedSize() + 2 >
+                                            std::numeric_limits<uint32_t>::max(),
+                                    "RoCE per-chunk padded packet " << targetWire
+                                        << " B body + " << FabricHeader().GetSerializedSize()
+                                        << " B FabricHeader + 2 B PPP (pad "
+                                        << (targetWire - pkt->GetSize())
+                                        << " B over an existing " << pkt->GetSize()
+                                        << "-B body) is not representable in the"
+                                           " uint32 packet API: raise the"
+                                           " efficiency or fragment the transfer");
+                    if (pkt->GetSize() < targetWire)
+                    {
+                        pkt->AddAtEnd(
+                            Create<Packet>(static_cast<uint32_t>(
+                                targetWire - pkt->GetSize())));
+                    }
+                }
+            }
+            else
+            {
+                // Non-RoCE arm (rounds 44-47): expand the chunk's bodies to
+                // the model's GetWireSize by padding the DEFICIT — the
+                // difference between the ledger and the sum of the bodies
+                // the builder already emitted. Fixed-width framing (LL
+                // 64/128, LL128 120/128) constructs bodies that sum to
+                // exactly the ledger (ceil(data/unit)*unitWire), so the
+                // deficit is zero and nothing is padded — round 45's
+                // proportional-share distribution instead assigned each
+                // sub-packet a share of the ledger that could EXCEED its
+                // existing body when a short tail padded the final unit
+                // (LL 1000 B: 15 lines at 131 B + tail at 128 B = 2093 B
+                // over the 2048-B ledger; codex round 46, finding 1).
+                // Distributing only the deficit can never overpad: every
+                // sub-packet grows by at most the total missing bytes. The
+                // split across sub-packets is even (last absorbs the
+                // remainder) — the LEDGER total is what pacing and queue
+                // accounting key on; per-sub-packet granularity only
+                // affects how the padding interleaves.
+                const uint64_t chunkLedger = destModel->GetWireSize(
+                    thisChunkDataSize, protocolId);
+                uint64_t bodySum = 0;
+                for (const auto& pkt : chunks)
+                {
+                    bodySum += pkt->GetSize();
+                }
+                const uint64_t deficit =
+                    (chunkLedger > bodySum) ? chunkLedger - bodySum : 0;
+                if (deficit > 0 && !chunks.empty())
+                {
+                    // Representability guard (rounds 46-47): a pad is
+                    // bounded at 2^30 - 1 B per sub-packet so every padded
+                    // body stays under 2^30 — the same bound the data cap
+                    // above fragments to, and the round-45
+                    // representability invariant (a 10737418-B MCCL chunk
+                    // at 0.01 pads to a 1073741800-B body and transmits
+                    // cleanly; the queue holds it without wrapping because
+                    // such a body serializes alone on its link). Round 47,
+                    // finding 1: the old `> 0x7FFFFFFF` skip boundary
+                    // ACCEPTED pads up to just under 2 GiB, and two ~2-GiB
+                    // packets in one DropTailQueue wrapped its
+                    // TracedValue<uint32_t> m_nBytes to 114 and fired the
+                    // dequeue assert — near-2^31 single pads cannot be
+                    // absorbed by any uint32 queue accounting. Round 47,
+                    // finding 2: when the expansion cannot be represented
+                    // at all, a warn-and-skip understates the model's
+                    // ledger while reporting success — a hard configuration
+                    // error (NS_ABORT_MSG) instead. Only a custom model
+                    // below the 0.01 checker floor can get here.
+                    constexpr uint64_t maxPadPerSubPacket = (1ull << 30) - 1;
+                    const uint64_t evenShare = deficit / chunks.size();
+                    const uint64_t lastShare =
+                        evenShare + (deficit % chunks.size());
+                    if (lastShare > maxPadPerSubPacket
+                        || evenShare > maxPadPerSubPacket)
+                    {
+                        NS_ABORT_MSG("Wire-efficiency expansion of "
+                                     << deficit << " B for a "
+                                     << thisChunkDataSize << "-B chunk"
+                                        " (efficiency " << efficiency
+                                     << ") cannot be represented: fragment"
+                                        " the transfer (smaller chunk size)"
+                                        " or raise the efficiency");
+                    }
+                    uint64_t assigned = 0;
+                    for (size_t i = 0; i < chunks.size(); ++i)
+                    {
+                        uint64_t pad = (i + 1 == chunks.size())
+                            ? deficit - assigned
+                            : deficit / chunks.size();
+                        assigned += pad;
+                        if (pad > 0)
+                        {
+                            chunks[i]->AddAtEnd(
+                                Create<Packet>(static_cast<uint32_t>(pad)));
+                        }
+                    }
+                }
+            }
+        }
+
         // For protocols with overhead (LL/LL128), each sub-packet carries a
         // fixed amount of data (64B per LL line, 120B per LL128 chunk).
         // Track how much of thisChunkDataSize has been assigned so far.
         uint32_t dataAssigned = 0;
 
-        for (auto& pkt : chunks)
+        for (size_t chunkIdx = 0; chunkIdx < chunks.size(); ++chunkIdx)
         {
+            auto& pkt = chunks[chunkIdx];
             uint32_t wireSize = pkt->GetSize();
 
             // Compute actual data bytes carried by this sub-packet.
-            // For overhead protocols, use payload builder to extract the true
-            // data size. The extraction buffer is sized to the sub-packet, not
-            // a fixed 256 B: any vendor builder with larger units (e.g. 512 KiB
-            // RoCE segments) would advertise only 256 B per segment and the
-            // receiver would drop the rest (4096 B send delivered 256 B). The
-            // result is capped by the data still unassigned in this chunk: a
-            // fixed-width wire unit (LL line / LL128 chunk) that pads a short
-            // tail otherwise advertises the full unit (64 B for a 50 B tail)
-            // and over-counts the flow.
+            // Non-RoCE at efficiency < 1.0: the TRUE pre-padding extraction
+            // hoisted above the padding loop (padding mutates the body and
+            // the raw extractors would count padding as data — codex round
+            // 47, finding 3). The result is capped by the data still
+            // unassigned in this chunk: a fixed-width wire unit (LL line /
+            // LL128 chunk) that pads a short tail otherwise advertises the
+            // full unit (64 B for a 50 B tail) and over-counts the flow.
             uint32_t subPacketDataSize;
-            if (efficiency < 1.0)
+            if (destIsRoce)
             {
+                // RoCE: the SoHeader declares this chunk's exact data count —
+                // no extraction round-trip needed, and NO model-chunk cap:
+                // chunk construction uses m_bulkChunkSize (8 MiB default), so
+                // capping the advertised size at the model's 512-KiB chunk
+                // truncated every larger chunk at the receiver (1 MiB in one
+                // chunk delivered 512 KiB, codex round 41, finding 1).
+                SoHeader soh;
+                pkt->PeekHeader(soh);
                 uint32_t dataStillNeeded = thisChunkDataSize - dataAssigned;
-                std::vector<uint8_t> tmpBuf(pkt->GetSize());
-                uint64_t extracted = GetPayloadBuilderForRank(destRank)->ExtractData(
-                    pkt, protocolId, tmpBuf.data(), tmpBuf.size());
-                subPacketDataSize = static_cast<uint32_t>(
-                    std::min<uint64_t>(extracted, dataStillNeeded));
+                subPacketDataSize = std::min(soh.GetDataSize(), dataStillNeeded);
+            }
+            else if (efficiency < 1.0)
+            {
+                subPacketDataSize = trueDataSizes[chunkIdx];
             }
             else
             {
@@ -1036,24 +1708,12 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             // back). The gate performs the HasCredits/ConsumeCredit pair
             // for the CREDIT policy, so a subclass override is no longer
             // bypassed on this path (codex round 29, finding 3).
-            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
-            {
-                NS_LOG_DEBUG("No credits for DATA_INTERNAL chunk on VC " << static_cast<int>(vcId)
-                             << ", queuing packet");
-                SendQueueEntry entry;
-                entry.packet = pkt;
-                entry.header = header;
-                entry.vcId = vcId;
-                entry.seqNum = seqNum;
-                m_sendQueue.push_back(entry);
-                TrySendQueuedPackets();
-                // Skip device selection for queued packets — TrySendQueuedPackets handles it
-                chunkIndex++;
-                continue;
-            }
-
-            pkt->AddHeader(header);
-
+            // Spray-lane selection happens BEFORE the admission gate (codex
+            // round 43, finding 4): a gate-denied packet parked on the send
+            // queue must keep its round-robin lane — the drain otherwise
+            // fell back to ResolveDeviceIndex (the static routing entry,
+            // lane 0), so backpressure silently collapsed a multi-lane
+            // transfer onto one link.
             std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
             uint32_t deviceIdx;
             if (devices.size() > 1)
@@ -1068,6 +1728,24 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             {
                 deviceIdx = ResolveDeviceIndex(destRank);
             }
+
+            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
+            {
+                NS_LOG_DEBUG("No credits for DATA_INTERNAL chunk on VC " << static_cast<int>(vcId)
+                             << ", queuing packet");
+                SendQueueEntry entry;
+                entry.packet = pkt;
+                entry.header = header;
+                entry.vcId = vcId;
+                entry.seqNum = seqNum;
+                entry.deviceIndex = deviceIdx;
+                m_sendQueue.push_back(entry);
+                TrySendQueuedPackets();
+                chunkIndex++;
+                continue;
+            }
+
+            pkt->AddHeader(header);
 
             Mac48Address destMac = ResolveDestMac(destRank);
             if (!SendPacketOnDevice(pkt, deviceIdx, destMac))

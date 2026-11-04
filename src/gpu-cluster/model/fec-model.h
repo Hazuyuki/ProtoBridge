@@ -137,9 +137,13 @@ class FecModel : public Object
     /**
      * @brief Apply FEC encoding to a packet (returns encoded size)
      * @param payloadSize Original payload size in bytes
-     * @return Encoded size in bytes (payload * N/K, rounded up to codeword boundary)
+     * @return Encoded size in bytes (payload * N/K, rounded up to codeword
+     *         boundary). uint64 (codex round 51, finding 2): a ~4-GB
+     *         payload encodes past UINT32_MAX and the old uint32 return
+     *         narrowed 4,339,299,640 to 44,332,344 — SMALLER than the
+     *         payload, silently skipping the parity padding.
      */
-    uint32_t GetEncodedSize(uint32_t payloadSize) const;
+    uint64_t GetEncodedSize(uint32_t payloadSize) const;
 
     /**
      * @brief Get original payload size from encoded size
@@ -169,6 +173,23 @@ class FecModel : public Object
 
   private:
     void DoDispose() override;
+
+    /**
+     * Round 62: N/K/T must satisfy the same divisor invariants no matter
+     * how they are set. SetFecParams validates the triple atomically, but
+     * the TypeId attributes used to bind MakeUintegerAccessor directly to
+     * these members, so SetAttribute("K", UintegerValue(0)) bypassed the
+     * round-61 assert and made DecodePacket / GetEncodedSize divide by
+     * zero (dataBitsPerCodeword = 0), and SetAttribute("N", ...) could
+     * zero the GetPayloadSize divisor the same way. The attribute setters
+     * below re-validate each parameter against the CURRENT siblings
+     * (raising the floor where the MDS relation 2T <= N-K demands it) and
+     * then run the full SetFecParams assert suite, so every write path —
+     * method or attribute — lands on a valid triple.
+     */
+    void SetNAttribute(uint32_t n);
+    void SetKAttribute(uint32_t k);
+    void SetTAttribute(uint32_t t);
 
     uint32_t m_n;              ///< Total codeword length (symbols)
     uint32_t m_k;              ///< Data symbols per codeword

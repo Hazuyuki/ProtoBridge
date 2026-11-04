@@ -41,6 +41,7 @@ static const char* RESERVED[] = {
 static bool
 IsReserved(const std::string& k)
 {
+    if (k.rfind("rdma",0) == 0 || k.rfind("ibgda",0) == 0 || k.rfind("pcie",0) == 0) return true;
     for (const char* r : RESERVED)
     {
         if (k == r)
@@ -99,7 +100,7 @@ ProtocolProfile::Load(const std::string& path)
         {
             continue;
         }
-        m_kv[key] = val;
+        m_kv[CanonicalRdmaOption(key)] = val;
     }
     m_loaded = !m_kv.empty();
     NS_LOG_INFO("ProtocolProfile: loaded " << m_kv.size() << " keys from " << path);
@@ -115,7 +116,7 @@ ProtocolProfile::IsLoaded() const
 void
 ProtocolProfile::Set(const std::string& key, const std::string& value)
 {
-    m_kv[key] = value;
+    m_kv[CanonicalRdmaOption(key)] = value;
     m_loaded = true;
 }
 
@@ -128,7 +129,7 @@ ProtocolProfile::GetValues() const
 std::string
 ProtocolProfile::Get(const std::string& key, const std::string& fallback) const
 {
-    auto it = m_kv.find(key);
+    auto it = m_kv.find(CanonicalRdmaOption(key));
     return (it == m_kv.end()) ? fallback : it->second;
 }
 
@@ -136,6 +137,7 @@ ProtocolBundle
 ProtocolProfile::Build() const
 {
     ProtocolBundle b;
+    ApplyRdmaProfile(m_kv,b.rdmaSubmission,b.ibgda);
 
     // --- Protocol model ---------------------------------------------------
     std::string tid = Get("protocolModel", "ns3::NcclProtocolModel");
@@ -167,6 +169,8 @@ ProtocolProfile::Build() const
         proto->SetForceProtocolId(id);
     }
     b.protocol = proto;
+    if (IsDetailedRdmaMode(b.rdmaSubmission) && tid == "ns3::RoceProtocolModel")
+        proto->SetAttribute("StartupDelayNs",UintegerValue(0));
 
     // --- Payload builder (vendor-specific, paired with the protocol) -----
     // Derive the builder type from the *effective* protocol TypeId (robust to

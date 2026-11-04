@@ -308,10 +308,19 @@ GatewayEndpoint::ScheduleForwarding(Ptr<Packet> packet, FabricHeader header,
         std::remove_if(m_forwardingEvents.begin(), m_forwardingEvents.end(),
                        [](const EventId& ev) { return ev.IsExpired(); }),
         m_forwardingEvents.end());
-    m_forwardingEvents.push_back(
-        Simulator::Schedule(m_gatewayDelay,
-                            &GatewayEndpoint::ForwardToFabric,
-                            this, packet, header, outFabric, outDeviceIndex));
+    // Round 74 (codex finding 12): m_gatewayDelay is a configured Time and
+    // accepts Time::Max(); Now()+Max wraps DefaultSimulatorImpl's deadline
+    // to a negative/past firing — the forward executes immediately with a
+    // corrupted timeline. A delay at/beyond the remaining horizon cannot
+    // fire within the simulation, so the forwarding is dropped (same
+    // far-future policy as every other guarded Schedule site).
+    if (m_gatewayDelay < Time::Max() - Simulator::Now())
+    {
+        m_forwardingEvents.push_back(
+            Simulator::Schedule(m_gatewayDelay,
+                                &GatewayEndpoint::ForwardToFabric,
+                                this, packet, header, outFabric, outDeviceIndex));
+    }
 }
 
 } // namespace ns3

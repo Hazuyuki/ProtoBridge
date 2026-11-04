@@ -8,6 +8,7 @@ from __future__ import annotations
 
 
 COLLECTIVES = [
+    {"value": "rdma", "label": "RDMA operations", "algorithms": ["p2p"], "scope": "multi"},
     {"value": "allreduce", "label": "AllReduce", "algorithms": ["auto", "ring", "tree", "fullmesh", "nvls", "sharp", "hierarchical", "ncclring"]},
     {"value": "allgather", "label": "AllGather", "algorithms": ["auto", "ring", "fullmesh", "nvls", "hierarchical"]},
     {"value": "reducescatter", "label": "ReduceScatter", "algorithms": ["ring", "fullmesh", "hierarchical"]},
@@ -16,6 +17,7 @@ COLLECTIVES = [
     {"value": "reduce", "label": "Reduce", "algorithms": ["ring"]},
 ]
 ALGORITHMS = {
+    "p2p": "Point-to-point",
     "auto": "Auto · 按数据量选择", "ring": "Ring", "tree": "Tree",
     "fullmesh": "Full mesh", "nvls": "NVLS", "sharp": "SHARP",
     "hierarchical": "Hierarchical · 分层", "ncclring": "NCCL pipelined ring",
@@ -111,6 +113,122 @@ OPTION_GROUPS = [
         field("sprayChunkSize", "Spray 分片大小 · bytes", target="stack", default=131072, minimum=1, maximum=67108864),
         field("bulkChunkSize", "Bulk 包大小上限 · bytes", default=8388608, minimum=1, maximum=67108864),
     ]},
+    {"id": "rdma", "title": "RDMA submission", "subtitle": "Initiator / memory path / timing", "hint": "Select CPU or GPU submission independently of host memory, host staging, or GPUDirect. Stage costs are explicit inputs.", "fields": [
+        field("rdmaSubmission", "Timing model", target="stack", scope="multi", default="startup", choices=[("startup", "Startup delay (legacy)"), ("detailed", "Detailed RDMA"), ("ibgda", "IBGDA compatibility preset")]),
+        field("rdmaInitiator", "Request initiator", target="stack", scope="multi", default="gpu", choices=[("cpu", "CPU"), ("gpu", "GPU")], when="rdma"),
+        field("rdmaDataPath", "Payload memory path", target="stack", scope="multi", default="gpudirect", choices=[("host", "Host DRAM"), ("staged", "GPU via host staging"), ("gpudirect", "GPUDirect RDMA")], when="rdma"),
+        field("rdmaOperation", "RDMA operation", target="stack", scope="multi", default="write", choices=[
+            ("write", "RDMA Write"), ("read", "RDMA Read / Get"), ("send", "Send / Recv"),
+            ("write_imm", "Write with immediate"), ("send_imm", "Send with immediate"),
+            ("fetch_add", "Atomic fetch-and-add"), ("compare_swap", "Atomic compare-and-swap"),
+            ("put_signal", "Put with signal"), ("signal", "Signal update")], when="rdma-ops"),
+        *[field(key,label,target="stack",scope="multi",default=default,minimum=minimum,maximum=maximum,when="rdma-ops")
+          for key,label,default,minimum,maximum in [
+            ("rdmaMaxReadAtomic", "Outstanding Reads / atomics per QP",16,0,65536),
+            ("rdmaResponderDepth", "Responder slots",16,1,65536),
+            ("rdmaReceiveQueueDepth", "Posted receive capacity",128,1,65536),
+            ("rdmaRnrRetryLimit", "RNR retry limit",7,0,65536),
+            ("rdmaRnrRetryNs", "RNR retry delay · ns",1000,1,1000000000),
+            ("rdmaReadServiceNs", "Read responder latency · ns",0,0,1000000000),
+            ("rdmaAtomicServiceNs", "Atomic service latency · ns",0,0,1000000000),
+            ("rdmaReceivePostNs", "Receive posting service · ns",0,0,1000000000),
+            ("rdmaReceivePostDelayNs", "Start posting receives after · ns",0,0,1000000000),
+            ("rdmaSignalPollNs", "Signal observation delay · ns",0,0,1000000000),
+            ("rdmaOperand", "Atomic add / swap value",1,0,9007199254740991),
+            ("rdmaCompare", "Atomic comparison value",0,0,9007199254740991),
+            ("rdmaInitialValue", "Initial remote atomic value",0,0,9007199254740991),
+            ("rdmaImmediate", "Immediate notification · uint32",0,0,4294967295),
+            ("rdmaSignalValue", "Signal value",1,0,9007199254740991),
+            ("rdmaLocalAddress", "Local buffer address",0,0,9007199254740991),
+            ("rdmaRemoteAddress", "Remote buffer address",0,0,9007199254740991),
+            ("rdmaSignalAddress", "Remote signal address",281474976710656,0,9007199254740991),
+          ]],
+        field("rdmaSignalOp", "Signal operation", target="stack", scope="multi", default="set",
+              choices=[("set", "Set"), ("add", "Add")], when="rdma-ops"),
+        field("rdmaCpuWorkers", "CPU submission workers", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma-cpu"),
+        field("rdmaGpuProducers", "GPU producers", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma-gpu"),
+        field("rdmaQpsPerPeer", "RC QPs per peer", target="stack", scope="multi", default=1, minimum=1, maximum=4096, when="rdma"),
+        field("rdmaQueueDepth", "QP depth · WQEs", target="stack", scope="multi", default=128, minimum=1, maximum=65536, when="rdma"),
+        field("rdmaDoorbellBatch", "WQEs per doorbell", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="rdma"),
+        field("rdmaCqModeration", "CQ moderation · WQEs", target="stack", scope="multi", default=1, minimum=1, maximum=65536, when="rdma"),
+        field("rdmaMtu", "RDMA packet body limit · bytes", target="stack", scope="multi", default=4096, minimum=1, maximum=1048576, when="rdma"),
+        field("rdmaWqeBytes", "WQE fetch size · bytes", target="stack", scope="multi", default=64, minimum=1, maximum=4096, when="rdma"),
+        field("rdmaDoorbellBytes", "Doorbell size · bytes", target="stack", scope="multi", default=8, minimum=1, maximum=4096, when="rdma-pcie"),
+        field("rdmaCqeBytes", "CQ entry size · bytes", target="stack", scope="multi", default=64, minimum=1, maximum=4096, when="rdma-pcie"),
+        field("rdmaMapQpByProducer", "QP assignment", target="stack", scope="multi", default=1, choices=[("1", "Map by producer"), ("0", "Round robin per request")], when="rdma"),
+        field("rdmaStagingChunkBytes", "Staging chunk · bytes", target="stack", scope="multi", default=65536, minimum=1, maximum=67108864, when="rdma-staged"),
+        field("rdmaStagingBufferBytes", "Staging buffer per direction · bytes", target="stack", scope="multi", default=131072, minimum=1, maximum=1073741824, when="rdma-staged"),
+        *[field(key,label,target="stack",scope="multi",default=default,when=when) for key,label,default,when in [
+            ("rdmaCpuWqeBuildNs", "CPU WQE construction · ns",0,"rdma-cpu"),
+            ("rdmaCpuPublishNs", "CPU QP publication · ns",0,"rdma-cpu"),
+            ("rdmaCpuDoorbellNs", "CPU doorbell service · ns",0,"rdma-cpu"),
+            ("rdmaCpuPollNs", "CPU completion observation · ns",0,"rdma-cpu"),
+            ("rdmaCpuHandoffNs", "GPU-to-CPU request handoff · ns",0,"rdma-cpu"),
+            ("rdmaGpuWqeBuildNs", "WQE construction · ns",0,"rdma-gpu"),
+            ("rdmaGpuPublishNs", "QP publication · ns",0,"rdma-gpu"),
+            ("rdmaGpuDoorbellNs", "Doorbell service · ns",0,"rdma-gpu"),
+            ("rdmaGpuPollNs", "GPU completion observation · ns",0,"rdma-gpu"),
+            ("rdmaBatchTimeoutNs", "Doorbell tail timeout · ns",100,"rdma"),
+            ("rdmaWqeFetchNs", "NIC WQE fetch · ns",0,"rdma"),
+            ("rdmaDmaReadNs", "Source DMA latency · ns",0,"rdma"),
+            ("rdmaDmaWriteNs", "Destination DMA latency · ns",0,"rdma"),
+            ("rdmaCqWriteNs", "CQ write latency · ns",0,"rdma"),
+            ("rdmaD2hNs", "GPU-to-host copy latency · ns",0,"rdma-staged"),
+            ("rdmaH2dNs", "Host-to-GPU copy latency · ns",0,"rdma-staged"),
+        ]],
+        *[field(key,label,target="stack",scope="multi",default=0,kind="float",maximum=1000000,
+                when="rdma-bandwidth" if key.startswith("rdmaPcie") else "rdma") for key,label in [
+            ("rdmaPcieReadGbps", "PCIe read bandwidth · Gb/s"),
+            ("rdmaPcieWriteGbps", "PCIe write bandwidth · Gb/s"),
+            ("rdmaHbmReadGbps", "HBM read bandwidth · Gb/s"),
+            ("rdmaHbmWriteGbps", "HBM write bandwidth · Gb/s"),
+            ("rdmaHostReadGbps", "Host DRAM read bandwidth · Gb/s"),
+            ("rdmaHostWriteGbps", "Host DRAM write bandwidth · Gb/s"),
+        ]],
+        *[field(key,label,target="stack",scope="multi",default=0,kind="float",maximum=1000000,when="rdma-staged") for key,label in [
+            ("rdmaD2hGbps", "GPU-to-host copy bandwidth · Gb/s"),
+            ("rdmaH2dGbps", "Host-to-GPU copy bandwidth · Gb/s"),
+        ]],
+    ]},
+    {"id": "pcie", "title": "Local PCIe", "subtitle": "TLP / credits / read window",
+     "hint": "The TLP model uses error-free Gen3–5 links and VC0. GPU copies, NIC DMA and control traffic share their actual PCIe paths.", "fields": [
+        field("pcieModel", "PCIe model", target="stack", scope="multi", default="bandwidth",
+              choices=[("bandwidth", "Bandwidth and latency"), ("tlp", "TLP packets · no errors")], when="rdma"),
+        field("pcieTopology", "PCIe topology", target="stack", scope="multi", default="switch",
+              choices=[("switch", "Shared PCIe switch"), ("root", "P2P through root complex")], when="rdma-pcie"),
+        field("pcieGeneration", "PCIe generation", target="stack", scope="multi", default=4,
+              choices=[("3", "Gen3"), ("4", "Gen4"), ("5", "Gen5")], when="rdma-pcie"),
+        field("pcieLanes", "PCIe lanes per link", target="stack", scope="multi", default=16,
+              choices=[(str(n), f"x{n}") for n in [1, 2, 4, 8, 16, 32]], when="rdma-pcie"),
+        *[field(key, label, target="stack", scope="multi", default=default,
+                choices=[(str(n), str(n)) for n in [128, 256, 512, 1024, 2048, 4096]], when="rdma-pcie")
+          for key, label, default in [("pcieMps", "Maximum payload · bytes", 256),
+                                      ("pcieMrrs", "Maximum read request · bytes", 512)]],
+        field("pcieRcb", "Read completion boundary · bytes", target="stack", scope="multi", default=128,
+              choices=[("64", "64"), ("128", "128")], when="rdma-pcie"),
+        *[field(key, label, target="stack", scope="multi", default=default, minimum=minimum,
+                maximum=maximum, when="rdma-pcie") for key, label, default, minimum, maximum in [
+            ("pcieTags", "PCIe read tags per requester", 32, 1, 256),
+            ("pcieMaxReadBytes", "Outstanding PCIe read bytes", 16384, 4, 1073741824),
+            ("pcieCompletionBufferBytes", "Reserved completion space · bytes", 32768, 4, 1073741824),
+            ("pcieQueuePackets", "Output queue capacity · TLPs", 64, 1, 65536),
+            ("pciePostedHeaderCredits", "Posted header credits", 32, 1, 16777216),
+            ("pciePostedDataCredits", "Posted data credits · 16 B", 512, 1, 16777216),
+            ("pcieNonPostedHeaderCredits", "Non-posted header credits", 32, 1, 16777216),
+            ("pcieNonPostedDataCredits", "Non-posted data credits · 16 B", 32, 0, 16777216),
+            ("pcieCompletionHeaderCredits", "Completion header credits", 32, 1, 16777216),
+            ("pcieCompletionDataCredits", "Completion data credits · 16 B", 512, 1, 16777216),
+            ("pcieReplayBufferBytes", "Link replay buffer · bytes", 65536, 152, 1073741824),
+            ("pcieAckEvery", "TLPs per link ACK", 8, 1, 65536),
+            ("pcieLinkLatencyNs", "PCIe propagation latency · ns", 10, 0, 1000000000),
+            ("pcieSwitchLatencyNs", "PCIe forwarding latency · ns", 20, 0, 1000000000),
+            ("pcieRootLatencyNs", "Root complex forwarding latency · ns", 50, 0, 1000000000),
+            ("pcieCreditUpdateNs", "Credit update delay · ns", 50, 0, 1000000000),
+            ("pcieAckDelayNs", "Link ACK tail delay · ns", 50, 0, 1000000000),
+        ]],
+        field("pcieRelaxedOrdering", "PCIe relaxed ordering", target="stack", scope="multi", default=0,
+              choices=[("0", "Disabled"), ("1", "Enabled")], when="rdma-pcie"),
+    ]},
     {"id": "flow", "title": "流控与拥塞控制", "subtitle": "Credit / 发送窗口 / PFC", "hint": "Credit 控制每个 VC 的可发分片数；So 窗口控制跨节点在途分片数。PFC 和拥塞控制可同时使用。", "fields": [
         field("vcCredits", "每 VC 信用额度 · 分片数", target="credits", minimum=1, maximum=1073741824),
         field("vcCount", "虚拟通道数量", target="stack", scope="stencil", default=4, minimum=1, maximum=255),
@@ -172,6 +290,67 @@ OPTION_GROUPS = [
 ]
 
 
+# Show operation-specific inputs only where they affect the selected verb.
+_RDMA_OPERATION_FIELDS = {
+    "rdmaMaxReadAtomic": ["read", "fetch_add", "compare_swap", "put_signal", "signal"],
+    "rdmaResponderDepth": ["read", "fetch_add", "compare_swap", "put_signal", "signal"],
+    "rdmaReadServiceNs": ["read"],
+    "rdmaAtomicServiceNs": ["fetch_add", "compare_swap", "put_signal", "signal"],
+    "rdmaReceiveQueueDepth": ["send", "send_imm", "write_imm"],
+    "rdmaReceivePostNs": ["send", "send_imm", "write_imm"],
+    "rdmaReceivePostDelayNs": ["send", "send_imm", "write_imm"],
+    "rdmaRnrRetryLimit": ["send", "send_imm", "write_imm"],
+    "rdmaRnrRetryNs": ["send", "send_imm", "write_imm"],
+    "rdmaImmediate": ["send_imm", "write_imm"],
+    "rdmaOperand": ["fetch_add", "compare_swap"],
+    "rdmaCompare": ["compare_swap"],
+    "rdmaInitialValue": ["fetch_add", "compare_swap"],
+    "rdmaSignalPollNs": ["put_signal", "signal"],
+    "rdmaSignalAddress": ["put_signal", "signal"],
+    "rdmaSignalValue": ["put_signal", "signal"],
+    "rdmaSignalOp": ["put_signal", "signal"],
+}
+for _group in OPTION_GROUPS:
+    for _field in _group["fields"]:
+        if _field["key"] in _RDMA_OPERATION_FIELDS:
+            _field["operations"] = _RDMA_OPERATION_FIELDS[_field["key"]]
+
+
+RDMA_ALIASES = {
+    'ibgdaProducers': 'rdmaGpuProducers',
+    'ibgdaQpsPerPeer': 'rdmaQpsPerPeer',
+    'ibgdaQueueDepth': 'rdmaQueueDepth',
+    'ibgdaDoorbellBatch': 'rdmaDoorbellBatch',
+    'ibgdaCqModeration': 'rdmaCqModeration',
+    'ibgdaMtu': 'rdmaMtu',
+    'ibgdaWqeBytes': 'rdmaWqeBytes',
+    'ibgdaMapQpByProducer': 'rdmaMapQpByProducer',
+    'ibgdaWqeBuildNs': 'rdmaGpuWqeBuildNs',
+    'ibgdaPublishNs': 'rdmaGpuPublishNs',
+    'ibgdaDoorbellNs': 'rdmaGpuDoorbellNs',
+    'ibgdaGpuPollNs': 'rdmaGpuPollNs',
+    'ibgdaBatchTimeoutNs': 'rdmaBatchTimeoutNs',
+    'ibgdaWqeFetchNs': 'rdmaWqeFetchNs',
+    'ibgdaDmaReadNs': 'rdmaDmaReadNs',
+    'ibgdaDmaWriteNs': 'rdmaDmaWriteNs',
+    'ibgdaCqWriteNs': 'rdmaCqWriteNs',
+    'ibgdaPcieReadGbps': 'rdmaPcieReadGbps',
+    'ibgdaPcieWriteGbps': 'rdmaPcieWriteGbps',
+    'ibgdaHbmReadGbps': 'rdmaHbmReadGbps',
+    'ibgdaHbmWriteGbps': 'rdmaHbmWriteGbps',
+}
+
+
+def normalize_rdma_values(values):
+    result = dict(values)
+    for alias, canonical in RDMA_ALIASES.items():
+        if alias in result:
+            if canonical in result and str(result[canonical]) != str(result[alias]):
+                raise ValueError(f"Conflicting RDMA options: {alias} and {canonical}.")
+            result[canonical] = result.pop(alias)
+    return result
+
+
 def validate_value(key, value, rule):
     if "choices" in rule:
         choices = [item["value"] if isinstance(item, dict) else item for item in rule["choices"]]
@@ -195,6 +374,8 @@ def validate_value(key, value, rule):
         if not math.isfinite(number) or not rule["min"] <= number <= rule["max"]:
             raise ValueError(f"{key} 范围为 {rule['min']}–{rule['max']}。")
 
+
+PROFILE_SOURCED.update(item["key"] for group in OPTION_GROUPS if group["id"] in {"rdma", "pcie"} for item in group["fields"])
 
 def validate_configuration(op, resolved, cli, request):
     """Return actual rank count, effective settings and compatibility notes."""
@@ -360,6 +541,41 @@ def validate_configuration(op, resolved, cli, request):
             notices.append("已注入错误而未启用 LLR；未被 FEC 纠正的丢失可能使操作无法完成。")
         elif not enabled("llrTimeoutRetransmit"):
             notices.append("随机错误可能使 NACK 丢失；可启用“超时主动重传”来恢复这类传输。")
+    if op.get("collective") != "rdma" and settings.get("rdmaOperation") != "write":
+        raise ValueError("Choose an RDMA operations preset to change the operation type.")
+    if op.get("collective") == "rdma":
+        if settings.get("rdmaSubmission") not in {"detailed", "ibgda"}:
+            raise ValueError("RDMA operations require detailed timing.")
+        opcode = settings["rdmaOperation"]
+        if opcode in {"read", "fetch_add", "compare_swap", "put_signal", "signal"} and integer("rdmaMaxReadAtomic") == 0:
+            raise ValueError("Read and atomic operations require a positive outstanding Read/atomic limit.")
+        if opcode in {"fetch_add", "compare_swap"} and (integer("rdmaRemoteAddress") % 8 or integer("rdmaLocalAddress") % 8):
+            raise ValueError("Atomic buffer addresses must be 8-byte aligned.")
+        if opcode in {"put_signal", "signal"} and integer("rdmaSignalAddress") % 8:
+            raise ValueError("Signal addresses must be 8-byte aligned.")
+        if settings["rdmaDataPath"] == "staged" and opcode in {"fetch_add", "compare_swap", "put_signal", "signal"} and integer("rdmaStagingBufferBytes") < 8:
+            raise ValueError("Staged atomic and signal operations need at least 8 bytes of staging space.")
+    if settings.get("rdmaSubmission") in {"detailed", "ibgda"}:
+        if not multi or settings["interNodeFabricType"] != "RoCE":
+            raise ValueError("Detailed RDMA requires a multi-node RoCE scenario.")
+        if settings["rdmaSubmission"] == "ibgda" and (settings["rdmaInitiator"] != "gpu" or settings["rdmaDataPath"] != "gpudirect"):
+            raise ValueError("The IBGDA compatibility preset requires GPU submission and GPUDirect; select Detailed RDMA for other combinations.")
+        depth = integer("rdmaQueueDepth")
+        if integer("rdmaDoorbellBatch") > depth or integer("rdmaCqModeration") > depth:
+            raise ValueError("RDMA doorbell batch and CQ moderation must not exceed the QP depth.")
+        if integer("rdmaDoorbellBatch") > 1 and integer("rdmaBatchTimeoutNs") == 0:
+            raise ValueError("RDMA batching requires a positive tail timeout.")
+        if integer("rdmaStagingBufferBytes") < integer("rdmaStagingChunkBytes"):
+            raise ValueError("The staging buffer must hold at least one staging chunk.")
+    if settings.get("pcieModel") == "tlp":
+        if not multi or settings.get("rdmaSubmission") not in {"detailed", "ibgda"}:
+            raise ValueError("The PCIe TLP model requires multi-node detailed RDMA or IBGDA.")
+        if min(integer("pciePostedDataCredits"), integer("pcieCompletionDataCredits")) * 16 < integer("pcieMps"):
+            raise ValueError("PCIe Posted and Completion data credits must each hold a maximum-sized payload.")
+        if integer("pcieReplayBufferBytes") < integer("pcieMps") + 24:
+            raise ValueError("The PCIe replay buffer must hold a maximum-sized TLP including its 24-byte overhead.")
+        if float(settings["rdmaPcieReadGbps"]) or float(settings["rdmaPcieWriteGbps"]):
+            notices.append("The TLP model derives PCIe bandwidth from generation and lane count; the legacy PCIe bandwidth inputs are ignored.")
     if multi:
         if integer("failedOpticalLink") >= 0 or enabled("failureAwareRouting"):
             raise ValueError("当前光链路故障选项用于单节点统一拓扑构建器；请选择单节点 Leaf–spine。")

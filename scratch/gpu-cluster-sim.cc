@@ -8,62 +8,65 @@
  * Output format: machine-parseable RESULT_START/RESULT_END block
  */
 
-#include "ns3/core-module.h"
-#include "ns3/node-list.h"
-#include "ns3/gpu-cluster-helper.h"
-#include "ns3/fabric-endpoint.h"
-#include "ns3/nvswitch.h"
-#include "ns3/ethernet-switch.h"
-#include "ns3/ring-allreduce.h"
-#include "ns3/sharp-allreduce.h"
-#include "ns3/nvls-allgather.h"
-#include "ns3/tree-allreduce.h"
-#include "ns3/fullmesh-allreduce.h"
-#include "ns3/fullmesh-allgather.h"
-#include "ns3/fullmesh-reducescatter.h"
-#include "ns3/ring-allgather.h"
-#include "ns3/ring-reducescatter.h"
-#include "ns3/ring-broadcast.h"
-#include "ns3/ring-reduce.h"
 #include "ns3/alltoall-injector.h"
-#include "ns3/hierarchical-allreduce.h"
-#include "ns3/hierarchical-allgather.h"
-#include "ns3/hierarchical-reducescatter.h"
-#include "ns3/hierarchical-alltoall.h"
-#include "ns3/nccl-ring-allreduce.h"
-#include "ns3/multi-node-topology-helper.h"
-#include "ns3/device-type.h"
-#include "ns3/fabric-type.h"
-#include "ns3/protocol-model.h"
-#include "ns3/protocol-profile.h"
-#include "ns3/protocol-config.h"
-#include "ns3/protocol-config-runner.h"
-#include "ns3/nccl-protocol-model.h"
-#include "ns3/ub-protocol-model.h"
-#include "ns3/roce-protocol-model.h"
-#include "ns3/ethernet-protocol-model.h"
-#include "ns3/dcqcn-rate-machine.h"
-#include "ns3/rttcc-rate-machine.h"
-#include "ns3/protocol-payload-builder.h"
-#include "ns3/nccl-protocol-payload-builder.h"
-#include "ns3/roce-payload-builder.h"
-#include "ns3/ub-payload-builder.h"
-
-#include "ns3/link-degradation.h"
-#include "ns3/fec-model.h"
-#include "ns3/llr-manager.h"
 #include "ns3/contention-model.h"
+#include "ns3/core-module.h"
+#include "ns3/dcqcn-rate-machine.h"
+#include "ns3/device-type.h"
+#include "ns3/drop-tail-queue.h"
+#include "ns3/ethernet-protocol-model.h"
+#include "ns3/ethernet-switch.h"
+#include "ns3/fabric-endpoint.h"
+#include "ns3/fabric-type.h"
+#include "ns3/fec-model.h"
+#include "ns3/fullmesh-allgather.h"
+#include "ns3/fullmesh-allreduce.h"
+#include "ns3/fullmesh-reducescatter.h"
+#include "ns3/gpu-cluster-helper.h"
+#include "ns3/hierarchical-allgather.h"
+#include "ns3/hierarchical-allreduce.h"
+#include "ns3/hierarchical-alltoall.h"
+#include "ns3/hierarchical-reducescatter.h"
+#include "ns3/link-degradation.h"
+#include "ns3/llr-manager.h"
+#include "ns3/multi-node-topology-helper.h"
+#include "ns3/nccl-protocol-model.h"
+#include "ns3/nccl-protocol-payload-builder.h"
+#include "ns3/nccl-ring-allreduce.h"
+#include "ns3/node-list.h"
+#include "ns3/nvls-allgather.h"
+#include "ns3/nvswitch.h"
 #include "ns3/p2p-traffic.h"
+#include "ns3/point-to-point-channel.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/point-to-point-net-device.h"
-#include "ns3/point-to-point-channel.h"
-#include "ns3/drop-tail-queue.h"
+#include "ns3/protocol-config-runner.h"
+#include "ns3/protocol-config.h"
+#include "ns3/protocol-model.h"
+#include "ns3/protocol-payload-builder.h"
+#include "ns3/protocol-profile.h"
+#include "ns3/rdma-operation-traffic.h"
+#include "ns3/rdma-submission-model.h"
+#include "ns3/ring-allgather.h"
+#include "ns3/ring-allreduce.h"
+#include "ns3/ring-broadcast.h"
+#include "ns3/ring-reduce.h"
+#include "ns3/ring-reducescatter.h"
+#include "ns3/roce-payload-builder.h"
+#include "ns3/roce-protocol-model.h"
+#include "ns3/rttcc-rate-machine.h"
+#include "ns3/sharp-allreduce.h"
+#include "ns3/tree-allreduce.h"
+#include "ns3/ub-payload-builder.h"
+#include "ns3/ub-protocol-model.h"
 
 #include <algorithm>
-#include <iostream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
+#include <memory>
 #include <queue>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -73,6 +76,9 @@ NS_LOG_COMPONENT_DEFINE("GpuClusterSim");
 
 static uint64_t g_durationNs = 0;
 static bool g_collectiveCompleted = false;
+static uint64_t g_deliveryDurationNs = 0;
+static bool g_waitingRdma = false;
+static std::vector<Ptr<RdmaSubmissionModel>> g_rdmaModels;
 
 // ---------------------------------------------------------------------------
 // Wire-transfer patterns (p2p / fanout / incast): bare point-to-point bulk
@@ -155,9 +161,30 @@ ResolveAutoAlgorithm(const std::string& coll, const std::string& topo,
 void
 OnCollectiveComplete(uint64_t durationNs)
 {
-    g_durationNs = durationNs;
-    g_collectiveCompleted = true;
-    Simulator::Stop();
+    if (g_waitingRdma || g_collectiveCompleted) return;
+    g_deliveryDurationNs = durationNs;
+    if (g_rdmaModels.empty())
+    {
+        g_durationNs = durationNs;
+        g_collectiveCompleted = true;
+        Simulator::Stop();
+        return;
+    }
+    g_waitingRdma = true;
+    const Time start=Simulator::Now()-NanoSeconds(durationNs);
+    auto remaining=std::make_shared<uint32_t>(g_rdmaModels.size());
+    for (auto model : g_rdmaModels)
+    {
+        model->Quiet([start,remaining](bool ok) {
+            if (!ok) return;
+            if (--*remaining == 0)
+            {
+                g_durationNs=(Simulator::Now()-start).GetNanoSeconds();
+                g_collectiveCompleted=true;
+                Simulator::Stop();
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +346,10 @@ main(int argc, char* argv[])
     uint16_t rootRank = 0;
     uint32_t forceProtocol = 0;  // 0=auto, 1=LL, 2=LL128, 3=SIMPLE
     double protocolWireEfficiency = 1.0;
+    // So (inter-node) RoCE wire efficiency: -1 means "leave the model default
+    // (0.95) untouched". Separate from --protocolWireEfficiency (the Su-model
+    // knob, default 1.0) so that overriding one never silently changes the other.
+    double soRoceWireEfficiency = -1.0;
     bool useTransactionModel = true;
     bool verbose = false;
 
@@ -448,12 +479,27 @@ main(int argc, char* argv[])
     std::string intraNodeAlgorithm = "fullmesh";
 
 
+    uint32_t p2pIterations=1;
+    std::string rdmaSubmission="startup";
+    std::string rdmaTraceFile;
+    std::string pcieTraceFile;
+    uint64_t pcieTraceMaxEvents{100000};
+    RdmaConfig rdmaConfig;
     CommandLine cmd;
+    AddRdmaCommandLine(cmd,rdmaSubmission,rdmaConfig);
+    cmd.AddValue("p2pIterations","Work requests per p2p/fanout/incast flow",p2pIterations);
+    cmd.AddValue("rdmaTraceFile","Per-WR RDMA timing CSV (empty=disabled)",rdmaTraceFile);
+    cmd.AddValue("pcieTraceFile", "Per-hop PCIe TLP/credit CSV (pcieModel=tlp)", pcieTraceFile);
+    cmd.AddValue("pcieTraceMaxEvents",
+                 "PCIe CSV event limit (0=unlimited; counters remain complete)",
+                 pcieTraceMaxEvents);
+    cmd.AddValue("ibgdaTraceFile","Compatibility alias for rdmaTraceFile",rdmaTraceFile);
     cmd.AddValue("topology", "Topology: ring/fullmesh/switched/fattree/railfattree/leafspine/nvl72/torus/mesh/hypercube/2dfullmesh/ndfullmesh/2dfullmeshclos", topology);
     cmd.AddValue("collective", "Collective: allreduce/alltoall/allgather/reducescatter/broadcast/reduce/p2p/fanout/incast", collective);
     cmd.AddValue("algorithm", "Algorithm: ring/sharp/nvls/tree/fullmesh/collnetdirect/collnetchain/hierarchical/ncclring", algorithm);
     cmd.AddValue("protocolModel", "Protocol model type: ns3::NcclProtocolModel/ns3::UbProtocolModel/ns3::McclProtocolModel", protocolModelType);
     cmd.AddValue("protocolWireEfficiency", "Protocol payload bytes divided by transmitted bytes", protocolWireEfficiency);
+    cmd.AddValue("soRoceWireEfficiency", "So (inter-node) RoCE wire efficiency; -1 keeps the model default 0.95", soRoceWireEfficiency);
     cmd.AddValue("fabricType", "Fabric type: NVLink/ETH/ICI/HCCS/xGMI/MetaXLink/RoCE/UB", fabricTypeStr);
     cmd.AddValue("deviceType", "Device type: GPU/CPU/TPU/NPU/Gaudi/UB_NPU", deviceTypeStr);
     cmd.AddValue("numGpus", "Number of GPUs", numGpus);
@@ -732,7 +778,12 @@ main(int argc, char* argv[])
         {
             prof.Set(kv.first, kv.second);
         }
+        ApplyRdmaProfile(prof.GetValues(),rdmaSubmission,rdmaConfig);
         pbundle = prof.Build();
+        pbundle.rdmaSubmission=rdmaSubmission;
+        pbundle.ibgda=rdmaConfig;
+        if (IsDetailedRdmaMode(rdmaSubmission))
+            pbundle.protocol->SetAttributeFailSafe("StartupDelayNs",UintegerValue(0));
         configMode = true;
 
         // Source the profile's PEX + fabric-hardware values into the same
@@ -836,13 +887,26 @@ main(int argc, char* argv[])
         }
     }
 
+    NS_ABORT_MSG_IF(p2pIterations == 0 || p2pIterations > 1000000,
+                    "p2pIterations must be in [1,1000000]");
+    ApplyRdmaProfile({},rdmaSubmission,rdmaConfig);
+    if (IsDetailedRdmaMode(rdmaSubmission))
+    {
+        rdmaConfig.Validate();
+        NS_ABORT_MSG_IF(numNodes < 2 || interNodeFabricTypeStr != "RoCE",
+                        "Detailed RDMA currently requires numNodes>=2 and interNodeFabricType=RoCE");
+        interNodeStartupNs=0;
+        interNodeStartupLLNs=interNodeStartupLL128Ns=interNodeStartupSIMPLENs=0;
+    }
     if (topology == "railfattree")
     {
         NS_ABORT_MSG_IF(railCount == 0 || railNodesPerLeaf == 0 || numGpus % railCount != 0,
                         "railfattree requires a nonzero rail count, a nonzero leaf size, and divisible GPU count");
         const uint32_t enclosures = numGpus / railCount;
+        // Round 64 (codex finding 7): divide-first ceiling (same wrap as
+        // the helper's BuildRailOptimizedFatTree).
         const uint32_t leavesPerRail =
-            (enclosures + railNodesPerLeaf - 1) / railNodesPerLeaf;
+            enclosures / railNodesPerLeaf + (enclosures % railNodesPerLeaf != 0);
         const uint32_t totalLeaves = railCount * leavesPerRail;
         if (railSpineSwitches == 0)
         {
@@ -892,10 +956,15 @@ main(int argc, char* argv[])
     if (collective != "allreduce" && collective != "alltoall" &&
         collective != "allgather" && collective != "reducescatter" &&
         collective != "broadcast" && collective != "reduce" &&
-        collective != "p2p" && collective != "fanout" && collective != "incast")
+        collective != "p2p" && collective != "fanout" && collective != "incast" && collective != "rdma")
     {
-        NS_ABORT_MSG("Unknown collective: " << collective << ". Supported: allreduce, alltoall, allgather, reducescatter, broadcast, reduce, p2p, fanout, incast");
+        NS_ABORT_MSG("Unknown collective: " << collective << ". Supported: allreduce, alltoall, allgather, reducescatter, broadcast, reduce, p2p, fanout, incast, rdma");
     }
+
+    NS_ABORT_MSG_IF(collective=="rdma" && (!IsDetailedRdmaMode(rdmaSubmission) || numNodes<2),
+                    "collective=rdma requires detailed timing and multiple nodes");
+    NS_ABORT_MSG_IF(rdmaConfig.operation!="write" && collective!="rdma",
+                    "rdmaOperation selects the collective=rdma workload; it does not replace collective transfers");
 
     if (verbose)
     {
@@ -941,6 +1010,12 @@ main(int argc, char* argv[])
         {
             Config::SetDefault("ns3::McclProtocolModel::PerGpuStartupDelayNs", UintegerValue(startupPerGpuNs));
         }
+    }
+    else if (protocolModelType == "ns3::RoceProtocolModel")
+    {
+        // handled at the So model creation site (Config::SetDefault before
+        // CreateObject<RoceProtocolModel>); --protocolModel itself still
+        // validates against the Su models below.
     }
     else if (protocolModelType == "ns3::UbProtocolModel")
     {
@@ -1038,6 +1113,11 @@ main(int argc, char* argv[])
     else if (protocolModelType == "ns3::UbProtocolModel")
     {
         payloadBuilderType = "ns3::UbPayloadBuilder";
+    }
+    else if (protocolModelType == "ns3::RoceProtocolModel" ||
+             protocolModelType == "ns3::EthernetProtocolModel")
+    {
+        payloadBuilderType = "ns3::RocePayloadBuilder";
     }
     else
     {
@@ -1359,7 +1439,22 @@ main(int argc, char* argv[])
         Ptr<EthernetProtocolModel> ethModel;
         if (interNodeFabricType == FabricType::ROCE)
         {
+            // --soRoceWireEfficiency overrides the So (inter-node) RoCE model's
+            // wire efficiency. The default 0.95 (Eth+IP+UDP+BTH+aETH framing
+            // amortization) inflates every bulk transfer by 1/0.95 on the wire;
+            // matching studies against simulators that charge headers per packet
+            // (ns3-rdma) need a way to neutralize the double-count (the fabric
+            // headers are already serialized per chunk by the switch). The knob
+            // defaults to -1 = "leave the model default (0.95) alone" so that
+            // default PB behavior is unchanged unless explicitly overridden.
+            if (soRoceWireEfficiency > 0.0)
+            {
+                Config::SetDefault("ns3::RoceProtocolModel::WireEfficiency",
+                                   DoubleValue(soRoceWireEfficiency));
+            }
             roceModel = CreateObject<RoceProtocolModel>();
+            if (IsDetailedRdmaMode(rdmaSubmission))
+                roceModel->SetAttribute("StartupDelayNs",UintegerValue(0));
         }
         else if (interNodeFabricType == FabricType::ETHERNET)
         {
@@ -1439,7 +1534,7 @@ main(int argc, char* argv[])
         // (intra-node) framing/timing untouched. Off (--dcqcn=0, default) ->
         // null -> byte-identical.
         Ptr<RocePayloadBuilder> soPayloadBuilder;
-        if (interNodeFabricType == FabricType::ROCE && enableDcqcn)
+        if (interNodeFabricType == FabricType::ROCE && (enableDcqcn || IsDetailedRdmaMode(rdmaSubmission)))
         {
             soPayloadBuilder = CreateObject<RocePayloadBuilder>();
         }
@@ -1571,8 +1666,10 @@ main(int argc, char* argv[])
             else if (topology == "railfattree")
             {
                 const uint32_t enclosures = numGpus / railCount;
+                // Round 64 (codex finding 7): divide-first ceiling (same
+                // wrap as the helper's BuildRailOptimizedFatTree).
                 const uint32_t leavesPerRail =
-                    (enclosures + railNodesPerLeaf - 1) / railNodesPerLeaf;
+                    enclosures / railNodesPerLeaf + (enclosures % railNodesPerLeaf != 0);
                 numSwitches = railCount * leavesPerRail +
                               railSpineSwitches + railCoreSwitches;
             }
@@ -1909,6 +2006,79 @@ main(int argc, char* argv[])
         }
     }
 
+    std::shared_ptr<std::ofstream> rdmaTrace;
+    std::shared_ptr<std::ofstream> pcieTrace;
+    auto pcieTraceEvents = std::make_shared<uint64_t>(0);
+    auto pcieTraceTruncated = std::make_shared<bool>(false);
+    if (!pcieTraceFile.empty())
+    {
+        NS_ABORT_MSG_IF(rdmaConfig.pcieModel != "tlp", "pcieTraceFile requires pcieModel=tlp");
+        pcieTrace = std::make_shared<std::ofstream>(pcieTraceFile);
+        NS_ABORT_MSG_IF(!*pcieTrace, "Cannot open pcieTraceFile");
+        *pcieTrace << "host,timeNs,event,from,to,transaction,type,traffic,tag,address,bytes,"
+                      "wireBytes,ph,pd,nph,npd,cplh,cpld\n";
+    }
+    if (IsDetailedRdmaMode(rdmaSubmission))
+    {
+        if (!rdmaTraceFile.empty())
+        {
+            rdmaTrace=std::make_shared<std::ofstream>(rdmaTraceFile);
+            NS_ABORT_MSG_IF(!*rdmaTrace,"Cannot open rdmaTraceFile");
+            *rdmaTrace << "rank,workId,peer,producer,qp,bytes,readyNs,reservedNs,publishedNs,doorbellNs,executeNs,firstWireNs,ackedNs,observedNs,requestId,offset,submittedNs,stagingAcquiredNs,sourceStagedNs,initiator,dataPath,opcode\n";
+        }
+        std::map<uint32_t,std::shared_ptr<RdmaHostMemoryResources>> hostMemory;
+        for (auto ep : endpoints)
+        {
+            auto model=CreateObject<RdmaSubmissionModel>();
+            model->Configure(rdmaConfig);
+            auto& host=hostMemory[ep->GetNodeId()];
+            if (!host) host=std::make_shared<RdmaHostMemoryResources>();
+            model->SetHostMemoryResources(host);
+            if (pcieTrace)
+            {
+                model->GetPcieFabric()->SetObserver(
+                    [pcieTrace,
+                     pcieTraceEvents,
+                     pcieTraceTruncated,
+                     pcieTraceMaxEvents,
+                     node = ep->GetNodeId()](const PcieTraceEvent& e) {
+                        if (pcieTraceMaxEvents && *pcieTraceEvents >= pcieTraceMaxEvents)
+                        {
+                            *pcieTraceTruncated = true;
+                            return;
+                        }
+                        ++*pcieTraceEvents;
+                        *pcieTrace << node << ',' << e.time.GetNanoSeconds() << ',' << e.event
+                                   << ',' << e.from << ',' << e.to << ',' << e.transaction << ','
+                                   << (e.transaction ? PcieTlpName(e.type) : "-") << ','
+                                   << PcieTrafficName(e.traffic) << ',' << unsigned(e.tag) << ','
+                                   << e.address << ',' << e.bytes << ',' << e.wireBytes;
+                        for (auto credit : e.credits)
+                        {
+                            *pcieTrace << ',' << credit;
+                        }
+                        *pcieTrace << '\n';
+                    });
+            }
+            if (rdmaTrace)
+            {
+                model->SetObserver([rdmaTrace,rank=ep->GetRank(),rdmaConfig](const RdmaWorkTiming& t) {
+                    *rdmaTrace << rank << ',' << t.id << ',' << t.peer << ',' << t.producer
+                        << ',' << t.qp << ',' << t.bytes << ',' << t.ready.GetNanoSeconds()
+                        << ',' << t.reserved.GetNanoSeconds() << ',' << t.published.GetNanoSeconds()
+                        << ',' << t.doorbell.GetNanoSeconds() << ',' << t.execute.GetNanoSeconds()
+                        << ',' << t.firstWire.GetNanoSeconds() << ',' << t.acknowledged.GetNanoSeconds()
+                        << ',' << t.observed.GetNanoSeconds() << ',' << t.requestId << ',' << t.offset
+                        << ',' << t.submitted.GetNanoSeconds() << ',' << t.stagingAcquired.GetNanoSeconds()
+                        << ',' << t.sourceStaged.GetNanoSeconds() << ',' << rdmaConfig.initiator
+                        << ',' << rdmaConfig.dataPath << ',' << RdmaOpcodeName(t.opcode) << '\n';
+                });
+            }
+            ep->SetRdmaSubmissionModel(model);
+            g_rdmaModels.push_back(model);
+        }
+    }
+
     // soTxWindow / soGbnStrict are independent LLR-free opt-ins (the perftest
     // tx_depth analog). They used to live inside the llrEnabled block, so a
     // run with LLR off (lossless RoCE) silently ignored --soTxWindow — an
@@ -1946,6 +2116,7 @@ main(int argc, char* argv[])
               << llrReloadLatencyNs << "ns" << std::endl;
 
     Ptr<CollectiveInjector> injector;
+    Ptr<RdmaOperationTraffic> rdmaTraffic;
     ProtocolConfigRunner configRunner;  // used only in config mode
     // Resolve "auto" for the single-shot path (trace path resolves per-phase
     // inside CreateTraceCollectiveInjector). hasNvls follows the same rule.
@@ -2050,7 +2221,10 @@ main(int argc, char* argv[])
             NS_ABORT_MSG("protocol config compile error: " << cfgErr);
         }
         configRunner.SetCompletionCallback(
-            [](uint64_t durationNs) { OnCollectiveComplete(durationNs); });
+            [&configRunner](uint64_t durationNs) {
+                OnCollectiveComplete(durationNs);
+                g_deliveryDurationNs=configRunner.GetDeliveryDurationNs();
+            });
         configRunner.Start();
     }
     else if (collective == "allreduce")
@@ -2067,7 +2241,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2139,7 +2321,11 @@ main(int argc, char* argv[])
                 ar->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
             // Inter-node startup delay
-            if (interNodeStartupNs > 0)
+            if (IsDetailedRdmaMode(rdmaSubmission))
+            {
+                ar->SetInterNodeStartupDelay(NanoSeconds(0));
+            }
+            else if (interNodeStartupNs > 0)
             {
                 ar->SetInterNodeStartupDelay(NanoSeconds(interNodeStartupNs));
             }
@@ -2164,7 +2350,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2290,7 +2484,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2308,7 +2510,11 @@ main(int argc, char* argv[])
             a2a->SetStartupPerGpuNs(startupPerGpuNs);
             a2a->SetLlThreshold(llThreshold);
             a2a->SetLl128Threshold(ll128Threshold);
-            if (interNodeStartupNs > 0)
+            if (IsDetailedRdmaMode(rdmaSubmission))
+            {
+                a2a->SetInterNodeStartupDelay(NanoSeconds(0));
+            }
+            else if (interNodeStartupNs > 0)
             {
                 a2a->SetInterNodeStartupDelay(NanoSeconds(interNodeStartupNs));
             }
@@ -2392,7 +2598,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2419,7 +2633,11 @@ main(int argc, char* argv[])
             {
                 ag->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
-            if (interNodeStartupNs > 0)
+            if (IsDetailedRdmaMode(rdmaSubmission))
+            {
+                ag->SetInterNodeStartupDelay(NanoSeconds(0));
+            }
+            else if (interNodeStartupNs > 0)
             {
                 ag->SetInterNodeStartupDelay(NanoSeconds(interNodeStartupNs));
             }
@@ -2520,7 +2738,15 @@ main(int argc, char* argv[])
             }
             else if (topology == "nvl72")
             {
+                // Round 65 (codex finding 2): match BuildNvl72's repair —
+                // an auto group size (numGpus/6) is zero below 6 GPUs and
+                // numGpus/0 raised SIGFPE (topology=nvl72, numGpus=4,
+                // collective=allreduce, algo=ncclring, default group size).
                 uint32_t gpg = nvl72GpusPerGroup > 0 ? nvl72GpusPerGroup : numGpus / 6;
+                if (gpg == 0)
+                {
+                    gpg = numGpus;
+                }
                 effectiveNumNodes = numGpus / gpg;
                 effectiveGpusPerNode = gpg;
             }
@@ -2583,7 +2809,11 @@ main(int argc, char* argv[])
             {
                 rs->SetStartupDelay(NanoSeconds(startupDelayNs));
             }
-            if (interNodeStartupNs > 0)
+            if (IsDetailedRdmaMode(rdmaSubmission))
+            {
+                rs->SetInterNodeStartupDelay(NanoSeconds(0));
+            }
+            else if (interNodeStartupNs > 0)
             {
                 rs->SetInterNodeStartupDelay(NanoSeconds(interNodeStartupNs));
             }
@@ -2650,6 +2880,18 @@ main(int argc, char* argv[])
         injector = rd;
     }
 
+    else if (collective == "rdma")
+    {
+        NS_ABORT_MSG_IF(!IsDetailedRdmaMode(rdmaSubmission) || numNodes<2,
+                        "collective=rdma requires detailed RDMA and at least two nodes");
+        uint16_t peer=static_cast<uint16_t>((rootRank+gpusPerNode)%numGpus);
+        rdmaTraffic=CreateObject<RdmaOperationTraffic>();
+        rdmaTraffic->Initialize(endpoints[rootRank],endpoints[peer],dataSize,p2pIterations,rdmaConfig);
+        rdmaTraffic->SetCompletionCallback([](bool success,uint64_t duration){
+            if(success) OnCollectiveComplete(duration);else Simulator::Stop();
+        });
+        Simulator::ScheduleNow(&RdmaOperationTraffic::Start,rdmaTraffic);
+    }
     else if (collective == "p2p" || collective == "fanout" || collective == "incast")
     {
         // Bare wire-transfer patterns on the credit-gated bulk path (see
@@ -2682,7 +2924,10 @@ main(int argc, char* argv[])
                 }
             }
         }
-        g_patternExpectedBytes = static_cast<uint64_t>(flows.size()) * dataSize;
+        NS_ABORT_MSG_IF(dataSize != 0 && flows.size() >
+            std::numeric_limits<uint64_t>::max()/dataSize/p2pIterations,
+            "p2pIterations times dataSize overflows the transfer byte ledger");
+        g_patternExpectedBytes = static_cast<uint64_t>(flows.size()) * dataSize * p2pIterations;
         g_patternReceivedBytes = 0;
         g_patternStartNs = Simulator::Now().GetNanoSeconds();
         // Zero-byte pattern (codex round 20, finding 10): SendBulkWire-
@@ -2701,11 +2946,12 @@ main(int argc, char* argv[])
         {
             Simulator::Schedule(NanoSeconds(0),
                                 [src = flows[i].first, dst = flows[i].second,
-                                 endpoints, dataSize, protocolId, i]()
+                                 endpoints, dataSize, protocolId, i, p2pIterations]()
                                 {
-                                    endpoints[src]->SendBulkWireTransferSize(
-                                        dst, dataSize,
-                                        protocolId, static_cast<uint16_t>(i + 1), 0);
+                                    for (uint32_t wr=0;wr<p2pIterations;++wr)
+                                        endpoints[src]->SendBulkWireTransferSize(
+                                            dst, dataSize,protocolId,
+                                            static_cast<uint16_t>(i + 1),0);
                                 });
         }
     }
@@ -2771,6 +3017,165 @@ main(int argc, char* argv[])
     // Print machine-parseable result
     std::cout << "RESULT_START" << std::endl;
     std::cout << "status=" << statusStr << std::endl;
+    std::cout << "rdmaSubmission=" << rdmaSubmission << std::endl;
+    std::cout << "p2pIterations=" << p2pIterations << std::endl;
+    std::cout << "rdmaInitiator=" << rdmaConfig.initiator << std::endl;
+    std::cout << "rdmaDataPath=" << rdmaConfig.dataPath << std::endl;
+    std::cout << "pcieModel=" << rdmaConfig.pcieModel << std::endl;
+    if (rdmaConfig.pcieModel == "tlp")
+    {
+        PcieStats total;
+        std::set<Ptr<PcieFabric>> seen;
+        for (auto model : g_rdmaModels)
+        {
+            auto fabric = model->GetPcieFabric();
+            if (!fabric || !seen.insert(fabric).second)
+            {
+                continue;
+            }
+            const auto& s = fabric->GetStats();
+            total.reads += s.reads;
+            total.writes += s.writes;
+            total.readRequests += s.readRequests;
+            total.writeTlps += s.writeTlps;
+            total.completionTlps += s.completionTlps;
+            total.tlpHops += s.tlpHops;
+            total.wireBytes += s.wireBytes;
+            total.flowUpdates += s.flowUpdates;
+            total.linkAcks += s.linkAcks;
+            total.creditStalls += s.creditStalls;
+            total.queueStalls += s.queueStalls;
+            total.tagStalls += s.tagStalls;
+            total.orderingStalls += s.orderingStalls;
+            total.replayStalls += s.replayStalls;
+            total.peakOutstandingReads =
+                std::max(total.peakOutstandingReads, s.peakOutstandingReads);
+            total.peakOutstandingReadBytes =
+                std::max(total.peakOutstandingReadBytes, s.peakOutstandingReadBytes);
+            total.peakQueuePackets = std::max(total.peakQueuePackets, s.peakQueuePackets);
+            total.peakReplayBytes = std::max(total.peakReplayBytes, s.peakReplayBytes);
+            for (size_t i = 0; i < total.trafficBytes.size(); ++i)
+            {
+                total.trafficBytes[i] += s.trafficBytes[i];
+            }
+        }
+        std::cout << "pcieGeneration=" << rdmaConfig.pcie.generation << std::endl;
+        std::cout << "pcieLanes=" << rdmaConfig.pcie.lanes << std::endl;
+        std::cout << "pcieTopology=" << rdmaConfig.pcie.topology << std::endl;
+        std::cout << "pcieReadRequests=" << total.readRequests << std::endl;
+        std::cout << "pcieWriteTlps=" << total.writeTlps << std::endl;
+        std::cout << "pcieCompletionTlps=" << total.completionTlps << std::endl;
+        std::cout << "pcieTlpHops=" << total.tlpHops << std::endl;
+        std::cout << "pcieWireBytes=" << total.wireBytes << std::endl;
+        std::cout << "pcieFlowUpdates=" << total.flowUpdates << std::endl;
+        std::cout << "pcieLinkAcks=" << total.linkAcks << std::endl;
+        std::cout << "pcieCreditStalls=" << total.creditStalls << std::endl;
+        std::cout << "pcieQueueStalls=" << total.queueStalls << std::endl;
+        std::cout << "pcieReadWindowStalls=" << total.tagStalls << std::endl;
+        std::cout << "pcieOrderingStalls=" << total.orderingStalls << std::endl;
+        std::cout << "pcieReplayBufferStalls=" << total.replayStalls << std::endl;
+        std::cout << "pciePeakOutstandingReads=" << total.peakOutstandingReads << std::endl;
+        std::cout << "pciePeakOutstandingReadBytes=" << total.peakOutstandingReadBytes << std::endl;
+        std::cout << "pciePeakQueuePackets=" << total.peakQueuePackets << std::endl;
+        std::cout << "pcieTraceEvents=" << *pcieTraceEvents << std::endl;
+        std::cout << "pcieTraceTruncated=" << (*pcieTraceTruncated ? 1 : 0) << std::endl;
+        for (size_t i = 0; i < total.trafficBytes.size(); ++i)
+        {
+            std::cout << "pcieBytes_" << PcieTrafficName(static_cast<PcieTraffic>(i)) << '='
+                      << total.trafficBytes[i] << std::endl;
+        }
+    }
+    if(rdmaTraffic)
+    {
+        std::cout << "rdmaOperation=" << rdmaConfig.operation << std::endl;
+        std::cout << "rdmaOperationsCompleted=" << rdmaTraffic->GetCompleted() << std::endl;
+        std::cout << "rdmaOperationsFailed=" << rdmaTraffic->GetFailed() << std::endl;
+        std::cout << "rdmaLastAtomicValue=" << rdmaTraffic->GetLastValue() << std::endl;
+        std::cout << "rdmaRemoteValue=" << rdmaTraffic->GetRemoteValue() << std::endl;
+        std::cout << "rdmaSignalValue=" << rdmaTraffic->GetSignalValue() << std::endl;
+        std::cout << "rdmaLastAtomicValueHex=0x" << std::hex << rdmaTraffic->GetLastValue() << std::dec << std::endl;
+        std::cout << "rdmaRemoteValueHex=0x" << std::hex << rdmaTraffic->GetRemoteValue() << std::dec << std::endl;
+        std::cout << "rdmaSignalValueHex=0x" << std::hex << rdmaTraffic->GetSignalValue() << std::dec << std::endl;
+    }
+    if (IsDetailedRdmaMode(rdmaSubmission))
+    {
+        RdmaStats total;
+        for (auto model : g_rdmaModels)
+        {
+            const auto& st=model->GetStats();
+            total.requests+=st.requests;total.completedRequests+=st.completedRequests;
+            total.failedRequests+=st.failedRequests;
+            total.peakReadAtomic=std::max(total.peakReadAtomic,st.peakReadAtomic);
+            total.submitted+=st.submitted;total.completed+=st.completed;
+            total.failed+=st.failed;total.doorbells+=st.doorbells;total.cqes+=st.cqes;
+            total.startupSamples+=st.startupSamples;total.startupTotalNs+=st.startupTotalNs;
+            total.startupMaxNs=std::max(total.startupMaxNs,st.startupMaxNs);
+            total.requestStartupSamples+=st.requestStartupSamples;
+            total.requestStartupTotalNs+=st.requestStartupTotalNs;
+            total.requestStartupMaxNs=std::max(total.requestStartupMaxNs,st.requestStartupMaxNs);
+            total.peakOutstanding=std::max(total.peakOutstanding,st.peakOutstanding);
+            total.peakQpOutstanding=std::max(total.peakQpOutstanding,st.peakQpOutstanding);
+            total.sourceD2hBytes+=st.sourceD2hBytes;total.destinationH2dBytes+=st.destinationH2dBytes;
+            total.hostReadBytes+=st.hostReadBytes;total.hostWriteBytes+=st.hostWriteBytes;
+            total.hbmReadBytes+=st.hbmReadBytes;total.hbmWriteBytes+=st.hbmWriteBytes;
+            total.sourceStagingPeakBytes=std::max(total.sourceStagingPeakBytes,st.sourceStagingPeakBytes);
+            total.destinationStagingPeakBytes=std::max(total.destinationStagingPeakBytes,st.destinationStagingPeakBytes);
+            total.lastObservedNs=std::max(total.lastObservedNs,st.lastObservedNs);
+            total.lastDataReadyNs=std::max(total.lastDataReadyNs,st.lastDataReadyNs);
+        }
+        auto emit=[&total](const std::string& prefix) {
+            std::cout << prefix << "SubmittedWqes=" << total.submitted << std::endl;
+            std::cout << prefix << "CompletedWqes=" << total.completed << std::endl;
+            std::cout << prefix << "FailedWqes=" << total.failed << std::endl;
+            std::cout << prefix << "Doorbells=" << total.doorbells << std::endl;
+            std::cout << prefix << "Cqes=" << total.cqes << std::endl;
+            std::cout << prefix << "PeakOutstanding=" << total.peakOutstanding << std::endl;
+            std::cout << prefix << "PeakQpOutstanding=" << total.peakQpOutstanding << std::endl;
+            std::cout << prefix << "StartupSamples=" << total.startupSamples << std::endl;
+            std::cout << prefix << "MeanWqeStartupNs=" << (total.startupSamples ?
+                static_cast<double>(total.startupTotalNs)/total.startupSamples : 0) << std::endl;
+            std::cout << prefix << "MeanStartupNs=" << (total.requestStartupSamples ?
+                static_cast<double>(total.requestStartupTotalNs)/total.requestStartupSamples : 0) << std::endl;
+            std::cout << prefix << "MaxStartupNs=" << total.requestStartupMaxNs << std::endl;
+        };
+        emit("rdma");
+        if (rdmaSubmission == "ibgda") emit("ibgda");
+        std::cout << "rdmaSubmittedRequests=" << total.requests << std::endl;
+        std::cout << "rdmaCompletedRequests=" << total.completedRequests << std::endl;
+        std::cout << "rdmaFailedRequests=" << total.failedRequests << std::endl;
+        std::cout << "rdmaPeakReadAtomic=" << total.peakReadAtomic << std::endl;
+        RdmaOperationStats operations;
+        for(auto ep:endpoints) if(ep && ep->GetRdmaOperationEngine())
+        {
+            const auto& st=ep->GetRdmaOperationEngine()->GetStats();
+            operations.readRequests+=st.readRequests;operations.readResponseBytes+=st.readResponseBytes;
+            operations.atomicExecutions+=st.atomicExecutions;operations.rnrRetries+=st.rnrRetries;
+            operations.rnrExhausted+=st.rnrExhausted;operations.receiveCompletions+=st.receiveCompletions;
+            operations.signalUpdates+=st.signalUpdates;operations.responsePeak=std::max(operations.responsePeak,st.responsePeak);
+            operations.wireDataBytes+=st.wireDataBytes;operations.wireControlBytes+=st.wireControlBytes;
+        }
+        std::cout << "rdmaReadRequests=" << operations.readRequests << std::endl;
+        std::cout << "rdmaReadResponseBytes=" << operations.readResponseBytes << std::endl;
+        std::cout << "rdmaAtomicExecutions=" << operations.atomicExecutions << std::endl;
+        std::cout << "rdmaRnrRetries=" << operations.rnrRetries << std::endl;
+        std::cout << "rdmaRnrExhausted=" << operations.rnrExhausted << std::endl;
+        std::cout << "rdmaReceiveCompletions=" << operations.receiveCompletions << std::endl;
+        std::cout << "rdmaSignalUpdates=" << operations.signalUpdates << std::endl;
+        std::cout << "rdmaResponderPeak=" << operations.responsePeak << std::endl;
+        std::cout << "rdmaOperationDataBytes=" << operations.wireDataBytes << std::endl;
+        std::cout << "rdmaOperationControlBytes=" << operations.wireControlBytes << std::endl;
+        std::cout << "rdmaSourceD2hBytes=" << total.sourceD2hBytes << std::endl;
+        std::cout << "rdmaDestinationH2dBytes=" << total.destinationH2dBytes << std::endl;
+        std::cout << "rdmaHostReadBytes=" << total.hostReadBytes << std::endl;
+        std::cout << "rdmaHostWriteBytes=" << total.hostWriteBytes << std::endl;
+        std::cout << "rdmaHbmReadBytes=" << total.hbmReadBytes << std::endl;
+        std::cout << "rdmaHbmWriteBytes=" << total.hbmWriteBytes << std::endl;
+        std::cout << "rdmaSourceStagingPeakBytes=" << total.sourceStagingPeakBytes << std::endl;
+        std::cout << "rdmaDestinationStagingPeakBytes=" << total.destinationStagingPeakBytes << std::endl;
+        std::cout << "rdmaCompletionObservedNs=" << total.lastObservedNs << std::endl;
+        std::cout << "rdmaDataReadyNs=" << total.lastDataReadyNs << std::endl;
+        std::cout << "dataDeliveryDurationNs=" << g_deliveryDurationNs << std::endl;
+    }
     std::cout << "topology=" << topology << std::endl;
     std::cout << "collective=" << collective << std::endl;
     std::cout << "algorithm=" << algorithm << std::endl;

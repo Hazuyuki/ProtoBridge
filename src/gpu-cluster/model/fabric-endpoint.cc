@@ -22,9 +22,78 @@
 #include "ns3/enum.h"
 
 #include <algorithm>
+#include <cfenv>
+#include <cmath>
+#include <limits>
 
 namespace ns3
 {
+
+namespace
+{
+
+// Saturated Time addition (round 66, codex finding 4): the pacer machines
+// can return a saturated INT64_MAX-tick delay (a tiny configured rate with a
+// multi-MiB chunk), and adding any positive component to it overflows the
+// signed Time storage. Saturate at Time::Max() — a saturated component
+// already means "no earlier than the far-future bound". Normal inputs take
+// the plain addition (each positive component is far below the horizon, so
+// the pairwise-saturated sum is exact).
+//
+// Round 67 (codex finding 4): saturate against the ACTUAL tick storage, not
+// the nanosecond projection, and construct the saturated result via
+// Time::Max() — never Time(int64) or Seconds() on a large value:
+//  - Time(int64) interprets its argument as ticks in the CURRENT resolution,
+//    so a ns sum stored that way comes back 10^3x wrong at PS and 10^6x
+//    wrong at FS (Seconds(1)+Seconds(2) = 0.003 s at PS).
+//  - Seconds(x) routes x * ticksPerSecond through the 128-bit fixed-point
+//    multiply, which asserts on overflow: at MS/NS the INT64_MAX-ns product
+//    blows past 2^63, so a PS/FS-built SaturatedAdd result could not be
+//    reconstructed at a coarser resolution anyway — the far-future bound is
+//    resolution-dependent by construction (Time::Max() is INT64_MAX ticks,
+//    9.2e9 s at NS but 9.223372e+6 s at PS — round-68 correction; the
+//    previous 9.2e3 s was the FS span divided wrong).
+//  - Time::Max().GetNanoSeconds() (round-69 correction of the round-68
+//    note, which itself corrected a round-67 overclaim): the ns projection
+//    MULTIPLIES by the integer ns/tick factor at US and coarser
+//    resolutions, where INT64_MAX * factor overflows int64 (native probe at
+//    MS prints -1000000; the exact product is
+//    9223372036854775807*1000000); at NS the factor is 1 so ticks pass
+//    through unchanged (always exact); at PS/FS the projection DIVIDES by
+//    10^3/10^6 — exact whenever the quotient fits int64. No harness or
+//    parity path changes the resolution from the NS default, so the
+//    US-and-coarser overflow is unreachable here.
+Time
+SaturatedAdd(Time a, Time b)
+{
+    if (a <= Time(0) || b <= Time(0))
+    {
+        return (a <= Time(0)) ? b : a;
+    }
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
+}
+
+// Round 69 (codex finding 3): a saturated far-future delay passed directly
+// to Simulator::Schedule wraps inside DefaultSimulatorImpl's `delay +
+// TimeStep(now)` — Time::Max() at now >= 1 exceeds INT64_MAX (native
+// repro: 64-byte bulk at tick 1 with FEC encode latency Time::Max() ->
+// MacTx at INT64_MIN). Clamp every relative delay to the safe horizon
+// Time::Max() - Now(); the event then lands at Time::Max(), the latest
+// timestamp the simulator can represent.
+static Time
+ClampEgressDelay(Time delay)
+{
+    const Time horizon = Time::Max() - Simulator::Now();
+    return delay > horizon ? horizon : delay;
+}
+
+} // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("FabricEndpoint");
 
@@ -67,11 +136,19 @@ FabricEndpoint::GetTypeId()
                       BooleanValue(false),
                       MakeBooleanAccessor(&FabricEndpoint::m_sprayingEnabled),
                       MakeBooleanChecker())
+        // Round 63 (codex finding 16): route through the setter, not the raw
+        // member. The setter caps at 2^30 (keeping every fragment body
+        // representable in the packet pipeline) and aborts on zero; the
+        // old direct binding accepted UINT32_MAX, and the spray paths then
+        // built a fragment body larger than the packet pipeline can hold.
         .AddAttribute("SprayChunkSize",
                       "Chunk size for spraying in bytes (default 4KB)",
                       UintegerValue(4*1024),  // 4KB default
-                      MakeUintegerAccessor(&FabricEndpoint::m_sprayChunkSize),
-                      MakeUintegerChecker<uint32_t>())
+                      MakeUintegerAccessor(&FabricEndpoint::SetSprayChunkSize,
+                                           &FabricEndpoint::GetSprayChunkSize),
+                      // min 1: zero divides by zero in every spray chunk
+                      // count (codex round 50, finding 3)
+                      MakeUintegerChecker<uint32_t>(1))
         .AddAttribute("CreditManager",
                       "Credit manager for flow control",
                       PointerValue(),
@@ -211,6 +288,7 @@ void
 FabricEndpoint::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    DisposeIbgda();
     // Cancel every pending deferred-egress event: each captures raw `this`
     // and dereferences m_devices, which is cleared below. A survivor fired
     // after disposal crashed on the cleared member (codex round 13,
@@ -563,6 +641,7 @@ FabricEndpoint::AddNetDevice(Ptr<NetDevice> device)
     NS_LOG_FUNCTION(this << device);
     uint32_t idx = m_devices.size();
     m_devices.push_back(device);
+    if (m_ibgda) ConnectIbgdaDevice(device);
 
     // Set endpoint MAC address from first device if not already configured
     if (m_address == Mac48Address() && idx == 0)
@@ -655,7 +734,27 @@ FabricEndpoint::GetSprayingEnabled() const
 void
 FabricEndpoint::SetSprayChunkSize(uint32_t chunkSize)
 {
+    // Zero is a division-by-zero in every spray chunk count (codex round
+    // 50, finding 3); the representability cap mirrors SetBulkChunkSize
+    // (rounds 50-51: bodies stay under 2^30 — Buffer's grown
+    // g_recommendedStart headroom overflows a UINT32_MAX-41 body before
+    // the first AddHeader).
+    NS_ABORT_MSG_IF(chunkSize == 0, "Spray chunk size must be greater than zero");
+    constexpr uint32_t maxChunk = 1u << 30;
+    if (chunkSize > maxChunk)
+    {
+        NS_LOG_WARN("SprayChunkSize " << chunkSize << " capped to " << maxChunk
+                    << " to keep every fragment body representable in the "
+                       "packet pipeline");
+        chunkSize = maxChunk;
+    }
     m_sprayChunkSize = chunkSize;
+}
+
+uint32_t
+FabricEndpoint::GetSprayChunkSize() const
+{
+    return m_sprayChunkSize;
 }
 
 void
@@ -1031,6 +1130,24 @@ void
 FabricEndpoint::SetBulkChunkSize(uint32_t bytes)
 {
     NS_ABORT_MSG_IF(bytes == 0, "Bulk chunk size must be greater than zero");
+    // Representability cap (codex rounds 50-51): a body near UINT32_MAX
+    // breaks the packet pipeline in layers below the 39-B FabricHeader +
+    // 2-B PPP prepend: Buffer::Initialize starts the zero area at
+    // g_recommendedStart — headroom grown by every prior Buffer's header
+    // prefix (up to 51 B in the default pipeline) — so a
+    // UINT32_MAX - 41 body overflows m_zeroAreaStart + zeroSize in uint32
+    // and the first AddHeader asserts. The 1-GiB bound is the same
+    // representability invariant SendDataInternal's cap already uses
+    // (bodies stay under 2^30, with every downstream consumer in uint32
+    // range); transfers just fragment into more chunks.
+    constexpr uint32_t maxChunk = 1u << 30;
+    if (bytes > maxChunk)
+    {
+        NS_LOG_WARN("BulkChunkSize " << bytes << " capped to " << maxChunk
+                    << " to keep every fragment body representable in the "
+                       "packet pipeline");
+        bytes = maxChunk;
+    }
     m_bulkChunkSize = bytes;
 }
 
@@ -1125,6 +1242,12 @@ FabricEndpoint::PumpBulkTxWindow()
         header.SetEffectiveDataSize(desc.fragmentDataSize);
         header.SetTtl(64);
         chunkPacket->AddHeader(header);
+        if (desc.ibgdaWorkId != 0)
+        {
+            IbgdaPacketTag tag;
+            tag.workId=desc.ibgdaWorkId;
+            chunkPacket->AddPacketTag(tag);
+        }
 
         m_bulkTxInflight++;
         // Register window membership so the release paths can release a slot
@@ -1178,6 +1301,7 @@ FabricEndpoint::ReleaseBulkTxSlot()
         m_bulkTxInflight--;
     }
     PumpBulkTxWindow();
+    PumpRdmaOperationPackets();
 }
 
 bool
@@ -1561,8 +1685,15 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
             // append-site convention as SendDeferredEgressInternal and the
             // switch result-event ledger (codex round 29, finding 2).
             PruneDeferredEgressEvents();
+            // Round 70 (codex finding 6): clamp the configured decode
+            // latency through ClampEgressDelay like every other egress
+            // schedule site — an unclamped Time::Max()-scale latency wraps
+            // inside DefaultSimulatorImpl's `delay + TimeStep(now)` and the
+            // continuation fires at INT64_MIN (native repro: decodeLatency =
+            // Time::Max(), MacRx at tick 104, callback at tick
+            // -9223372036854775705).
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(decodeLatency,
+                Simulator::Schedule(ClampEgressDelay(decodeLatency),
                                     &FabricEndpoint::ContinueReceiveAfterFec,
                                     this, pkt, header));
             return true;
@@ -1971,11 +2102,23 @@ FabricEndpoint::DeliverBypassDataPacket(Ptr<Packet> packet, const FabricHeader& 
 void
 FabricEndpoint::NotifyPermanentLoss(FabricHeader originalHeader)
 {
+    if(m_rdmaOperations) m_rdmaOperations->PermanentLoss(originalHeader);
     uint32_t seqNum = originalHeader.GetSequenceNumber();
     uint16_t destRank = originalHeader.GetDestRank();
     uint8_t vcId = originalHeader.GetVirtualChannel();
 
     NS_LOG_FUNCTION(this << seqNum << destRank << static_cast<int>(vcId));
+    if (m_ibgda)
+    {
+        IbgdaPacketKey key{destRank,vcId,originalHeader.GetFlowId(),seqNum};
+        auto it=m_ibgdaPackets.find(key);
+        if (it != m_ibgdaPackets.end())
+        {
+            m_ibgda->NotifyFailure(it->second.first);
+            m_ibgdaPackets.erase(it);
+        }
+    }
+
 
     // A permanently lost chunk will never be ACKed: free its TX-window slot
     // so the window can't leak closed. Gate on window MEMBERSHIP, not just
@@ -2276,7 +2419,20 @@ FabricEndpoint::SendRetransmission(LlrManager::Retransmission retransmission)
 void
 FabricEndpoint::ProcessAckPacket(Ptr<Packet> packet, const FabricHeader& header)
 {
+    if(m_rdmaOperations) m_rdmaOperations->PacketAcknowledged(header,packet);
     NS_LOG_FUNCTION(this << packet << header.GetSequenceNumber());
+    if (m_ibgda)
+    {
+        IbgdaPacketKey key{header.GetSourceRank(),header.GetVirtualChannel(),
+                           header.GetFlowId(),header.GetSequenceNumber()};
+        auto it=m_ibgdaPackets.find(key);
+        if (it != m_ibgdaPackets.end())
+        {
+            auto [id,bytes]=it->second;
+            m_ibgdaPackets.erase(it); // duplicate ACKs never retire a WR twice
+            m_ibgda->NotifyPacketAck(id,bytes);
+        }
+    }
 
     // ACK-clocked TX window, independent of LLR: the ACK proves the receiver
     // got the chunk, so its window slot is free — the same "delivery means
@@ -2492,11 +2648,39 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
             // lifetime of the stream. Prune here so every append site owns
             // its own expired-entry removal.
             PruneDeferredEgressEvents();
-            m_deferredEgressEvents.push_back(
-                Simulator::Schedule(m_memoryLatency,
-                                    &FabricEndpoint::SendMemoryResponse,
-                                    this, header.GetSourceRank(),
-                                    dataPtr, availSize));
+            // Round 72 (codex finding 2): clamp the schedule delay exactly
+            // like the six other egress schedule sites. A Time::Max()
+            // configured memory latency is a degenerate-but-accepted value;
+            // passed raw, DefaultSimulatorImpl::Schedule's
+            // `delay + TimeStep(now)` wraps past INT64_MAX (probe:
+            // m_memoryLatency = Time::Max(), now = 7 -> response fires at
+            // tick -9223372036854775799) and the response goes out
+            // immediately with a corrupted timestamp instead of never.
+            // Round 73 (codex finding 2): ClampEgressDelay only fixes the
+            // SCHEDULE instant — at absolute Time::Max() the simulator
+            // still executes the event (probe: read at tick 7, memory
+            // latency Time::Max(), 200 Gbps link -> tx at
+            // 9223372036854775807, downstream serialization wraps and the
+            // response is DELIVERED at -9223372036854775807). A degenerate
+            // latency must drop the response entirely rather than emit it
+            // past the representable horizon, so skip scheduling when the
+            // clamp saturated at Time::Max().
+            // Round 74 (codex finding 2): the boundary above is off by the
+            // remaining horizon — a finite latency that merely saturates the
+            // deadline still produces a Time::Max() schedule (probe: read at
+            // tick 7, m_memoryLatency = Time::Max()-1 -> deferred deadline
+            // INT64_MAX, response tx at Max, rx at -9223372036854775807).
+            // Reject ANY latency whose deadline lands at Time::Max(), i.e.
+            // latency >= Time::Max() - Now() (the same
+            // IsUnrepresentableTimeout rule used by the LLR retry arm).
+            if (m_memoryLatency < Time::Max() - Simulator::Now())
+            {
+                m_deferredEgressEvents.push_back(
+                    Simulator::Schedule(ClampEgressDelay(m_memoryLatency),
+                                        &FabricEndpoint::SendMemoryResponse,
+                                        this, header.GetSourceRank(),
+                                        dataPtr, availSize));
+            }
         }
     }
     else if (!duplicate && type == FabricPacketType::MEMORY_WRITE)
@@ -2615,6 +2799,11 @@ FabricEndpoint::SendCreditPacket(uint16_t destRank, uint8_t vcId, uint16_t count
 void
 FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumulative)
 {
+    // Duplicate data may arrive while the original is waiting for memory
+    // service or a staging buffer. It cannot acknowledge unwritten data.
+    if (m_rdmaPendingAck.count({receivedHeader.GetSourceRank(),receivedHeader.GetVirtualChannel(),
+                                receivedHeader.GetFlowId(),receivedHeader.GetSequenceNumber()})) return;
+
     // The ACK has two consumers: the LLR retry store (LLR on) and the So TX
     // window (soTxWindow > 0 — the ACK is the window's clock, the perftest
     // tx_depth analog's completion notification). LLR-off used to suppress
@@ -2622,7 +2811,8 @@ FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumula
     // window filled with its first soTxWindow chunks and no ACK ever came
     // to release a slot (the 2:1 incast stall investigation). Keep the LLR
     // store dependencies inside; the plain ACK itself needs neither.
-    if ((!m_llrEnabled || !m_llrManager) && m_soTxWindow == 0)
+    if ((!m_llrEnabled || !m_llrManager) && m_soTxWindow == 0 &&
+        !(m_ibgda && !IsLocalRank(receivedHeader.GetSourceRank())))
     {
         return;
     }
@@ -2658,6 +2848,7 @@ FabricEndpoint::SendLlrAckPacket(const FabricHeader& receivedHeader, bool cumula
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(receivedHeader.GetSourceRank()));
     packet->AddHeader(header);
+    if(m_rdmaOperations) m_rdmaOperations->DecorateAck(receivedHeader,packet);
 
     uint32_t deviceIndex = ResolveDeviceIndex(receivedHeader.GetSourceRank());
     SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(receivedHeader.GetSourceRank()));
@@ -3128,6 +3319,8 @@ bool
 FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                                     const Address& dest)
 {
+    if (PrepareIbgdaPacket(packet, deviceIndex, dest)) return true;
+
     NS_LOG_FUNCTION(this << packet << deviceIndex);
 
     // PFC throttle (802.1Qbb analog, So-only): while the switch holds a pause
@@ -3215,13 +3408,32 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         if (!hdr.IsControlPacket() && !hdr.IsMemoryPacket() && !hdr.IsRetryPacket()
             && hdr.GetSourceRank() == m_rank)
         {
-            double eff = GetProtocolModelForDest(hdr.GetDestRank())->GetEfficiency(hdr.GetProtocol());
-            if (eff < 1.0)
+            // Union gate (codex round 36, finding 1 + test regression on its
+            // first fix): shape when EITHER condition holds.
+            //   - destIsRoce: the destination's model being the RoCE So model
+            //     is what makes inter-node RDMA traffic subject to DCQCN rate
+            //     shaping at ANY configured WireEfficiency — the old
+            //     `eff < 1.0` test silently disabled shaping (and the
+            //     SoHeader/ECN/CNP framing below) whenever WireEfficiency was
+            //     exactly 1.0, e.g. the ns3-rdma alignment knob
+            //     --soRoceWireEfficiency=1.0, which is about header accounting,
+            //     not about turning congestion control off.
+            //   - eff < 1.0: Su-protocol framing inflation (NCCL LL 64/128,
+            //     LL128 120/128) still needs the per-QP pacer even though the
+            //     destination model is the Su (NCCL) model. Identity alone
+            //     dropped this and broke EgressDisposeCancelsDeferredSendsTest,
+            //     which relies on ShapingDelay spacing same-flow NCCL LL sends.
+            Ptr<ProtocolModel> destModel = GetProtocolModelForDest(hdr.GetDestRank());
+            bool destIsRoce = (destModel
+                               && destModel->GetInstanceTypeId()
+                                      == RoceProtocolModel::GetTypeId());
+            double eff = destModel ? destModel->GetEfficiency(hdr.GetProtocol()) : 1.0;
+            if (destIsRoce || eff < 1.0)
             {
                 uint64_t flowKey = MakeRateFlowKey(m_rank,
                                                   hdr.GetDestRank(),
                                                   hdr.GetVirtualChannel(),
-                                                  hdr.GetFlowId());
+                                                  GetIbgdaRateFlow(packet,hdr));
                 shapingDelay = m_dcqcnRate->ShapingDelay(packet->GetSize(), flowKey);
             }
         }
@@ -3249,7 +3461,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             uint64_t flowKey = MakeRateFlowKey(m_rank,
                                               hdr.GetDestRank(),
                                               hdr.GetVirtualChannel(),
-                                              hdr.GetFlowId());
+                                              GetIbgdaRateFlow(packet,hdr));
             shapingDelay = std::max(shapingDelay,
                                     m_rttccRate->ShapingDelay(packet->GetSize(), flowKey));
             // At most one probe per ProbeInterval rides ahead of the data
@@ -3259,7 +3471,7 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             if (m_rttccRate->MaybeStartProbe(flowKey, probeSeq))
             {
                 SendRttProbePacket(hdr.GetDestRank(), hdr.GetVirtualChannel(),
-                                   hdr.GetFlowId(), probeSeq);
+                                   GetIbgdaRateFlow(packet,hdr), probeSeq);
             }
         }
     }
@@ -3305,11 +3517,84 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         FabricHeader hdr;
         packet->PeekHeader(hdr);
         uint32_t payloadSize = packet->GetSize() - hdr.GetSerializedSize();
-        uint32_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
+        // uint64 encoded size (codex round 51, finding 2): the encoded
+        // size of a near-4-GB payload crosses UINT32_MAX — the old uint32
+        // GetEncodedSize narrowed 4,339,299,640 to 44,332,344, BELOW the
+        // payload, silently skipping the parity padding and understating
+        // serialization. With the widened return, an over-large pad is a
+        // configuration error (no uint32-sized packet can carry it) —
+        // fail loudly instead of truncating. Bound the complete encoded
+        // packet, not the pad alone (round 52: padding alone can fit
+        // uint32 while payload + padding wraps the 32-bit packet
+        // accounting; keep header headroom the rest of the pipeline
+        // reserves, and reject AT the boundary). The headroom is 9 MiB,
+        // not 51 B (codex rounds 54/55/56): Buffer offsets are absolute
+        // from the allocation origin, and Packet::AddHeader grows the
+        // buffer with AddAtStart — a warm prefix (up to 51 B: 39-B
+        // FabricHeader + 10-B SoHeader + 2-B PPP at this very send path)
+        // can precede the fragment in the same Buffer, so an encoded
+        // body that fits UINT32_MAX - 51 by itself still overflows the
+        // 32-bit offset space once a prefix exists. Round 55 doubled
+        // the margin after a probe reproduced the overflow AT
+        // kMaxPayload - 1 because Buffer's recommended starting offset
+        // is a process-global high-water mark (buffer.cc:
+        // g_recommendedStart) raised by any earlier large
+        // Packet(bytes, N) constructor call. Round 57: the round-56 "margin" reasoning was unsound — the raw
+        // SendData single-packet path constructs Create<Packet>(data,
+        // size) with size up to the 128 MiB fragmentation threshold
+        // (fabric-endpoint-send.cc SendData), so g_recommendedStart can
+        // drift far past any fixed slack, and Buffer::AddAtEnd(Buffer)
+        // reuses a recycled oversized Data whose absolute offsets wrap
+        // the uint32 end computation for any encoded body near
+        // kMaxPayload. There is no in-module bound on the drift, so the
+        // guard must be expressed against the ACTUAL headroom: the live
+        // g_recommendedStart value plus the packet's own serialized
+        // header prefix.
+        uint64_t encodedPayloadSize = m_fecModel->GetEncodedSize(payloadSize);
         if (encodedPayloadSize > payloadSize)
         {
-            uint32_t padding = encodedPayloadSize - payloadSize;
-            packet->AddAtEnd(Create<Packet>(padding));
+            // Absolute-offset guard (codex round 57): Buffer::Initialize
+            // starts every new buffer's zero area at
+            // Buffer::g_recommendedStart, a process-global high-water
+            // mark raised by ANY Packet construction (buffer.cc). A
+            // fixed margin cannot bound it: SendData's single-packet
+            // path alone admits bodies up to 128 MiB
+            // (MEM_SAFE_THRESHOLD). The AddAtEnd(padding) below recycles
+            // an oversized Data whose m_start already sits near the old
+            // mark; the uint32 m_zeroAreaEnd / m_end then wrap for any
+            // encoded body whose absolute end exceeds UINT32_MAX. Read
+            // the live mark and the packet's own header prefix
+            // (FabricHeader + optional SoHeader + PPP) so the bound
+            // tracks the real offset space.
+            // Round 59: also reserve Buffer::Allocate's 100-B
+            // ALLOC_OVER_PROVISION (plus the Buffer::Data header) — the
+            // append below re-enters Allocate when the shared-buffer
+            // path recycles an oversized Data, and a request within 100
+            // of UINT32_MAX would wrap the uint32 allocation size and
+            // under-allocate the memcpy destination (codex probe: FEC
+            // N=813,K=1 payload 5,282,862 encodes to 4,294,967,213;
+            // request 4,294,967,252 wrapped to 56).
+            const uint32_t headerPrefix =
+                hdr.GetSerializedSize() + SoHeader().GetSerializedSize() + 2;
+            const uint64_t headroom =
+                static_cast<uint64_t>(Buffer::GetRecommendedStart()) + headerPrefix +
+                Buffer::GetAllocationOverProvision() + Buffer::GetDataHeaderSize();
+            NS_ABORT_MSG_IF(encodedPayloadSize + headroom >=
+                                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
+                            "FEC parity expansion of a " << payloadSize
+                                                       << "-B payload encodes to "
+                                                       << encodedPayloadSize
+                                                       << " B; with the current Buffer "
+                                                          "recommended-start "
+                                                       << Buffer::GetRecommendedStart()
+                                                       << " B and " << headerPrefix
+                                                       << " B of header prefix there is no "
+                                                          "uint32 offset space left "
+                                                          "— reduce the chunk size, disable "
+                                                          "FEC, or lower the preceding "
+                                                          "packet sizes");
+            const uint64_t padding = encodedPayloadSize - payloadSize;
+            packet->AddAtEnd(Create<Packet>(static_cast<uint32_t>(padding)));
         }
     }
 
@@ -3325,7 +3610,16 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                                      ? m_fecModel->GetEncodeLatency()
                                      : Time(0);
             Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-            Time totalDelay = serviceTime + encodeLatency + shapingDelay;
+            // Round 66 (codex finding 4, deferred chain from round 65): a
+            // saturated pacer slot (INT64_MAX ns — reachable at 1 MiB with a
+            // 2^-40 Gbps configured rate) overflows the signed Time storage
+            // in these sums. Saturate the composed delay at Time::Max():
+            // any saturated component already means "never" for scheduling
+            // purposes, and the far-future bound keeps the addition in range.
+            // Normal inputs are untouched (each positive component is well
+            // below the horizon, so the pairwise-saturated sum is exact).
+            const Time totalDelay = SaturatedAdd(SaturatedAdd(serviceTime, encodeLatency),
+                                                 shapingDelay);
             if (totalDelay > Time(0))
             {
                 NS_LOG_DEBUG("WFQ contention: class=" << static_cast<int>(tc)
@@ -3336,9 +3630,13 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 // before a deferred egress fires (codex round 28, finding 1).
                 const bool retransmit = m_isRetransmitting;
                 m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(totalDelay, [this, packet, deviceIndex, dest, retransmit]() {
-                        SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
-                    }));
+                    // Round 69 (codex finding 3): clamp the saturated
+                    // far-future delay to Time::Max() - Now(); Schedule
+                    // adds Now() and Time::Max() + 1 wraps past INT64_MAX.
+                    Simulator::Schedule(ClampEgressDelay(totalDelay),
+                                        [this, packet, deviceIndex, dest, retransmit]() {
+                                            SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
+                                        }));
                 // Decrement backlog after packet finishes transmission
                 // (serialization). Tracked like the deferred send itself:
                 // the lambda captures raw `this`, so DoDispose must cancel
@@ -3350,8 +3648,11 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                 // a replacement model gets debited for backlog it never
                 // accrued.
                 Ptr<ContentionModel> model = m_contentionModel;
-                Time txDone = totalDelay + serialization;
-                EventId decrEv = Simulator::Schedule(txDone, [model, tc]() {
+                // Round 67 (codex finding 4): totalDelay can be the
+                // saturated far-future bound; adding serialization to it
+                // overflows the signed Time storage. Saturate the sum.
+                Time txDone = SaturatedAdd(totalDelay, serialization);
+                EventId decrEv = Simulator::Schedule(ClampEgressDelay(txDone), [model, tc]() {
                     if (model)
                     {
                         model->DecrementBacklog(tc);
@@ -3368,14 +3669,18 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
     if (LinkUsesFec())
     {
         Time encodeLatency = m_fecModel->GetEncodeLatency();
-        Time delay = encodeLatency + shapingDelay;
+        // Round 66 (codex finding 4): same saturated-pacer composition as
+        // the WFQ branch above — saturate at Time::Max() instead of
+        // overflowing the signed Time addition.
+        const Time delay = SaturatedAdd(encodeLatency, shapingDelay);
         if (delay > Seconds(0))
         {
             // Capture the retransmit flag (codex round 28, finding 1).
             const bool retransmit = m_isRetransmitting;
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(delay, [this, packet, deviceIndex, dest, retransmit]() {
-                    SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
+                Simulator::Schedule(ClampEgressDelay(delay),
+                                    [this, packet, deviceIndex, dest, retransmit]() {
+                                        SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
                 }));
             // Decrement backlog after serialization. Tracked for DoDispose
             // like the deferred send above (raw-`this` capture; codex round
@@ -3385,12 +3690,16 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
             {
                 Ptr<ContentionModel> model = m_contentionModel;
                 Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-                EventId decrEv = Simulator::Schedule(delay + serialization, [model, tc]() {
-                    if (model)
-                    {
-                        model->DecrementBacklog(tc);
-                    }
-                });
+                // Round 67 (codex finding 4): saturate — delay can be the
+                // saturated far-future bound (see the WFQ branch above).
+                EventId decrEv = Simulator::Schedule(
+                    ClampEgressDelay(SaturatedAdd(delay, serialization)),
+                    [model, tc]() {
+                        if (model)
+                        {
+                            model->DecrementBacklog(tc);
+                        }
+                    });
                 m_deferredEgressEvents.push_back(decrEv);
                 TrackBacklogDecrement(decrEv, model, tc);
             }
@@ -3423,12 +3732,15 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         // increment ran on (codex round 20, finding 7 — see the WFQ branch).
         Ptr<ContentionModel> model = m_contentionModel;
         Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-        EventId decrEv = Simulator::Schedule(shapingDelay + serialization, [model, tc]() {
-            if (model)
-            {
-                model->DecrementBacklog(tc);
-            }
-        });
+        // Round 67 (codex finding 4): saturate — shapingDelay can be the
+        // saturated far-future bound (see the WFQ branch above).
+        EventId decrEv = Simulator::Schedule(ClampEgressDelay(SaturatedAdd(shapingDelay, serialization)),
+                                             [model, tc]() {
+                                                 if (model)
+                                                 {
+                                                     model->DecrementBacklog(tc);
+                                                 }
+                                             });
         m_deferredEgressEvents.push_back(decrEv);
         TrackBacklogDecrement(decrEv, model, tc);
     }
@@ -3561,6 +3873,8 @@ void
 FabricEndpoint::OnPacketDelivered(Ptr<Packet> packet, uint32_t seqNum, FabricHeader header)
 {
     NS_LOG_FUNCTION(this << packet << seqNum);
+    if(m_rdmaOperations && m_rdmaOperations->Receive(packet,header)) return;
+    if (DeferIbgdaReceive(packet, header)) return;
     NS_LOG_DEBUG("OnPacketDelivered: rank=" << m_rank << " seq=" << seqNum << " callback null=" << m_receiveCallback.IsNull());
 
     // Record flow completion in latency statistics
@@ -3570,7 +3884,9 @@ FabricEndpoint::OnPacketDelivered(Ptr<Packet> packet, uint32_t seqNum, FabricHea
     }
 
     FabricPacketType packetType = header.GetPacketType();
-    SendLlrAckPacket(header, false);
+    IbgdaPacketTag rdmaTag;
+    if (!packet->PeekPacketTag(rdmaTag) || !rdmaTag.ackIssued)
+        SendLlrAckPacket(header,false);
     // Return credits only for intra-node (Su) traffic. Scale-out (So) packets
     // bypassed credit on send (SendBulkWireTransferSize's IsLocalRank guard),
     // so there is no credit owed back. Returning one for an So packet would
@@ -3653,9 +3969,11 @@ FabricEndpoint::SendBulkWireTransfer(uint16_t destRank, const uint8_t* data, uin
 }
 
 void
-FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
+FabricEndpoint::SendBulkWireTransferSizeImpl(uint16_t destRank, uint64_t dataSize,
                                           uint8_t protocolId, uint16_t flowId, uint8_t vcId)
 {
+    const uint32_t chunkLimit = m_activeIbgdaWork != 0
+        ? std::min(m_bulkChunkSize, m_ibgda->GetConfig().mtuBytes) : m_bulkChunkSize;
     NS_LOG_FUNCTION(this << destRank << dataSize << static_cast<int>(protocolId) << flowId << vcId);
 
     // A zero-byte transfer carries nothing: emit no packet and no retry-store
@@ -3685,34 +4003,95 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
     const double efficiency = GetProtocolModelForDest(destRank)->GetEfficiency(protocolId);
     const uint64_t wireSize = GetProtocolModelForDest(destRank)->GetWireSize(dataSize, protocolId);
 
+    // Unsizable-ledger guard (codex rounds 48-49): a sub-2^-62 efficiency
+    // saturates GetWireSize to UINT64_MAX, and a near-saturated ledger
+    // (e.g. efficiency just above 2^-64: 1 B -> 18446744073709547536)
+    // passes a bare sentinel test but still wraps the fragmentation
+    // arithmetic below — wireSize + MAX_CHUNK_BYTES - 1 overflows to a
+    // small memCapChunks, wireChunkSize underflow-divides, and the
+    // dataChunkSize line SIGFPEs. Every ceiling division and offset in
+    // the fragmentation stays representable only when the ledger is far
+    // from 2^64; 2^62 bounds it with 4 exabits of headroom (the largest
+    // transfer the packet pipeline can physically service is bounded by
+    // the data cap at ~2^30 anyway — a bigger ledger is a configuration
+    // error like the saturation, not a queueable transfer). The UB
+    // model's attribute checker floors the efficiency at DBL_MIN, but
+    // GetWireSize is also reachable through direct object attribute
+    // sets. Fail loudly with an actionable message instead.
+    constexpr uint64_t maxServicableWireLedger = 1ull << 62;
+    NS_ABORT_MSG_IF(wireSize > maxServicableWireLedger,
+                    "Bulk transfer of " << dataSize << " B to rank " << destRank
+                    << " (efficiency " << efficiency << ", wire ledger "
+                    << wireSize << " B) cannot be serviced: raise the "
+                       "efficiency or reduce the transfer size");
+    // Wrapped-inside-GetWireSize ledger (codex round 50, finding 2): the
+    // NCCL LL framing multiplies in uint64, so dataSize = 2^63 wraps its
+    // true 2^64 ledger to ZERO — which passes the bound above and emits a
+    // header-only "successful" transfer (or divides by zero through
+    // wireChunkSize). Zero wire bytes for nonzero data is never legitimate.
+    NS_ABORT_MSG_IF(wireSize == 0,
+                    "Bulk transfer of " << dataSize << " B to rank " << destRank
+                    << " computed a ZERO wire ledger (model arithmetic "
+                       "overflowed): reduce the transfer size");
+    // Wrapped-nonzero ledger (codex round 51, finding 4): a protocol
+    // model whose framing arithmetic wraps can return a small NONZERO
+    // ledger for a huge dataSize (the UB MAINTENANCE arm wrapped
+    // 16 + UINT64_MAX to 15 and max(128, 15) = 128 passed both guards
+    // above). No honest efficiency > 0 ever yields wire bytes below the
+    // data size, so an under-sized ledger is always a model bug.
+    NS_ABORT_MSG_IF(wireSize < dataSize,
+                    "Bulk transfer of " << dataSize << " B to rank " << destRank
+                    << " computed a wire ledger of " << wireSize
+                    << " B below the data size (model arithmetic "
+                       "overflowed): reduce the transfer size");
+
     NS_LOG_INFO("Bulk wire transfer: dataSize=" << dataSize << " wireSize=" << wireSize
                << " efficiency=" << efficiency << " protocol=" << static_cast<int>(protocolId));
 
     // Seam B (WU-SoH5): activate the dormant SoHeader/ECN/CNP loop on the So
-    // (RoCE) fabric. When efficiency < 1.0 (inter-node RoCE) and the mounted
-    // payload builder is RocePayloadBuilder, stamp a within-budget SoHeader +
-    // SetProtocol(SIMPLE) on each coalesced bulk packet. The 10-byte SoHeader
-    // sits WITHIN the wireSize budget (Create(wireChunk-10) + AddHeader(SoHeader)
-    // == wireChunk on-wire body), so chunk count and egress serialization are
-    // unchanged -> bit-identical at zero congestion (ECN never marks). Su
-    // (efficiency == 1.0) and non-RoCE builders stay on SetProtocol(0) with no
-    // SoHeader -> dormant, no breakage. This lights up
-    // EthernetSwitch::MarkEcnIfCongested (guard GetProtocol()==SIMPLE),
-    // SoHeader::PeekEcn, and SendCnpPacket on real So bulk traffic.
-    // NOTE: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1) on the
-    // receive dispatch; the protocol-framed wire flag stamped only when a
-    // SoHeader is actually present keeps Su NVLink LL packets (framed by the
-    // Su builder but byte-1) out of the So extraction path, so the two
-    // byte-1 populations never cross-fire. Chunks too small to hold the
-    // 10-byte header (wireChunk <= soHeaderSize) stay raw + unframed — the
-    // receiver delivers them through the raw path instead of aborting on a
-    // header deserialize that cannot fit.
+    // (RoCE) fabric. When the destination's model is the RoCE So model and the
+    // mounted payload builder is RocePayloadBuilder, stamp a within-budget
+    // SoHeader + SetProtocol(SIMPLE) on each coalesced bulk packet. The
+    // 10-byte SoHeader sits WITHIN the wireSize budget
+    // (Create(wireChunk-10) + AddHeader(SoHeader) == wireChunk on-wire body),
+    // so chunk count and egress serialization are unchanged -> bit-identical
+    // at zero congestion (ECN never marks). Su models and non-RoCE builders
+    // stay on SetProtocol(0) with no SoHeader -> dormant, no breakage. This
+    // lights up EthernetSwitch::MarkEcnIfCongested (guard
+    // GetProtocol()==SIMPLE), SoHeader::PeekEcn, and SendCnpPacket on real
+    // So bulk traffic. Union gate — RoCE identity *or* efficiency < 1.0
+    // (codex round 36, finding 1): WireEfficiency=1.0 (the ns3-rdma
+    // alignment setting, a header-accounting choice) must not silently
+    // deframe the ECN/CNP loop; conversely a non-RoCE So model still under
+    // efficiency < 1.0 keeps the legacy framing. Receive dispatch routes by
+    // the wire-level framed flag (round 11), so it adapts to either side.
+    // NOTE: RoceProtocol::SIMPLE(1) collides with NcclProtocol::LL(1) on
+    // the receive dispatch, and the protocol-framed wire flag alone does
+    // NOT separate them — Su NCCL LL sends also stamp it (SendDataInternal
+    // sets SetProtocolFramed for every builder-framed chunk), so both
+    // byte-1 populations enter protocol processing. Their actual
+    // separation is builder-based: Su LL packets are framed by the
+    // NcclProtocolPayloadBuilder and extracted with
+    // GetPayloadBuilderForRank(sourceRank) (never a SoHeader), while the
+    // switch-side ECN-mark and receiver CNP-echo guards additionally key
+    // on fabric type == ROCE, which Su NVLink packets never carry. Chunks
+    // too small to hold the 10-byte header (wireChunk <= soHeaderSize)
+    // stay raw + unframed — the receiver delivers them through the raw
+    // path instead of aborting on a header deserialize that cannot fit.
     const uint32_t soHeaderSize = SoHeader().GetSerializedSize();
-    const bool stampSoHeader = (efficiency < 1.0) && payloadBuilder &&
+    Ptr<ProtocolModel> destModel = GetProtocolModelForDest(destRank);
+    const bool destIsRoceModel = (destModel
+                                  && destModel->GetInstanceTypeId()
+                                         == RoceProtocolModel::GetTypeId());
+    const double framingEfficiency = (destModel
+                                      ? destModel->GetEfficiency(protocolId)
+                                      : 1.0);
+    const bool stampSoHeader = (destIsRoceModel || framingEfficiency < 1.0)
+        && payloadBuilder &&
         (payloadBuilder->GetInstanceTypeId() == RocePayloadBuilder::GetTypeId());
 
     std::vector<uint32_t> devices = GetPhysicalDevicesForDest(destRank);
-    const uint64_t MAX_CHUNK_BYTES = m_bulkChunkSize;
+    const uint64_t MAX_CHUNK_BYTES = chunkLimit;
     bool needFragment = (devices.size() > 1) ||
                         (wireSize > MAX_CHUNK_BYTES);
 
@@ -3725,7 +4104,6 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         }
 
         uint64_t minChunks = sendDevices.size();
-        uint64_t sizeBasedChunks = (wireSize + m_sprayChunkSize - 1) / m_sprayChunkSize;
         // Coalesce bulk transfers while retaining at least one chunk per path.
         // Total wire bytes and path striping are unchanged. Queue and credit
         // events occur at this coarser granularity, so this API is reserved for
@@ -3741,7 +4119,26 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
         // (wireSize - offset underflows) and emit zero/phantom data bytes.
         uint64_t memCapChunks = (wireSize + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
         uint64_t numChunks = std::max(minChunks, memCapChunks);
-        (void)sizeBasedChunks;
+        // Header headroom (codex rounds 50-51, findings 1+3): the fragment
+        // body must stay representable in the packet pipeline — not merely
+        // inside a uint32 after the 39-B FabricHeader + 2-B PPP prepend:
+        // Buffer::Initialize starts the zero area at g_recommendedStart
+        // (prefix headroom grown by every prior Buffer, up to 51 B), so a
+        // UINT32_MAX - 41 body overflows the uint32 end computation and
+        // the first AddHeader asserts. The 2^30 bound is the same
+        // representability invariant SendDataInternal's cap uses. The raw
+        // attributes can also sit near UINT32_MAX (the setters cap; the
+        // attribute path bypasses them). Clamp the fragment body; the
+        // transfer just fragments into more chunks. This also subsumes the
+        // unused sizeBasedChunks division (removed: it divided by a
+        // possibly-zero spray size and its result was never consumed).
+        constexpr uint64_t maxFragmentBody = 1ull << 30;
+        if (MAX_CHUNK_BYTES > maxFragmentBody)
+        {
+            const uint64_t bodyCapChunks =
+                (wireSize + maxFragmentBody - 1) / maxFragmentBody;
+            numChunks = std::max(numChunks, bodyCapChunks);
+        }
         numChunks = std::min(numChunks, std::max<uint64_t>(wireSize, 1));
         uint64_t wireChunkSize = (wireSize + numChunks - 1) / numChunks;
         // Only the first sentChunks fragments are actually emitted (the loops
@@ -3798,6 +4195,7 @@ FabricEndpoint::SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                     break; // wire-padding fragment: no data bytes left to send
                 }
                 BulkTxChunk desc;
+                desc.ibgdaWorkId = m_activeIbgdaWork;
                 desc.destRank = destRank;
                 desc.flowId = flowId;
                 desc.vcId = vcId;
@@ -4133,7 +4531,9 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
         protocolId == static_cast<uint8_t>(RoceProtocol::SIMPLE) &&
         SoHeader::PeekEcn(packet))
     {
-        SendCnpPacket(header);
+        FabricHeader feedbackHeader=header;
+        feedbackHeader.SetFlowId(GetIbgdaRateFlow(packet,header));
+        SendCnpPacket(feedbackHeader);
     }
 
     // Extract pure data from protocol-aware payload (So sources use the So
@@ -4147,6 +4547,10 @@ FabricEndpoint::ProcessProtocolDataPacket(Ptr<Packet> packet, const FabricHeader
     {
         // Create a new packet with extracted data
         Ptr<Packet> dataPacket = Create<Packet>(extractedData.data(), extracted);
+        IbgdaPacketTag ibgdaTag;
+        if (packet->PeekPacketTag(ibgdaTag)) dataPacket->AddPacketTag(ibgdaTag);
+        RdmaOperationTag operationTag;
+        if(packet->PeekPacketTag(operationTag)) dataPacket->AddPacketTag(operationTag);
 
         // Deliver to application via callback
         uint8_t vcId = header.GetVirtualChannel();

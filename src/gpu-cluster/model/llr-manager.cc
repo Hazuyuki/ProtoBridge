@@ -14,10 +14,52 @@
 #include "ns3/enum.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace ns3
 {
+
+namespace
+{
+
+// Round 73 (codex finding 3): a degenerate far-future RetryTimeout
+// (Time::Max(), or any value within RetryTimeout of Time::Max()) passed
+// directly to Simulator::Schedule wraps inside DefaultSimulatorImpl's
+// `delay + TimeStep(now)` — at tick 7 the event lands at
+// -9223372036854775802 and fires immediately. DefaultSimulatorImpl also
+// EXECUTES events scheduled at absolute Time::Max(), so "clamp to
+// Time::Max()" is not "never": the timeout callback would retransmit at
+// the end of time. A stored packet whose configured backstop can never
+// fire within the representable horizon has no timer at all — the entry
+// survives until an ACK, a NACK (which re-arms a plain timeout), or
+// teardown. Same policy as the round-73 memory-response fix
+// (FabricEndpoint::ProcessMemoryPacket): Time::Max() means "drop the
+// deferred action", not "run it at Time::Max()".
+bool
+IsUnrepresentableTimeout(Time timeout)
+{
+    return timeout >= Time::Max() - Simulator::Now();
+}
+
+// Saturating add for Time (raw-tick) ledgers: a sum that would pass
+// INT64_MAX clamps to Time::Max() instead of wrapping negative (round 74
+// codex finding 3 — the source-reload service/availability/cumulative
+// ledgers and the returned readyDelay otherwise wrap and the caller's
+// readyDelay > 0 test fails open, bypassing the reload hold).
+Time
+SaturatedAddTime(Time a, Time b)
+{
+    const int64_t aTicks = a.GetTimeStep();
+    const int64_t bTicks = b.GetTimeStep();
+    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
+    {
+        return Time::Max();
+    }
+    return Time(aTicks + bTicks);
+}
+
+} // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("LlrManager");
 
@@ -198,8 +240,10 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     }
     // A re-store after a timeout fired (event expired, wireArmed true) is a
     // reload refresh: re-arm the plain timeout so the un-ACKed reload keeps
-    // its backstop.
-    else if (m_retryTimeout > Time(0))
+    // its backstop. A degenerate far-future timeout gets no timer: it could
+    // only fire at a wrapped (already-past) tick or at Time::Max() itself,
+    // which DefaultSimulatorImpl executes (see IsUnrepresentableTimeout).
+    else if (m_retryTimeout > Time(0) && !IsUnrepresentableTimeout(m_retryTimeout))
     {
         sourceIt->second.timeoutEvent = Simulator::Schedule(
             m_retryTimeout, &LlrManager::OnRetryTimeout,
@@ -245,6 +289,12 @@ LlrManager::ArmRetryTimeoutAtTransmission(uint32_t seqNum, uint16_t destRank,
 {
     NS_LOG_FUNCTION(this << seqNum << destRank << flowId << static_cast<int>(vcId));
     if (m_retryTimeout <= Time(0))
+    {
+        return;
+    }
+    // A degenerate far-future timeout gets no timer (see
+    // IsUnrepresentableTimeout): nothing reachable can arm one.
+    if (IsUnrepresentableTimeout(m_retryTimeout))
     {
         return;
     }
@@ -785,14 +835,23 @@ LlrManager::ReserveSourceReload(uint32_t bytes)
         transferTime = Seconds(static_cast<double>(bytes) /
                                static_cast<double>(m_sourceReloadBandwidth));
     }
-    Time serviceTime = m_sourceReloadLatency + transferTime;
+    // Round 74 (codex finding 3): saturate every time addition so the
+    // ledgers and the returned readyDelay cannot wrap (probe: 64 B evicted
+    // entry, SourceReloadLatency = Time::Max(), bandwidth = 1e9 B/s at tick
+    // 7 -> service wraps to -9223372036854775745 ticks, the caller's
+    // readyDelay > 0 test fails open and the retransmission fires
+    // immediately instead of waiting for the reload service).
+    Time serviceTime = SaturatedAddTime(m_sourceReloadLatency, transferTime);
     Time now = Simulator::Now();
     Time start = std::max(now, m_sourceReloadAvailable);
-    m_sourceReloadAvailable = start + serviceTime;
+    m_sourceReloadAvailable = SaturatedAddTime(start, serviceTime);
 
     m_sourceReloadCount++;
     m_sourceReloadBytes += bytes;
-    m_sourceReloadServiceTime += serviceTime;
+    m_sourceReloadServiceTime = SaturatedAddTime(m_sourceReloadServiceTime, serviceTime);
+    // readyDelay below is relative to now and cannot be negative: start is
+    // max(now, available) >= now and SaturatedAddTime pins every sum at
+    // Time::Max(), so available >= now always.
     return m_sourceReloadAvailable - now;
 }
 

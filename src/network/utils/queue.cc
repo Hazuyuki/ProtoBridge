@@ -33,7 +33,7 @@ QueueBase::GetTypeId()
                             .AddTraceSource("BytesInQueue",
                                             "Number of bytes currently stored in the queue",
                                             MakeTraceSourceAccessor(&QueueBase::m_nBytes),
-                                            "ns3::TracedValueCallback::Uint32");
+                                            "ns3::TracedValueCallback::Uint64");
     return tid;
 }
 
@@ -83,7 +83,7 @@ QueueBase::GetNPackets() const
     return m_nPackets;
 }
 
-uint32_t
+uint64_t
 QueueBase::GetNBytes() const
 {
     NS_LOG_FUNCTION(this);
@@ -102,12 +102,16 @@ QueueBase::GetCurrentSize() const
     }
     if (m_maxSize.GetUnit() == QueueSizeUnit::BYTES)
     {
-        return QueueSize(QueueSizeUnit::BYTES, m_nBytes);
+        // Truncating cast is bounded by the uint32 QueueSize value range;
+        // queues configured in BYTES must stay under 4 GiB anyway for the
+        // comparison against GetMaxSize() to be meaningful.
+        return QueueSize(QueueSizeUnit::BYTES,
+                         static_cast<uint32_t>(m_nBytes));
     }
     NS_ABORT_MSG("Unknown queue size unit");
 }
 
-uint32_t
+uint64_t
 QueueBase::GetTotalReceivedBytes() const
 {
     NS_LOG_FUNCTION(this);
@@ -123,7 +127,7 @@ QueueBase::GetTotalReceivedPackets() const
     return m_nTotalReceivedPackets;
 }
 
-uint32_t
+uint64_t
 QueueBase::GetTotalDroppedBytes() const
 {
     NS_LOG_FUNCTION(this);
@@ -131,7 +135,7 @@ QueueBase::GetTotalDroppedBytes() const
     return m_nTotalDroppedBytes;
 }
 
-uint32_t
+uint64_t
 QueueBase::GetTotalDroppedBytesBeforeEnqueue() const
 {
     NS_LOG_FUNCTION(this);
@@ -139,7 +143,7 @@ QueueBase::GetTotalDroppedBytesBeforeEnqueue() const
     return m_nTotalDroppedBytesBeforeEnqueue;
 }
 
-uint32_t
+uint64_t
 QueueBase::GetTotalDroppedBytesAfterDequeue() const
 {
     NS_LOG_FUNCTION(this);
@@ -214,12 +218,29 @@ QueueBase::WouldOverflow(uint32_t nPackets, uint32_t nBytes) const
 {
     if (m_maxSize.GetUnit() == QueueSizeUnit::PACKETS)
     {
-        return (m_nPackets + nPackets > m_maxSize.GetValue());
+        // 64-bit promotion (codex round 50, finding 7): the uint32 sum
+        // wrapped at UINT32_MAX packets and admitted one extra.
+        return (static_cast<uint64_t>(m_nPackets) + nPackets
+                > m_maxSize.GetValue());
     }
     else
     {
         return (m_nBytes + nBytes > m_maxSize.GetValue());
     }
+}
+
+bool
+QueueBase::WouldOverflow(uint32_t bytes) const
+{
+    if (m_maxSize.GetUnit() == QueueSizeUnit::PACKETS)
+    {
+        return (static_cast<uint64_t>(m_nPackets) + 1
+                > m_maxSize.GetValue());
+    }
+    // 64-bit on both sides: m_nBytes is uint64 and the uint32 limit
+    // promotes, so a >4 GiB backlog compares correctly (no truncation
+    // through the uint32 QueueSize value like the operator+ path).
+    return (m_nBytes + bytes > m_maxSize.GetValue());
 }
 
 } // namespace ns3

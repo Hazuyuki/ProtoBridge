@@ -136,7 +136,7 @@ TraceSojourn(std::string sojournTrFileName)
  * @param newval New value.
  */
 static void
-QueueLengthTracer(Ptr<OutputStreamWrapper> stream, uint32_t oldval, uint32_t newval)
+QueueLengthTracer(Ptr<OutputStreamWrapper> stream, uint64_t oldval, uint64_t newval)
 {
     *stream->GetStream() << oldval << " " << newval << std::endl;
 }

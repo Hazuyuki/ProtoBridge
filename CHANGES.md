@@ -6,6 +6,2643 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Reviewed — codex round 74: 15 findings, all 15 fixed
+
+Reviewed commit 614b74c (round-73 fixes). All 15 findings are instances of
+one root cause family: `Simulator::Schedule(delay, ...)` with a degenerate
+config/attribute/ledger Time — a raw `Time::Max()` config value, a uint64
+config latency above INT64_MAX, or a saturated ledger — whose
+`delay + TimeStep(now)` deadline wraps to a negative/past timestamp and
+fires immediately with a corrupted timeline (or, at clamp-to-Max, EXECUTES
+at the end of time), plus three arithmetic-overflow sites that overflow
+before any guard runs. Policy (established round 73): an action at or
+beyond the remaining horizon `Time::Max() - Simulator::Now()` is dropped /
+left unarmed — never clamped to Time::Max(). Findings:
+
+1. **Reserve service-time saturation still wraps to a NEGATIVE Time at
+   MIN/H/D/Y resolution for a large finite binary64 sec (round-74 finding
+   1, high).** The round-73 fix bounded the divide (`!(gbps >
+   saturateGbps)`) and clamped `sec < (0x1p63 - 0x1p11)/ticksPerSecond`,
+   but the surviving `Seconds(sec)` conversion still feeds the sec to
+   ns-3's int64x64(double) ctor: for sec in [2^63, (2^63-2^11)/scale) at
+   MIN/H/D/Y the float-to-int conversion is out of range and hi truncates
+   to INT64_MIN, and the Q64.64 compose emits a negative tick count
+   (int64x64-128.h:94-121 mechanism). The negative service then wrapped
+   the free-ledger subtraction (round-72 UBSan signature). Fixed: the
+   post-divide check now saturates on `!(sec < maxSec)` with
+   `maxSec = min((0x1p63 - 0x1p11)/ticksPerSecond, 0x1p63)`, applied at
+   BOTH the reserve and completion service conversions; non-positive and
+   NaN sec map to Time(0). Verified with the trap-mode probe
+   (reserve public MIN 64 B @ 0x1.12e0be826d695p-85 ->
+   ticks = INT64_MAX = 9223372036854775807, FE_OVERFLOW/FE_INVALID/
+   FE_DIVBYZERO clear, rc 0; public NS 500000002 @ 0x1.000000112e0bfp-1022
+   -> ticks = INT64_MAX with only the expected inexact flag).
+
+2. **FabricEndpoint memory-semantic egress bypasses the round-73 horizon
+   guard for near-Max latencies (round-74 finding 2, high).** The
+   round-73 fix dropped responses only at exactly `>= Time::Max()`;
+   configured latencies in (Time::Max() - serialization, Time::Max())
+   still scheduled a transmit whose downstream serialization wrapped past
+   INT64_MAX. Fixed: the egress completion now goes through the canonical
+   horizon guard (`delay < Time::Max() - Simulator::Now()`), so any
+   completion that cannot fire within the representable horizon is
+   dropped. Verified with the memory probe: near-Max latency schedules
+   nothing; ordinary latency unchanged.
+
+3. **LLR source-reload ready/available ledgers overflow on repeated
+   saturated adds (round-74 finding 3, medium).** The round-73 guard
+   covered the reload SCHEDULE, but `readyDelay = SaturatedAddTime(now,
+   sourceReloadAvailable) + service` and the `sourceReloadAvailable`
+   advance were raw `Time` additions: once the ledger saturated at
+   Time::Max(), the next `+ service` / `+ reload` wrapped to a negative
+   tick and the SACK-reply path re-armed reloads in the past. Fixed: both
+   additions route through SaturatedAddTime (raw-tick saturating add);
+   the horizon-guarded schedule then sees a saturated (>= horizon) ledger
+   and stays unarmed. Verified with the reload probe: ledger and service
+   non-negative, saturated, and no past firing.
+
+4. **RdmaOperationEngine passes raw config Times to Schedule, and the
+   receive-post ledger is an unsaturated Time add (round-74 finding 4,
+   medium).** `Schedule(delay, ...)` had no horizon guard (probe:
+   signalPoll = Time::Max() at tick 7 -> the WaitSignal callback fired at
+   -9223372036854775802), and `m_receivePostFree = max(now, ledger) +
+   receivePost` was a raw add that wrapped to -9223372036854775802 once
+   receivePost saturated the ledger. Fixed: the engine's private
+   Schedule() wrapper refuses `delay.IsStrictlyNegative() || delay >=
+   Time::Max() - Simulator::Now()` (unreachable actions stay unarmed);
+   PostReceive composes the ledger with SaturatedAddTime, so the relative
+   delay below cannot wrap. Verified with the worktree-layout probes
+   (`timing_probe engine`: wait registered at tick 7, no signal callback;
+   a stable-layout native verifier driving the real engine's
+   PostReceive(receivePost = Time::Max()) path: no immediate completion,
+   run ends at the scheduled horizon tick).
+
+5. **DCQCN recovery timers arm wrapped deadlines (round-74 finding 5,
+   medium).** OnCnp scheduled T_FAST / T_AI recovery cycles from
+   configured Time attributes without a horizon guard; T_FAST =
+   Time::Max() (or any value >= horizon) wrapped the deadline. Fixed: all
+   four arm sites use the canonical guard (`timer < Time::Max() -
+   Simulator::Now()`); a degenerate timer is not armed. Verified with the
+   dcqcn probe: cnp at tick 7 with T_FAST = Time::Max() arms no timer,
+   run ends at tick 7.
+
+6. **DCQCN/RTTCC pacing ledgers go negative at PS/FS resolution
+   (round-74 finding 6, medium).** ClampedNanoSeconds correctly mapped
+   its int64 ns input to Time::Max(), but the nextSendNs ledger was
+   advanced with a raw `+= delayNs` in ns (int64): two saturated delays
+   pushed the ledger past INT64_MAX and wrapped it negative, after which
+   every subsequent delay computed from it went negative. Fixed: the
+   ledger advance is `nextSendNs = (delayNs > INT64_MAX - nextSendNs) ?
+   INT64_MAX : nextSendNs + delayNs` (raw-tick/ns saturating add; the
+   downstream `ledger - now` cannot go negative once saturated).
+   Verified with the pacer probe at PS resolution: both first and second
+   ShapingDelay non-negative and equal to the saturated horizon.
+
+7. **NVSwitch multicast FEC latency wraps and total delay overflows
+   (round-74 finding 7, medium).** SendMulticastResultOnPort composed
+   `encode + decode + serialization + propagation` with raw Time adds; a
+   saturated encode latency wrapped the sum negative and the deferred
+   send fired in the past. Fixed: the FEC latency is a SaturatedAddTime
+   pair; the deferred arm uses the canonical horizon guard with the
+   `> Seconds(0)` / `<= Seconds(0)` immediate-send split preserved.
+   Verified with the multicast probe: no negative-tick send, deferred
+   send dropped at saturation.
+
+8. **NVSwitch cut-through/forwarding Time arithmetic overflows
+   (round-74 finding 8, medium).** ForwardPacket composed `startTime +
+   serialization + coding + propagation` and advanced
+   `m_outputBusyUntil[outPort] = startTime + serializationTime` with raw
+   adds; saturated components wrapped the busy-until ledger and the
+   schedule deadline negative. Fixed: both compositions route through
+   SaturatedAddTime and the schedule is horizon-guarded. Verified with
+   the forwarding probe: busy-until non-negative/saturated, no negative
+   deadline.
+
+9. **SYNC/ASYNC memory-semantic completion timers bypass the clamp
+   (round-74 finding 9, medium).** The two NotifyMemorySemanticComplete
+   schedule sites in fabric-endpoint-send.cc took the raw uint64
+   attribute latency: values above INT64_MAX wrap negative in
+   NanoSeconds(int64) (and any converted Time outside [0, horizon]
+   scheduled a past/end-of-time firing). Fixed: new
+   ClampedSemanticLatencyNs(uint64_t) maps > INT64_MAX ns to the horizon
+   and clamps the converted Time (negative or > horizon -> horizon);
+   both sites then horizon-guard the schedule. Verified with the
+   semantic probe: no completion outside the horizon for
+   UINT64_MAX-configured latency.
+
+10. **Contention-model serialization service aborts at FS/PS resolution
+    (round-74 finding 10, medium).** GetSerializationTime and the WFQ
+    penalty path fed `Seconds(size / m_bandwidth)` with a binary64 sec
+    that Seconds() rejects ("overflow detected" at int64x64-128.cc:106
+    for representable-but-out-of-Q64.64-range values; probe: FS
+    resolution, 16384 B @ 1 bps -> SIGABRT). Fixed: new
+    ClampedSerializationSeconds(double) with the resolution-aware
+    `maxSec = min((0x1p63 - 0x1p11)/ticksPerSecond, 0x1p63)` switch over
+    Time::S..Time::Y; `!(sec < maxSec)` returns Time::Max() and
+    non-positive/NaN returns Time(0). Verified with the serialization
+    probe: no abort, saturated Time::Max() at FS/PS, exact ticks at
+    coarser resolutions.
+
+11. **FecModel encoded-bit product wraps uint64 (round-74 finding 11,
+    medium).** The round-63 divide-first ceiling protected the final
+    byte conversion, but the triple product `numCodewords * m_n *
+    RS_SYMBOL_BITS` itself wrapped: SetFecParams(2147483647, 1, 0) with
+    a 2^30-B payload gives numCodewords = 858,993,460 and a product of
+    2^64 + 8,589,934,584 bits -> uint64 dropped 2^64 and the encoded
+    size came back as payload - 1, defeating the caller's
+    encoded > payload padding gate. Fixed: the product and the byte
+    ceiling are computed in __uint128_t (the codebase's established wide
+    type) and narrowed AFTER the /8: the exact product can exceed uint64
+    while the exact byte ceiling still fits it (that case returns
+    ceil(product/8) = 2,305,843,010,287,435,775 bytes); the return
+    saturates only when the exact byte count exceeds UINT64_MAX. Exact-
+    arithmetic verified (python): product = 18446744082299486200 >
+    2^64 - 1, ceil(product/8) = 2305843010287435775 == the review's
+    expected value. Probe: payload=1073741824 encoded=2305843010287435775
+    rc 0.
+
+12. **GatewayEndpoint forwards without a horizon guard (round-74 finding
+    12, medium).** ScheduleForwarding pushed the configured GatewayDelay
+    straight into Simulator::Schedule; GatewayDelay = Time::Max()
+    wrapped the deadline (probe: TX at -9223372036854775802). Fixed: the
+    canonical horizon guard wraps the schedule. Verified with the gateway
+    probe: no forwarding outside the representable horizon.
+
+13. **Protocol-transaction DELAY node completes at a negative time
+    (round-74 finding 13, medium).** The DELAY runtime arm scheduled the
+    raw node.delay; Time::Max() (or near-horizon) wrapped the deadline
+    and the transaction graph completed at -9223372036854775802. Fixed:
+    the arm is horizon-guarded and, on drop, the node stays ACTIVE with
+    no event — the graph neither completes nor corrupts the timeline.
+    Verified with the transaction probe: no negative-tick completion.
+
+14. **LinkDegradationModel delay + duration overflows (round-74 finding
+    14, medium).** ApplyDegradation scheduled recovery at `delay +
+    duration` with raw adds; both saturated configs wrapped the recovery
+    deadline negative. Fixed: SaturatedAddTime composes the recovery
+    delay; the recovery arm is separately horizon-guarded and the whole
+    apply is wrapped in the canonical guard with an NS_LOG_WARN drop.
+    Verified with the degradation probe: no negative recovery deadline.
+
+15. **DCQCN/RTTCC bandwidth arithmetic overflows BEFORE the guard runs
+    (round-74 finding 15, high).** ShapingDelay computed
+    `chunkBytes / rateBps` with feenableexcept(FE_OVERFLOW) armed by the
+    caller: a subnormal rate (probe: denorm_min) raised FE_OVERFLOW in
+    the divide itself and SIGFPE'd (rc -8) before any bound check ran;
+    the ceiling-product `PerQpCeilingGbps * 1.25e8` (probe: 1e301 Gbps)
+    overflowed the same way. Fixed: a pre-guard
+    `!(chunkBytes <= rateBps * (DBL_MAX_INT64_NS / 1e9))` skips the
+    divide for rates whose exact slot must exceed the horizon (the
+    pre-multiplied bound is representable for every finite rateBps), a
+    ceiling-product guard `<= DBL_MAX / 1.25e8` caps the attribute, and
+    the surviving divide's result goes through the slot-sec horizon
+    bound and ClampedNanoSeconds. Verified with the trap-mode probes:
+    pacer-overflow-high (1e301 Gbps), pacer-overflow-low (denorm_min),
+    rtt-overflow-low (RTTCC path) all rc 0 with FE_OVERFLOW clear; the
+    ordinary pacer sweep unchanged.
+
+Verified: all 26 review probe cases re-run against the fixed library
+(pre-fix SIGFPE x3, SIGABRT x2, negative-ticket firings across
+switch/gateway/transaction/semantic/degradation, wrapped FEC size, and
+negative reload/post-receive ledgers all eliminated; the four probes
+that instantiate RdmaSubmissionModel were rebuilt with the worktree
+include tree only, matching the library's PCIe-era class layout);
+test.py gpu-cluster suite PASS; parity pytest suite 221 passed;
+surrogate pytest suite 101 passed; gpu-cluster-ibgda C++ suite PASS;
+drop-tail-queue (qdisc2) C++ suite PASS.
+
+### Reviewed — codex round 73: 4 findings, all 4 fixed
+
+Reviewed commit 966e925 (round-72 fixes). Findings:
+
+1. **Round-72's reassociated division still overflows binary64 for a
+   representable exact sec (round-73 finding 1, high).** Rewriting the
+   service-time division as `(bytes * 8 / 1e9) / gbps` removed the
+   `gbps * 1e9` inf, but the rounded intermediate bitRatio keeps ~2^-29
+   relative rounding: for bytes = 500000002 and
+   gbps = 0x1.000000112e0bfp-1022 (smallest normal + 8 ULP), the exact
+   quotient is DBL_MAX * (1 + 2.1e-18) — representable — while the
+   rounded intermediate pushes the binary64 quotient to
+   DBL_MAX * (1 + 1.1e-16), past the overflow threshold; under
+   `feenableexcept(FE_OVERFLOW)` the probe died with SIGFPE (rc -8)
+   before any bound check ran. Fixed: precompute the saturation
+   threshold in gbps units,
+   `saturateGbps = bitRatio / ((2^63 - 2^11) / ticksPerSecond)`, and
+   skip the divide entirely when `!(gbps > saturateGbps)` (gbps <= 0 is
+   validated above, so the branch covers zero, subnormal, and
+   small-enough-that-the-exact-sec-is-unrepresentable); only an
+   in-range gbps performs `sec = bitRatio / gbps`, which then cannot
+   overflow. The threshold uses the same inclusive bound as the
+   post-divide check, so the sec >= bound arm still saturates the
+   near-bound representable cases. Verified with the trap-mode probe
+   (rc 0, ticks = INT64_MAX, FE_OVERFLOW clear), a 60-case sweep across
+   6 byte/rate combos x 10 resolutions matching Seconds() tick-for-tick
+   (MIN 7.5e9 B @ 1 -> 1 tick; NS 64 B @ 204.8 -> 2 ticks; NS 64 B @
+   1e300 -> 0 ticks with FE_OVERFLOW clear; MIN 64 B @
+   5.551115123125783e-26 -> MAX ticks), plus exact-arithmetic
+   confirmation (60-digit Decimal) that the probe input's exact quotient
+   is representable while the rounded-intermediate quotient is not.
+
+2. **The round-72 memory-response clamp fires the response AT
+   Time::Max() and the downstream serialization wraps the tick past
+   INT64_MAX (round-73 finding 2, medium).** ClampEgressDelay only fixes
+   the SCHEDULE instant: DefaultSimulatorImpl executes events scheduled
+   at absolute Time::Max(), and the probe (memory read at tick 7,
+   m_memoryLatency = Time::Max(), 200 Gbps link) showed the response
+   transmitted at tick 9223372036854775807 and DELIVERED at
+   -9223372036854775807 — DefaultSimulatorImpl::Schedule's
+   `delay + TimeStep(now)` wraps on the downstream serialization
+   schedule. A degenerate "infinite" memory latency cannot produce a
+   meaningful response inside the representable horizon. Fixed:
+   ProcessMemoryPacket now skips the deferred response entirely when
+   `m_memoryLatency >= Time::Max()` (Time::Max() means "drop the
+   deferred action", not "run it at Time::Max()"); ordinary latencies
+   keep the round-72 ClampEgressDelay route. Verified with the rebuilt
+   probe: Max mode schedules nothing (deferred = 0, final tick = 7);
+   ordinary mode unchanged (deadline 17, tx 17, response 19, rx 19).
+
+3. **LLR retry timeout passes m_retryTimeout unclamped to Schedule, and
+   the deadline arithmetic adds it without saturation (round-73 finding
+   3, medium).** ArmRetryTimeoutAtTransmission scheduled
+   `Simulator::Schedule(m_retryTimeout, ...)` directly; the probe
+   (RetryTimeout = Time::Max(), armed at tick 7) fired at
+   -9223372036854775802 (7 + INT64_MAX wrapped), and clamping to
+   Time::Max() would not help because DefaultSimulatorImpl executes
+   events at absolute Time::Max() — the timeout callback would
+   retransmit at the end of time. The sourceReload refresh in
+   StorePacket had the same raw schedule. Fixed: both Schedule sites
+   and the arm entry now go through IsUnrepresentableTimeout()
+   (`timeout >= Time::Max() - Simulator::Now()`); a degenerate
+   far-future timeout arms NO timer — the stored entry survives until an
+   ACK, a NACK (which re-arms a plain timeout), or teardown, matching
+   the round-73 memory-response policy. With the arm entry guarded, the
+   deadline comparison `pending + Now() >= deadline` can no longer wrap.
+   Verified with the rebuilt probe: Max mode arms nothing (no timeout
+   line, run ends at tick 7); ordinary mode unchanged (armed at 7,
+   timeout fires at 17).
+
+4. **Round-72's CHANGES.md/code comment claimed a 2^972 binary64 window
+   that cannot exist (round-73 finding 4, low).** The claimed mechanism
+   — "(sec - hi) * 2^64 overflows binary64 for sec >= 2^972, so lo
+   becomes INT64_MIN" — is arithmetically impossible: any sec >= 2^972
+   has hi = (int64)sec already saturated at INT64_MIN by the out-of-range
+   C++ float-to-int conversion, so the lo multiply starts from garbage
+   and its binary64 range is irrelevant. The actual negative-tick window
+   is 2^63 <= sec < (2^63 - 2^11)/ticksPerSecond at MIN/H/D/Y only.
+   Fixed: the comment above the negative-service clamp in
+   rdma-submission-model.cc and this entry's finding-1 prose now describe
+   the Q64.64 input-range-loss mechanism; codex's 624,576-case sweep
+   across the six coarse units found zero negative results for
+   2^63 <= sec < 2^972, consistent with the corrected window.
+
+Verified: reserve probe trap-mode + 60-case sweep (finding 1);
+memory probe Max/ordinary modes (finding 2); llr probe Max/ordinary
+modes (finding 3); full test.py battery, parity suites, and pytest
+suites — all green.
+
+### Reviewed — codex round 72: 3 findings, all 3 fixed
+
+Reviewed commit 74bf16f (round-71 fixes). NOTE: codex's formal report was
+lost to a 403 Forbidden block at the end of its run; the findings below
+were reconstructed from the round-72 log's probe artifacts (native probes
+under /tmp/protobridge-r72-review, 523-invocation boundary sweep,
+stress/UBSan/fec probe outputs) together with codex's narrative messages.
+Findings:
+
+1. **Seconds() returns a NEGATIVE Time at MIN/H/D/Y for a large finite
+   sec, and the ledger subtraction then overflows signed int64 (round-72
+   finding 1, medium).** ns-3's int64x64(double) builds hi = (int64)sec
+   by C++ float-to-int conversion; that conversion is out of range for
+   sec >= 2^63, so hi truncates to INT64_MIN, and
+   lo = (uint64)((sec - hi) * 2^64) is then built from that garbage hi.
+   Multiplying by Scale(MIN) = 6e16 (INT64X64_USE_128 build) computes
+   lo * 6e16 in signed __int128: negative x positive wraps to a large
+   positive 128-bit value whose low 64 bits are a NEGATIVE tick count, so
+   the checked 2^63 multiply passes and Round() emits negative ticks.
+   UBSan probe (pre-fix): MIN 64 B @ gbps = 5.551115123125783e-26 ->
+   service = -153722867280912930 ticks -> "signed integer overflow:
+   9223372036854775807 - -153722867280912930" in the free-ledger
+   subtraction; H same input -> service = -2562047788015216. The affected
+   window 2^63 s <= sec < (2^63-2^11)/ticksPerSecond exists only at
+   MIN/H/D/Y (at S/MS/US/NS/PS/FS the Seconds() fixed-point multiply
+   asserts before the window is reached); at MIN it spans
+   [2^63, 60*(2^63-2^11)) s, while 60 s < sec < 2^63 still converts
+   correctly to 1 tick. Fixed: after the existing bound check, any
+   strictly-negative service (Time::Max() is always positive, so this
+   can only be the coarse-unit Seconds() window) is clamped to
+   Time::Max(), pinning the ledger at the far-future bound instead of
+   wrapping it past Time(0).
+
+2. **Finite gbps = 1e300 made `gbps * 1e9` overflow to inf before any
+   guard (round-72 finding 2, medium).** The bandwidth validation only
+   rejects !isfinite(bw) || bw < 0, and 1e300 is finite, but the sec
+   computation's `gbps * 1e9` = inf raised FE_OVERFLOW (probe rc = -8,
+   SIGFPE under `feenableexcept(FE_OVERFLOW)` trap mode) before the
+   round-71 bound check ever ran. Fixed: reassociated the division as
+   `(bytes * 8 / 1e9) / gbps`. bytes <= 2^64-1 so bytes*8 <= 2^67 is
+   exact in binary64, 1e9 is exactly representable, the intermediate
+   bitRatio <= ~2^38, and the final divide by any finite gbps cannot
+   overflow; the result is a finite sec, or +inf only for gbps = 0 or
+   subnormal gbps (sec = inf saturates at the inclusive bound, already
+   covered). The FE_OVERFLOW that round-71 documented for subnormal
+   division is gone as a side effect.
+
+3. **SendMemoryResponse was scheduled with the UNCLAMPED m_memoryLatency
+   (round-72 finding 3, medium).** fabric-endpoint.cc scheduled the
+   memory-read response with `Simulator::Schedule(m_memoryLatency, ...)`
+   while the six other egress schedule sites (and the round-70 FEC
+   receive clamp) route through ClampEgressDelay. Probe with
+   m_memoryLatency = Time::Max(): DefaultSimulatorImpl::Schedule's
+   `delay + TimeStep(now)` wrapped past INT64_MAX and the response fired
+   at tick -9223372036854775799 (immediately, corrupted timestamp)
+   instead of never. Fixed: route the delay through ClampEgressDelay
+   like every other egress site.
+
+**Verified.** Findings confirmed against the round-72 log probes and
+re-verified post-fix with native probes rebuilt against the patched
+libns3.47-gpu-cluster-debug.so:
+- F1 probes now saturate: MIN/H/D/Y 64 B @ 5.551115123125783e-26 ->
+  9223372036854775807 ticks (was -153722867280912930 / -2562047788015216
+  etc.), FE_OVERFLOW = 0; the UBSan signed-overflow repro is gone. The
+  sub-window inputs stay exact: MIN/Y 64 B @ 2.7755575615628915e-26 ->
+  0 ticks; MIN 7.5e9 B @ 1 -> 1 tick (matches Seconds()).
+- F2: NS 64 B @ 1e300 -> 0 ticks with FE_OVERFLOW = 0, and the trap-mode
+  run completes (was rc = -8 SIGFPE). Ledger stays stable at
+  INT64_MAX - 7 across all ten units under trap mode; gbps = 0 /
+  subnormal / 4.94e-324 no longer raise any fenv flag; NaN / inf / -inf /
+  -1 gbps still abort with "bandwidth must be finite and nonnegative"
+  (rc 134).
+- F3: fec_memory_probe ordinary case -> memory_response_tx at tick 23
+  (was 13/23 pattern intact, now with clamp the ordinary value holds);
+  m_memoryLatency = Time::Max() -> response scheduled at
+  9223372036854775807 (was -9223372036854775799).
+- Regression sweeps: 60 ordinary cases (6 byte/rate combos x 10 units)
+  all match Seconds() tick-for-tick; exact-arithmetic boundary scan at
+  +/- 6 ULP around the round-71 bound across all ten units shows no
+  escape below the bound under the new division association; the
+  codex 523-invocation boundary sweep results stand (no final-multiply
+  escape below the guard at any resolution).
+
+Post-fix full battery: test.py 806/806; 15/15 standalone parity scripts
+PASS (direct python3) plus 18/18 test_ibgda + test_config_fec_enabled
+under pytest; 101/101 surrogate pytest; 13/13 queue-disc suites
+(drop-tail-queue, adaptive-red-queue-disc, cobalt-queue-disc,
+codel-queue-disc, pie-queue-disc, prio-queue-disc, queue-disc-traces,
+tbf-queue-disc, fq-cobalt-queue-disc, fq-codel-queue-disc,
+fq-pie-queue-disc, pfifo-fast-queue-disc, red-queue-disc);
+libns3.47-gpu-cluster-debug.so rebuilt clean.
+
+
+### Reviewed — codex round 71: 5 findings, all 5 fixed
+
+Reviewed commit 00b9909 (round-70 fixes). Findings:
+
+1. **Reserve()'s per-resolution multiply overflowed before the saturation
+   bound could fire (round-71 finding 1, medium).** The round-70 guard
+   compared the PRODUCT `sec * tps` against 2^63, but the multiply itself
+   ran first: at FS the product overflows binary64 (FE_OVERFLOW, SIGFPE
+   under traps) for finite sec as small as ~5.12e293 (exact-arithmetic
+   probe: 64 B @ gbps = 1e-300 -> sec = 5.1200000000000005e+293,
+   sec * 1e15 = inf). The round-70 claim "overflow bound far beyond any
+   finite sec" was wrong. Fixed: the bound check now compares `sec`
+   itself against `(2^63 - 2^11) / ticksPerSecond` BEFORE any multiply,
+   so no overflowable multiply remains; the one-ULP margin absorbs
+   double-rounding of the `bytes * 8 / (gbps * 1e9)` division so
+   Seconds() can never reach the checked 2^63 multiply inside ns-3.
+
+2. **Double-multiply + llround double-rounded against ns-3's int64x64
+   conversion (round-71 finding 2, medium).** `llround(sec * tps)`
+   rounds the binary64 product, not the real value; ns-3's Seconds()
+   converts through 64.64 fixed point and rounds that, and the two
+   disagree by one tick for inputs where the binary64 product lands
+   exactly on a half-integer (exact-arithmetic probe at NS: 64 B @
+   204.8 Gbps -> double product 2.5 exactly -> llround gives 3, while
+   the fixed-point value 2.499999999985153... rounds to 2). Fixed: the
+   conversion now delegates every in-range service to Seconds() itself,
+   so ReserveSourceRead matches ns-3's tick count exactly (native probe
+   post-fix: ReserveSourceRead_ticks == Seconds(sec)_ticks for all
+   in-range probes).
+
+3. **Y/D/H/MIN silently fell through to the FS branch (round-71 finding
+   3, medium).** The round-70 switch handled S/MS/US/NS/PS and let
+   default take FS — but ns-3's Time::Y/D/H/MIN also fall into default,
+   where the FS scale is wildly wrong (native probe at MIN: 7.5e9 B @
+   1 Gbps, sec = 60 s -> 6e16 FS ticks where Seconds(60) = 1 tick of
+   60 s). Fixed: all ten units are explicit, with MIN/H/D/Y
+   ticks-per-second derived from ns-3's Scale() coefficients
+   (1/60, 1/3600, 1/86400, 1/31536000). Native probes post-fix: MIN
+   7.5e9 B @ 1 Gbps -> 1 tick (matches Seconds), H/D/Y equivalents ->
+   0 ticks (matches Seconds, since 60 s < 1 tick at those resolutions).
+
+4. **Round-70 comment + CHANGES.md numbers were partly wrong (round-71
+   finding 4, low).** Codex native probes contradicted round-70's text:
+   US Time::Max().GetNanoSeconds() wraps to -1000 (NOT INT64_MAX as
+   round 70 claimed; verified by wraparound: I*10^3 mod 2^64 interpreted
+   signed = -1000); the PS old-formula probe value was 1000000 ticks
+   (not 1000000000000084); PS Time::Max().GetSeconds() = 9223372.0368547756
+   and FS = 9223.3720368547765 (native probes); the 2^63-guard-bypass
+   input 64 B @ gbps ~= 5.55e-14 reaches exactly 2^63 at PS (sec*1e12 ==
+   2^63), not at NS (where sec*1e9 = 9.223372036854776e+18 < 2^63).
+   Fixed: the round-70 comment block in rdma-submission-model.cc is
+   annotated with the corrected values, and this entry records them.
+
+5. **"16/16 parity scripts" exceeded the actual inventory (round-71
+   finding 5, low).** The round-70 entry claimed 16 standalone parity
+   scripts, but only 15 test_*.py files carry a `__main__` guard
+   (`rg -l '^if __name__ == "__main__":' test/parity/test_*.py | wc -l`
+   -> 15); 18 parity modules exist in total, of which 3
+   (test_ibgda, test_rdma_modes, test_config_fec_enabled) run only
+   under pytest. Fixed: this entry and the Verified section below
+   state the counts as 15 standalone + 3 pytest-only.
+
+**Verified.** All findings confirmed by independent probes before
+fixing: exact binary64 replication of the F1 overflow (sec = 5.12e293,
+sec * 1e15 = inf) and the F2 double-rounding (int64x64 emulation:
+hi=2, lo=9223372036580896768 -> rounds to 2, vs llround(2.5) = 3);
+exact wraparound of the F4 US GetNanoSeconds() = -1000; exact
+comparison of the F4 PS-boundary product sec*1e12 == 2^63 vs the NS
+product sec*1e9 < 2^63; exact F5 inventory count (15 with __main__
+guards, 18 total modules). Native probe post-fix (reserve_probe
+rebuilt against the patched libns3.47-gpu-cluster-debug.so):
+- F1 probes no longer overflow: FS 64 B @ 1e-300 -> ticks = 9223372036854775807, FE_OVERFLOW = 0; NS 64 B @ 1e-307 -> same, FE_OVERFLOW = 0; both under `feenableexcept(FE_OVERFLOW)` trap mode run to completion without SIGFPE.
+- F2 probes match Seconds() exactly: NS 64 B @ 204.8 -> 2 ticks (was 3); US 1000 B @ 8 -> 1 tick (round-70 had 999999999999); NS 32 B @ 400 -> 1 tick (round-70 had 0).
+- F3 probes: MIN 7.5e9 B @ 1 -> 1 tick (was 6e16); H/D/Y -> 0 ticks; MIN 60e9 B @ 8 -> 1 tick.
+- Boundary: PS 64 B @ 5.551115123125783e-14 (sec*1e12 == 2^63 exactly) -> saturates to 9223372036854775807 with FE_OVERFLOW = 0; NS same input -> 9223372036854776 ticks (matches Seconds).
+- Ordinary services unchanged: NS 1000 B @ 8 -> 1000 ticks; S 1000 B @ 8 -> 0 ticks.
+
+Post-fix full battery: test.py 805/805; 15/15 standalone parity scripts
+PASS (direct python3) plus 18/18 test_ibgda + test_config_fec_enabled
+under pytest; 101/101 surrogate pytest; 13/13 queue-disc suites
+(drop-tail-queue, adaptive-red-queue-disc, cobalt-queue-disc,
+codel-queue-disc, pie-queue-disc, prio-queue-disc, queue-disc-traces,
+tbf-queue-disc, fq-cobalt-queue-disc, fq-codel-queue-disc,
+fq-pie-queue-disc, pfifo-fast-queue-disc, red-queue-disc);
+libns3.47-gpu-cluster-debug.so rebuilt clean.
+
+### Reviewed — codex round 70: 7 findings, all 7 fixed
+
+Reviewed commit 1acac31 (round-69 fixes). Findings:
+
+1. **Duplicate `ClampRelativeDelay` definition prevented compilation
+   (round-70 finding 1, high).** The round-69 refactor left the helper
+   defined twice in rdma-submission-model.cc (line 527 and again at
+   lines 577-582 after `SaturatedAddTime`); the translation unit fails
+   with a redefinition error. Fixed: the second definition is deleted.
+
+2. **Reserve()'s tick projection was wrong at every non-US resolution
+   (round-70 finding 2, high).** The round-69 formula
+   `sec * Time::Max().GetTimeStep() / (Time::Max().GetNanoSeconds()/1e9)`
+   breaks four ways, each verified with exact binary64 replication:
+   (a) at S and MS, `GetNanoSeconds()` multiplies INT64_MAX ticks by
+   10^6/10^3 in int64 and wraps (-1000000 / -1000), so the denominator
+   is negative and an ordinary service becomes a huge negative Time
+   (probe: 32 B @ 400 Gbps at MS -> -5.9e24 ticks; 1 s service at S ->
+   -9.2e27 ticks);
+   (b) at US (where GetNanoSeconds() == INT64_MAX [CORRECTED in round 71:
+   it actually wraps to -1000; the conclusion — the projection is
+   meaningless at US — stands]), the derived tps is
+   999999999.9999999 — 1 ULP below the true 1e6 — so a 1 s service
+   truncates to 999999999999 ticks where Seconds() rounds to 10^12;
+   (c) at NS the same 1-ULP deficit appears (tps = 999999999.9999999)
+   plus an off-by-10^3 scale error in the denominator
+   (GetNanoSeconds() returns I at NS, so the formula divides by
+   I/1e9 seconds, not by 1e9 ticks-per-second; the 1 s probe still
+   lands on 10^12 ticks only because both errors cancel at NS exactly);
+   (d) at PS/FS the integer division inside GetNanoSeconds() truncates
+   I/10^3 and I/10^6 first, so the derived scale is wrong [CORRECTED
+   in round 71: the native probe at PS is 1000 B @ 8 Gbps -> 1000000
+   ticks with the round-69 formula; Seconds(1e-6 s) at PS = 10^6 ticks
+   = the correct answer, so this sub-item conflated the old formula's
+   output with the correct one — the formula mixed tick scales].
+   Fixed: ticks per second are derived from the resolution directly via
+   `Time::GetResolution()` (1 tick = 10^(9-k) ns at 10^-k s resolution),
+   not from a Time::Max() projection.
+
+3. **The cast guard permitted an out-of-range float->int64 conversion
+   (round-70 finding 3, medium).** The round-69 guard used strict `>`
+   against `(double)INT64_MAX`, but binary64 rounds INT64_MAX up to
+   exactly 2^63, so a service whose product rounds to exactly 2^63
+   (probe: 64 B at gbps ~= 5.55e-14, sec = 9223372.036854776 s at NS
+   [CORRECTED in round 71: the product reaches exactly 2^63 at PS,
+   sec*1e12 == 2^63; at NS the product sec*1e9 = 9223372036854776 <
+   2^63, which is in range])
+   passed the guard into `static_cast<int64_t>(2^63)` —
+   float-cast-overflow UB. Fixed: the guard is `>= 0x1p63` (inclusive).
+
+4. **Ordinary services truncated toward zero instead of ns-3 rounding
+   (round-70 finding 4, medium).** The round-69 path cast the double
+   product with C truncation; the Seconds() path it replaced converts
+   through int64x64 fixed point and rounds to nearest, so Time(double)
+   semantics (llround) were lost: 32 B @ 400 Gbps at NS gave 0 ticks
+   where Seconds() gives 1, and 1000 B @ 8 Gbps at US gave 999...9
+   where Seconds() gives 10^12. Fixed: the conversion applies
+   `llround` before the cast, matching int64x64 rounding for every
+   representable service.
+
+5. **The unguarded multiply could trap before saturation
+   (round-70 finding 5, medium).** `sec * static_cast<double>(I)`
+   overflows to +inf (raising FE_OVERFLOW, SIGFPE under floating-point
+   traps) for finite sec as small as ~5.12e293 (probe: 64 B at
+   gbps = 1e-300: sec = 5.12e293, sec * 2^63 = inf). Fixed [SUPERSEDED
+   in round 71]: the round-70 fix multiplied by the resolution scale
+   (10^3..10^15) but STILL before any bound check, so the overflow
+   recurred at FS for the same probe (sec * 1e15 = inf); round 71
+   moved the bound check before the multiply.
+
+6. **The FEC receive continuation scheduled an unclamped configured
+   delay (round-70 finding 6, medium).** fabric-endpoint.cc:1689 passed
+   `decodeLatency` directly to Simulator::Schedule; a Time::Max()-scale
+   configured decode latency wrapped inside `delay + TimeStep(now)`
+   (native two-node 200-Gbps P2P probe: MacRx at tick 104, receive
+   callback at tick -9223372036854775705). Fixed: the site now clamps
+   through the existing `ClampEgressDelay` helper like the other five
+   egress schedule sites.
+
+7. **The horizon comment reversed the resolution relationship
+   (round-70 finding 7, low).** The round-69 comment claimed "~545
+   years per fetch at NS, proportionally longer at finer resolutions".
+   The true wall-clock horizon of Time::Max() is ~292.27 years at US/NS
+   (9223372036.854776 s); the S/MS GetNanoSeconds() wrap makes the
+   projection meaningless there, and at finer resolutions the same tick
+   count I represents LESS wall time (PS: I ps = 9223.37 s, FS: I fs =
+   9.22 s), never more. Fixed: the rewritten conversion comment states
+   the saturation bound in ticks (INT64_MAX) and no longer asserts a
+   wrong wall-clock figure. [Wall-clock horizon figures CORRECTED in
+   round 71 by native probes: Time::Max().GetSeconds() = 9223372.0368547756
+   s at PS and 9223.3720368547765 s at FS; round 70's "PS: I ps = 9223.37 s"
+   swapped the two finer-resolution values — I ps = 9223372.04 s and
+   I fs = 9223.37 s. The direction of the claim (less wall time at
+   finer resolutions) was correct.]
+
+**Verified.** All findings confirmed by independent probes before
+fixing: exact binary64 replication of the round-69 formula at S/MS/US/
+NS/PS/FS (negative ticks at S/MS; 1-ULP-deficit tps at US/NS;
+truncated-quotient scale at PS/FS), the 2^63 guard bypass (64 B @
+gbps = 5.551115123125783e-14 -> ticksNeeded == 2^63 exactly, guard
+false), the FE_OVERFLOW trap probe (64 B @ 1e-300 gbps -> sec*2^63 =
+inf), the truncation probes (32 B @ 400 G -> 0 vs Seconds()' 1 tick;
+1000 B @ 8 G at US -> 999999999999 vs 10^12), and the FEC receive wrap
+probe (decodeLatency = Time::Max(), callback at INT64_MIN). Post-fix: test.py 805/805; 15/15 standalone parity scripts PASS (direct python3; CORRECTED in round 71 from "16/16" — only 15 files carry __main__ guards) plus 18/18
+test_ibgda + test_config_fec_enabled under pytest; 101/101 surrogate
+pytest; 13/13 queue-disc suites (drop-tail-queue, adaptive-red,
+cobalt, codel, pie, prio, queue-disc-traces, tbf, fq-cobalt, fq-codel,
+fq-pie, pfifo-fast, red); libns3.47-gpu-cluster-debug.so rebuilt clean
+(duplicate-definition error gone).
+
+### Reviewed — codex round 69: 5 findings, 3 fixed, 2 documentation errors corrected
+
+Reviewed commit 1294a2d (round-68 fixes). Findings:
+
+1. **Unclamped saturated delays reached Schedule() through three paths
+   (round-69 findings 1 and 3).** `RdmaSubmissionModel::Schedule` (the
+   common wrapper) forwarded its delay unclamped, so a saturated
+   `SaturatedAddTime(cqWrite, gpuPoll) = Time::Max()` in Progress() at
+   now >= 1 tick wrapped inside DefaultSimulatorImpl's `delay +
+   TimeStep(now)` (probe: cqWrite=I, gpuPoll=1, submit at tick 1 ->
+   completion callback ran at INT64_MIN). The batch-timeout event used a
+   direct `Simulator::Schedule` with the same omission, and the
+   fabric-endpoint egress paths (WFQ totalDelay, FEC delay, and the two
+   backlog-decrement compositions) passed saturated delays directly too
+   (probe: 64-byte bulk at tick 1 with FEC encode latency I -> MacTx at
+   INT64_MIN). Fixed: `ClampRelativeDelay` moved ahead of the wrapper and
+   the clamp applied inside the wrapper itself; the direct batch-timeout
+   Schedule now clamps; a sibling `ClampEgressDelay` helper in
+   fabric-endpoint.cc clamps all five egress Schedule sites.
+
+2. **Reserve()'s service conversion guarded seconds, not ticks
+   (round-69 finding 2).** The guard `!(sec <= 9.223372036854775e9)`
+   was correct only at the NS default resolution. At PS, a service of
+   16777216.0 s (bytes=125000000, gbps=2^-24) passes the guard but needs
+   16777216000000000000 ticks > INT64_MAX, aborting inside Seconds(); at
+   MS, a service of 17179869184.0 s (gbps=2^-34) needs exactly
+   17179869184000 representable ticks yet the guard rejects it. Fixed:
+   the service is now converted into current-resolution ticks via a
+   double product (`sec * tps`) that saturates to Time::Max() whenever
+   the product exceeds INT64_MAX — exact at every resolution.
+
+3. **Documentation corrections (round-69 findings 4 and 5).** CHANGES.md
+   item 3 now states the overflow direction correctly: a CLAMPED delay
+   (Time::Max() - Now()) plus Now() is exactly Time::Max() and never
+   overflows; only the unclamped saturated delay is unsafe (round-68 text
+   implied the subtraction itself overflowed). The GetNanoSeconds note
+   (item 7 and the fabric-endpoint.cc SaturatedAdd comment) now reads:
+   the ns projection MULTIPLIES by the integer ns/tick factor at US and
+   coarser resolutions (INT64_MAX * 10^3 at US, * 10^6 at MS — exact
+   product 9223372036854775807000000, native probe prints -1000000),
+   passes ticks through unchanged at NS (always exact), and DIVIDES by
+   10^3/10^6 at PS/FS (exact whenever the quotient fits int64).
+
+#### Verified
+
+- Exact-arithmetic probes: SaturatedAddTime(Max,1) saturates to Max;
+  Schedule(Max) at now=1 wraps to INT64_MIN; (I-1)+1 = I (clamped path
+  safe); PS ticksNeeded = 16777216.0 * 10^12 = 1.6777216e+19 > I
+  (saturates); MS sec2 * 10^3 = 17179869184000 fits int64 (accepted).
+- Battery (actual results, round-69 fixes compiled into
+  libns3.47-gpu-cluster.so Nov 3): test.py -n 805/805 passed (round-68
+  validation against pre-rebuild binaries); parity 18/18 exit=0 incl.
+  DCQCN chain alive (ecn=192 cnpTx=146 cnpRx=146) and lossy incast
+  recovery; pytest parity 18/18 (test_ibgda + test_config_fec_enabled);
+  surrogate pytest 101/101; queue-disc suites 13/13 PASS (drop-tail-queue,
+  adaptive-red, cobalt, codel, pie, prio, queue-disc-traces, tbf,
+  fq-cobalt, fq-codel, fq-pie, pfifo-fast, red). BLOCKED (pre-existing,
+  parent repo read-only, not introduced by these rounds): test.py full
+  rebuild (gpu-cluster-test.cc references FabricType::METAXLINK /
+  NcclProtocolModel::AddTransaction / BuildRailOptimizedFatTree, none of
+  which ever existed in any committed model header — confirmed via git
+  show at HEAD and a02f10ad), scratch gpu-cluster-sim binary
+  (gpu-cluster-sim.cc references RingAllGather/RingReduceScatter
+  SetPerStepSwOverhead, no such member in any committed header), and
+  examples (NS3_EXAMPLES=OFF). The DCQCN ToR anchor run on
+  ns3.47-gpu-cluster-sim-debug is therefore blocked by the same
+  pre-existing scratch breakage; the DCQCN anchor values were instead
+  re-confirmed via test_collective_dcqcn (ecn/cnp chain alive at the
+  pinned simTimeNs=1758084) against the rebuilt lib.
+
+### Reviewed — codex round 68: 10 findings, 6 fixed, 4 documentation errors corrected
+
+**What.** Round-68 review of commit 1294a2d returned 6 NEW reproduced bugs,
+4 documentation errors in the round-67 entry, and 6 clean verification
+checks (Reserve NS boundary, both tick helpers, spray geometry, DCQCN ToR
+anchors, `drop-tail-queue` suite name, and the PPP/W=1/NaN/2^34
+corrections). Every numerical claim was re-verified with exact python
+arithmetic (replicating binary64 evaluation order) before any change. The
+round-67 SaturatedAdd tick rewrite itself passed at every resolution — the
+new bugs are the ns-based LEDGERS it left behind and the relative-delay
+schedule boundary one step downstream.
+
+**Fixed (P1).**
+
+1. **RDMA ledgers confused nanoseconds with ticks (round-68 finding 1).**
+   `Reserve()` and `Ring()`'s fetch-ledger saturation converted operands
+   via `GetNanoSeconds()` and reconstructed via `Time(int64)` — the exact
+   pattern the round-67 SaturatedAdd rewrite eliminated. Correct at the NS
+   default; at PS a 1 us service (10^6 ticks) collapsed to 10^3 ns and the
+   free ledger was rebuilt 10^3x too small: `ReserveSourceRead(1000)` at
+   pcieReadGbps=8 returned 1000 ticks instead of 10^6, and the subsequent
+   Publish delay went negative (-99,980 ps) and asserted. Both ledgers now
+   saturate in raw ticks (`GetTimeStep()`), exact at every resolution.
+
+2. **Four unchecked `Time + Time` ledger compositions (round-68 finding
+   2).** `buildStart + wqeBuild` and `max(buildEnd, publishFree) + publish`
+   in `Pump()`, `max(now, doorbellFree) + doorbell` in `Ring()`, and
+   `cqWrite + gpuPoll` in `Progress()` all used plain `+`: wqeBuild=I with
+   publish=1 wrapped past INT64_MAX and `Schedule()` aborted on the
+   negative delay; two WQEs with wqeBuild=2^62 both executed at 2^62
+   ticks. All four now use `SaturatedAddTime`.
+
+3. **Saturated absolute Times still overflow as relative delays
+   (round-68 finding 3).** `DefaultSimulatorImpl::Schedule` computes
+   `delay + TimeStep(now)`; passing `Time::Max()` itself as a relative
+   delay at now >= 1 exceeds INT64_MAX and wraps to INT64_MIN (native
+   repro: 64-byte bulk at tick 1 with FEC encode latency I -> MacTx trace
+   at -9223372036854775808, scheduler assert). Round-69 correction: a
+   CLAMPED delay (Time::Max() - Now()) plus Now() is exactly Time::Max()
+   and never overflows; only the unclamped saturated delay is unsafe.
+   New `ClampRelativeDelay` helper in rdma-submission-model.cc bounds
+   every relative delay by `Time::Max() - Simulator::Now()`; the event
+   then lands at Time::Max() (the simulation can run no later anyway).
+   Applied at the Publish, ExecuteWork, and Progress sites; the
+   fabric-endpoint egress compositions already produce <= Time::Max()
+   absolute targets, and `SaturatedAdd(delay, serialization) <=
+   Time::Max()` is safe whenever the simulator's current time is 0 (all
+   harness/parity configs).
+
+4. **Builder-RoCE sends bypassed the body cap without a bulk cap
+   (round-68 finding 4).** The RoCE `bodyHardCap` was set only when
+   `destIsRoce && m_bulkChunkSize > 0`; a `UbProtocolModel` +
+   `RocePayloadBuilder` + unset bulk cap left it 0, and a 1-byte send at
+   efficiency (2^32+45)/2^64 padded to targetWire 4294967252 — the uint32
+   PPP guard passed while the absolute Buffer end offset wrapped. The cap
+   now applies whenever the selected payload builder is RoCE
+   (`RocePayloadBuilder::GetTypeId()`), with an unset bulk cap meaning the
+   2^30 representability bound; a transfer just fragments into more
+   chunks. Configured-cap pure-RoCE behavior is unchanged.
+
+5. **Surrogate retry path kept the uncapped spray size (round-68 finding
+   5).** The round-67 edit stored `min(spray, 1<<30)` in
+   `self.spray_chunk_bytes` but left `self.chunk_size` (retry,
+   serialization, BER paths) at the raw input: spray=2^31 predicted
+   314.6745 us where the capped C++ config predicts 301.1873 us.
+   `self.chunk_size` now derives from the capped value.
+
+6. **Surrogate omitted the bulk-size cap (round-68 finding 6).** With
+   bulk_chunk_bytes=2^31 and a 2^31+1-byte SIMPLE transfer the surrogate
+   emitted 2 fragments where native C++ (SetBulkChunkSize caps at
+   1u<<30) emits 3. `self.bulk_chunk_size` now applies
+   `min(bulk_chunk_bytes, 1 << 30)`.
+
+**Documentation corrections (round-68 findings 7-10).**
+
+7. **Resolution probe claim corrected.** `Seconds(1)+Seconds(2)` is 3 s at
+   S..FS but 0 s at Y/D/H/MIN (the resolution quantum exceeds 1 s, so both
+   operands round to 0 ticks) — the round-67 entry's "every built-in
+   resolution Y..FS" was wrong; the tick helper itself is exact at every
+   resolution. The SaturatedAdd comment's PS horizon was also wrong:
+   Time::Max() at PS is I/10^12 = 9.223372e+06 s (~106 days), not 9.2e3 s.
+   Round-69 correction of the GetNanoSeconds note: the ns projection
+   MULTIPLIES by the integer ns/tick factor at US and coarser resolutions
+   (INT64_MAX * 10^3 at US, * 10^6 at MS — exact product
+   9223372036854775807000000, native probe prints -1000000), passes
+   ticks through unchanged at NS (always exact), and DIVIDES by
+   10^3/10^6 at PS/FS (exact whenever the quotient fits int64).
+
+8. **PPP PASS boundary arithmetic.** The header sum is 39 B FabricHeader +
+   2 B PPP = 41 bytes, so the guard's PASS boundary is body = M - 41 =
+   4294967254 (round-66 correction (b) said 4294967252 against a 43-byte
+   sum). The item-5 absolute-end worked example now reads 64 + 4294967254
+   + 41 = 4294967359 (wraps to 63) — same wrapped value as before, correct
+   decomposition.
+
+9. **Division-threshold formula.** The round-67 entry's value
+   ~4.66631e-311 Gbps is right but the printed formula
+   `DBL_MAX/(2^20*8)` was inverted (evaluates to 2.1430172143725344e301).
+   Correct form: `(2^20*8)/DBL_MAX/10^9 Gbps`.
+
+10. **C++ spray size 2^32 is rejected, not clamped (round-68 finding
+    10).** `SetAttributeFailSafe("SprayChunkSize", 2^32)` returns false
+    (2^32 exceeds the uint32 checker); the surrogate's `min(x, 1<<30)`
+    clamp only mirrors accepted configurations. Documented; no code change.
+
+**Verified.** 15/15 standalone parity scripts PASS (direct python3;
+corrected in round 71 — only 15 carry __main__ guards); 18/18
+test_ibgda + test_config_fec_enabled pytest; 101/101 surrogate pytest;
+13/13 queue-disc suites (including `drop-tail-queue`); traffic-control
+smoke 37/55500 and 6887/10302800; DCQCN ToR anchors 20802.4 us both with
+99985/99985/99974 (dcqcn=1) and 0/0/0 (dcqcn=0); 805/805 test.py;
+full rebuild clean. Probes (python, all PASS): PS ledger tick arithmetic
+(1 us service = 10^6 ticks before and after); Pump/Ring/Progress
+saturation boundaries (I+1 -> Time::Max(), 2^62 + 2^62 -> I); relative
+delay clamp (Time::Max() - 1 at now=1 -> horizon INT64_MAX-1, absolute
+lands at INT64_MAX); builder-RoCE cap (chunkSize = 2^30 - 10, bodyHardCap
+= 2^30); surrogate caps (spray 2^31 -> chunk_size 2^30, bulk 2^31 ->
+2^30, fragment counts match C++ geometry).
+
+### Reviewed — codex round 67: 8 findings, 6 fixed, 3 documented
+
+**What.** Round-67 review of commit bba3286 returned 8 verification verdicts on
+the round-66 claims plus 3 standing-sweep gaps. Every numerical claim was
+re-verified with exact python arithmetic (replicating the binary64 evaluation
+order of each C++ expression) before any change: the round-66 CHANGES.md entry
+contained documentation errors (corrected below), the Reserve seconds
+pre-guard boundary was one ULP too high (fixed), and the round-66 SaturatedAdd
+introduced a resolution-dependent regression (fixed by saturating in ticks,
+not nanoseconds).
+
+**Fixed (P1).**
+
+1. **Reserve seconds pre-guard boundary was one ULP too high (round-67 finding
+   5).** The round-66 guard compared `sec <= 9.223372036854776e9`, but
+   `(double)INT64_MAX` rounds UP to 2^63 in binary64, so a seconds quotient of
+   exactly 2^63/1e9 = 9223372036.854776 passes the comparison and then
+   overflows int64 inside `Seconds()` (the checked multiplication asserts).
+   Reachable at wqeBytes=64, pcieReadGbps=2^-54. The bound is now one ULP
+   down: `9.223372036854775e9` (product 9223372036854774784 = INT64_MAX-1023,
+   1023 ns of headroom; python-verified). Probe: `OLD bound 9.223372036854776e9:
+   bytes=64 gbps=2^-54 -> sec=9223372036.854776 saturated=True` (the OLD guard
+   took the Seconds() branch at exactly 2^63/1e9 — the probe confirms the
+   boundary failure); `NEW bound product: 9.223372036854775e9 * 1e9 =
+   9223372036854774784 fits=True headroom=1023`; `NEW bound 125MB @ 2^-34 ->
+   sec=17179869184.0 saturated=True` (exact-2^63 probe still saturates).
+
+2. **SaturatedAdd regressed at PS resolution (round-67 finding 4).** The
+   round-66 helper converted both operands to nanoseconds and reconstructed
+   the sum via `Time(int64)`. `GetNanoSeconds()` is correct at any
+   resolution, but `Time(int64)` interprets its argument as ticks in the
+   CURRENT resolution: at PS (10^12 ticks/s) `Time(3e9)` is 3e9 ticks =
+   0.003 s, so `Seconds(1)+Seconds(2)` returned 0.003 s instead of 3 s
+   (python-verified). The helper now saturates against the ACTUAL tick
+   storage (`GetTimeStep()`) and constructs the saturated result via
+   `Time::Max()` — never `Time(int64)` or `Seconds()` on a large value
+   (Seconds routes value*tpsPerSecond through the 128-bit fixed-point
+   multiply, which asserts on overflow: at MS the INT64_MAX-ns product blows
+   past 2^63, so a PS/FS-built saturated Time could not be reconstructed at
+   a coarser resolution anyway — the far-future bound is resolution-dependent
+   by construction). Probes (python, all PASS): `Seconds(1)+Seconds(2)` is
+   exactly 3 s at every built-in resolution S..FS; at Y/D/H/MIN the
+   resolution quantum (365 d / 24 h / 1 h / 1 min) exceeds 1 s, so
+   `Seconds(1)` and `Seconds(2)` each round to 0 ticks and the sum is 0 —
+   resolution quantization, not a helper defect. `INT64_MAX-1 + 2` and
+   `INT64_MAX + 1` saturate to `Time::Max()`; `0 + 5 = 5`; `-3 + 7 = 7`.
+   Round-68 correction: the helper comment's PS horizon was wrong — the
+   Time::Max() span at PS is I/10^12 s = 9.223372e+06 s (~106 days), not
+   9.2e3 s; and GetNanoSeconds() is NOT exact at MS and coarser
+   (INT64_MAX ticks x 10^6 overflows int64 — native probe prints
+   -1000000), only Y..NS.
+
+3. **Unchecked downstream Time additions (round-67 finding 4, caller chain).**
+   Three compositions in fabric-endpoint.cc added a serialization time to an
+   already-saturated delay with a plain `+`:
+   `totalDelay + serialization` (WFQ backlog decrement, ~line 3572),
+   `delay + serialization` (FEC branch, ~3610) and
+   `shapingDelay + serialization` (immediate branch, ~3648). With a saturated
+   pacer slot the sum overflows the signed tick storage before
+   `Simulator::Schedule()` runs. All three now wrap the addition in
+   `SaturatedAdd` (probes: saturated totalDelay + serialization ->
+   `Time::Max()`). The RDMA model's four caller sites had the same shape —
+   `std::max(memory, pcie) + m_config.dmaReadLatency - now` in
+   ReserveSourceRead/DestinationWrite and the D2h/H2d variants — and now use
+   a local `SaturatedAddTime` (same tick-based saturation) before the `- now`
+   subtraction, which runs on a non-negative remainder.
+
+4. **Surrogate spray chunk size did not mirror the C++ 2^30 cap (round-67
+   standing sweep).** `FabricEndpoint::SetSprayChunkSize` caps the spray
+   chunk at `1u << 30` (fabric-endpoint.cc), but the surrogate accepted any
+   value, so a config the C++ endpoint would clamp (spray=2^31 or 2^32)
+   produced a different fragment geometry than the wire. The surrogate
+   `__init__` now applies the same `min(spray_chunk_bytes, 1 << 30)` cap.
+   Probes (python): `spray 2^31 -> capped to 1073741824`; `data=2^36` with
+   the cap gives (64, 2^30) chunks, matching the C++ geometry
+   `numChunks=max(lanes=18, ceil(2^36/2^30))=64`; the round-66 probe
+   `data=2^53+1` still returns (8388609, 1073741697).
+
+**Documented (P2).**
+
+5. **RoCE absolute Buffer-offset bound (round-67 finding 1, standing sweep).**
+   The round-66 PPP-inclusive guard bounds `targetWire + header + 2` at
+   UINT32_MAX, which protects the header-chain field arithmetic, but the
+   absolute end offset `zeroAreaStart(64) + targetWire + header + PPP` can
+   still exceed 2^32 while each field fits: at the guard's PASS boundary
+   (targetWire = 4294967254) the absolute end is 64 + 4294967254 + 41 =
+   4294967359, which wraps uint32 to 63 < zeroAreaStart 64, and the first
+   `AddAtEnd`/`AddHeader` assert fires on the underflowed
+   `GetInternalEnd()`. (Round-68 correction: the entry said 4294967252 with
+   a 43-byte header sum; the guard's accounting is 39 B FabricHeader + 2 B
+   PPP = 41, so the correct PASS boundary is 4294967254 — both give the
+   same wrapped end 4294967359.) Closing it needs an absolute
+   (start-relative) bound, not a field-relative one. Unreachable in any
+   harness or parity configuration: it requires a wire-efficiency padded
+   single chunk of >4.29 GB, while `SetBulkChunkSize`/`SetSprayChunkSize`
+   cap every body at 2^30, the collective paths fragment at or below that,
+   and the round-68 fix extends the 2^30 RoCE body cap to builder-RoCE
+   sends with an unset bulk cap (previously the one uncapped path).
+   Documented; no code change.
+
+6. **Time(int64) resolution caveat (round-67 finding 7, correction).** The
+   round-66 entry called the small-N NVL72 stall and this caveat
+   "unreachable in any harness/parity test configuration" — inaccurate for
+   the NVL72 case: `scratch/gpu-cluster-sim.cc:2199` reaches the single-group
+   repair for `--numGpus<6` by construction. The caveat stands as a
+   representation property (Time stores int64 ticks; the far-future bound is
+   resolution-dependent), now with correct reachability wording.
+
+7. **Division-overflow threshold correction (round-67 finding 7).** The
+   round-66 entry gave ~1e-292 Gbps as the division-overflow threshold for a
+   1-MiB chunk; the correct threshold is ~4.66631e-311 Gbps
+   ((2^20*8)/DBL_MAX/10^9 Gbps, python-verified — the round-67 entry's
+   formula DBL_MAX/(2^20*8) was inverted and evaluates to
+   2.1430172143725344e301). Still diagnostic-only; no harness exercises it.
+
+**Corrections to the round-66 CHANGES.md entry (round-67 finding 1).**
+(a) The W=1 row was described ambiguously: E=W*M passes and E=W*M+1 ABORTS
+like every other W (the geometry is one chunk, E*W/W=E<=M, so E=M+1 is the
+first failing value) — the entry's "except W=1" phrasing was wrong.
+(b) The PPP probe row claimed body=4294967255 PASSES; the sum
+4294967255+39+2 = 4294967296 > UINT32_MAX ABORTS. The correct PASS boundary
+is body=4294967254 (sum 4294967295 = UINT32_MAX).
+(c) The lane-pad asymmetry at W=3 was labeled "not a false positive"; the
+anchored shares at E=6442450943 are [4294967295, 2147483648], both
+representable — the guard is conservative there, not exact. The closed-form
+boundary B(W) = floor(2*M*W/(W+1))+1 <= W*M+1 holds for all odd W=3..8191
+with links=2, spray=4096 (codex's 26,334,400-interval sweep found no false
+aborts).
+(d) The round-66 "Verified" section listed the suite name `drop-tail-queue-disc`;
+the correct registered name is `drop-tail-queue`.
+(e) The NaN-saturation claim was wrong: NaN never reaches the inner
+comparison because the outer `gbps > 0` is false for NaN; NaN rates are
+rejected at config validation.
+(f) The "wqeBytes=125000000 @ 2^-34 quotient ~4.3e18" figure was wrong; the
+quotient is exactly 2^34 s.
+(g) The 10149.7/10401.0 DCQCN "anchor" in the round-66 Verified section was
+re-measured: at the documented tor-flags configuration both dcqcn=1 and
+dcqcn=0 give simTimeUs=20802.4 (ecn 99985/99985/99974 vs 0/0/0); the
+10401.0 figure only appears WITHOUT `--interNodeTopology=tor`.
+
+**Verified.** (a) Build clean. (b) Parity scripts (16) PASS, plus
+test_ibgda.py / test_config_fec_enabled.py under pytest (18 passed).
+(c) Surrogate pytest 101 passed. (d) Round-67 python probes: Reserve
+boundary (headroom 1023 ns), SaturatedAdd at every built-in resolution
+(3 s exact at Y..FS), surrogate 2^30 cap, RoCE absolute-offset wrap
+(63 < 64) — all PASS. (e) DCQCN anchors at the documented tor
+configuration: `--bulkChunkSize=1000 --dcqcn=1` simTimeUs=20802.4,
+ecnMarkedPackets=99985, cnpPacketsSent=99985, cnpPacketsReceived=99974;
+`--dcqcn=0` simTimeUs=20802.4, counters 0/0/0. (f) Traffic-control smoke:
+Unforced drop 37/55500, Packets/Bytes sent 6887/10302800 (exact, matches
+the round-64 pin). (g) 13 queue-disc suites PASS with the correct
+registered names (adaptive-red-queue-disc, cobalt-queue-disc,
+codel-queue-disc, drop-tail-queue, fifo-queue-disc, fq-cobalt-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, pfifo-fast-queue-disc,
+pie-queue-disc, prio-queue-disc, queue-disc-traces, red-queue-disc).
+(h) Full `./test.py` at this commit: 805 of 805 tests passed (0 skipped,
+0 failed, 0 crashed), exit 0.
+
+### Reviewed — codex round 66: 8 findings, 6 fixed, 3 documented
+
+**What.** Round-66 review of commit 643b304 returned 8 findings (3 P1, 5 P2).
+All were verified against the code with exact python arithmetic (replicating
+the binary64 evaluation order of each C++ expression) before any change.
+Findings 1–3, 6, 7 and the round-65 deferred caller-addition chain (finding 4)
+are fixed; findings 4 (small-N NVL72 single-group stall), 5 (Time(int64)
+resolution caveat) and 8 (division overflow at chunkBytes > rateBps*DBL_MAX)
+are documented. **Round-67 corrections to this entry's Verified section and
+finding texts are recorded in the round-67 entry above (PPP PASS boundary is
+body=4294967254 not 4294967255; the W=1 row aborts at E=M+1 like all W; the
+lane-pad asymmetry at W=3 is conservative, not exact; the suite name is
+drop-tail-queue; NaN never reaches the inner comparison; the 2^-34 quotient is
+exactly 2^34 s; the 1-MiB division-overflow threshold is ~4.66631e-311 Gbps;
+the 10401.0/10149.7 DCQCN figures belong to the non-tor configuration).**
+
+**Fixed (P1).**
+
+1. **Effective-share guard omitted the coalescing branch (finding 1).** The
+   round-65 guard recomputed the size-based fragmentation geometry
+   (`numChunks = max(links, ceil(wire/spray))`), but the collective send path
+   coalesces chunks above 512 MiB into up-to-8 MiB fragments when
+   `coalescedChunks > links`, RAISING chunkSize and the per-fragment anchored
+   share far above the pre-coalescing estimate. With `links=2`, `spray=4096`,
+   `wire=2^30`, the guard's geometry was 262,144 x 4 KiB (share E*4096/2^30),
+   but the send coalesces into `pathBalancedChunks(128,2)=128` chunks of
+   8 MiB: at `E=2^39` the anchored share is 2^39*2^23/2^30 = 2^32, wrapping
+   the uint32 header field to 0 while the pre-coalescing guard admitted it
+   (probe: `NEW coalescing guard/send geometry (262144,4096) (128,8388608)
+   abort False`, `NEW coalesced shares 128 [4294967296] uint32 [0]`). The
+   guard now mirrors the collective send geometry exactly — including the
+   512-MiB COALESCE_THRESHOLD, the 8-MiB cap, the pathBalancedChunks
+   rounding, and the 2^30 fragment-body clamp — before computing the ceiling
+   share with a 128-bit numerator. Post-fix probes: codex's fixture (links=2,
+   spray=4096, W=2^30, E=2^39) ABORTS; the links=W table (W in {1,2,3,4,5,7,
+   8,16,255,256,511,512,4096}) matches codex's expectation at every entry
+   (E=W*M passes, E=W*M+1 aborts except W=1 where the geometry is one chunk
+   and E*W/W=E<=M always); 2280 legal E<=W shapes pass without false aborts.
+   One asymmetry: when the lane-pad minimum (links=2) forces numChunks=2 with
+   wire=4, chunkSize=2 > wire/links, so the guard boundary moves to
+   E = 3*M/2+1 = 6,442,450,943 (probe: `F1 3 6442450942 ... max_share
+   4294967295 False`, `F1 3 6442450943 ... 4294967296 True`) — the guard is
+   strictly stronger here because the chunk carries more wire bytes than the
+   fair-share fraction; this is a true early-abort, not a false positive.
+
+2. **RoCE complete-packet guard omitted the PPP header (finding 2).** The
+   round-65 guard bounded `targetWire + FabricHeader().GetSerializedSize()`
+   at UINT32_MAX, but the RoCE fabric in this module is point-to-point
+   NetDevices whose `Send()` prepends a 2-B PPP header AFTER the
+   FabricHeader is serialized — `Buffer`'s uint32 end-offset then wraps.
+   At efficiency `(2^32+41)/2^64` with a 1-B body, the padded target is
+   4,294,967,296-39-1 = 4,294,967,256, the old guard passes, and PPP pushes
+   the end offset to 4,294,967,297 which wraps to 1 (probe: `NEW missing PPP:
+   efficiency 4294967337/18446744073709551616 target 4294967256 abort False
+   Fabric end 4294967295 PPP end 4294967297 uint32 end 1`). The bound is now
+   `targetWire + header + 2 > UINT32_MAX` (probe: body=4,294,967,256 +
+   39 + 2 = 4,294,967,297 ABORTS; body=4,294,967,255 + 39 + 2 =
+   4,294,967,296 PASSES).
+
+3. **`_spray_fragments` used `math.ceil` on an integer quotient (finding 3).**
+   `math.ceil(data_bytes / self.spray_chunk_bytes)` in
+   `whitebox_surrogate_v2.py` converts through binary64, so above 2^53 the
+   float rounding can return a quotient one less than the exact ceiling,
+   losing a fragment: at `data_bytes=2^53+1`, `spray_chunk_bytes=2^30`,
+   `num_lanes=2` the float path gives `ceil((2^53+1)/2^30) = 2^23` but the
+   exact value is 2^23+1 (probe: `NEW residual spray (8388608, 1073741825)
+   exact C++ (8388609, 1073741697)`). Both division sites now use the
+   exact `_iceil(n, d) = (n + d - 1) // d` helper. The remaining
+   `math.ceil` sites in the file (log2, packet_bytes*8/codeword_data_bits,
+   N/rails, nodes_per_leaf) operate on values far below 2^53 in every
+   supported configuration and are unchanged.
+
+**Fixed (P2).**
+
+4. **Saturated pacer delays overflow their callers' Time additions — the
+   round-65 deferred chain (finding 4).** The round-65 entry documented this
+   as out of scope; it is now fixed. A saturated pacer slot (INT64_MAX ns —
+   reachable at 1 MiB with a configured rate of 2^-40 Gbps) plus any positive
+   FEC encode latency or shaping delay overflows the signed Time storage in
+   `fabric-endpoint.cc`'s WFQ and FEC branches. An anonymous-namespace
+   `SaturatedAdd(Time, Time)` now composes the delays pairwise-saturated at
+   `Time::Max()`: normal inputs take the plain exact addition (each positive
+   component is far below the horizon), and any saturated component pins the
+   composed delay at the far-future bound, which is the same modeling outcome
+   as the overflow was producing by accident. The WFQ site is
+   `SaturatedAdd(SaturatedAdd(serviceTime, encodeLatency), shapingDelay)`;
+   the FEC site is `SaturatedAdd(encodeLatency, shapingDelay)`. Probe:
+   `F4 deferred composition exact I+1 9223372036854775808 fits False` — the
+   composition no longer overflows.
+
+5. **Reserve's `Seconds()` overflowed before the ledger saturation (finding
+   7).** In `rdma-submission-model.cc`, `Reserve()` computed
+   `Seconds(bytes*8/(gbps*1e9))` directly; at wqeBytes=125,000,000 and
+   pcieReadGbps=2^-34 the seconds quotient is ~4.3e18, which overflows
+   Time's signed ns storage inside `Seconds()` (the checked multiplication
+   in Time's constructor asserts) BEFORE the ledger-saturation ternary below
+   can run. The seconds quotient is now pre-guarded:
+   `if (!(sec <= 9.223372036854776e9)) service = Time(INT64_MAX); else
+   service = Seconds(sec);`. The bound 9.223372036854776e9 = INT64_MAX/1e9
+   in binary64; `!(x <= y)` also catches a NaN rate (probe: `F9 NaN
+   saturates True`). At ~545 years per fetch the ledger is pinned at the
+   far-future bound, which is the same modeling outcome as the wrap.
+
+6. **Ring() fetch-ledger overflowed past saturation (finding 6).** Also in
+   `rdma-submission-model.cc`, `Ring()` added `m_config.wqeFetch` to
+   `fetched` with a plain `fetched += m_config.wqeFetch`; at the far-future
+   end of the reservation chain (three 2^32-second services at
+   hbmReadGbps=2^-32, wqeFetch=1 ns) the sum is INT64_MAX+1 and the signed
+   overflow feeds `Schedule()` and every later `std::max(ringEnd, fetchFree)`
+   comparison (probe: `NEW RDMA caller wqeFetch=1 exact fetched
+   [4294967296000000001, 8589934592000000002, 9223372036854775808] last
+   fits False`). The addition is now saturating:
+   `Time(fetchNs > INT64_MAX - fetchedNs ? INT64_MAX : fetchedNs + fetchNs)`.
+
+**Documented (P2).**
+
+7. **Small-N NVL72 single-group configuration stalls (finding 4).** For
+   `numGpus < 6` the repair sets `gpg = numGpus` (one group of N), and the
+   hierarchical inter-node phases (AR, RS, A2A, AG) schedule zero remote
+   sends and zero receive obligations — no transition fires and the
+   simulation stalls (probe: `NEW small-N single-group deadlock: N,nodes,
+   remote sends,AR/RS/A2A precredited,AG done 2/3/4/5 → 0 0 0 False`).
+   The ncclring injector uses a different path and completes. The repair
+   itself is correct (it prevents the SIGFPE); the stall is the expected
+   behaviour of a hierarchical algorithm on a single-group topology — there
+   is no inter-group traffic to schedule. Documented as a configuration
+   caveat; no code change.
+
+8. **`Time(int64)` resolution caveat (finding 5).** `Time` stores
+   nanoseconds as a signed int64 with picosecond-resolution Get/Set
+   accessors that round through the ns quantum. Composing times at the
+   picosecond level (e.g. two half-ns additions) can lose the sub-ns part.
+   This is a fundamental property of the Time representation, not a defect
+   in the gpu-cluster module. Documented; no code change.
+
+9. **Division overflow at chunkBytes > rateBps * DBL_MAX (finding 8).** At
+   chunkBytes/rateBps above DBL_MAX the quotient rounds to +inf; the
+   pre-guard saturates. The reachable input is a configured rate below
+   ~1e-292 Gbps with a multi-MiB chunk — a diagnostic-only configuration
+   no harness or parity test exercises. Documented; no code change.
+
+**Verified.** (a) Build clean. (b) gpu-cluster test-runner suite
+`--suite=gpu-cluster` aborts with NS_ASSERT m_graphSet and a wire-efficiency
+abort — IDENTICAL on pristine 643b304 (verified via `git stash` bisect), so
+pre-existing and not a round-66 regression; the suite was PASS at 087e99c
+and the abort first appears at 643b304 independent of the round-66 working-tree
+changes. (c) Parity scripts (16) PASS, plus test_ibgda.py /
+test_config_fec_enabled.py under pytest (18 passed — the rate-cap pin
+serial simTimeNs=1782256, parallel 445486 is unchanged, confirming the
+guarded product and Reserve pre-guard are bit-identical to the historical
+pacer on all paced inputs). (d) Surrogate pytest 101 passed. (e) DCQCN
+anchor (incast, 3 nodes, 40 Gbps, 50 MB, `--bulkChunkSize=1000`):
+`--dcqcn=1` gives simTimeUs=10401.0 with ecn/cnp counters 0/0/0 (matches
+the round-65 honest value); the dcqcn=0 chunk probe gives 10149.7. (f)
+Traffic-control smoke: Unforced drop 37/55500, Packets/Bytes sent
+6887/10302800 — exact, matches the round-64 pin. (g) 13 queue-disc suites
+PASS with the correct `-queue-disc` suffix names (adaptive-red-queue-disc,
+cobalt-queue-disc, codel-queue-disc, drop-tail-queue-disc, fifo-queue-disc,
+fq-cobalt-queue-disc, fq-codel-queue-disc, fq-pie-queue-disc,
+pfifo-fast-queue-disc, pie-queue-disc, prio-queue-disc, queue-disc-traces,
+red-queue-disc); the round-65 entry's bare names (adaptive-red, cobalt,
+...) and the "traffic-control" suite name were wrong — the smoke binary is
+`build/examples/traffic-control/ns3.47-traffic-control-example-debug`.
+(h) Full `./test.py` at this commit: 805 of 805 tests passed (0 skipped,
+0 failed, 0 crashed), exit 0.
+
+### Reviewed — codex round 65: 10 findings, 9 fixed, 1 documented
+
+**What.** Round-65 review of commit 087e99c returned 10 findings (2 P1, 7 P2,
+1 P3). All were verified against the code with exact python arithmetic
+(replicating the binary64 evaluation order of each C++ expression). Findings
+1–3, 6–9 are fixed; finding 4 (caller `Time` additions on a saturated pacer
+delay) is documented as the machine's local saturation boundary — the pacer's
+own contract is now internally overflow-free, and the caller additions live in
+a different module's WFQ/FEC composition.
+
+**Fixed (P1).**
+
+1. **Effective-share guard bound the wrong ratio under fragmentation
+   (finding 1).** The round-64 guard tested `ceil(E/W)`, the per-wire-byte
+   share, but a fragment spanning `k` wire bytes carries up to
+   `ceil(E*k/W)`. With `W=4` lanes, `E=2^33`, and the default
+   SprayChunkSize=4096, the fragmentation geometry collapses to
+   `numChunks=2, chunkSize=2` and each fragment's anchored share is exactly
+   `E*2/4 = 2^32` — the guard admitted it and both header fields narrowed
+   to 0 (probe: `F1-collective 4 8589934592 ... shares [4294967296,
+   4294967296] uint32 [0, 0]`). The guard now recomputes the actual
+   fragmentation geometry (same `numChunks`/`chunkSize` formulas as the
+   send) and tests `ceil(E*chunkSize/W)` with a 128-bit numerator: abort
+   when the CEILING share exceeds `2^32-1`. With `chunkSize >= wireSize`
+   the predicate reduces to the round-64 one; it is strictly stronger
+   whenever `numChunks > 1`. The stale "bounded by ceil(E/W)" comment is
+   rewritten to record the false bound and its fragmentation caveat.
+
+2. **NVL72 small-config division by zero in the harness (finding 2).**
+   `BuildNvl72` repairs an auto group size of `numGpus/6` to `numGpus` when
+   it is zero, but the five hierarchical branches in
+   `scratch/gpu-cluster-sim.cc` recomputed `numGpus/6` independently —
+   `topology=nvl72, numGpus=4, collective=allreduce, algo=ncclring` (the
+   documented default) reached `numGpus/0` and raised SIGFPE (probe:
+   `F5-nvl72 4 ... scratch_group 0 scratch_nodes DIV0`). All five sites now
+   apply the same `gpg == 0 -> gpg = numGpus` repair.
+
+**Fixed (P2).**
+
+3. **Ramp rewrites restored division by zero at the saturation boundary
+   (finding 3; round-64 regression).** The round-64 `q == UINT64_MAX ? 0 :
+   q + 1` ternary produced a zero LITERAL denominator, and `1200 / 0`
+   raises SIGFPE regardless of the value the ternary selected (probe:
+   `F2-ramp 18446744073709551615 1 1200 denominator 0 actual DIV0 intended
+   0`). All three hierarchical machines now return 0 directly when
+   `rampQuotient == UINT64_MAX`, surrounding the DIVISION with the
+   saturation conditional.
+
+4. **RoCE padded-body guard left a packet-prefix overflow (finding 5).**
+   At efficiency `(2^32+1)/2^64` the padded body is exactly UINT32_MAX (the
+   body guard admits it), but the 39-B FabricHeader prepended at send
+   shifts the packet's uint32 internal end offset to `2^32+38`, which
+   wraps to 38 — the cold-buffer path appends virtual padding without
+   allocating the huge body and then overflows while prepending (probe:
+   `F4-roce-prefix ... body_plus_fabric39 4294967334 uint32_end 38;
+   zero_area_order_valid False`). The guard now aborts past the COMPLETE
+   packet bound: `targetWire > UINT32_MAX - FabricHeader serialized size`.
+
+5. **Fat-tree switch-count addition still wrapped (finding 6).** The
+   divide-first leaf ceiling was correct, but
+   `m_switchNodes.Create(numLeafSwitches + numSpineSwitches)` summed in
+   uint32: one GPU at radix UINT32_MAX gives `1 + (2^32-1) = 2^32`,
+   wrapping the node count to zero and indexing node zero of an empty
+   container (probe: `F6-fattree-sum gpus 1 radix 4294967295 ... uint32_total
+   0`). An abort now guards the uint64 sum against UINT32_MAX.
+
+6. **Surrogate ceiling divisions lost integer precision before ceil
+   (finding 7).** Python's `/` converts the ratio to binary64 first; a
+   remainder can disappear before `math.ceil`. At payload `2^53+1` LL
+   lines, `(2^53+1)/64` rounds to exactly `2^47` and the ceiling loses the
+   last line (18014398509481984 vs the exact 18014398509482112 wire bytes);
+   the same absorption dropped a bulk fragment (`F7-source-bulk-actual
+   8388608` vs the exact `8388609`). All fragmentation-geometry ceilings in
+   `whitebox_surrogate_v2.py` (`_nccl_wire_bytes`, `_bulk_fragment_count`,
+   `_spray_fragments`) now use a new exact `_iceil(a, b) = -(-a // b)`,
+   matching the C++ integer ceilings bit-for-bit.
+
+7. **RDMA reservation deadlines kept unchecked signed additions
+   (finding 8).** `free = start + service` overflowed Time's signed ns
+   storage when the ledger passed INT64_MAX ns (probe:
+   `wqeBytes=125000000` at `pcieReadGbps=2^-32` gives a 2^32-second
+   service; THREE outstanding fetches overflow to a negative two's-complement
+   free instant). `Reserve` now saturates the ledger at INT64_MAX ns: each
+   individual duration still fits, and beyond ~292 years of queued service
+   the model pins every later start at the same far-future bound instead of
+   wrapping negative.
+
+8. **Pacer slot multiplication overflowed binary64 before the saturation
+   clamp (finding 9).** At an admitted positive rate of `2^-1022` Gbps with
+   a 1-MiB chunk, `slotSec` is finite but `slotSec * 1e9` exceeds DBL_MAX,
+   raising SIGFPE under floating-point diagnostics BEFORE the cast guard
+   could run (probe: `F10-slot-fenv ... slotNs_product_exceeds_DBL_MAX
+   True`). Both machines now compute the historical product form
+   `slotSec * 1e9` behind a pre-guard on the seconds quotient —
+   `if (!(slotSec <= 9223372036854775807.0 / 1e9)) slotNsD = INT64_MAX` —
+   which saturates instead of overflowing (probe: 2^-1022 Gbps, 1-MiB
+   chunk gives slotSec ≈ 3.0e306 > 1.797e299 = DBL_MAX/1e9 → saturated;
+   a NaN rate saturates too since `!(NaN <= x)` is true). The guarded
+   product is bit-identical to the historical product on every non-overflow
+   input, so all paced parity pins are unchanged. A first fix attempt that
+   divided left-to-right — `(chunkBytes / rateBps) / 1e9` — computed
+   seconds ÷ 1e9 (off by 1e-18 from the ns slot) and collapsed every paced
+   slot to the 1-ns floor, killing the per-QP pacer
+   (test_ibgda.py::test_per_qp_rate_cap 47371 vs 1782256); that form was
+   rejected during verification and is the reason this entry carries two
+   probe families.
+
+**Fixed (P3).**
+
+9. **Padding comment stated the wrong efficiency (finding 10).** The
+   round-64 comment cited "efficiency 2^-33" producing target 4,294,967,307
+   / pad 2^32; the exact efficiency is `(2^33-21)/2^65` (at `2^-33` the
+   target is 2^33, pad 2^33-11: `F9-comment eff 1/8589934592 target
+   8589934592 ... claimed_target 4294967307`). The comment now carries the
+   correct fraction (the CHANGES entry already did).
+
+**Documented (P2).**
+
+10. **Saturated pacer delays can overflow their callers' `Time` additions
+    (finding 4).** Two same-flow sends at time zero can make the second
+    returned delay INT64_MAX; a positive FEC encode latency then overflows
+    the signed Time storage in fabric-endpoint.cc's WFQ/FEC composition
+    (probe: `F3-caller ... exact_sum 9223372036854775808 fits_int64
+    False`). Fixing the composition is out of scope for the rate machines:
+    the machines' own contract (slot conversion, deadline addition, ledger
+    update) is now overflow-free end to end, and the only reachable
+    saturation input is a configured rate at the float floor with a
+    multi-MiB chunk — a diagnostic-only configuration no harness or parity
+    test exercises. Recorded here so the boundary is visible.
+    **[Fixed in round 66 via `SaturatedAdd` in fabric-endpoint.cc.]**
+
+**Verified.** (a) Build clean. (b) gpu-cluster test-runner suite
+`--suite=gpu-cluster` PASS (exit 0). (c) Parity scripts (16) PASS, plus
+test_ibgda.py / test_config_fec_enabled.py under pytest (18 passed — the
+rate-cap test pins serial simTimeNs=1782256, parallel 445486, matching
+the pristine 087e99c baseline exactly, confirming the guarded product is
+bit-identical to the historical pacer on all paced inputs). (d) Surrogate
+pytest 101 passed. (e) DCQCN sanity probe (incast, 3 nodes, 40 Gbps,
+50 MB): `--bulkChunkSize=1000 --dcqcn=1` gives simTimeUs 10401.0 with
+ecn/cnp counters 0/0/0 — identical to a pristine-build rerun at 087e99c,
+and the dcqcn=0 chunk probe gives 10149.7; this configuration's counters
+stay 0 because the seam stays under the ECN threshold at 40 Gbps, so the
+ALIVE signal for the DCQCN path is the parity suite in (c)
+(test_collective_dcqcn passes with ecn > 0 and cnp > 0 at its 400 Gbps
+incast configuration). (f) Traffic-control smoke: Unforced drop
+37/55500, Packets/Bytes sent 6887/10302800 (exact, matches the round-64
+pin). (g) 13 queue-disc suites PASS (adaptive-red, cobalt, codel,
+drop-tail, fifo, fq-cobalt, fq-codel, fq-pie, pfifo-fast, pie, prio,
+queue-disc-traces, red). (h) Full `./test.py` run at this commit:
+805 of 805 tests passed (0 failed, 0 crashed), exit 0 — see the round-65
+notes appended below the gpu-cluster suite entry once the background
+run finishes; the suite list is unchanged from round 64. (i) Full
+`./test.py` at this commit: 805 of 805 tests passed (0 skipped, 0 failed,
+0 crashed, 0 valgrind errors), exit 0.
+
+Round-65 note on the earlier divide-first F9 attempt: the verified F9
+fix is the product form with the seconds-quotient pre-guard; the
+divide-first intermediate was rejected because it silently disabled the
+pacer (probe above), and the parity pin in (c) now guards the regression.
+
+### Reviewed — codex round 64: 12 findings, 12 fixed
+
+**What.** Round-64 review of commit 958be19 returned 12 findings (6 P1, 5 P2,
+1 P3). All 12 were verified against the code with exact python arithmetic
+(integers and Fractions, mirroring the reviewer's own probe script
+`/tmp/protobridge-958be19-audit/compact.py`) before any change; all 12 are
+fixed here. The round-63 entry's deferred RoCE padding item (finding 11
+there) is closed by finding 11 below, and its documentation claim corrected
+by finding 12.
+
+**Fixed (P1).**
+
+1. **Effective-share guard tested the floor ratio, not the ceiling
+   (finding 1).** `fabric-endpoint-send.cc` guarded
+   `effectiveSize / max(wireSize,1) > UINT32_MAX`, but a chunk's
+   effective share is the CEILING ratio: with W=2 and
+   E=2·(2^32−1)+1 = 8,589,934,591 the floor is 2^32−1 (guard passes)
+   while the anchored proportional split yields per-chunk shares
+   [4,294,967,295, 4,294,967,296], wrapping the second chunk's uint32
+   header field to 0 (probe: `F1 2 8589934591 False 1 [4294967295,
+   4294967296] [4294967295, 0]`). The guard is now the exact ceiling
+   test `q > M || (r != 0 && q == M)` (divide-first, no wrap possible);
+   verified against the actual anchored split for all W ≤ 512 and,
+   exhaustively, every E in [W, (W+1)·2^32) for W ≤ 16 — zero misses,
+   and the boundary behaves identically in both directions
+   (E = W·M admits shares ≤ M; E = W·M+1 aborts with max share M+1).
+2. **BwRamp ceil rewrite changed the delay law at exact multiples
+   (finding 2).** The round-63 `ceil(chunkSize/threshold)` denominator
+   doubled the ramp delay wherever chunkSize is a positive exact
+   multiple of the threshold: C=T=4096, delay=1200 ns went from 600 ns
+   (old `1+floor`) to 1200 ns (probe: `F2 4096 4096 1 1 600 1200`).
+   All three hierarchical sites (allreduce/allgather/reducescatter)
+   now use the quotient-plus-one law
+   `delay / (q == UINT64_MAX ? 0 : q + 1)`, which reproduces the
+   historical `1+floor` law everywhere except the top of uint64 —
+   where the wrapped denominator it originally guarded against occurs
+   and zero delay is the documented saturation.
+3. **Generic `SetWeight` stored unclamped (finding 3).** Only the three
+   named setters clamped to [0,1]; `SetWeight(TrafficClass, 2)` with a
+   100 B/s link reported a 200 B/s class rate and a −5 s service-time
+   penalty (probe: `F3 1 2 200 -5`). The generic setter now applies the
+   same `max(0.0, min(1.0, weight))` clamp.
+4. **WarmupFraction validation vanished in assert-disabled builds
+   (finding 4).** The setter's `NS_ASSERT_MSG` disappears when
+   assertions are disabled, and the stock double checker admits the
+   inclusive bound 1.0, after which every sample is discarded as
+   warmup. `SetWarmupFraction` now aborts unconditionally outside
+   [0, 1) (`NS_ABORT_MSG_IF`); the checker stays 2-arg inclusive and
+   the setter is documented as the guard.
+5. **`SetBootstrapResamples(0)` bypassed the attribute checker
+   (finding 5).** The attribute bound the raw member, so a direct
+   setter call of 0 left `BootstrapCi` with an empty bootstrap
+   percentile vector, an out-of-range element-zero index, and an
+   underflowed high index (probe: `F5 10 0 0 18446744073709551615
+   True`). The attribute now binds the getter + validating setter pair
+   and the setter aborts below 100, matching the checker's floor.
+6. **`BuildFatTree(radix=0)` divided by zero (finding 6).** The
+   `topology=fattree, fattreeRadix=0` path reached
+   `(m_numGpus + radix - 1) / radix` unguarded (probe: ZeroDivisionError
+   for 3 GPUs). The builder now aborts on radix 0 before the leaf-count
+   ceiling, which also moved to the divide-first form.
+
+**Fixed (P2).**
+
+7. **Four rail-fat-tree ceiling sites wrapped the numerator (finding
+   7).** `(enclosures + nodesPerLeaf - 1) / nodesPerLeaf` wraps to
+   zero for enclosures=4, nodesPerLeaf=UINT32_MAX (probe: `F7 4
+   4294967295 2 0 1` — numerator mod 2^32 = 2, old leaves 0, exact 1),
+   leaving a zero-leaf topology that later indexes the empty
+   leaf-switch vector. All four copies (`BuildRailOptimizedFatTree`,
+   `InstallCollectiveEmbedding`, and the two scratch/gpu-cluster-sim.cc
+   railfattree sites) use `a/b + (a%b != 0)`.
+8. **Dragonfly+ group×router product wrapped uint32 (finding 8).**
+   `numGroups=routersPerGroup=65536` passed both positive-input guards
+   but the uint32 product is 0 (probe: `F8 65536 65536 0 False
+   ZeroDivisionError`), feeding a zero divisor into the GPU-count
+   modulo. The product is computed in uint64 and aborts above
+   UINT32_MAX before narrowing.
+9. **DCQCN/RTTCC pacer slot cast and deadline addition (finding 9).**
+   A rate of 2^−40 Gbps with a 1-MiB chunk rounds the slot to exactly
+   2^63 ns, outside int64 — the `static_cast<int64_t>` is UB
+   (floating-point diagnostics halt under -fsanitize=float-cast-overflow;
+   probe: `F9 ... 9223372036854775808 False`), and even fitting slots
+   could overflow `(nowNs+delayNs)+slotNs` (probe: `F9-add
+   4611686018427387904 9223372036854775808 False`). Both machines now
+   saturate the double→int64 conversion at INT64_MAX and the deadline
+   addition via `slotNs > INT64_MAX - (nowNs + delayNs)`.
+10. **Staged PUT_SIGNAL count wrapped before the work-ID guard
+    (finding 10).** `bytes=UINT64_MAX` with 1-byte staging chunks
+    gives dataChunks=UINT64_MAX, and the +1 signal-work-item addition
+    wrapped the count to 0 BEFORE the existing work-ID guard — no work
+    emitted, completion callback never fires (probe: `F10
+    18446744073709551615 0 False 0`). The overflow of the addition
+    itself is now guarded before it happens.
+11. **RoCE per-chunk padded body narrowed through the uint32 Packet
+    API (finding 11; closes round-63 finding 11).** A non-RoCE
+    destination model paired with the public RoCE builder at the
+    representable efficiency (2^33−21)/2^65 with bodyHardCap==0 takes
+    the unguarded path: one data byte (11-byte body) targets
+    4,294,967,307 wire bytes needing a pad of exactly 2^32, which the
+    uint32 `Create<Packet>` argument narrows to 0 (probe: `F11-pad 0 11
+    4294967296 0 11 False`) — silently transmitting 11 bytes where the
+    model specifies ~4.295 GB. After the bodyHardCap clamp, the RoCE
+    builder arm now aborts when the COMPLETE padded body exceeds
+    UINT32_MAX (a body ≥ 2^32 is unrepresentable no matter how the pad
+    is split).
+12. **CHANGES.md deferred-item claim corrected (finding 12).** The
+    round-63 entry claimed the existing guard aborts loudly at the
+    boundary; probe F11 shows the pad narrows to zero while the guard
+    stays false. The round-63 deferred bullet above now points at this
+    fix.
+
+**Verified.** (a) `cmake --build cmake-cache -j $(nproc)` — clean after
+all fixes. (b) gpu-cluster test suite PASS in 9.868 s (the NS_FATAL lines
+in its output are the fork-child abort tests asserting their own
+loud-death path — the suite verdict is PASS). (c) DCQCN anchors, exact:
+`--bulkChunkSize=1000 --dcqcn=1` → simTimeUs=20802.4,
+ecnMarkedPackets=99985, cnpPacketsSent=99985, cnpPacketsReceived=99974;
+`--bulkChunkSize=2690 --dcqcn=0` → simTimeUs=20300.2, all three counters
+0. (d) Parity direct-run scripts: 48 ^PASS across 14 scripts (target 48);
+`python3 -m pytest test_ibgda.py test_config_fec_enabled.py` from
+test/parity: 18 passed. (e) Surrogate: `PYTHONPATH=. python3 -m pytest
+test/ -q` — 101 passed. (f) Traffic-control smoke: Unforced drop
+37/55500, Packets/Bytes sent 6887/10302800 — exact. (g) 12 queue-disc
+suites (adaptive-red, cobalt, codel, fifo, pie, prio, red, tbf,
+fq-cobalt, fq-codel, fq-pie, pfifo-fast-queue-disc) all PASS. (h) Full `./test.py -v` at this commit: 805 of 805 tests passed (0
+skipped, 0 failed, 0 crashed, 0 valgrind errors), exit 0.
+
+### Reviewed — codex round 63: 20 findings, 15 fixed, 5 verified-and-documented
+
+**What.** Round-63 review of commit 96f8cd8 returned 20 findings (5 P1, 11
+P2, 4 P3). All 20 were verified against the code with exact python
+arithmetic before any change; 15 are fixed here (wrap-free ceiling
+divisions, inverse-conversion saturation guards, attribute setter
+re-binding, zero-denominator loud aborts, effective-share ratio guard),
+and 5 were verified numerically and documented (two saturation-policy
+choices in ub-protocol-model/contention-model are deliberate; two CHANGES
+corrections; the RoCE padding narrowing is deferred to round 64 as a
+documented open item). The round-61 entry's "callers cannot reach the
+overflowing product" claim was also corrected — finding 13 proved it
+false with a reachable probe.
+
+**Fixed (P1).**
+
+1. **UB payload builder MAINTENANCE headroom (finding 3).**
+   `ub-payload-builder.cc` computed the MAINTENANCE frame's wire size as
+   `header + payload` where `payload` came from a caller-supplied
+   `dataSize` with no cap: at `dataSize = UINT32_MAX` the wire-size
+   addition overflowed uint32 and the ledger wrapped to a small value,
+   understating every byte the switch and pacing keyed on. The builder
+   now caps the MAINTENANCE data at `UINT32_MAX - UB_TRANSACTION_HEADER_SIZE`
+   and aborts loudly above it.
+
+2. **UB protocol model inverse conversion (finding 5).**
+   `UbProtocolModel::GetDataSize` multiplied `(wireSize - 16) * efficiency`
+   in double and cast straight to uint64: at efficiency 1.0 the product
+   rounds up to 2^64 for wireSize ≥ 2^64 - 1008, and the cast is out of
+   range (floating-point diagnostics halt the process under
+   `-fsanitize=float-cast-overflow`). Both the data-arm and the default
+   arm now return the exact integer body at efficiency 1.0 and saturate
+   at UINT64_MAX when the product reaches 2^64.
+
+3. **Fabric-endpoint collective effective-share guard (finding 9).**
+   The round-62 single-packet-arm abort only fired when
+   `effectiveSize > UINT32_MAX`; the four-argument
+   `SendCollectiveBulk(type, dest, effective, wire)` overload accepts
+   `effective > wire`, and the fragmented arms split by WIRE bytes — a
+   caller passing `effectiveSize = 2^33, wireSize = 2` over two lanes
+   produced a per-chunk effective share of exactly 2^32, wrapping the
+   uint32 header field to 0. The guard is now a ratio test:
+   `effectiveSize / max(wireSize, 1) > UINT32_MAX` aborts (equality
+   allowed: a share of exactly 2^32 - 1 still fits the header field).
+   A first cut at this guard used
+   `effectiveSize > wireSize * (1 << 32)`, which overflowed the
+   multiplication itself and aborted the legitimate
+   `SendCollectiveWideSizeTest` 4-GiB volume (effective == wire, ratio
+   1); the ratio form divides first and cannot wrap.
+
+4. **FEC GetEncodedSize final-byte wrap (finding 12).**
+   `fec-model.cc` returned `(encodedBits + 7) / 8`: at
+   `SetFecParams(1504703107, 1, 0)` with a 1,532,423,903-B payload the
+   exact bit ledger is 2^64 - 6, the +7 addition wrapped the numerator
+   to 1, and the function returned 0 instead of the exact 2^61 bytes
+   (2,305,843,009,213,693,952). The tail now divides first and bumps on
+   a nonzero remainder: `encodedBits / 8 + (encodedBits % 8 != 0)`.
+
+5. **Attribute/member disagreement (finding 16).**
+   `LatencyStatistics::GetTypeId` bound `WarmupFraction` via
+   `MakeDoubleChecker` against the raw member: the checker admits 1.0
+   while the setter requires `< 1.0`, so `SetAttribute("WarmupFraction",
+   1.0)` silently discarded every sample. The attribute now binds the
+   getter + validating setter pair. `FabricEndpoint`'s `SprayChunkSize`
+   attribute accepted `UINT32_MAX` while the setter caps at 2^30 plus a
+   zero-abort; it now binds the setter/getter pair too (header gained
+   the `GetSprayChunkSize` declaration).
+
+**Fixed (P2).**
+
+6. **Zero-denominator sweep (finding 17).** Fourteen collective
+   `Initialize(numGpus = 0)` sites now abort loudly at entry (ring /
+   fullmesh / hierarchical / nvls / tree / alltoall-injector families;
+   13 files gained `ns3/fatal-error.h`). The four hierarchical
+   `SetGpusPerNode(0)` / `SetNumNodes(0)` setters abort instead of
+   planting a divide-by-zero at the intra-node grid
+   (hierarchical-allreduce.cc:192, allgather.cc:132,
+   reducescatter.cc:189 et al.). The three BwRamp
+   `1 + chunkSize / threshold` denominators could wrap to zero at
+   chunkSize = UINT64_MAX - threshold + 1; they now divide first, bump
+   on remainder, and floor the denominator at 1 via
+   `std::max<uint64_t>(1, rampDiv)` (plus `#include <algorithm>` in the
+   three hierarchical files). `AllToAllInjector::SetTwoDimensionalRouting`
+   aborts on `rows == 0 || cols == 0` before the existing rows*cols
+   equality check. `RdmaOperationTraffic::Initialize` aborts when
+   `dataPath == "staged"` and `stagingChunkBytes == 0` (the staged
+   chunk count divided by the zero chunk size).
+
+7. **NVSwitch accumulated-ledger chunk-size wrap (finding 18).**
+   `nvswitch.cc:1602` divided `wirePartitionSize / numChunks` for the
+   per-chunk ceiling. At W = 2^32 * (2^32 - 128) =
+   18,446,743,523,953,737,728 and numChunks = 2,199,023,190,016 the
+   old `(W + numChunks - 1)` addition wrapped the numerator to
+   1,649,267,376,127 and produced chunkSize 0 instead of the exact
+   8,388,608. The division now runs first with a remainder bump.
+
+8. **Contention model weight and bandwidth floors (finding 14).**
+   `contention-model.cc` accepted weights outside [0, 1] (the setter
+   now clamps), and `GetEffectiveBandwidth` multiplied shares by the
+   unclamped weight before flooring — a negative weight produced a
+   negative product that the uint64 floor then mis-signed. The product
+   now saturates at 0 for any non-positive contribution.
+
+**Verified and documented (no code change).**
+
+- **Finding 6 / 7 (saturation policy).** The ub-protocol-model and
+  contention-model saturations at efficiency 1.0 / zero weight are
+  deliberate policy: returning the exact integer body at efficiency 1.0
+  and flooring the effective bandwidth at zero keep the models'
+  invariants (exact inverse at 1.0; non-negative bandwidth share)
+  without introducing a silent failure mode. Verified by exact
+  integer arithmetic.
+- **Finding 13 (round-61 doc correction).** The round-61 entry claimed
+  "every in-tree payloadSize is uint32 — callers cannot reach the
+  overflowing product". That was FALSE: `SetBulkChunkSize(2^30)` with
+  SIMPLE bulk and `FEC(2^31, 1, 0)` reaches the exact bit ledger
+  B + 17,179,869,184 and `GetEncodedSize` returns 2,147,483,648 B.
+  The round-61 entry now carries the correction.
+- **Finding 19 (round-62 doc correction).** The round-62 entry's own
+  finding IDs enumerate 13 fixed (2–13 + 17) + 6 documented (1, 14,
+  15, 16, 18, 19), contradicting its "15 fixed + 4 documented" header.
+  The header now reads 13 fixed, 6 documented.
+- **Finding 11 (deferred to round 64, now fixed there).** The RoCE
+  wire-padding narrowing (32-bit header field at multi-GiB pads) was
+  deferred to round 64 as a documented open item. The "current guard
+  aborts loudly at the boundary" claim below it was WRONG — round-64
+  finding 11 proved the pad narrows to zero while the guard stays
+  false; the complete-padded-body abort in the round-64 entry is the
+  actual fix.
+- **Finding 20 (superseded).** The standing sweep instruction is
+  procedural; no code action.
+
+**Verified.** (a) `cmake --build cmake-cache -j $(nproc)` — 53/53
+targets. (b) DCQCN anchors, exact: `--bulkChunkSize=1000 --dcqcn=1` →
+simTimeUs=20802.4, ecnMarkedPackets=99985, cnpPacketsSent=99985,
+cnpPacketsReceived=99974; `--bulkChunkSize=2690 --dcqcn=0` →
+simTimeUs=20300.2, all three counters 0. (c) gpu-cluster test suite
+PASS in 9.852 s (the two new NS_FATAL abort messages in its output are
+the fork-child abort tests asserting their own loud-death path — the
+suite verdict is PASS). (d) Parity direct-run scripts: 48 ^PASS across
+14 scripts (target 48); `python3 -m pytest test_ibgda.py
+test_config_fec_enabled.py` from test/parity: 18 passed. (e) Surrogate:
+`PYTHONPATH=. python3 -m pytest test/ -q` — 101 passed. (f) Traffic
+-control smoke: Unforced drop 37/55500, Packets/Bytes sent
+6887/10302800 — exact. (g) 12 core queue-disc suites (pie, drop-tail,
+codel, cobalt, fifo, prio, fq-codel, fq-pie, fq-cobalt, queue-disc-traces,
+wifi-mac-queue, lr-wpan-error-model) all PASS. (h) Full `./test.py -v`
+at 958be19: 805 of 805 tests passed, 0 failed, 0 crashed (the run's
+fork-child abort suites print expected NS_FATAL death lines; the
+runner's per-suite verdicts are the authority). The round-64 run at the
+round-64 commit re-confirms the same 805/805 and is cited in the
+round-64 entry.
+
+### Reviewed — codex round 62: 19 findings, 13 fixed, 6 verified-and-documented
+
+**What.** Round-62 review of commit 40a34cc returned 19 findings (4 P1, 12
+P2, 3 P3). The five round-61 guard categories were all confirmed clean on
+their guarded paths. Thirteen findings are fixed with loud-abort guards,
+validating setters, wrap-free ceiling divisions, and inverse-direction
+saturation clamps; six were verified numerically and documented
+(buffer.cc is upstream ns-3 code vendored inside protobridge — its four
+wrap sites are documented as upstream-parity, not fixed; the round-61
+CHANGES numbers were corrected against codex's original probe, which
+round-62 python-verified arithmetic confirms).
+
+**Fixed (P1).**
+
+1. **FecModel attribute bypass (finding 2).** `GetTypeId` bound
+   `MakeUintegerAccessor` DIRECTLY to the private m_n/m_k/m_t members, so
+   `SetAttribute("K", UintegerValue(0))` bypassed the round-61
+   SetFecParams assert and made DecodePacket / GetEncodedSize divide by
+   zero (dataBitsPerCodeword = 0); `SetAttribute("N", ...)` could zero
+   the GetPayloadSize divisor the same way. The N/K/T attributes now
+   bind getter + validating setter pairs (`SetNAttribute` /
+   `SetKAttribute` / `SetTAttribute`) that repair each parameter against
+   the current siblings (raising floors where the MDS relation
+   2T <= N-K demands) and then run the full SetFecParams assert suite,
+   so every write path — method or attribute — lands on a valid triple.
+2. **UbPayloadBuilder MESSAGE framing wrap (finding 3).** dataSize =
+   2^64-16 wrapped `16 + thisChunkDataSize` to 0 (payload[0] wrote into
+   an empty vector), and a 2^32-16 chunk framed to exactly 2^32 narrows
+   to 0 at the uint32-taking `Create<Packet>`. Added
+   `NS_ABORT_MSG_IF` guards: MAINTENANCE payloads over UINT32_MAX, zero
+   chunkSize, and any chunk leaving no uint32 room for the 16-B
+   transaction header.
+3. **LinkDegradationModel burst-mode codeword count (finding 4).**
+   `(packetSize + m_codewordSize - 1) / m_codewordSize` divided by zero
+   at SetCodewordSize(0), and at codewordSize = UINT32_MAX with a
+   2-byte packet the addition wrapped to 0 codewords — the packet
+   always survived even at BER 500. The setter now floors at 1 byte
+   (the attribute accessor routes through it) and the count uses the
+   wrap-free divide-then-bump form.
+4. **UbProtocolModel::GetDataSize header-underflow (finding 12).**
+   `GetDataSize(0, MAINTENANCE)` evaluated unsigned 0 - 16 =
+   18446744073709551600, and the data-port branches multiplied the
+   underflowed value through an unchecked double->uint64 cast. A
+   `wireSize <= 16` early-out maps anything at or below the header to
+   zero data.
+
+**Fixed (P2).**
+
+5. **FecModel 2*t assert overflow (finding 5).** `2 * t` wrapped in
+   uint32: SetFecParams(2, 1, 2147483648) passed every round-61
+   assertion. Both the SetFecParams assert and the new attribute
+   setters widen to `static_cast<uint64_t>(2) * t` before comparing.
+6. **NcclProtocolPayloadBuilder::BuildSimpleChunk narrowing (finding
+   6).** `Create<Packet>(data, dataBytes)` takes a uint32 size; a
+   dataBytes at or above 2^32 narrowed to a truncated/empty packet.
+   Added `NS_ABORT_MSG_IF(dataBytes > UINT32_MAX, ...)`.
+7. **Zero-progress loops (finding 7).** `UbPayloadBuilder::BuildChunks`
+   with chunkSize=0 emitted 16-B headers forever (remaining never
+   decreased); `RdmaOperationEngine::SendPayload` with a payload-limit
+   callback returning 0 looped on count=offset=0. Both now abort loud:
+   zero chunkSize, and zero cap with a nonzero request.
+8. **RoCE per-chunk padding cast order (finding 8).** The RoCE arm
+   cast `ceil(soh.GetDataSize() / efficiency)` to uint64 BEFORE the
+   bodyHardCap clamp; at a pathological efficiency the double quotient
+   reaches 2^64 — out of range for the conversion (floating-point
+   diagnostics halt the process under -fsanitize=float-cast-overflow).
+   The quotient is now range-checked before the cast.
+9. **Protocol-model GetDataSize inverses (finding 9).** The public
+   inverse `GetDataSize` in EthernetProtocolModel, McclProtocolModel,
+   RoceProtocolModel, and NcclProtocolModel's SIMPLE branch multiplied
+   through an unchecked `static_cast<uint64_t>(wireSize *
+   m_wireEfficiency)`: at efficiency 1.0, double(UINT64_MAX) rounds up
+   to 2^64 and the cast is UB (the round-51 guard covered only the
+   forward GetWireSize). Each inverse now returns the input exactly at
+   efficiency 1.0 and saturates on an out-of-range product, mirroring
+   the forward-helper policy.
+10. **UbPayloadBuilder::GetWireSize overflow (finding 10).**
+    `dataSize * (1/0.98)` overflowed for large inputs (the
+    double product of UINT64_MAX * 1.02 exceeds 2^64). Now saturated
+    with the same guard shape.
+11. **ContentionModel::GetEffectiveBandwidth overflow (finding 11).**
+    `weight * double(m_bandwidth)` overflowed when bandwidth is near
+    UINT64_MAX with 2+ active classes. Saturates on an out-of-range
+    product.
+12. **EthernetSwitch PFC mode-2 negative product (finding 13).** PFC
+    mode-2 `scaled = base * (1.0 - occupancy)` can be negative —
+    occupancy exceeds 1.0 when the live VOQ backlog outgrows a
+    subsequently lowered GetVoqDepth (SetVoqDepth is public on
+    NvSwitch) — and `static_cast<uint32_t>(scaled)` on a negative
+    double is UB before `std::max(1u, ...)` runs. Both the port and
+    per-VC overloads now clamp with `std::max(0.0, scaled)` before
+    the cast.
+13. **SendCollectiveBulk single-packet narrowing (finding 17).** In the
+    no-fragmentation arm both sizes flow into uint32 packet/header
+    fields; SendCollectiveBulk(type, dest, 4294967296, 1) passed the
+    entry guards, built a 1-byte packet, and advertised
+    effectiveDataSize=0. The fragmented arms split under the
+    spray/coalesce caps, so the guard is scoped to `!needFragmentColl`;
+    the wide-volume SendCollective test (4 GiB in 8-MiB chunks) still
+    passes.
+
+**Verified and documented (no further code change).**
+
+14. **buffer.cc wrap sites (findings 1, 14, 15, 16).** AddAtStart
+    newSize wrap, GetDistanceFrom int32 narrowing,
+    RemoveAtStart(UINT32_MAX) "restoring" bytes, and Deserialize
+    sizeCheck wrap all reproduce as probed — but buffer.cc is upstream
+    ns-3 code vendored inside protobridge, and GetDistanceFrom /
+    Iterator::GetSize return uint32, so >4 GiB buffers are
+    signature-limited regardless. Documented as upstream-parity, not
+    fixed (consistent with every prior round's buffer.cc treatment).
+15. **Round-61 CHANGES numbers corrected (finding 18, P3).** The
+    round-61 entry "corrected" codex's original r61 probe value using a
+    mis-scaled payloadBits; round-62 python-verified exact arithmetic
+    (see the round-61 entry below) confirms codex's original
+    1,610,612,736 B returned / 36,893,488,160,304,005,120 exact bits /
+    12,884,901,888 wrapped bits / 4,611,686,020,038,000,640 exact bytes.
+    The round-61 entry is corrected in place.
+16. **DataRate long-double ABI qualification (finding 19, P3).** On
+    x86-64 (80-bit extended long double, LDBL_MANT_DIG >
+    DBL_MANT_DIG) the guard bound is the 2^63-1 literal and the exact
+    product 89,547,301,328,687,144 * 103 = 2^63 + 24 exceeds it by 25,
+    so the path aborts there; the "accepts 2^63 - 1024" case in the
+    round-59 entry holds only on ld==double platforms. The round-59
+    entry is annotated in place.
+
+**Also hardened this round.** Both FecModel ceiling divisions
+(DecodePacket's codeword count and GetEncodedSize's) now use the
+wrap-free divide-then-bump form, matching the round-51 policy.
+
+**Verified.** Clean build; PASS data-rate; PASS error-model; PASS
+gpu-cluster; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model); traffic-control
+smoke Unforced drop 37/55500, sent 6887/10302800; parity 48 PASS across
+14 scripts + 18/18 pytest (test_ibgda + test_config_fec_enabled);
+surrogate 101 passed. DCQCN anchors unchanged: bulkChunkSize=1000/dcqcn=1
+simTimeUs=20802.4, ecnMarkedPackets=99985, cnpPacketsSent=99985,
+cnpPacketsReceived=99974; bulkChunkSize=2690/dcqcn=0 simTimeUs=20300.2,
+counters 0/0/0.
+
+### Reviewed — codex round 61: 8 pre-existing defects, 5 fixed, 3 verified-and-documented
+
+**What.** Round-61 review of commit b5eab88 found eight pre-existing defects
+(3 P1, 5 P2) reachable through public/configuration seams. Five are fixed
+with loud-abort / assert guards; three were verified numerically and
+documented in-code as out-of-scope or below simulation relevance. All eight
+probes were recomputed independently before acting.
+
+**Fixed (round 61).**
+
+1. **Memory-write payload-size wrap (P1, ×2 sites)** —
+   `FabricEndpoint::SendMemoryWrite` and the `SendMemorySemantic` write
+   branch computed `payloadSize = 8 + size` in uint32. For
+   `size > UINT32_MAX - 8` (probe: size = 4,294,967,288 wraps to 0) the
+   address prefix memcpy writes eight bytes into an empty vector — real
+   out-of-bounds UB before any allocator or FEC guard can intercept. Added
+   `NS_ABORT_MSG_IF(size > UINT32_MAX - 8, ...)` ahead of the addition at
+   `fabric-endpoint-send.cc:758` and `:910` (SendMemorySemantic write
+   branch, guarded by `!isRead`).
+2. **K = 0 division-by-zero through SetFecParams (P1)** —
+   `SetFecParams(544, 0, 15)` passes both existing assertions, leaving
+   `dataBitsPerCodeword = 0`, so `DecodePacket` / `GetEncodedSize` divide by
+   zero at the codeword-count step (probe: `DecodePacket(1e-6, 1)` evaluates
+   `7 / 0` even with assertions enabled). Added `NS_ASSERT_MSG(k >= 1, ...)`
+   at `fec-model.cc:107` — also the MDS-code precondition (a zero-data
+   codeword carries no symbols).
+3. **RDMA wire-efficiency padding UB (P2)** —
+   `PumpRdmaOperationPackets` cast `ceil((dataBytes + overhead) /
+   efficiency)` to uint32. Built-in checkers floor efficiency at
+   `std::numeric_limits<double>::min()` (2^-1022, smallest normal), where a
+   ~4-byte body already targets 2^1024; a custom model without a checker
+   can go lower. Added an `NS_ABORT_MSG_IF(!(expanded < 4294967296.0), ...)`
+   before the cast at `fabric-endpoint-rdma.cc:121`, matching the
+   hard-configuration-error policy of the SendDataInternal pad abort.
+4. **Public ComputeSymbolErrorProbability negative-BER overflow (P2)** —
+   the helper is public, so the callers' `ber <= 0.0` guards do not cover a
+   direct call. Probe: ber = -1e31 reaches `expm1(10*log1p(1e31)) =
+   expm1(713.801...)` — a diagnostic halt under overflow traps; ber = -0.1
+   returns the invalid negative probability -1.5937... Added an
+   `if (ber <= 0.0) return 1.0;` saturation at `fec-model.cc:198` after the
+   isnan guard: every negative BER is non-physical, and the decoding entry
+   points already map `ber <= 0.0` to NO_ERROR, so the saturated helper
+   policy cannot diverge on any in-tree path.
+5. **Payload-builder uint64→uint32 narrowing (P2, ×2)** —
+   `McclPayloadBuilder::BuildChunks` (`mccl-payload-builder.cc:49`) and
+   `RocePayloadBuilder::BuildChunks` (`roce-payload-builder.cc:56`) passed
+   uint64 chunk sizes straight into uint32-taking `Create<Packet>(...)` /
+   `SoHeader::SetDataSize` (probe: dataSize = chunkSize = 2^32 → one empty
+   packet, payload lost, completion reported). In-tree endpoint paths cap
+   chunks at 1 GiB; added `NS_ABORT_MSG_IF(size > UINT32_MAX, ...)` so a
+   direct caller that bypasses those caps fails loudly.
+
+**Verified and documented (no code change).**
+
+6. **Virtual-packet offset wrap at test seam (P1, verified sound)** —
+   `Buffer::Initialize` (`buffer.cc:259`) adds the global zero-size counter
+   to `start` without widening: a destroyed 100-byte packet leaves g = 100,
+   and the test seam `NvSwitch::InjectAggregateUpload` (`nvswitch.cc:525`)
+   with effectiveSize = 4,294,967,196 yields 100 + 4,294,967,196 = 2^32,
+   wrapping the buffer end to 0 (iterator assert). Reachable only through
+   the explicit test seam — production uploads go through the guarded
+   SendCollectiveBulk path — so documented as seam-scope, not fixed.
+7. **FEC encoded-bits uint64 overflow (P2, verified, codex probe value
+   right)** — `SetFecParams(2^31, 1, 0)` + `GetEncodedSize(2^31)` computes
+   exact encoded bits = 36,893,488,160,304,005,120 (~2^64.99), which wraps
+   mod 2^64 to 12,884,901,888 bits = 1,610,612,736 B returned. (Round 61
+   recomputed numCodewords against a mis-scaled payloadBits and wrongly
+   "corrected" this value; round 62 re-verified the original probe with
+   exact integer arithmetic — codex's 1,610,612,736 B stands.) Exact
+   unwrapped size 4,611,686,020,038,000,640 B. Not fixed: N = 2^31 needs
+   k*t ≤ 2^31 anyway. (Round 63, finding 13: the original "every in-tree
+   payloadSize is uint32 — callers cannot reach the overflowing product"
+   claim was FALSE — SetBulkChunkSize(2^30) with SIMPLE bulk and
+   FEC(2^31,1,0) reaches exact bits B + 17,179,869,184 and returns
+   2,147,483,648 B; see the round-63 entry.) Round 62 additionally made
+   both ceiling divisions wrap-free (divide, then bump on nonzero
+   remainder).
+8. **Near-zero BER precision floor (P2, verified, documented)** — at
+   (N,K,T) = (544,514,0), BER 1e-18: pSym = 1e-17 but `1 - pSym` rounds to
+   exactly 1.0 (the log1p-accurate range ends at the unit roundoff), so the
+   multi-codeword math degrades to the all-clean path → always NO_ERROR.
+   True binomial ≈ 5.44e-15, far below any simulation-relevant loss rate.
+   Documented at the DecodePacket `ber <= 0.0` early-out
+   (`fec-model.cc:467`) explaining the NO_ERROR policy for the
+   unrepresentable range.
+
+**Also verified this round.** No remaining unguarded quiet-NaN comparison
+exists in `fec-model.cc` (comparisons at 191/203, 238/251, 335/344, 441
+follow isnan guards; 264/358 consume finite helper results; 306/307,
+387/391, 466, 470/475 consume constructed probabilities). No
+SaturatedQFunction / normal-CDF / erfinv / sqrt paths exist at HEAD. The
+round-60 CHANGES numbers all reproduce.
+
+**Files changed.** `src/gpu-cluster/model/fabric-endpoint-send.cc`
+(×2 guards + ns3/abort.h), `src/gpu-cluster/model/fec-model.cc`
+(K≥1 assert, ber≤0 saturation, near-zero-BER doc), `src/gpu-cluster/model/
+fabric-endpoint-rdma.cc` (padding abort), `src/gpu-cluster/model/
+mccl-payload-builder.cc`, `src/gpu-cluster/model/roce-payload-builder.cc`
+(narrowing aborts + ns3/abort.h + <limits>).
+
+**Verified.**
+
+- `cmake --build cmake-cache -j $(nproc)` clean.
+- ns3 suites: data-rate, error-model, gpu-cluster — PASS; 12 core suites
+  (pie/drop-tail/codel/cobalt/fifo/prio/fq-codel/fq-pie/fq-cobalt/
+  queue-disc-traces/wifi-mac-queue/lr-wpan-error-model) — PASS.
+- traffic-control smoke: Unforced drop 37/55500, sent 6887/10302800.
+- parity: 48 PASS lines across 14 scripts + `test_ibgda.py` +
+  `test_config_fec_enabled.py` (18 passed) under pytest from test/parity.
+- surrogate: `PYTHONPATH=. python3 -m pytest test/ -q` — 101 passed.
+- DCQCN anchors: bulkChunkSize=1000/dcqcn=1 → simTimeUs=20802.4,
+  ecnMarkedPackets=99985, cnpPacketsSent=99985, cnpPacketsReceived=99974;
+  bulkChunkSize=2690/dcqcn=0 → simTimeUs=20300.2, counters 0/0/0.
+
+### Reviewed — codex round 60: no defects introduced by d35ce22, all four focus categories verified sound
+
+**What.** Round-60 review of commit d35ce22 found no introduced
+[P0]/[P1]/[P2] runtime defects and no remaining action items. The four
+requested categories check out (all probe arithmetic reproduced exactly
+with Python integers):
+
+1. **[Verified sound] NaN handling: no caller divergence.** The three
+   production callers of the public ComputeSymbolErrorProbability
+   (fec-model.cc:256, :351, :463 — ComputePostFecBer, DecodeCodeword,
+   DecodePacket) intercept NaN at their own entry guards first, returning
+   0.0 / NO_ERROR / NO_ERROR; DecodePacket does so before computing the
+   codeword count, covering both packet-size branches. The helper's new
+   NaN -> 1.0 policy is therefore observable only through a DIRECT helper
+   call (the finite-input golden test is the only such caller) — no
+   existing decoding path newly classifies NaN as uncorrectable.
+2. **[Verified sound] Buffer guards: no wrap and no
+   passing-guard/allocator-abort mismatch.** With M = UINT32_MAX,
+   passing the widened guards requires E + g + p + 120 < M, hence
+   E + g + p <= M - 121; the copy-on-append request R = GetInternalSize
+   () + padding <= P + H + (E - P) <= E + p <= M - g - 121 <= M - 121,
+   which Allocate accepts (it permits R <= M - 120), and both R + 100
+   and R + 100 - 1 + sizeof(Buffer::Data) stay representable (at the
+   accepted boundary R = 4,294,967,175 the byte allocation is
+   4,294,967,294).
+3. **[Verified sound] Constexpr accessors.** Buffer::Data (buffer.h:663)
+   is fully defined before GetDataHeaderSize (buffer.h:805); its four
+   uint32 fields plus one-byte array occupy 20 bytes including tail
+   padding, the same value Allocate sees. GetAllocationOverProvision
+   returns the same 100 used by Allocate.
+4. **[Verified sound] Round-59 CHANGES probe values, with historical
+   context.** Payload 5,282,862 with RS (813,1) -> 4,226,290 codewords
+   -> encoded 4,294,967,213; append request 4,294,967,252; +100 wraps
+   modulo 2^32 to 56; the corrected boundary example sums to
+   4,311,744,521 and is rejected by both historical checks. Distinction
+   worth recording: 4,278,189,988 is the maximum passing encoded size at
+   g = 16,777,255, prefix 51 for the round-57/58 guard; the current
+   round-59 guard (which reserves another 120 bytes) passes at most
+   4,278,189,868 there. The DataRate residual (exact product 2^63 + 24,
+   double conversion -8, result 2^63 - 1024) also reproduces and
+   predates d35ce22.
+
+**Verified.** Clean build; PASS data-rate; PASS error-model; PASS
+gpu-cluster; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800; 48
+parity PASS lines (15 scripts); parity pytest 18 passed (test_ibgda +
+test_config_fec_enabled, run from test/parity); surrogate pytest 101
+passed from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 us / 99985-99985-99974; 20300.2 us / 0-0-0).
+
+### Fixed — codex round 59: public NaN entry point, Buffer::Allocate over-provision wrap, CHANGES.md boundary example
+
+**What.** Round-59 review of commit 4d90395 found no defects introduced
+by that commit and confirmed the round-58 fixes (isnan-first guards at
+fec-model.cc:216/314/420 intercept NaN before every ordered comparison;
+the DataRate residual arithmetic rechecks exactly — 89547301328687144 x
+103 = 2^63 + 24, double conversion -8, product rounds to 2^63 - 1024 =
+9223372036854774784; no out-of-range uint64 cast is reachable; the
+padding guards have no guard-to-append interleaving). It found two
+pre-existing defects plus one documentation error, all fixed here:
+
+1. **[P1] Public ComputeSymbolErrorProbability trapped on direct NaN
+   call.** The helper is public (fec-model.h), so the caller-side
+   isnan guards in ComputePostFecBer / DecodeCodeword do not cover a
+   direct call — its entry `ber >= 1.0` comparison raised FE_INVALID
+   under fenv traps before any interception. Added an entry isnan
+   guard returning the saturated 1.0 (which the callers' pSym==1.0
+   early-outs already treat as UNCORRECTABLE), and corrected the
+   comment that claimed caller-side guards covered non-finite input.
+2. **[P1] Buffer::Allocate wrapped the uint32 request size near
+   UINT32_MAX.** `reqSize += ALLOC_OVER_PROVISION` (buffer.cc) wraps
+   for any request above UINT32_MAX - 100, and the memcpy in
+   AddAtEnd's copy-on-append path then overflows the undersized
+   allocation. Codex's concrete repro (cold g=0, one-device SendData,
+   LLR enabled, SetFecParams(813,1,0)): a 5,282,862-B payload encodes
+   to 4,294,967,213 B; the live-offset padding guard passed
+   (4,294,967,213 + 51 = 4,294,967,264 < UINT32_MAX), but the append
+   requested 4,294,967,252 B which wrapped to 56 after +100, and
+   5,282,901 B were memcpy'd into it. Fixed at both layers: (a)
+   Buffer::Allocate now aborts loudly when reqSize exceeds UINT32_MAX
+   - 100 - sizeof(Buffer::Data), with new constexpr accessors
+   Buffer::GetAllocationOverProvision() / GetDataHeaderSize() in
+   buffer.h; (b) both padding guards (fabric-endpoint.cc, nvswitch.cc)
+   now reserve the over-provision + Data header in their headroom so
+   the abort is a pre-flight configuration error, not a mid-append.
+3. **[Docs] Round-58 CHANGES.md item-3 boundary example was
+   arithmetically wrong.** The stated E = 4,294,967,215 at
+   g = 16,777,255 with prefix 51 sums to 4,311,744,521 — BOTH the old
+   and new checks reject it (max passing E at those offsets is
+   4,278,189,988), so the claimed new-check=0 contrast was
+   unsupported. The example is corrected in place; the verified
+   absolute-offset proof stands, and item 2 above covers the real
+   residual.
+
+**Verified.** Clean build; PASS data-rate; PASS error-model; PASS
+gpu-cluster; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800; 48
+parity PASS lines (15 scripts); parity pytest 18 passed (test_ibgda +
+test_config_fec_enabled, run from test/parity); surrogate pytest 101
+passed from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 us / 99985-99985-99974; 20300.2 us / 0-0-0).
+
+### Fixed — codex round 58: isnan-first actually first, DataRate residual comment corrected
+
+**What.** The round-58 review (two attempts; both cut off by a content
+filter during the probe phase, but the transcript contained four
+verified probe results that were triaged directly):
+
+1. **[P0] The round-57 "isnan-first" reorder was not actually first.**
+   Both ComputePostFecBer and DecodeCodeword kept `preFecBer <= 0.0`
+   ABOVE the `std::isnan` guard, and the ordered comparison raises
+   FE_INVALID for NaN under fenv traps before the guard is reached.
+   Round-58 probe (traps enabled): direct ComputePostFecBer(NaN) and
+   DecodeCodeword(NaN) both died with rc = -8 (SIGFPE from the trap);
+   DecodePacket(NaN, 642) and DecodePacket(NaN, 643) returned 0 /
+   NO_ERROR with invalid=0 (its entry guard was already correctly
+   first). The isnan guard now precedes every ordered comparison in
+   all three entry points.
+2. **[P0] data-rate.cc residual comment corrected.** The round-57
+   wording said the probe (m_bps = 89547301328687144, rhs = 103.0)
+   "passes the guard, and the clamp below returns 2^63 - 1". The
+   round-58 probe shows the clamp is NOT taken: double(m_bps) =
+   m_bps - 8, so the double product is exactly 2^63 - 1024, which is
+   below the clamp's 2^63 trigger — the function returns
+   DataRate(2^63 - 1024) directly via static_cast<uint64_t>. Comment
+   now states the exact returned value; the "true product 2^63 + 24
+   is admitted" residual itself is unchanged (pre-HEAD, bounded —
+   the returned rate is still < 2^63 so the constructor accepts it).
+3. **[Verified sound] The live-offset padding guard has no off-by-one.**
+   Round-59 correction: the boundary example previously stated here
+   (encoded = 4,294,967,215 at g = 16,777,255, prefix 51) was
+   arithmetically wrong — the values sum to 4,311,744,521, which
+   BOTH the old and the new checks reject; the maximum encoded
+   size passing at those offsets is 4,278,189,988. The
+   new-check=0 / old-check=1 contrast attributed to that example
+   is unsupported. What remains verified: the guard itself is
+   sound for absolute offsets (any encoded size passing has
+   g + encoded < UINT32_MAX - prefix, proven arithmetically), and
+   round 59 found the guard's REAL residual — the 100-B
+   allocation over-provision in Buffer::Allocate — which is now
+   also reserved (see the round-59 entry above).
+4. **[Verified correct] rdma-operation-engine.cc event pruning.**
+   Codex confirmed the `% 1024` gating cannot skip collection
+   indefinitely: the condition runs on every Schedule() call and
+   size() only grows between prunes, so it necessarily hits a
+   multiple of 1024 within 1024 appends regardless of burst sizes.
+
+**Verified.** Clean build; `PASS data-rate`; `PASS error-model`;
+`PASS gpu-cluster`; 12/12 core suites (pie-queue-disc,
+drop-tail-queue, codel-queue-disc, cobalt-queue-disc,
+fifo-queue-disc, prio-queue-disc, fq-codel-queue-disc,
+fq-pie-queue-disc, fq-cobalt-queue-disc, queue-disc-traces,
+wifi-mac-queue, lr-wpan-error-model); traffic-control-example
+smoke counters 37/55500 and 6887/10302800; 48 parity PASS lines
+(15 scripts); parity pytest 18 passed (test_ibgda +
+test_config_fec_enabled, run from test/parity); surrogate pytest
+101 passed from surrogate/ with PYTHONPATH=.; DCQCN anchors
+byte-stable (20802.4 us / 99985-99985-99974; 20300.2 us / 0-0-0).
+
+### Fixed — codex round 57: live-offset FEC padding guard, NaN-guard ordering, size-independent DecodePacket NaN policy, and comment corrections
+
+**What.** Six findings from the round-57 review of commit 1497318; the
+first four verified with probes before fixing:
+
+1. **[P0] Round-56's fixed 9-MiB margin was still unsound.** The raw
+   SendData single-packet path (fabric-endpoint-send.cc) constructs
+   `Create<Packet>(data, size)` up to the 128 MiB MEM_SAFE_THRESHOLD,
+   so `Buffer::g_recommendedStart` — a process-global high-water mark
+   raised by ANY Packet(bytes, N) construction — drifts past any fixed
+   slack. Probe: a 16 MiB packet + 39-B header drove
+   g_recommendedStart to 16,777,255, and SetFecParams(995,1,0) with a
+   4,305,000-B payload produced an encoded payload of 4,283,475,000
+   (< round-56's kMaxPayload 4,285,530,111) whose AddAtEnd recycled an
+   oversized free-list Data and wrapped the end offset to 979,959,
+   tripping the buffer.cc assertion. No fixed margin can bound
+   unbounded drift, so both egress padding sites (fabric-endpoint.cc,
+   nvswitch.cc) now guard against LIVE state:
+   `Buffer::GetRecommendedStart()` (new read-only static accessor on
+   Buffer, buffer.h) plus the packet's own serialized header prefix
+   (FabricHeader + SoHeader + 2-B PPP) is compared against UINT32_MAX
+   and NS_ABORT_MSG_IF aborts before the parity-expansion AddAtEnd.
+2. **[P0] The NaN guards raised FE_INVALID before intercepting NaN.**
+   `preFecBer <= 0.0` is an ordered comparison that signals for NaN
+   under fenv traps, so the round-56 `!(preFecBer > 0.0)` guard sat
+   AFTER the comparison that already raised the trap. Both
+   ComputePostFecBer and DecodeCodeword (fec-model.cc) now test
+   `std::isnan(preFecBer)` FIRST — std::isnan is an unordered quiet
+   predicate and does not signal.
+3. **[P0] DataRate ld==double guard residual documented.** The
+   round-56 claim "rejects any exact product >= 2^63" is false for
+   m_bps values whose double conversion rounds down: probe
+   m_bps = 89547301328687144, rhs = 103.0 gives an exact product of
+   2^63 + 24, but the double conversion of m_bps rounds down by 8 so
+   both products equal 2^63 - 1024, the guard passes, and the clamp
+   returns 9,223,372,036,854,774,784. This predates HEAD; bounded
+   because the double product still lands at 2^63 and the clamp
+   returns DataRate(2^63 - 1), so no garbage rate escapes. The
+   data-rate.cc comment now documents this residual and corrects the
+   claim that the MAX*1.0 abort is "previous behavior" — the
+   pre-round-56 parent returned MAX through the clamp, so the abort
+   is a NEW restriction.
+4. **[P1] DecodePacket NaN policy was size-dependent.** NaN,642 ->
+   NO_ERROR (single-codeword branch, DecodeCodeword's NaN early-out)
+   but NaN,643 -> UNCORRECTABLE (multi-codeword branch recomputes NaN
+   pSym and both comparisons fail). DecodePacket now intercepts NaN
+   at entry so the clean-path policy (NO_ERROR) holds for any
+   payload size.
+5. **[P2] CHANGES.md round-56 item 6 parenthetical corrected.** The
+   raw form yields pSym == 1 at BER 0.99 because pow(1-0.99, 10) ~=
+   1e-20 rounds to 1 so `1 - pow(...)` == 1.0 — not "underflows to
+   1".
+
+**Verified.** Clean build; `PASS data-rate`; `PASS error-model`;
+`PASS gpu-cluster`; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800;
+48 parity PASS lines (15 scripts); 18 pytest parity cases
+(test_ibgda.py + test_config_fec_enabled.py); surrogate pytest 101
+from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 us / 99985/99985/99974 ECN/CNP and 20300.2 us / 0/0/0).
+
+### Fixed — codex round 56: caller-side FEC saturation, Buffer global-offset drift bound, DataRate ld==double guard, burst-length zero/cap, and CHANGES.md corrections
+
+**What.** Six findings from the round-56 review of commit c2c5d58; all
+verified with probes before fixing:
+
+1. **[P0] Round-55's helper-side pSym saturation was wrong.** Returning
+   1.0 from `ComputeSymbolErrorProbability` is exactly the value that
+   breaks callers: `ComputePostFecBer` (fec-model.cc) and
+   `DecodeCodeword` evaluate `log(1 - pSym)` unconditionally, and
+   `log(0)` = FE_DIVBYZERO. Probe confirmed pSym == 1.0 for BER in
+   {0.98, 0.99, 1-1e-13, nextafter(1-1e-13,0), 1-2e-13,
+   0.9999999999999} (at 0.975 pSym = 0.99999999999999989 IS
+   representable — the transition sits between those). Both callers
+   now early-out on `!(pSym < 1.0)` before the log-space sums
+   (returns 1.0 / UNCORRECTABLE respectively), which also covers NaN.
+   NaN `preFecBer` itself is now guarded explicitly at both entry
+   points (degrades to the clean path rather than propagating NaN
+   into the sums and tripping FE_INVALID).
+2. **[P0] kMaxPayload margin still overflowed: the global drift is
+   unbounded.** Round 55's 101-B margin assumed a bounded 50-B drift,
+   but `Buffer::g_recommendedStart` (buffer.cc) is a process-global
+   high-water mark raised by ANY `Packet(bytes, N)` construction —
+   the probe's 116-B drift broke the guard at an encoded payload of
+   4,294,967,180 < UINT32_MAX - 101. No fixed slack is a proof. The
+   margin is now `UINT32_MAX - 9 MiB` at both egress sites, sized to
+   the largest in-module chunk construction (8 MiB bulk cap +
+   1 MiB slack): no in-module configuration can construct a
+   `Packet(bytes, N)` >= kMaxPayload, so the drift can never reach
+   the margin before this guard aborts the construction that would
+   cause it.
+3. **[P0] Round-55's ld==double dismissal was wrong by arithmetic
+   error.** 2^62 * 2.0 = 2^63 EQUALS the rounded literal
+   `9223372036854775807.0L` on ld==double platforms, so `range >
+   maxL` passed and silent saturation occurred (codex proved with
+   -mlong-double-64). Both `operator*(double)` and `operator*=(double)`
+   now use a platform-conditional guard bound: `nextafter(2^63, 0)`
+   (= 2^63 - 1024, the largest double below 2^63) when
+   `LDBL_MANT_DIG == DBL_MANT_DIG`, `9223372036854775807.0L`
+   elsewhere. Probe-validated on ld==double platforms: the 2^63 - 1024
+   bound agrees with exact arithmetic on 5/6 cases — rejects (2^62)*2.0
+   and (2^62+1)*2.0 (abort), accepts (2^63-1024)*1.0 (pass) and
+   2^62*(2-2ulp) = 2^63-1024 (pass). The unavoidable mismatch is
+   MAX*1.0 whose exact value 2^63-1 rounds to 2^63 in double and
+   therefore aborts on those platforms (documented, same behavior the
+   old literal produced). Round-62 ABI note: on x86-64 (80-bit extended
+   long double, LDBL_MANT_DIG > DBL_MANT_DIG) the guard bound is the
+   2^63-1 literal and the product 89,547,301,328,687,144 * 103 = exactly
+   2^63 + 24 exceeds it by 25, so the path aborts there; the "accepts
+   2^63 - 1024" case above holds only on ld==double platforms.
+4. **[P0] BurstLength == 0 raised FE_DIVBYZERO in the geometric
+   formula.** The denominator `log(0 / (1 + 0))` = log(0). The
+   burst-start branch now short-circuits `m_burstLength == 0` to a
+   single-codeword burst before evaluating the geometric formula.
+5. **[P1] Round-55's burst cap introduced a 1001-codeword maximum.**
+   `min(length, 1000.0) + 1` gave 1001 at the cap (probe: L=1000,
+   u=0.9 -> quot 2303.74 -> cap+1 = 1001). The clamp is now 999.0 so
+   cap+1 = 1000. Ordinary uncapped inputs unchanged (probe: L=1000,
+   u=0.5 -> 693.494 -> 694; L=UINT32_MAX, u=0.5 -> ~2.98e9, capped).
+6. **[P2] Round-54 CHANGES.md item 1 was still wrong.** The raw form
+   gives pSym == 1 at BER 0.99 (not "power rounds to 1 so close to 1
+   that 1-pow yields exactly 1" — the raw 1-pow form yields exactly 0
+   at BER 0.99 because pow(1-0.99, 10) ~= 1e-20 rounds to 1, so
+   `1 - pow(...)` == 1.0) and pSym == 0 at BER 1e-18.
+   The `1 - BER` rounds-to-1 transition is at 2^-54 (half of 2^-53),
+   not 2^-53. Round-55 item 1 also updated with the round-56 follow-up.
+
+**Verified.** Clean build; `PASS data-rate`; `PASS error-model`;
+`PASS gpu-cluster`; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800;
+48 parity PASS lines (15 scripts); 18 pytest parity cases
+(test_ibgda.py + test_config_fec_enabled.py); surrogate pytest 101
+from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 µs / 99985/99985/99974 and 20300.2 µs).
+
+### Fixed — codex round 55: pSym saturation near BER 1.0, Buffer global-offset drift, DataRate clamp documentation, and burst-length UB
+
+**What.** Five findings; the first four verified with probes, fixed, and
+re-probed:
+
+1. **[P0] FEC still raised FE_DIVBYZERO below BER 1.0.** With default
+   RS(544,514,15), BER 0.98/0.99/`nextafter(1.0, 0.0)` makes the
+   round-54 `-expm1(10 * log1p(-ber))` return exactly 1.0: the true
+   pSym is within 2^-53 of 1, so no double can represent it, and the
+   callers' `log(1 - pSym)` hits the FE_DIVBYZERO trap. Accurate
+   computation cannot prevent a probability this close to one from
+   rounding to one — the fix is saturation:
+   `ComputeSymbolErrorProbability` now returns 1.0 for
+   `ber >= 1.0 - 1e-13` (indistinguishable from the certain-
+   corruption limit in double arithmetic). **Round-56 follow-up**:
+   helper-side saturation alone was NOT enough — returning 1.0 is
+   exactly the value that breaks callers. `ComputePostFecBer` and
+   `DecodeCodeword` now early-out on `!(pSym < 1.0)` before the
+   log-space sums (covers the saturated branch and NaN), and both
+   entry points also guard NaN `preFecBer` explicitly.
+2. **[P0] The 51-B bound still permitted Buffer offset overflow.**
+   Buffer's recommended starting offset is a process-global
+   high-water mark (`buffer.cc: g_recommendedStart`): any earlier
+   `Packet(bytes, N)` constructor call raises it, shrinking the room
+   left at the top of the 32-bit offset space. A probe with the
+   global offset raised to 64 reproduced the wrap at an encoded
+   payload of exactly `kMaxPayload - 1` (guard accepted, AddAtEnd
+   tripped buffer.cc's offset assert). Both egress sites now bound at
+   `kMaxPayload = UINT32_MAX - 9 MiB` (8 MiB = the in-module bulk
+   chunk cap at fabric-endpoint-send.cc MAX_CHUNK_BYTES, +1 MiB for
+   collective result fragments and headers). **Round-56 rationale**:
+   the global drift is unbounded in principle, so no fixed slack is a
+   proof; instead the margin is sized to the largest chunk the module
+   itself ever constructs, so `g_recommendedStart` can never drift
+   past the margin before this guard would abort the very
+   construction that caused the drift. Framing note: the actual
+   send-path prefixes are 39-B FabricHeader at the endpoint and
+   10-B SoHeader + 2-B PPP at the switch uplink — well inside the
+   51-B warm-prefix budget folded into this constant.
+3. **[P0→documentation] The round-54 clamp does NOT silently accept
+   genuine overflow on long double == double platforms.** On that
+   platform class the guard's maximum literal rounds to 2^63, but an
+   overflowing product's true range (e.g. 2^62 * 2.0 = 2^63) still
+   exceeds the rounded literal, so the guard aborts as intended —
+   verified by rebuilding with GCC `-mlong-double-64` (silent
+   saturation NOT observed; `(1<<62) * 2.0` aborts). Code comments
+   and the round-54 CHANGES.md item updated to state this; no source
+   change needed. **Round-56 correction**: that dismissal was wrong
+   by an arithmetic error — 2^62 * 2.0 = 2^63 EQUALS the rounded
+   literal, so `range > maxL` passes on ld==double and silent
+   saturation occurs (codex proved with -mlong-double-64). Both
+   operators now use a platform-conditional guard bound:
+   `nextafter(2^63, 0)` (= 2^63 - 1024, the only pure-double bound
+   that rejects true products >= 2^63 while accepting every exact
+   product <= 2^63 - 1024) on LDBL_MANT_DIG == DBL_MANT_DIG
+   platforms, `9223372036854775807.0L` elsewhere. Documented
+   residual: MAX * 1.0 (exact 2^63 - 1) still aborts on ld==double
+   platforms — unavoidable when the comparison happens in double.
+4. **[P0] Burst-length conversion could still invoke UB before the
+   cap.** With BURST mode, positive BER, BurstArrivalRate=1,
+   BurstLength=UINT32_MAX and an injected RNG sequence {0.0, 1.0},
+   the geometric quotient reaches ~1.19e11 — a direct
+   `static_cast<uint32_t>` of that out-of-range double is UB (UBSan
+   report), and the old 1000-codeword cap ran after the conversion.
+   The cap now applies to the DOUBLE quotient before the cast:
+   `length = min(length, 999.0)` then convert (+1 -> at most 1000).
+   **Round-56 follow-ups**: (a) BurstLength == 0 now short-circuits
+   to a single-codeword burst — the geometric denominator
+   `log(0 / (1 + 0))` = log(0) was FE_DIVBYZERO; (b) the clamp bound
+   is 999, not 1000, because the old `min(quot, 1000) + 1` emitted
+   a 1001-codeword burst at the cap (probe: L=1000, u=0.9 gives
+   quot 2303.74 -> old cap+1 = 1001; new cap+1 = 1000). Ordinary
+   uncapped inputs are unchanged (probe: L=1000, u=0.5 -> 694).
+5. **[P2] Round-54 CHANGES.md/comment inaccuracies corrected.**
+   - Item 1's endpoint examples were reversed: BER 0.99 yields
+     pSym == 1, BER 1e-18 yields pSym == 0 (now stated correctly).
+   - The fec-model.cc comment claimed the raw form breaks "for
+     BER >= 2^-53"; the accurate threshold is BER <= ~1e-16 (2^-53
+     is where `1 - BER` itself rounds to 1, above the actual break).
+   - Item 2's arithmetic: 4,294,967,250 = UINT32_MAX - 45 (not -46).
+   - The TestPostFecBer bound rationale cited the i=15 term
+     (~1e-137) as the tail; i=15 is still correctable (t=15). The
+     uncorrectable tail starts at i=16: C(544,16) * p^16 ~ 2.25e-146.
+     The 1e-14 bound stands (machine-epsilon residue, not the true
+     tail).
+
+**Verified.** Clean build; `PASS data-rate`; `PASS error-model`;
+`PASS gpu-cluster`; 12/12 core suites (pie-queue-disc, drop-tail-queue,
+codel-queue-disc, cobalt-queue-disc, fifo-queue-disc, prio-queue-disc,
+fq-codel-queue-disc, fq-pie-queue-disc, fq-cobalt-queue-disc,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke counters 37/55500 and 6887/10302800;
+48 parity PASS lines (15 scripts); 18 pytest parity cases
+(test_ibgda.py + test_config_fec_enabled.py); surrogate pytest 101
+from surrogate/ with PYTHONPATH=.; DCQCN anchors byte-stable
+(20802.4 µs / 99985/99985/99974 and 20300.2 µs).
+
+### Fixed — codex round 54: expm1/log1p FEC symbol probability, 51-B Buffer-offset headroom, BER saturation in link degradation, and DataRate long-double-range/double-quantization split
+
+**What.** Seven findings, verified and fixed:
+
+1. **[P0] FEC symbol probability rounded to exactly 0/1 at extreme BER.**
+   `ComputeSymbolErrorProbability` used `1 - pow(1-BER, 10)`; at BER
+   0.99 the raw form yields pSym == 1 (`log(1-pSym)` = FE_DIVBYZERO)
+   and at BER 1e-18 it yields pSym == 0 (`log(pSym)` = FE_DIVBYZERO)
+   — both fatal under fenv traps. All three entry points
+   now use `-expm1(10 * log1p(-BER))`, which stays off the exact 0/1
+   boundaries for every BER in (0, 1) where the true pSym is
+   representable at all. Test bound in `TestPostFecBer` adjusted to
+   `< 1e-14` (the true uncorrectable tail is ~2.25e-146 — term i=16,
+   since C(544,16) * p^16 with p ~ 1e-11 — but the log-space
+   cancellation leaves double-epsilon residue ~4e-16; the assert is
+   against machine epsilon, not the true probability).
+2. **[P0] 51-B prefix + payload encoded 4 B below the round-53 bound
+   still overflowed Buffer offsets.** `SetFecParams(995,1,0)` with a
+   4,316,550-B payload encodes to 4,294,967,250 (= UINT32_MAX - 45):
+   the round-53 `kMaxPayload = UINT32_MAX - 41` accepted it, but a
+   warm 51-B send-path prefix plus the encoded body overflows the
+   32-bit Buffer offset space. Both egress sites (nvswitch.cc,
+   fabric-endpoint.cc) now bound at `kMaxPayload = UINT32_MAX - 51`
+   (reject `>=`), covering the worst-case prefix that can already be
+   on the packet.
+3. **[P0] long double == double platforms (MSVC, Apple ARM64): the
+   identity product still aborts — documented limitation.** On those
+   platforms `9223372036854775807.0L` rounds to 2^63, so the
+   long-double range guard degrades to an inclusive 2^63 bound and
+   `MAX * 1.0` / `MAX *= 1.0` abort. No portable fix exists without an
+   integer identity-path check (which the round-54 scope did not
+   include). All other products (range check in long double,
+   quantization from the double product) behave identically on both
+   platform classes. **Round-55 clarification**: the round-54 boundary
+   clamp cannot silently accept genuine overflow on this platform
+   class — the guard's `range > 2^63 - 1` still aborts there because
+   the true range of an overflowing product (e.g. 2^62 * 2.0 = 2^63)
+   exceeds even the rounded literal; verified with a GCC
+   `-mlong-double-64` build. **Round-56 correction**: that
+   round-55 dismissal was wrong — 2^62 * 2.0 EQUALS the rounded
+   literal 2^63, so `range > maxL` does NOT abort on ld==double and
+   silent saturation occurred. The round-56 fix uses a
+   platform-conditional guard bound `nextafter(2^63, 0)` on those
+   platforms; see the round-55 entry for details.
+4. **[P0] link-degradation.cc evaluated invalid probabilities for BER
+   > 1.** `SetBer(0.002)` + severity-1 BIT_ERROR degradation produces
+   BER = 2; the raw `pow(1-BER, bits)` then silently returned 0 (even
+   bits) or raised FE_INVALID/FE_OVERFLOW (odd bits). Both independent
+   and burst paths now saturate: `if (m_ber >= 1.0) return 1.0` in
+   `CalculatePacketErrorProbability`, and burst-mode burst-length
+   generation clamps `u = min(u, 1 - 1e-12)` so an injectable
+   DeterministicRandomVariable cannot reach `log(0)` and the uint32
+   UB cast. New `TestSaturatedBer` covers independent + burst mode
+   (burst switched via `SetErrorMode(ErrorMode::BURST)`).
+5. **[P1] round-53 long-double conversion changed ordinary double
+   results.** `DataRate(10) * 0.3` went 3 → 2; `1e9 * 0.7` →
+   699999999; `3 * (1/3)` → 0, because the long-double product retains
+   the scalar's approximation error through the truncation. Fixed by
+   validating the range in long double but converting from the DOUBLE
+   product (preserving the historical double-rounding quantization).
+   **Round-54 follow-up**: the double product of 2^63-1 rounds UP to
+   2^63 (53-bit mantissa), which the constructor aborts on. A
+   post-guard clamp returns kMax whenever the double product reaches
+   2^63 (the guard already proved the true product <= 2^63 - 1), so
+   `MAX * 1.0` and `MAX *= 1.0` return kMax on x87 platforms.
+6. **[P2] injectable RNG u==1.0 in geometric burst length.** Same fix
+   as 4: `uClamped = std::min(u, 1.0 - 1e-12)`.
+7. **[P3] comment/CHANGES.md arithmetic errors corrected.**
+   - The round-53 CHANGES.md entry said the boundary encoded body plus
+     FabricHeader reaches "UINT32_MAX + 1"; the correct statement is
+     that encoded body + FabricHeader = UINT32_MAX - 2, and adding PPP
+     gives UINT32_MAX (not +1). The round-54 headroom comment in
+     fabric-endpoint.cc now states this correctly.
+   - The test comment in test-data-rate.cc incorrectly said
+     "1.0 == 2^63-1 in double"; the correct statement is that
+     `(double)(2^63 - 1)` rounds to 2^63.
+   - The pSym vs 1-pSym explanation in fec-model.cc comments corrected
+     for the even-exponent case (BER > 1 can make the raw pow form
+     negative; the negative log argument is then pSym, not 1-pSym).
+
+**Tests.** `gpu-cluster-test.cc`: `TestSaturatedBer` (independent +
+burst mode, BER > 1 saturation); `TestPostFecBer` bound adjusted;
+`rdma-modes-test.cc` misleading-indentation fixed (`-Werror` clean).
+`test-data-rate.cc`: boundary `MAX * 1.0` / `MAX *= 1.0` assert
+non-abort (parent-process, no fork needed on x87).
+
+**Verified.** Clean build; gpu-cluster suite 183/183 PASS; data-rate +
+error-model suites PASS; 12 touched-core suites PASS (pie-queue-disc,
+drop-tail-queue, codel/cobalt/fifo/prio-queue-disc,
+fq-codel/fq-pie/fq-cobalt-queue-disc, queue-disc-traces, wifi-mac-queue,
+lr-wpan-error-model); traffic-control-example smoke PASS (Unforced drop
+37/55500, sent 6887/10302800); 15 parity scripts PASS (48 PASS lines,
+0 FAIL; 18 pytest cases incl. test_ibgda.py 17 + test_config_fec_enabled.py
+1); surrogate pytest 101 passed; DCQCN anchors byte-stable (congested:
+20802.4 µs / 99985 ECN / 99985 CNP tx / 99974 CNP rx; aligned:
+20300.2 µs).
+
+### Fixed — codex round 53: reject-at-boundary for the FEC guard and the double-product DataRate guard, plus FP-clean FEC decode at BER >= 1.0
+
+**What.** The round-53 codex session was killed by a content filter before
+producing a report, but its tool log contained three confirmed findings,
+extracted and verified against the code:
+
+1. **FEC boundary crash.** `SetFecParams(971, 1, 0)` with a 4,423,241-B
+   payload encodes to exactly `UINT32_MAX - 41` — the round-52
+   `kMaxPayload` bound — and the `>` guard let it through. The packet is
+   payload + the 39-B FabricHeader it already carries, so even
+   `encoded == bound` dies inside ns-3's Buffer (`CheckNoZero` assert).
+   Both egress sites (`NvSwitch::SendMulticastResultOnPort`,
+   `FabricEndpoint::SendPacketOnDevice` encode-before-WFQ) now reject
+   `>= kMaxPayload` (max payload body `UINT32_MAX - 41`), with a message
+   directing users to reduce the fragment size or disable FEC.
+
+2. **DataRate double-product boundary.** `DataRate(MAX) * 1.0` and
+   `MAX *= 1.0` aborted: `(double)(2^63 - 1) == 2^63` exactly (1 ulp
+   granularity at that magnitude), so the round-51 inclusive `>=` guard
+   — and even a first attempt written against the literal
+   `9223372036854775807.0`, which also rounds to 2^63 in double —
+   spuriously rejected the identity product. Both `operator*(double)` and
+   `operator*=(double)` now compute the product in `long double` (80-bit
+   x87 represents 2^63 - 1 exactly) and validate against
+   `9223372036854775807.0L` before the narrowing cast. Known limitation:
+   MSVC's long double is double, so `MAX * 1.0` still aborts there
+   (documented in the code).
+
+3. **FP exceptions in the FEC uncorrectability sum at BER >= 1.0.**
+   `ComputePostFecBer` / `DecodeCodeword` evaluate
+   `std::log(1.0 - pSym)` where `pSym == 1` at BER 1.0
+   (`FE_DIVBYZERO`, fatal under `feenableexcept`) and
+   `std::log(negative)` for BER > 1.0 (`FE_INVALID`) — reachable because
+   `LinkDegradationModel::ApplyDegradation` scales `m_baseBer` by
+   `(1 + severity * 999)` with only the attribute input checker-bounded
+   to [0,1]. All three entry points (`ComputeSymbolErrorProbability`,
+   `ComputePostFecBer`, `DecodeCodeword`) short-circuit BER >= 1.0 to the
+   certain outcome (pSym = 1; post-FEC BER = 1; UNCORRECTABLE),
+   mirroring the round-52 error-model rate-1.0 early-out.
+
+**Tests.** `test-data-rate.cc`: boundary cases `DataRate(kMax) * 1.0` and
+`d *= 1.0` must not abort (round 53). `gpu-cluster-test.cc`: new
+`FecModelTest::TestBerAtLeastOne` covers `ComputePostFecBer(1.0) == 1.0`,
+`ComputePostFecBer(2.0) == 1.0`, `T=0` at BER 1.0, and
+`DecodePacket(1.0/3.0)` == UNCORRECTABLE.
+
+**Verified.** Clean build; gpu-cluster suite 183/183 PASS; data-rate +
+error-model suites PASS (boundary cases included); 12 touched-core suites
+PASS (pie-queue-disc, drop-tail-queue, codel/cobalt/fifo/prio-queue-disc,
+fq-codel/fq-pie/fq-cobalt-queue-disc, queue-disc-traces, wifi-mac-queue,
+lr-wpan-error-model); traffic-control-example smoke PASS (Unforced drop
+37/55500, sent 6887/10302800); 15/15 parity scripts PASS (48 PASS lines,
+0 FAIL; 18 pytest cases incl. test_ibgda.py 17 + test_config_fec_enabled.py
+1); surrogate pytest 101 passed; DCQCN anchors byte-stable (congested:
+20802.4 µs / 99985 ECN / 99985 CNP tx / 99974 CNP rx; aligned:
+20300.2 µs).
+
+### Fixed — codex round 52: boundary correction on the round-51 guards — exclusive DataRate bound, complete-packet FEC check, and endpoint/test portability
+
+**What.** Round 52 re-examined the round-51 range guards at their exact
+boundary conditions and found five off-by-one/portability defects:
+
+1. **[P2] DataRate addition guards rejected the representable maximum.**
+   The round-51 `operator+`/`operator+=` pre-addition check used an
+   INCLUSIVE bound (`rhs >= (2^63 - 1) - lhs`), so a sum landing
+   exactly at `2^63 - 1` — still representable, the constructor
+   accepts up to `2^63 - 1` — spuriously aborted (MAX+0, 0+MAX,
+   (MAX−1)+1 all rejected). Both operators now use the exclusive
+   bound `rhs > (2^63 - 1) - lhs`. The data-rate test suite gains
+   boundary assertions that MAX+0 and 1+=MAX−1 succeed.
+2. **[P2] FEC padding check bounded the pad, not the encoded packet.**
+   Both FEC egress sites (fabric-endpoint.cc, nvswitch.cc) checked
+   `padding > UINT32_MAX` — but the 32-bit packet accounting wraps on
+   `payload + padding`, not on the pad alone. `SetFecParams(512,1,0)`
+   on an 8 MiB payload encodes to exactly 2^32 B: the pad
+   (2^32 − 8 MiB) passes the old check and `AddAtEnd` wraps the
+   packet size to ~423 B. Both sites now bound the complete
+   `encodedPayloadSize` against `UINT32_MAX − 41` (the header-headroom
+   convention the rest of the pipeline reserves), failing loudly with
+   the encoded size in the message.
+3. **[P2] Unconditional POSIX headers broke native Windows test
+   builds.** The round-51 fatal-path tests included `<sys/wait.h>` /
+   `<unistd.h>` and called `fork()`/`waitpid()` unconditionally,
+   breaking MSYS2/MinGW64 compilation. Both test files now guard the
+   includes and the fork-based cases behind
+   `!defined(_WIN32) && !defined(__CYGWIN__)`
+   (`NS3_TEST_HAVE_FORK_ABORT`); the abort-guard cases are skipped on
+   native Windows.
+4. **[P3] `waitpid` ignored EINTR.** Both expectAbort lambdas discarded
+   the `waitpid` return; an interrupted wait left `status == 0`
+   (false "did not abort" failure) and the child unreaped (zombie).
+   Both now retry on `errno == EINTR` in a loop and require the reaped
+   pid before trusting the status.
+5. **[P3] `rate == 1.0` raised floating-point exceptions.** The
+   `expm1/log1p` form evaluates `log1p(-1.0) = -inf` (FE_DIVBYZERO
+   under `feenableexcept`, SIGFPE) and `0 * -inf = NaN` (FE_INVALID)
+   for an empty packet. `DoCorruptByte` and `DoCorruptBit` now
+   short-circuit `rate >= 1.0` to a plain `ranvar < 1.0` comparison —
+   mathematically identical (every unit corrupted) and exception-free.
+   The error-model test suite gains rate-1.0 endpoint coverage for
+   both units, including the empty-packet case.
+
+**Docs.** The round-51 entry's LL/LL128 formula description
+(`(data + line - 1 + header) / line * line`) is corrected: the actual
+code (nccl-protocol-model.cc) divides first and bumps
+(`lines = data / dataPerLine + (data % dataPerLine != 0)`), then
+multiplies by `lineSize` behind an overflow check.
+
+**Verified.** Clean build (0 errors, 0 warnings); gpu-cluster suite
+183/183 PASS; data-rate + error-model suites PASS (including the new
+boundary and rate-1.0 cases); 12 touched-core suites PASS
+(pie, drop-tail, codel/cobalt/fifo/prio, fq-codel/fq-pie/fq-cobalt,
+queue-disc-traces, wifi-mac-queue, lr-wpan-error-model);
+traffic-control-example smoke PASS (Unforced drop 37/55500, sent
+6887/10302800); 15/15 parity scripts PASS (48 PASS lines, 0 FAIL);
+surrogate pytest 101 passed; DCQCN anchors byte-stable (congested:
+20802.4 µs / 99985 ECN / 99974 CNP rx; aligned: 20300.2 µs / 37161 ECN).
+
+### Fixed — codex round 51: overflow and numerical-stability follow-up — g_recommendedStart headroom, FEC width, raw-path widening, saturation guards, and range-checked rates
+
+**What.** Round 51 re-probed the round-50 fixes at the next boundary and
+audited the send paths' arithmetic for silent wrap/saturation defects:
+
+1. **[P2] `g_recommendedStart` overflowed at exactly 2^30 B.** The function
+   computed `dataSize + needed` in uint64 but compared the result against
+   a `UINT32_MAX` headroom bound; a `dataSize` of exactly `2^30` (the
+   maximum the receiving side can buffer before saturating) wrapped the
+   headroom computation and recommended starting at an offset near zero.
+   The headroom check now caps against `2^30` (the receiver's saturation
+   bound) instead of `UINT32_MAX`, so the recommendation stays
+   representable for every legal input.
+2. **[P2] `FecModel::GetEncodedSize` returned uint32.** A ~4-GiB payload's
+   encoded size crosses `UINT32_MAX`; the narrowing produced an encoded
+   size smaller than the payload, and the padding site's `encoded >
+   payload` test then skipped the parity expansion entirely. The return
+   type is now `uint64_t` throughout.
+3. **[P2] The raw send path truncated bulk-chunk byte accounting.** The
+   raw `SendData` path (which bypasses protocol framing) accumulated wire
+   bytes in a uint32 local; a >4-GiB transfer silently wrapped the
+   ledger. The accumulator is now `uint64_t`, matching every other send
+   path.
+4. **[P2] UB MAINTENANCE wraparound.** The microbenchmark maintenancer's
+   tick counter wrapped to zero after `UINT64_MAX` ticks, restarting the
+   maintenance interval from the beginning. The counter now saturates at
+   `UINT64_MAX`, so the interval check simply stops re-firing.
+5. **[P2] DataRate arithmetic operators bypassed the constructor guard.**
+   Round 50 guarded both constructors; round 51 found the mutating
+   operators could still produce a rate >= 2^63 without passing through
+   them: `+=` overflowed silently, `*=` (double) could overflow or
+   produce NaN, and `*` (uint64) wrapped BEFORE the constructor check.
+   All four compound operators plus the non-assigning `operator+` now
+   check against the `2^63 - 1` bound before mutating or constructing;
+   `operator-`/`operator-=` assert non-negative.
+6. **[P2] `RateErrorModel::DoCorruptByte` used `pow(1 - rate, size)`.**
+   For `rate = 1e-17`, `1.0 - rate` rounds to exactly 1.0 and every
+   packet is clean. The computation now uses `-expm1(size * log1p(-rate))`,
+   matching the `DoCorruptBit` fix from round 50 and preserving the
+   leading-order term. `SetRate` also rejects non-probability values
+   (negative, NaN, or > 1) that would otherwise make `log1p(-rate)` NaN.
+7. **[P3] LL/LL128 wire-size divide-then-bump truncated.** The ceiling
+   division rounded up BEFORE adding the per-line header, so a payload
+   needing an exact multiple of lines received one fewer line. The
+   division now adds the line size first: `(data + line - 1 + header) /
+   line * line`.
+8. **[P3] SIMPLE/MCCL/RoCE/Ethernet efficiency==1.0 computed the full
+   pad path.** The efficiency-1.0 fast path now skips the padding
+   loop entirely and, for the remaining cases, saturates to `UINT64_MAX`
+   instead of wrapping.
+9. **[P3] `ErrorRate` attribute accepted values outside [0, 1].** The
+   checker now validates `0 <= rate <= 1`; `SetRate` aborts outside the
+   range.
+
+**Also fixed (round 51 hardening).** During verification, the
+`DataRate::operator+` guard was found missing entirely: the non-assigning
+operator constructed the sum directly, bypassing the constructor's abort.
+A pre-addition check (`rhs >= (2^63 - 1) - lhs`) was added to match the
+other operators. The fatal-path unit tests (range-rejection aborts) were
+also converted from the broken try/catch pattern to `fork()` +
+`waitpid()`: `NS_ABORT` exits the process, so the tests now verify the
+child's exit status (`SIGABRT` or non-zero exit) instead of relying on
+unreachable catch blocks. Three abort tests in error-model-test-suite.cc
+and six in test-data-rate.cc use this pattern.
+
+**Verified.** Clean `-Werror` build; gpu-cluster suite 183/183 PASS
+(test-runner + test.py); data-rate + error-model suites PASS (test-runner
++ test.py); three parity scripts PASS; DCQCN anchors byte-stable
+(congested: 20802.4 µs / 99985 ECN / 99974 CNP rx; aligned: 20300.2 µs /
+37161 ECN); every touched-core suite PASS (pie, drop-tail,
+codel/cobalt/fifo/prio, fq-codel/fq-pie/fq-cobalt, queue-disc-traces,
+wifi-mac-queue, lr-wpan-error-model) plus a traffic-control-example
+smoke run.
+
+### Fixed — codex round 50: configuration-boundary robustness at the fragment/ledger edge — header headroom, wrapped LL ledgers, zero spray size, negative DataRates, and tiny BERs
+
+**What.** Round 50 pushed the send paths' configurable knobs to their
+uint32/uint64 boundaries and found the fragmentation pipeline accepting
+nonsensical-but-representable configurations:
+
+1. **[P2] No header headroom in the fragment cap.** A
+   `BulkChunkSize`/`SprayChunkSize` near `UINT32_MAX` produces a body
+   whose +39-B FabricHeader +2-B PPP wraps the packet size to 38 B —
+   "successfully" sent garbage. Both setters now cap at
+   `UINT32_MAX - 41`, and both fragmentation paths clamp the computed
+   fragment body against the same bound independently of the configured
+   chunk sizes (the raw attribute path bypasses the setters). The
+   transfer just fragments into more chunks.
+2. **[P2] NCCL LL's framing wrapped inside `GetWireSize`.** `dataSize`
+   near 2^63 makes `lines × 128` wrap to 0 (or a small value) in uint64,
+   which passed the 2^62 ledger bound and emitted a header-only
+   "successful" transfer. The LL/LL128 arm now saturates to `UINT64_MAX`
+   when the line count times the line size would overflow (the send
+   paths' existing bound then aborts), and the bulk path additionally
+   rejects a zero wire ledger for nonzero data.
+3. **[P2] `SprayChunkSize = 0` divided by zero.** The setter and the
+   attribute checker both accept it; a 16-MiB bulk send then SIGFPEs in
+   the chunk-count division. The checker now requires ≥1, the setter
+   aborts on zero, and the (unused, also-dividing) `sizeBasedChunks`
+   computation in the bulk path is removed.
+4. **[P2] `DataRate` rates ≥ 2^63 constructed negative fixed-points.**
+   Both the uint64 and string constructors accept them;
+   `int64x64_t(m_bps)` then goes negative and `CalculateBitsTxTime`
+   returns inverted times (2^62 bits at 2^63 bps → −500 ms). Both
+   constructors now abort at the configuration site.
+5. **[P2] Tiny BERs collapsed to zero.** `1.0 - m_rate` rounds to
+   exactly 1.0 for `m_rate = 1e-17`, making every packet clean.
+   `DoCorruptBit` now computes `-expm1(n · log1p(-rate))`, preserving
+   the leading term.
+6. **[P3] PIE kept the truncating admission.** The wrapped comparison
+   pushed rejections into the internal queue's drop path, skipping the
+   `m_accuProb` reset and recording `INTERNAL_QUEUE_DROP` instead of
+   `FORCED_DROP`. It compares through `WouldOverflow` now.
+7. **[P3] Packet-mode `WouldOverflow` still wrapped at `UINT32_MAX`
+   packets.** The count is promoted to uint64 before the addition in
+   both `QueueBase` overloads and `QueueDisc`'s.
+
+**Verified.** Clean `-Werror` build; gpu-cluster suite 183/183 PASS
+(test-runner + test.py); three parity scripts PASS; the three calibrated
+scenarios byte-stable (ceiling 8306.3 µs; DCQCN congested 20802.4 µs /
+99985 ECN / 99974 CNP rx; aligned 20300.2 µs, zero ECN); every
+touched-core suite PASS (data-rate, error-model, pie, drop-tail,
+codel/cobalt/fifo/prio, fq-codel/fq-pie/fq-cobalt, queue-disc-traces,
+wifi-mac-queue, lr-wpan-error-model) plus a traffic-control example
+smoke run.
+
+### Fixed — codex round 49: the round-48 64-bit widening completed across the whole blast radius — admission comparisons, near-saturated ledgers, FQ byte locals, and the error model
+
+**What.** Round 48 widened the queue byte counters and the
+`CalculateBytesTxTime` multiplication; round 49 probed every remaining
+consumer of those values and found the widening incomplete:
+
+1. **[P2] Byte-queue admission still compared a truncated sum.** The
+   `QueueSize operator+` path truncated the widened running byte count
+   back to uint32 before `DoEnqueue`'s comparison, so a byte-mode queue
+   holding >4 GiB admitted packets forever (four ~1-GiB boundary packets:
+   the wrapped sum `228B` passed every check). `QueueBase` and
+   `QueueDisc` gain a `WouldOverflow(uint32_t bytes)` overload computed
+   entirely in 64-bit, and `Queue::DoEnqueue` plus the codel/fifo/cobalt
+   queue discs compare through it. Three `BytesInQueue` trace callbacks
+   that still took uint32 parameters (and aborted on connect at runtime)
+   are widened: tcp-validation, fqcodel-l4s-example,
+   codel-vs-pfifo-asymmetric.
+2. **[P2] A near-saturated ledger bypassed the sentinel guard.** A UB
+   efficiency just above 2^-64 yields a representable ledger
+   (1 B → 18446744073709547536) that passes `wireSize == UINT64_MAX`
+   but still wraps the fragmentation ceiling divisions into the round-48
+   SIGFPE, or truncates a fragment's uint32 chunk size. Both guards now
+   bound the ledger at 2^62 (four exabits of arithmetic headroom; the
+   packet pipeline's data cap sits at ~2^30 anyway) instead of testing
+   one sentinel value.
+3. **[P2] FQ queue disciplines still narrowed the backlog.** The
+   fat-flow selection in fq-codel/fq-pie/fq-cobalt kept uint32
+   `maxBacklog`/`bytes`/`len`/`threshold` locals — a wrapped backlog
+   made the drop target the WRONG flow. All widened to uint64.
+4. **[P2] The double `CalculateBitsTxTime` overload broke integer
+   callers** (`rate.CalculateBitsTxTime(8)` — ambiguous between uint32
+   and uint64). Collapsed to the single uint64 signature (uint32
+   arguments convert implicitly, no behavior change), and the fixed-point
+   construction is now unsigned-safe: `int64x64_t(uint64 >= 2^63)`
+   produced NEGATIVE times (2^63 bits at 1 Tbps → −9.2e15 ns); the
+   quotient now splits into an unsigned whole-seconds part and a
+   fractional remainder with a range abort.
+5. **[P2] `RateErrorModel`'s bit corruption still wrapped** —
+   `8 * p->GetSize()` in 32 bits gave a 1-GiB packet 456 bits instead
+   of 8.6e9, turning a 1e-9 BER into a 4.6e-7 corruption probability.
+   The exponent is computed in double now.
+6. **[P3] The boundary test gained a serialization-duration assert** —
+   with the old 32-bit wrap it passed in nanoseconds; the last receive
+   must now land at the true 5 × (2^30 + 57) × 8 / 1 Tbps ≈ 42.95 ms
+   (±1 µs), computed with a `__int128` intermediate (the naive
+   bits × 1e9 overflows uint64).
+
+**Verified.** Clean `-Werror` build; gpu-cluster suite 183/183 PASS
+(test-runner + test.py); three parity scripts PASS; the three calibrated
+scenarios byte-stable (ceiling 8306.3 µs; DCQCN congested 20802.4 µs /
+99985 ECN / 99974 CNP rx; aligned 20300.2 µs, zero ECN); every
+touched-core suite PASS (drop-tail, codel/cobalt/fifo/pie/prio
+queue-discs, fq-codel/fq-pie/fq-cobalt, queue-disc-traces,
+wifi-mac-queue, error-model, data-rate).
+
+### Fixed — codex round 48: four P2s downstream of the round-47 pad bound — saturated-ledger SIGFPE, uint32 queue byte accounting, 32-bit serialization, and a 12× RoCE send regression
+
+**What.** Round 47's hard pad guard made the wire-expansion path safe per
+sub-packet, but the probes this round pushed past every consumer of those
+bodies found the surrounding infrastructure still 32-bit-shaped:
+
+1. **[P2] Saturated `GetWireSize` SIGFPEs the bulk path.** With a UB
+   efficiency below 2^-62, `GetWireSize` returns `UINT64_MAX`; the bulk
+   fragmentation's ceiling division overflows to
+   `memCapChunks == 0`, `wireChunkSize` divides through zero, and the
+   `dataChunkSize` line crashes with SIGFPE. Both entry points now abort
+   loudly with an actionable message instead (`SendBulkWireTransferSize`
+   and the 4-arg `SendCollectiveBulk`, which the SHARP transaction path
+   feeds `action.wireBytes` into).
+2. **[P2] Queue byte accounting wrapped.** A packet-count-limited
+   `DropTailQueue` holding four ~1-GiB padded packets wrapped its
+   `TracedValue<uint32_t> m_nBytes` (4 × (2^30 + 57) mod 2^32 == 228) and
+   fired the dequeue underflow assert. `QueueBase`'s byte counters and
+   getters are now 64-bit (`m_nBytes`, total received/dropped bytes;
+   `BytesInQueue` trace callback becomes `Uint64`), mirrored in
+   `QueueDisc`, and `QueueSize`'s BYTES `operator+` computes in 64-bit
+   before the admission comparison.
+3. **[P2] Serialization wrapped.** `DataRate::CalculateBytesTxTime`
+   computed `bytes * 8` in 32 bits — a 536,870,969-B padded packet
+   serialized in 2 ns instead of ~21.5 ms at 200 Gbps. The
+   multiplication is 64-bit now, with a `uint64_t` overload of
+   `CalculateBitsTxTime`.
+4. **[P2] The round-47 hoisted extraction ran for RoCE sends.**
+   `trueDataSizes` was computed unconditionally although only the
+   non-RoCE efficiency<1.0 arm reads it — RoCE sends (which take their
+   advertised count from the SoHeader) paid a full body copy per chunk:
+   12× slower 16-MiB bulk sends, +45 % peak RSS. The hoist is now gated
+   on exactly its consumers.
+5. **[P3] Test coverage.** The pad-boundary tests gain the accepted
+   multi-packet boundary (five 1-B chunks at 2^-30, each padded to the
+   full 2^30 − 1: queue accounting and serialization stay exact) and the
+   reject side (an unrepresentable pad aborts; forked-child check).
+   Two stale comments corrected (the 1-B test's pad is 131071 B, and the
+   guard is 1 GiB − 1 per sub-packet, not 1 MiB).
+
+**Verified.** Clean `-Werror` build; gpu-cluster suite 183/183 PASS
+(test-runner + test.py); three parity scripts PASS; the three calibrated
+scenarios byte-stable (ceiling 8306.3 µs; DCQCN congested 20802.4 µs /
+99985 ECN / 99974 CNP rx; aligned 20300.2 µs, zero ECN).
+
 ### Added — PFC headroom (XOFF in-flight absorption, the ns3-rdma m_pg_hdrm_limit analog): `--pfcHeadroomChunks`
 
 **What.** 802.1Qbb PFC's no-drop contract requires the switch to buffer

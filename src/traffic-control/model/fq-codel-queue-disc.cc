@@ -455,7 +455,12 @@ FqCoDelQueueDisc::FqCoDelDrop()
 {
     NS_LOG_FUNCTION(this);
 
-    uint32_t maxBacklog = 0;
+    // Byte counts are 64-bit (codex round 49, finding 4): the per-flow
+    // backlog is uint64 since QueueDisc::GetNBytes widened; a 32-bit
+    // maxBacklog wrapped past 4 GiB and made the fat-flow selection drop
+    // the WRONG flow (a 1000-B flow instead of the one holding four
+    // boundary packets).
+    uint64_t maxBacklog = 0;
     uint32_t index = 0;
     Ptr<QueueDisc> qd;
 
@@ -463,7 +468,7 @@ FqCoDelQueueDisc::FqCoDelDrop()
     for (uint32_t i = 0; i < GetNQueueDiscClasses(); i++)
     {
         qd = GetQueueDiscClass(i)->GetQueueDisc();
-        uint32_t bytes = qd->GetNBytes();
+        uint64_t bytes = qd->GetNBytes();
         if (bytes > maxBacklog)
         {
             maxBacklog = bytes;
@@ -472,9 +477,9 @@ FqCoDelQueueDisc::FqCoDelDrop()
     }
 
     /* Our goal is to drop half of this fat flow backlog */
-    uint32_t len = 0;
+    uint64_t len = 0;
     uint32_t count = 0;
-    uint32_t threshold = maxBacklog >> 1;
+    uint64_t threshold = maxBacklog >> 1;
     qd = GetQueueDiscClass(index)->GetQueueDisc();
     Ptr<QueueDiscItem> item;
 

@@ -219,7 +219,15 @@ EthernetSwitch::EffectivePfcPauseThreshold(uint32_t outPort) const
             double occupancy = static_cast<double>(GetVoqSize(outPort))
                                / static_cast<double>(depth);
             double scaled = static_cast<double>(m_pfcPauseThreshold) * (1.0 - occupancy);
-            return std::max<uint32_t>(1u, static_cast<uint32_t>(scaled));
+            // Round 62: clamp to a nonnegative value BEFORE the cast
+            // (codex finding 13). GetVoqSize can exceed GetVoqDepth —
+            // SetVoqDepth is public and may be lowered below the live
+            // backlog — so occupancy > 1 makes scaled negative, and the
+            // float->uint32 conversion of a negative double is UB
+            // (aborting under -fsanitize=float-cast-overflow) before
+            // std::max ever runs.
+            return std::max<uint32_t>(1u,
+                                      static_cast<uint32_t>(std::max(0.0, scaled)));
         }
     }
     return m_pfcPauseThreshold;
@@ -244,7 +252,11 @@ EthernetSwitch::EffectivePfcPauseThreshold(uint32_t outPort, uint8_t vcId) const
             double occupancy = static_cast<double>(GetVoqSize(outPort))
                                / static_cast<double>(depth);
             double scaled = static_cast<double>(base) * (1.0 - occupancy);
-            return std::max<uint32_t>(1u, static_cast<uint32_t>(scaled));
+            // Round 62: same negative-product clamp as the port-level
+            // overload above (occupancy can exceed 1 when the live
+            // backlog outgrows a subsequently lowered VOQ depth).
+            return std::max<uint32_t>(1u,
+                                      static_cast<uint32_t>(std::max(0.0, scaled)));
         }
     }
     return base;
@@ -628,41 +640,36 @@ EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
     // per-hop budget instead of admitting unbounded toward the base VoqDepth
     // hard cap. The XOFF needs a link RTT (+ any already-serialized source
     // burst) to actually stop the source; those packets are exactly what the
-    // budget holds. Checked BEFORE the pause trigger so the threshold-
+    // budget holds. The GATE runs before the pause trigger so the threshold-
     // crossing packet itself (admitted to the shared buffer in ns3-rdma's
-    // model) does not draw the budget — only post-XOFF arrivals do.
-    // Exhaustion drops (m_pfcHeadroomDrops — the "ingress headroom full"
-    // analog). Control/retry bypass: pausing feedback would deadlock the
-    // loop, same exemption as every other congestion hook. 0 = off (legacy
-    // unbounded admission while paused).
-    if (m_pfcHeadroomChunks > 0 && !fh.IsControlPacket() && !fh.IsRetryPacket())
+    // model) does not draw the budget — only post-XOFF arrivals do — but the
+    // CHARGE is committed only after every other drop path has admitted the
+    // packet (a tail-dropped packet never reaches the VOQ, so it must not
+    // consume headroom; codex round 35, finding 2). Exhaustion drops
+    // (m_pfcHeadroomDrops — the "ingress headroom full" analog).
+    // Control/retry bypass: pausing feedback would deadlock the loop, same
+    // exemption as every other congestion hook. 0 = off (legacy unbounded
+    // admission while paused).
+    const PfcHopKey headroomKey{inPort, outPort, fh.GetVirtualChannel()};
+    const bool headroomGated = m_pfcHeadroomChunks > 0
+                                   && !fh.IsControlPacket() && !fh.IsRetryPacket()
+                                   && IsPfcPaused(inPort, outPort, fh.GetVirtualChannel());
+    if (headroomGated)
     {
-        const PfcHopKey key{inPort, outPort, fh.GetVirtualChannel()};
-        if (IsPfcPaused(inPort, outPort, fh.GetVirtualChannel()))
+        auto it = m_pfcHeadroomUsed.find(headroomKey);
+        const uint32_t used = (it != m_pfcHeadroomUsed.end()) ? it->second : 0;
+        if (used >= m_pfcHeadroomChunks)
         {
-            auto it = m_pfcHeadroomUsed.find(key);
-            const uint32_t used = (it != m_pfcHeadroomUsed.end()) ? it->second : 0;
-            if (used >= m_pfcHeadroomChunks)
-            {
-                m_pfcHeadroomDrops++;
-                NS_LOG_WARN("PFC headroom exhausted for hop " << inPort << "->"
-                              << outPort << " vc " << static_cast<int>(fh.GetVirtualChannel())
-                              << ", dropping packet");
-                // NACK like the lossy drop below: a silent drop in a
-                // lossless fabric is an unrecoverable loss (h=10 with no
-                // NACK deadlocks the transfer — verified). The LLR/SACK
-                // retry path is the recovery, exactly as for tail-drops.
-                EmitNackBack(fh, inPort, fh.GetSourceMac());
-                return false; // drop: caller skips the push + counts m_voqDrops
-            }
-            if (it != m_pfcHeadroomUsed.end())
-            {
-                it->second = used + 1;
-            }
-            else
-            {
-                m_pfcHeadroomUsed[key] = 1;
-            }
+            m_pfcHeadroomDrops++;
+            NS_LOG_WARN("PFC headroom exhausted for hop " << inPort << "->"
+                          << outPort << " vc " << static_cast<int>(fh.GetVirtualChannel())
+                          << ", dropping packet");
+            // NACK like the lossy drop below: a silent drop in a lossless
+            // fabric is an unrecoverable loss (h=10 with no NACK deadlocks
+            // the transfer — verified). The LLR/SACK retry path is the
+            // recovery, exactly as for tail-drops.
+            EmitNackBack(fh, inPort, fh.GetSourceMac());
+            return false; // drop: caller skips the push + counts m_voqDrops
         }
     }
 
@@ -687,21 +694,29 @@ EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
         // Without this guard `voqDepth >= 0` is always true and every
         // Ethernet DATA packet would be tail-dropped -- a total-stall
         // foot-gun (the opposite of the documented "off").
-        if (m_voqDropThreshold == 0)
-        {
-            return true;
-        }
-        if (voqDepth >= m_voqDropThreshold)
+        if (m_voqDropThreshold > 0 && voqDepth >= m_voqDropThreshold)
         {
             EmitNackBack(fh, inPort, fh.GetSourceMac());
             return false; // drop: caller skips the push + counts m_voqDrops
         }
         if (fh.GetFabricType() == FabricType::ETHERNET)
         {
+            if (headroomGated)
+            {
+                m_pfcHeadroomUsed[headroomKey]++;
+            }
             return true; // admit; plain Ethernet carries no SoHeader to ECN-mark
         }
         // Lossy RoCE: fall through to ECN marking (ecnThreshold < drop
         // threshold gives mark-before-drop, the real RoCEv2 ordering).
+    }
+
+    // Admitted (every drop path above has passed): commit the headroom
+    // charge for a paused hop NOW — the packet is joining the VOQ the
+    // budget tracks.
+    if (headroomGated)
+    {
+        m_pfcHeadroomUsed[headroomKey]++;
     }
 
     // RoCE lossless path: mark the inner SoHeader ECN bit when congested.

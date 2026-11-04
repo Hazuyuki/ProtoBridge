@@ -382,7 +382,7 @@ ProtocolConfig::Compile(ProtocolTransactionGraph& graph,
                         uint16_t numGpus,
                         uint64_t dataSize,
                         uint16_t baseFlowId,
-                        std::string* error) const
+                        std::string* error, bool includeStartup) const
 {
     if (!proto)
     {
@@ -467,7 +467,12 @@ ProtocolConfig::Compile(ProtocolTransactionGraph& graph,
     // (mirrors RingAllReduce::Initialize).
     uint64_t startupNs = 0;
     bool hasStartup = false;
-    if (m_startup == "auto")
+    if (!includeStartup)
+    {
+        // The explicit RDMA runtime supplies NIC startup; do not add the
+        // legacy scalar, including a numeric startup from an older stencil.
+    }
+    else if (m_startup == "auto")
     {
         uint8_t startupProto = proto->GetProtocolId(dataSize);
         startupNs = proto->GetStartupDelayNs(startupProto, numGpus);

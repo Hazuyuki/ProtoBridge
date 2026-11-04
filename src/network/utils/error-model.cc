@@ -157,10 +157,13 @@ RateErrorModel::GetTypeId()
                                           ERROR_UNIT_PACKET,
                                           "ERROR_UNIT_PACKET"))
             .AddAttribute("ErrorRate",
-                          "The error rate.",
+                          "The error rate (a probability in [0, 1]).",
                           DoubleValue(0.0),
                           MakeDoubleAccessor(&RateErrorModel::m_rate),
-                          MakeDoubleChecker<double>())
+                          // Domain restriction (codex round 51, finding 9):
+                          // a rate above 1 makes log1p(-rate) NaN, and NaN
+                          // compares false — every packet silently clean.
+                          MakeDoubleChecker<double>(0.0, 1.0))
             .AddAttribute("RanVar",
                           "The decision variable attached to this error model.",
                           StringValue("ns3::UniformRandomVariable[Min=0.0|Max=1.0]"),
@@ -204,6 +207,12 @@ void
 RateErrorModel::SetRate(double rate)
 {
     NS_LOG_FUNCTION(this << rate);
+    // Same domain restriction as the attribute checker (codex round 51,
+    // finding 9): a rate above 1 (or NaN) makes the expm1/log1p
+    // probability NaN, and NaN compares false — every packet clean.
+    NS_ABORT_MSG_IF(std::isnan(rate) || rate < 0.0 || rate > 1.0,
+                    "RateErrorModel rate " << rate
+                    << " is not a probability in [0, 1]");
     m_rate = rate;
 }
 
@@ -256,8 +265,21 @@ bool
 RateErrorModel::DoCorruptByte(Ptr<Packet> p)
 {
     NS_LOG_FUNCTION(this << p);
-    // compute pkt error rate, assume uniformly distributed byte error
-    double per = 1 - std::pow(1.0 - m_rate, static_cast<double>(p->GetSize()));
+    // compute pkt error rate, assume uniformly distributed byte error.
+    // Stable expm1/log1p form (codex round 51, finding 6): 1.0 - m_rate
+    // rounds to exactly 1.0 for a tiny rate (1e-17), so the old
+    // pow(1 - rate, size) collapsed to 1 and per to 0 — every packet
+    // clean, whatever its size. -expm1(n * log1p(-rate)) keeps the
+    // leading term; mirrors the bit-unit fix from round 50. Endpoint
+    // (round 52): log1p(-1.0) is -inf (raises FE_DIVBYZERO under
+    // feenableexcept) and 0 * -inf is NaN for an empty packet, so
+    // short-circuit rate == 1.0 where every byte is corrupted anyway.
+    if (m_rate >= 1.0)
+    {
+        return (m_ranvar->GetValue() < 1.0);
+    }
+    const double per = -std::expm1(static_cast<double>(p->GetSize())
+                                   * std::log1p(-m_rate));
     return (m_ranvar->GetValue() < per);
 }
 
@@ -265,8 +287,22 @@ bool
 RateErrorModel::DoCorruptBit(Ptr<Packet> p)
 {
     NS_LOG_FUNCTION(this << p);
-    // compute pkt error rate, assume uniformly distributed bit error
-    double per = 1 - std::pow(1.0 - m_rate, static_cast<double>(8 * p->GetSize()));
+    // compute pkt error rate, assume uniformly distributed bit error.
+    // 64-bit exponent (codex round 49, finding 7): 8 * p->GetSize() wraps
+    // in 32 bits for packets above 512 MiB — a 1073741881-B boundary
+    // packet counted 456 bits instead of 8589935048, so a 1e-9 BER
+    // modeled a ~4.6e-7 corruption probability instead of ~0.9998.
+    // expm1/log1p (codex round 50, finding 5): 1.0 - m_rate rounds to
+    // exactly 1.0 for a tiny BER (m_rate = 1e-17), making every packet
+    // clean. -expm1(n * log1p(-rate)) keeps the leading term. Endpoint
+    // (round 52): same FE_DIVBYZERO/FE_INVALID hazard as the byte unit
+    // — short-circuit rate == 1.0 where every bit is corrupted anyway.
+    if (m_rate >= 1.0)
+    {
+        return (m_ranvar->GetValue() < 1.0);
+    }
+    const double exponent = static_cast<double>(8.0 * p->GetSize());
+    const double per = -std::expm1(exponent * std::log1p(-m_rate));
     return (m_ranvar->GetValue() < per);
 }
 

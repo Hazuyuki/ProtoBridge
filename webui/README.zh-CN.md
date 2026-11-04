@@ -83,7 +83,7 @@ Mac 浏览器中的 `localhost` 指 Mac 本机，因此只在远程容器启动�
 
 ### 配置的含义
 
-配置选择器读取仓库自带的 11 个 `.cfg` 模板。可以分别选择 collective、算法和物理
+配置选择器读取仓库自带的 `.cfg` 模板。可以分别选择 collective、算法和物理
 拓扑，也可以导入或编辑 `.cfg` / `.profile`，在高级区填写经过校验的附加 CLI JSON。
 每次运行保存独立快照，不会改写仓库 `configs/` 中的文件。
 
@@ -95,6 +95,7 @@ Mac 浏览器中的 `localhost` 指 Mac 本机，因此只在远程容器启动�
 | 算法参数 | Broadcast/Reduce 的 root rank、NCCL ring 通道数、分层算法的节点内阶段。与拓扑结构分开设置。 |
 | 分片与链路 | Lanes、每 GPU 链路数、分片大小及链路介质。 |
 | 流控与拥塞控制 | VC credit、跨节点发送窗口、VOQ、PFC 模式和 headroom、DCQCN/ECN、RTTCC、每 QP 速率上限。 |
+| RDMA 提交 | StartupDelay 或详细模型；独立选择 CPU/GPU 提交与主机内存/中转/GPUDirect 路径，调整提交耗时、队列、内存带宽和中转缓冲。 |
 | 错误注入 | 统一或分层 BER、独立/突发错误、随机丢包及相关参数。 |
 | 纠错与重传 | FEC 开关/范围及 RS 参数，LLR 开关、Go-back-N/SACK、重试次数、超时、缓冲区和溢出策略。 |
 | 光链路故障 | 单节点光互联 Leaf–spine 的链路移除及原生路由重算。 |
@@ -128,6 +129,34 @@ PFC/ECN/丢包阈值顺序会在启动进程前报错。Ethernet、部分 lossy 
 突发错误实验要求关闭 FEC 并设置正的统一 BER，因为原生 FEC 接收路径使用独立误码
 解码模型。FEC 开关已经传入 profile 及委托执行路径，更新后请重新构建仿真器。
 
+### RDMA 路径实验
+
+在“多节点网络”选择主机内存 RDMA、GPU 经主机中转、GPUDirect 或 IBGDA 示例。
+打开“RDMA 提交”，可分别选择计时模型、CPU/GPU 提交方与数据路径。CPU 和 GPU 的
+构建 WQE、发布、doorbell 和完成观测耗时分别设置。中转路径会实际安排 D2H/H2D
+事件，并受分块大小、拷贝带宽和有限缓冲容量限制。
+
+这些模式都使用现有的 RoCE RC RDMA Write 网络，示例耗时未经硬件校准。
+
+其他操作可选择“RDMA 读取 / Get”“RDMA 发送 / 接收”“RDMA 原子操作”或“RDMA Put +
+信号”模板。操作下拉框还提供 Write/Send with immediate 及单独信号更新。可以调整
+Read/原子操作在途上限、响应方槽位、接收队列容量、RNR 重试和操作数；延迟提交接收
+缓冲可用于观察 RNR 恢复。完成语义和集成示例见 [RDMA 操作说明](../doc/RDMA_OPERATIONS.md)。
+详细模式在完整运行压缩包中保存 `rdma.csv`，也可通过
+`/api/runs/<id>/artifacts/rdma.csv` 单独下载。结果分别统计用户请求与分块 WR、
+提交方观测完成与目标数据就绪，以及拷贝字节数。参数和 C++ 集成方式见
+[RDMA 使用说明](../doc/RDMA.md)。
+
+启用详细 RDMA 或 IBGDA 后，打开“本机 PCIe”，选择“TLP 包级模型 · 无误码”。可调整
+代际、lane 数、交换机/根复合体拓扑、MPS/MRRS、读 Tag、队列容量和六类信用额度。
+数据信用额度以 16 字节为单位。GPU 拷贝、NIC DMA、WQE、doorbell 和 CQ 流量经过实际
+共享的 PCIe 路径；HBM、主机内存及拷贝引擎的限制继续生效。该模式支持 Gen3–5 和
+VC0，不注入 PCIe 误码；以太网/RoCE 的错误配置仍单独作用于网络。
+
+运行归档包含 `pcie.csv`，也可从 `/api/runs/<id>/artifacts/pcie.csv` 下载。默认最多记录
+100000 个事件，`pcieTraceTruncated` 表示是否截断；汇总计数不受影响。参数、事件含义和
+建模范围见 [PCIe 说明](../doc/PCIE.md)。
+
 ### 如何读图
 
 拓扑图表示选择的网络结构，是示意图。步骤时序图使用真实 `stepTraceFile` 记录，
@@ -143,7 +172,7 @@ python -m webui --data-dir /path/to/run-storage
 ```
 
 每次运行保存 `config.cfg`、`profile.profile`、`stdout.log`、`result.json`，以及场景
-实际输出的 `steps.csv`。记录包含请求、有效参数、原生结果、精确 argv、Git 版本、
+实际输出的 `steps.csv`，详细 RDMA 模式还保存 `rdma.csv`。记录包含请求、有效参数、原生结果、精确 argv、Git 版本、
 二进制 SHA-256 和 wall time；配置快照中的 profile 路径就是执行时使用的绝对路径。
 
 队列一次执行一个仿真，最多接收 16 个未完成任务。默认 wall time 上限 120 秒，最多

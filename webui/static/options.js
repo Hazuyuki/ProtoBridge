@@ -121,13 +121,27 @@ class SimulationOptions {
       return result;
     };
     const config = parse(document.getElementById("config-editor").value, true);
+    const normalize = (values) => {
+      const result = { ...values };
+      for (const [alias, canonical] of Object.entries(this.schema.rdma_aliases || {})) {
+        if (alias in result) {
+          if (!(canonical in result)) result[canonical] = result[alias];
+          delete result[alias];
+        }
+      }
+      return result;
+    };
     return {
       op: config.op,
       stack: {
-        ...parse(document.getElementById("profile-editor").value, false)[""],
-        ...config.stack,
+        ...normalize(parse(document.getElementById("profile-editor").value, false)[""]),
+        ...normalize(config.stack),
       },
     };
+  }
+
+  collectiveChoices() {
+    return this.schema.collectives.filter((item) => item.scope !== "multi" || this.context().multi);
   }
 
   reset(request = {}) {
@@ -144,7 +158,7 @@ class SimulationOptions {
     }
     this.setChoices(
       "collective-select",
-      this.schema.collectives,
+      this.collectiveChoices(),
       request.op_overrides?.collective ?? "",
     );
     this.setChoices(
@@ -399,10 +413,21 @@ class SimulationOptions {
       let show = scope;
       if (this.schema.topology_fields.includes(item) && item.scope === "single")
         show = scope && (topology?.params || []).includes(item.key);
+      if (item.when?.startsWith("rdma")) {
+        const detailed = ["detailed", "ibgda"].includes(setting("rdmaSubmission"));
+        show = scope && detailed;
+        if (item.when === "rdma-ops") show = show && operation.collective === "rdma";
+        if (item.operations) show = show && item.operations.includes(setting("rdmaOperation") || "write");
+        if (item.when === "rdma-cpu") show = show && (setting("rdmaInitiator") || "gpu") === "cpu";
+        if (item.when === "rdma-gpu") show = show && (setting("rdmaInitiator") || "gpu") === "gpu";
+        if (item.when === "rdma-staged") show = show && setting("rdmaDataPath") === "staged";
+        if (item.when === "rdma-pcie") show = show && setting("pcieModel") === "tlp";
+        if (item.when === "rdma-bandwidth") show = show && setting("pcieModel") !== "tlp";
+      }
       if (item.when === "burst")
         show = scope && (setting("errorMode") || "independent") === "burst";
       if (item.when === "root")
-        show = scope && ["broadcast", "reduce"].includes(operation.collective);
+        show = scope && ["broadcast", "reduce", "rdma"].includes(operation.collective);
       if (["ncclring", "hierarchical"].includes(item.when))
         show = scope && operation.algorithm === item.when;
       if (item.when?.startsWith("so-"))
@@ -647,7 +672,7 @@ class SimulationOptions {
       }
     }
     for (const [id, choices] of [
-      ["collective-select", this.schema.collectives],
+      ["collective-select", this.collectiveChoices()],
       ["physical-topology", this.schema.topologies],
     ])
       this.setChoices(id, choices, document.getElementById(id).value);

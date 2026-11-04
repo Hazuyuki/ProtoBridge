@@ -75,7 +75,7 @@ follow the interface language; their saved representation is English for new run
 ## Use
 
 1. Choose collective communication, a multi-node network, or a transfer stencil.
-   The configuration selector reads all eleven shipped `.cfg` files.
+   The configuration selector reads the shipped `.cfg` files.
 2. Choose the collective, algorithm, and physical topology independently. Set
    rank count, application bytes per rank, and optional link overrides. The
    preview resolves the profile, `[stack]`, and `[op]` values before the run.
@@ -144,9 +144,42 @@ each field, usually ns, while PFC pause time uses µs.
 | Physical topology | 14 native topologies, including Ring, Full mesh, NVSwitch, Fat-tree, Rail fat-tree, Leaf–spine, NVL72, Torus, Mesh, Hypercube, 2D full mesh, three-level, Dragonfly+, and Multi-plane |
 | Multi-node topology | Eight inter-node choices, intra-node NVSwitch/Full mesh, and topology-specific dimensions |
 | Flow control | Per-VC credits, So transmit window, VOQ depth/drop threshold, PFC static/dynamic/quanta modes and headroom, DCQCN/ECN, RTTCC, per-QP rate ceiling |
+| RDMA submission | Legacy startup or detailed timing; independent CPU/GPU initiator and host/staged/GPUDirect payload path; worker count, WQE/doorbell/CQ costs, queue depth, memory bandwidths and bounded staging buffers |
 | Error injection | Uniform or per-tier BER, independent/burst errors, random packet loss, codeword and burst parameters |
 | Recovery | FEC enable/scope and RS parameters, LLR enable, Go-back-N/SACK, retry count/timeout/buffer/overflow, timeout retransmission, strict So GBN |
 | Link failure | Optical Leaf–spine link removal and native failure-aware routing |
+
+### RDMA paths
+
+Choose a host-memory RDMA, GPU staging, GPUDirect, or IBGDA example under
+**Multi-node network**. Open **RDMA submission** to select detailed timing,
+CPU/GPU initiation, and the payload path. CPU and GPU stage costs are separate;
+staging adds D2H/H2D copies with configurable chunks, bandwidth and finite buffers.
+All examples use RC RDMA Write over RoCE. The example costs are uncalibrated.
+
+For other operations, choose **RDMA Read / Get**, **RDMA Send / Recv**, **RDMA
+atomics**, or **RDMA Put with signal**. The operation selector also offers
+Write/Send with immediate and standalone signal updates. Configure Read/atomic
+credits, responder slots, posted receive capacity, RNR retries and operands in
+the same section. Delaying receive posting lets you observe RNR recovery.
+See [RDMA operations](../doc/RDMA_OPERATIONS.md) for completion rules and examples.
+
+Detailed runs include `rdma.csv` in **Download run archive**; it is also available
+at `/api/runs/<id>/artifacts/rdma.csv`. Results distinguish logical requests from
+chunk WRs, completion observation from destination data readiness, and report
+copy traffic. See [the RDMA guide](../doc/RDMA.md) for parameters and C++ APIs.
+
+Open **Local PCIe** and select **TLP packets · no errors** to model shared local
+PCIe links. Select Gen3/4/5, lane count, switch/root topology, MPS/MRRS, read tags,
+queue capacities and six credit pools. Posted/Completion data credits use 16-byte
+units. Legacy PCIe bandwidth inputs are hidden in this mode; HBM/host-memory and
+copy-engine limits still apply. The model supports VC0 and established links.
+It does not inject PCIe errors. Ethernet/RoCE error settings remain independent.
+
+TLP runs include `pcie.csv` in the archive and at
+`/api/runs/<id>/artifacts/pcie.csv`. The trace records at most 100000 events by
+default; `pcieTraceTruncated` reports truncation, while aggregate counters remain
+complete. See [the PCIe guide](../doc/PCIE.md) for defaults and modeling limits.
 
 The form supplies editable dimensions when selecting a topology. Torus, Mesh,
 Hypercube, and 2D full mesh derive the actual rank count from those dimensions.

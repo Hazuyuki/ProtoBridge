@@ -10,6 +10,7 @@
 #include "ns3/double.h"
 #include "ns3/uinteger.h"
 #include "ns3/random-variable-stream.h"
+#include "ns3/fatal-error.h"
 
 #include <algorithm>
 #include <cmath>
@@ -28,10 +29,22 @@ LatencyStatistics::GetTypeId()
         .SetParent<Object>()
         .SetGroupName("GpuCluster")
         .AddConstructor<LatencyStatistics>()
+        // Round 63 (codex finding 16): bind through the setter, not the raw
+        // member. The setter requires [0, 1); the old direct member binding
+        // accepted 1.0 via the attribute (checker admits the inclusive
+        // bound), and RecordFlowCompletion then treats every sample as
+        // warmup and discards the entire run.
+        // Round 64 (codex finding 4): the stock double checker only
+        // offers inclusive bounds, so 1.0 still passes this checker —
+        // the unconditional NS_ABORT_MSG_IF in SetWarmupFraction below
+        // is the guard (the old NS_ASSERT disappeared in
+        // assert-disabled builds, which then accepted 1.0 and discarded
+        // every sample as warmup).
         .AddAttribute("WarmupFraction",
-                      "Fraction of simulation time to exclude as warmup (0.0 to 1.0)",
+                      "Fraction of simulation time to exclude as warmup [0.0, 1.0)",
                       DoubleValue(0.2),
-                      MakeDoubleAccessor(&LatencyStatistics::m_warmupFraction),
+                      MakeDoubleAccessor(&LatencyStatistics::SetWarmupFraction,
+                                         &LatencyStatistics::GetWarmupFraction),
                       MakeDoubleChecker<double>(0.0, 1.0))
         .AddAttribute("SimulationDuration",
                       "Configured simulation stop time for warmup calculation",
@@ -39,10 +52,15 @@ LatencyStatistics::GetTypeId()
                       MakeTimeAccessor(&LatencyStatistics::SetSimulationDuration,
                                        &LatencyStatistics::GetSimulationDuration),
                       MakeTimeChecker())
+        // Round 64 (codex finding 5): bind through the setter — the old
+        // direct member binding let SetBootstrapResamples(0) bypass the
+        // attribute's >=100 checker, after which BootstrapCi built an
+        // empty percentile vector and indexed element zero.
         .AddAttribute("BootstrapResamples",
                       "Number of bootstrap resamples for confidence intervals",
                       UintegerValue(1000),
-                      MakeUintegerAccessor(&LatencyStatistics::m_bootstrapResamples),
+                      MakeUintegerAccessor(&LatencyStatistics::SetBootstrapResamples,
+                                           &LatencyStatistics::GetBootstrapResamples),
                       MakeUintegerChecker<uint32_t>(100))
         .AddTraceSource("FlowComplete",
                         "A flow completion was recorded",
@@ -76,7 +94,13 @@ void
 LatencyStatistics::RecordFlowStart(uint16_t flowId)
 {
     NS_LOG_FUNCTION(this << flowId);
-    m_flows[flowId].startTime = Simulator::Now();
+    // Per-message start bookkeeping (codex rounds 40-45): the sender records
+    // ONE start per message, the receiver records a completion PER DELIVERED
+    // FRAGMENT. Perfect message-tail matching is not reconstructible from
+    // the start/complete event stream alone. The semantics are deliberately
+    // simple and monotone (see the FIFO note in RecordFlowComplete): each
+    // completion measures from the OLDEST unmatched start and consumes it.
+    m_flows[flowId].pendingStarts.push_back(Simulator::Now());
 }
 
 void
@@ -85,14 +109,44 @@ LatencyStatistics::RecordFlowComplete(uint16_t flowId)
     NS_LOG_FUNCTION(this << flowId);
 
     auto it = m_flows.find(flowId);
-    if (it == m_flows.end())
+    if (it == m_flows.end() || it->second.pendingStarts.empty())
     {
         NS_LOG_WARN("Flow complete without start: flowId=" << flowId);
         return;
     }
 
-    Time latency = Simulator::Now() - it->second.startTime;
-    RecordLatency(flowId, latency);
+    // FIFO: consume the OLDEST unmatched start. When per-flow delivery is
+    // sequence-ordered (the reorder-buffer path — the common case), the
+    // k-th completion belongs to the k-th start: single-delivery messages
+    // measure exactly their own latency even when overlapped (round 44's
+    // LIFO recorded 50 and 110 us for two messages whose true latencies
+    // were 100 and 60 — the 110 exceeded both; codex round 45, finding 1).
+    // With multi-fragment messages the pairing degrades: EVERY completion
+    // consumes a start, not just the message's first fragment — an
+    // earlier message's LATER fragments consume the NEXT message's start
+    // (which under ordered delivery is a later timestamp than the
+    // fragment's own message's start, so the recorded duration is a true
+    // lower bound of that next message's latency), and a message whose
+    // start was already consumed by an earlier message's fragment records
+    // NO sample at all (codex round 47, finding 5: A/B start at 0/10 us,
+    // A's fragments complete at 20/30 us, B completes at 40 — FIFO
+    // records 20/20 us from A's fragments and nothing for B).
+    // HONEST LIMIT (codex round 46, finding 2): the guarantee does NOT
+    // hold unconditionally even for first fragments. Delivery can
+    // reorder — a receiver in bypass mode (SetBypassReorderBuffer(true))
+    // delivers packets in ARRIVAL order, and spraying one flow across
+    // devices with different propagation delays can deliver a LATER
+    // message's fragment before an earlier one's (start 0 us via a
+    // 100-us link, start 10 us via a 0-us link: FIFO records
+    // 10.169/90.169 us where the true latencies are 0.169/100.169 us —
+    // the first sample overestimates by 10 us).
+    // The samples remain a bounded, monotone approximation; consumers
+    // needing per-message FCT exactness must not use overlapped flows on
+    // reordering paths. No in-tree consumer reads these samples at all
+    // (the harness measures durations from completion callbacks).
+    Time startTime = it->second.pendingStarts.front();
+    it->second.pendingStarts.pop_front();
+    RecordLatency(flowId, Simulator::Now() - startTime);
 }
 
 void
@@ -124,7 +178,11 @@ void
 LatencyStatistics::SetWarmupFraction(double fraction)
 {
     NS_LOG_FUNCTION(this << fraction);
-    NS_ASSERT_MSG(fraction >= 0.0 && fraction < 1.0, "Warmup fraction must be in [0, 1)");
+    // Round 64 (codex finding 4): unconditional validation — the old
+    // NS_ASSERT_MSG disappears in assert-disabled builds, which then
+    // accepted 1.0 and discarded every sample as warmup.
+    NS_ABORT_MSG_IF(!(fraction >= 0.0 && fraction < 1.0),
+                    "Warmup fraction must be in [0, 1)");
     m_warmupFraction = fraction;
 }
 
@@ -137,6 +195,12 @@ LatencyStatistics::GetWarmupFraction() const
 void
 LatencyStatistics::SetBootstrapResamples(uint32_t resamples)
 {
+    // Round 64 (codex finding 5): match the attribute checker's floor —
+    // BootstrapCi indexes element zero of the bootstrap percentile
+    // vector, which is empty below the >=10-sample fast path when the
+    // resample count is zero.
+    NS_ABORT_MSG_IF(resamples < 100,
+                    "Bootstrap resample count must be at least 100");
     m_bootstrapResamples = resamples;
 }
 

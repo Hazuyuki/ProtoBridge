@@ -14,6 +14,7 @@
 #include "ns3/uinteger.h"
 
 #include <cmath>
+#include <limits>
 
 namespace ns3
 {
@@ -86,14 +87,45 @@ uint64_t
 EthernetProtocolModel::GetWireSize(uint64_t dataSize, uint8_t protocolId) const
 {
     (void)protocolId;
-    return static_cast<uint64_t>(std::ceil(dataSize / m_wireEfficiency));
+    // Checked conversion (codex round 51, finding 8): at dataSize =
+    // UINT64_MAX even efficiency 1.0 rounds the double quotient to 2^64,
+    // and the direct static_cast is undefined behavior. Efficiency 1.0 is
+    // exact (and required — see the attribute doc); otherwise saturate on
+    // an out-of-range quotient (the send paths abort on ledgers above the
+    // serviceable bound, which a saturated value always exceeds).
+    if (m_wireEfficiency == 1.0)
+    {
+        return dataSize;
+    }
+    const double quotient =
+        std::ceil(static_cast<double>(dataSize) / m_wireEfficiency);
+    if (quotient >= 18446744073709551615.0) // >= 2^64 - 1
+    {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return static_cast<uint64_t>(quotient);
 }
 
 uint64_t
 EthernetProtocolModel::GetDataSize(uint64_t wireSize, uint8_t protocolId) const
 {
     (void)protocolId;
-    return static_cast<uint64_t>(wireSize * m_wireEfficiency);
+    // Round 62: inverse-direction conversion guard. At efficiency 1.0 the
+    // forward helper returns the input unconverted, but here
+    // double(UINT64_MAX) rounds up to 2^64 and the static_cast is UB on
+    // any platform (and aborts under -fsanitize=float-cast-overflow).
+    // Efficiency 1.0 is exact — return the input; otherwise saturate on
+    // an out-of-range product (mirrors the GetWireSize policy).
+    if (m_wireEfficiency == 1.0)
+    {
+        return wireSize;
+    }
+    const double product = static_cast<double>(wireSize) * m_wireEfficiency;
+    if (!(product < 18446744073709551616.0)) // >= 2^64
+    {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return static_cast<uint64_t>(product);
 }
 
 double

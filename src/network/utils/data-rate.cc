@@ -12,6 +12,10 @@
 #include "ns3/log.h"
 #include "ns3/nstime.h"
 
+#include <cmath>
+#include <float.h>
+#include <limits>
+
 namespace ns3
 {
 
@@ -124,17 +128,43 @@ DataRate::DataRate(uint64_t bps)
     : m_bps(bps)
 {
     NS_LOG_FUNCTION(this << bps);
+    // Signed-construction guard (codex round 50, finding 4): every
+    // fixed-point computation in CalculateBitsTxTime constructs
+    // int64x64_t from m_bps, and a rate >= 2^63 converts negative (2^62
+    // bits at 2^63 bps returned -500 ms instead of +500 ms). Rates that
+    // large (an exabit per second) are beyond any modeled link; reject
+    // at construction so the failure is at the configuration site.
+    NS_ABORT_MSG_IF(bps >= (1ull << 63),
+                    "DataRate of " << bps << " bps exceeds the supported "
+                    "range (>= 2^63 bps)");
 }
 
 DataRate
 DataRate::operator+(DataRate rhs) const
 {
+    // Pre-addition guard (codex round 51, finding 5): the non-assigning
+    // operator constructs the sum without passing through the uint64_t
+    // constructor's >= 2^63 abort. Check before adding; use 2^63 - 1 as
+    // the operand bound so a sum landing exactly at 2^63 - 1 is still
+    // representable (codex round 52: the bound is exclusive — rejecting
+    // >= 2^63 - 1 spuriously aborts the representable maximum sum).
+    NS_ABORT_MSG_IF(rhs.m_bps > ((1ull << 63) - 1) - m_bps,
+                    "DataRate sum of " << m_bps << " + " << rhs.m_bps
+                    << " bps exceeds the supported range (>= 2^63 bps)");
     return DataRate(m_bps + rhs.m_bps);
 }
 
 DataRate&
 DataRate::operator+=(DataRate rhs)
 {
+    // Same signed-range guard as the constructors (codex round 51,
+    // finding 5): compound assignment mutates m_bps in place and would
+    // otherwise bypass the constructor aborts. Use 2^63 - 1 as the
+    // operand bound so a sum landing exactly at 2^63 - 1 is still
+    // representable (codex round 52: exclusive bound, same as above).
+    NS_ABORT_MSG_IF(rhs.m_bps > ((1ull << 63) - 1) - m_bps,
+                    "DataRate sum of " << m_bps << " + " << rhs.m_bps
+                    << " bps exceeds the supported range (>= 2^63 bps)");
     m_bps += rhs.m_bps;
     return *this;
 }
@@ -157,25 +187,123 @@ DataRate::operator-=(DataRate rhs)
 DataRate
 DataRate::operator*(double rhs) const
 {
-    return DataRate((uint64_t)(m_bps * rhs));
+    // Pre-scale guard (codex round 51, finding 5): the double product can
+    // exceed uint64 (converts to 0 or garbage) or cross 2^63 before the
+    // constructor's own check sees it — both produce a rate the fixed-point
+    // time arithmetic cannot represent. Validate before the narrowing
+    // conversion.
+    //
+    // Range in long double, result in double (codex rounds 53/54): the
+    // bound 2^63 - 1 is exactly representable only in long double (80-bit
+    // x87); in double it rounds to 2^63, so any guard written against a
+    // double literal spuriously rejects the identity product MAX * 1.0.
+    //
+    // On platforms where long double == double (MSVC, Apple ARM64,
+    // -mlong-double-64), the literal 9223372036854775807.0L rounds UP to
+    // 2^63 and the strict > guard would pass a true product of exactly
+    // 2^63 (e.g. (1<<62) * 2.0) — the exact product 2^63 equals the
+    // rounded bound, so range > bound is false and the guard lets a
+    // genuine overflow through to the clamp below, which silently
+    // returns MAX for it (round 56). Use the next representable double
+    // below 2^63 (2^63 - 1024) as the guard bound on those platforms:
+    // Documented residuals (codex round 57): (a) the guard compares in
+    // long double, and when rhs is an integer-valued double the product
+    // m_bps * rhs is exact in long double — but m_bps itself passes
+    // through double conversion on the way, so an m_bps whose 64-bit
+    // value rounds DOWN to its double can admit a TRUE product slightly
+    // ABOVE 2^63 (round-58 probe: m_bps = 89547301328687144, rhs =
+    // 103.0 -> true product 2^63 + 24, but double(m_bps) = m_bps - 8 so
+    // the double AND the long-double-range product both equal
+    // 2^63 - 1024 = 9223372036854774784). The guard passes and the clamp
+    // is NOT taken (the double product is below 2^63), so
+    // DataRate(static_cast<uint64_t>(prod)) returns exactly
+    // 2^63 - 1024. This predates HEAD; it is bounded because the
+    // returned value is still < 2^63 (the constructor accepts it), so no
+    // garbage rate escapes — the abort simply cannot catch every true
+    // overflow on ld==double platforms. (b) The identity product
+    // MAX * 1.0 has exact value 2^63 - 1, which rounds to 2^63 in
+    // double and therefore aborts here — note this abort is a NEW
+    // restriction (round 57): the pre-round-56 parent returned
+    // DataRate(2^63 - 1) through the clamp for the same input, so the
+    // abort is a behavior change, not previous behavior.
+#if LDBL_MANT_DIG == DBL_MANT_DIG
+    const long double maxProduct = static_cast<long double>(std::nextafter(9223372036854775808.0, 0.0));
+#else
+    const long double maxProduct = 9223372036854775807.0L;
+#endif
+    const long double range = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
+    NS_ABORT_MSG_IF(!(range >= 0.0L) || range > maxProduct,
+                    "DataRate product of " << m_bps << " bps * " << rhs
+                                           << " exceeds the supported range (>= 2^63 bps)");
+    // Boundary clamp (codex rounds 54/55): the guard above proves the
+    // true product is below 2^63, but the DOUBLE product rounds values
+    // in (2^63 - 1024, 2^63) up to exactly 2^63 (53-bit mantissa) and
+    // the constructor aborts on the rounded value. A double product
+    // that reached 2^63 is a rounding artifact of an in-range true
+    // product — clamp to the representable maximum instead.
+    // On ld==double platforms the guard bound 2^63 - 1024 already
+    // rejects true products >= 2^63 before this line, so the clamp is
+    // unreachable for genuine overflow there (round 56).
+    const double prod = m_bps * rhs;
+    if (prod >= 9223372036854775808.0) // == 2^63 as a double literal
+    {
+        return DataRate((1ull << 63) - 1);
+    }
+    return DataRate(static_cast<uint64_t>(prod));
 }
 
 DataRate&
 DataRate::operator*=(double rhs)
 {
-    m_bps *= rhs;
+    // Same pre-scale guard as operator*(double): in-place mutation
+    // bypasses the constructor aborts. Long-double range / double
+    // result for the same reasons (rounds 53/54); the platform-
+    // conditional guard bound is the same as operator*(double)
+    // (round 56).
+#if LDBL_MANT_DIG == DBL_MANT_DIG
+    const long double maxProduct = static_cast<long double>(std::nextafter(9223372036854775808.0, 0.0));
+#else
+    const long double maxProduct = 9223372036854775807.0L;
+#endif
+    const long double range = static_cast<long double>(m_bps) * static_cast<long double>(rhs);
+    NS_ABORT_MSG_IF(!(range >= 0.0L) || range > maxProduct,
+                    "DataRate product of " << m_bps << " bps * " << rhs
+                                           << " exceeds the supported range (>= 2^63 bps)");
+    // Same boundary clamp as operator*(double): a double product of
+    // an in-range true value rounds up to 2^63, which the constructor
+    // would abort on. Unreachable for genuine overflow on long double
+    // == double platforms for the same reason as above (round 55/56).
+    const double prod = m_bps * rhs;
+    if (prod >= 9223372036854775808.0) // == 2^63 as a double literal
+    {
+        m_bps = (1ull << 63) - 1;
+        return *this;
+    }
+    m_bps = static_cast<uint64_t>(prod);
     return *this;
 }
 
 DataRate
 DataRate::operator*(uint64_t rhs) const
 {
+    // Pre-scale guard (codex round 51, finding 5): the uint64 product
+    // wraps BEFORE the constructor's check runs — 2^62 bps * 4 wrapped to
+    // zero, silently creating a divide-by-zero rate. Check the operands
+    // against the 2^63 bound before multiplying.
+    NS_ABORT_MSG_IF(m_bps != 0 && rhs > (((1ull << 63) - 1) / m_bps),
+                    "DataRate product of " << m_bps << " bps * " << rhs
+                    << " exceeds the supported range (>= 2^63 bps)");
     return DataRate(m_bps * rhs);
 }
 
 DataRate&
 DataRate::operator*=(uint64_t rhs)
 {
+    // Same pre-scale guard as operator*(uint64_t): in-place mutation
+    // bypasses the constructor aborts.
+    NS_ABORT_MSG_IF(m_bps != 0 && rhs > (((1ull << 63) - 1) / m_bps),
+                    "DataRate product of " << m_bps << " bps * " << rhs
+                    << " exceeds the supported range (>= 2^63 bps)");
     m_bps *= rhs;
     return *this;
 }
@@ -184,14 +312,33 @@ Time
 DataRate::CalculateBytesTxTime(uint32_t bytes) const
 {
     NS_LOG_FUNCTION(this << bytes);
-    return CalculateBitsTxTime(bytes * 8);
+    // 64-bit multiplication (codex round 48, finding 3): a packet larger
+    // than 512 MiB wraps the old 32-bit bytes*8 (a 536,870,969-B padded
+    // packet serialized in 2 ns instead of ~21.5 ms at 200 Gbps). Wire-
+    // efficiency padding can legitimately produce such bodies.
+    return CalculateBitsTxTime(static_cast<uint64_t>(bytes) * 8);
 }
 
 Time
-DataRate::CalculateBitsTxTime(uint32_t bits) const
+DataRate::CalculateBitsTxTime(uint64_t bits) const
 {
     NS_LOG_FUNCTION(this << bits);
-    return Seconds(int64x64_t(bits) / m_bps);
+    // Unsigned-safe quotient (codex round 49, finding 6): constructing
+    // int64x64_t directly from a uint64 >= 2^63 converts to a NEGATIVE
+    // int64 (2^63 bits at 1 Tbps returned -9.2e15 ns). Split into an
+    // unsigned whole-seconds quotient and a fractional remainder, both
+    // well inside int64 range, and reassemble. bits beyond ~292 Gs
+    // (2^64 / 64e9... i.e. durations beyond Time's own range) abort
+    // inside Seconds anyway.
+    const uint64_t wholeSec = bits / m_bps;
+    const uint64_t remBits = bits % m_bps;
+    if (wholeSec > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    {
+        NS_ABORT_MSG("CalculateBitsTxTime: " << bits << " bits at "
+                     << m_bps << " bps exceeds Time's representable range");
+    }
+    const int64x64_t fractional = int64x64_t(remBits) / int64x64_t(m_bps);
+    return Seconds(int64x64_t(wholeSec) + fractional);
 }
 
 uint64_t
@@ -209,6 +356,11 @@ DataRate::DataRate(std::string rate)
     {
         NS_FATAL_ERROR("Could not parse rate: " << rate);
     }
+    // Same signed-construction guard as the uint64_t constructor (codex
+    // round 50, finding 4): the string parser accepts >= 2^63 bps.
+    NS_ABORT_MSG_IF(m_bps >= (1ull << 63),
+                    "DataRate of " << rate << " (" << m_bps
+                    << " bps) exceeds the supported range (>= 2^63 bps)");
 }
 
 /* For printing of data rate */

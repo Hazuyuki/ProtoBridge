@@ -76,7 +76,7 @@ LimitsTrace(Ptr<OutputStreamWrapper> stream, uint32_t oldVal, uint32_t newVal)
  * @param newVal New value.
  */
 void
-BytesInQueueTrace(Ptr<OutputStreamWrapper> stream, uint32_t oldVal, uint32_t newVal)
+BytesInQueueTrace(Ptr<OutputStreamWrapper> stream, uint64_t oldVal, uint64_t newVal)
 {
     *stream->GetStream() << Simulator::Now().GetSeconds() << " " << newVal << std::endl;
 }
