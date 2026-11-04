@@ -130,7 +130,7 @@ class RdmaOperationEngine : public Object
         std::function<void(uint64_t)> complete;
     };
 
-    void Schedule(Time delay, std::function<void()> action);
+    bool Schedule(Time delay, std::function<void()> action);
     std::function<void()> Guard(std::function<void()> action);
     bool InRegion(uint32_t key, uint64_t address, uint64_t bytes) const;
     bool InAnyRegion(uint64_t address, uint64_t bytes) const;

@@ -255,6 +255,7 @@ set(header_files
     model/names.h
     model/node-printer.h
     model/nstime.h
+    model/time-bounds.h
     model/object-base.h
     model/object-factory.h
     model/object-map.h

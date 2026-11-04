@@ -14,6 +14,8 @@
 
 #include <algorithm>
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 
@@ -32,7 +34,7 @@ GatewayEndpoint::GetTypeId()
                       "Processing delay for cross-fabric forwarding",
                       TimeValue(MicroSeconds(1)),
                       MakeTimeAccessor(&GatewayEndpoint::m_gatewayDelay),
-                      MakeTimeChecker())
+                      MakeTimeChecker(Time(0)))
         .AddAttribute("MaxHops",
                       "Maximum forwarding hops to prevent loops",
                       UintegerValue(8),
@@ -131,6 +133,7 @@ GatewayEndpoint::GetHybridRoutingTable() const
 void
 GatewayEndpoint::SetGatewayDelay(Time delay)
 {
+    NS_ABORT_MSG_IF(delay.IsStrictlyNegative(), "Latency must be nonnegative");
     NS_LOG_FUNCTION(this << delay);
     m_gatewayDelay = delay;
 }
@@ -317,7 +320,7 @@ GatewayEndpoint::ScheduleForwarding(Ptr<Packet> packet, FabricHeader header,
     if (m_gatewayDelay < Time::Max() - Simulator::Now())
     {
         m_forwardingEvents.push_back(
-            Simulator::Schedule(m_gatewayDelay,
+            TimeBounds::Schedule(m_gatewayDelay,
                                 &GatewayEndpoint::ForwardToFabric,
                                 this, packet, header, outFabric, outDeviceIndex));
     }

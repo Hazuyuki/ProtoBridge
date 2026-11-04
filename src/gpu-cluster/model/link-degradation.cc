@@ -17,6 +17,8 @@
 
 #include <cmath>
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 
@@ -31,13 +33,7 @@ namespace
 Time
 SaturatedAddTime(Time a, Time b)
 {
-    const int64_t aTicks = a.GetTimeStep();
-    const int64_t bTicks = b.GetTimeStep();
-    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
-    {
-        return Time::Max();
-    }
-    return Time(aTicks + bTicks);
+    return TimeBounds::SaturatingAdd(a, b);
 }
 
 } // unnamed namespace
@@ -528,6 +524,9 @@ LinkDegradationModel::ScheduleDegradation(Time delay, DegradationTrigger trigger
 {
     NS_LOG_FUNCTION(this << delay << static_cast<int>(trigger) << severity << duration);
 
+    NS_ABORT_MSG_IF(delay.IsStrictlyNegative() || duration.IsStrictlyNegative(),
+                    "Degradation delay and duration must be nonnegative");
+
     CancelScheduledDegradation();
 
     // Store parameters for the degradation event
@@ -542,7 +541,7 @@ LinkDegradationModel::ScheduleDegradation(Time delay, DegradationTrigger trigger
     if (delay < Time::Max() - Simulator::Now())
     {
         // Schedule degradation
-        m_degradationEvent = Simulator::Schedule(delay,
+        m_degradationEvent = TimeBounds::Schedule(delay,
                                                  &LinkDegradationModel::OnDegradationEvent,
                                                  this);
 
@@ -555,7 +554,7 @@ LinkDegradationModel::ScheduleDegradation(Time delay, DegradationTrigger trigger
             const Time recoveryDelay = SaturatedAddTime(delay, duration);
             if (recoveryDelay < Time::Max() - Simulator::Now())
             {
-                m_recoveryEvent = Simulator::Schedule(recoveryDelay,
+                m_recoveryEvent = TimeBounds::Schedule(recoveryDelay,
                                                       &LinkDegradationModel::OnRecoveryEvent,
                                                       this);
             }

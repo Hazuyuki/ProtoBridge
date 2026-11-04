@@ -104,7 +104,7 @@ class DcqcnRateMachine : public Object
         uint32_t fastCycles{0};    ///< Fast-recovery cycles consumed
         bool fastArmed{false};    ///< A fast-recovery timer is pending
         bool aiArmed{false};      ///< An additive-increase timer is pending
-        int64_t nextSendNs{0};    ///< Earliest next-chunk egress (pacer), ns
+        __uint128_t nextSendNs{0}; ///< Nanosecond ledger spanning every native Time resolution.
         EventId fastTimer;       ///< Pending fast-recovery event
         EventId aiTimer;         ///< Pending additive-increase event
     };

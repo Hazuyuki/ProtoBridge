@@ -5,6 +5,7 @@
  */
 
 #include "point-to-point-channel.h"
+#include "ns3/time-bounds.h"
 
 #include "point-to-point-net-device.h"
 
@@ -85,14 +86,20 @@ PointToPointChannel::TransmitStart(Ptr<const Packet> p, Ptr<PointToPointNetDevic
 
     uint32_t wire = src == m_link[0].m_src ? 0 : 1;
 
+    const Time delivery = TimeBounds::SaturatingAdd(txTime, m_delay);
+    if (!TimeBounds::CanSchedule(delivery))
+    {
+        return false;
+    }
+
     Simulator::ScheduleWithContext(m_link[wire].m_dst->GetNode()->GetId(),
-                                   txTime + m_delay,
+                                   delivery,
                                    &PointToPointNetDevice::Receive,
                                    m_link[wire].m_dst,
                                    p->Copy());
 
     // Call the tx anim callback on the net device
-    m_txrxPointToPoint(p, src, m_link[wire].m_dst, txTime, txTime + m_delay);
+    m_txrxPointToPoint(p, src, m_link[wire].m_dst, txTime, delivery);
     return true;
 }
 

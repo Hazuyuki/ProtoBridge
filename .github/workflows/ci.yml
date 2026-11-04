@@ -61,8 +61,12 @@ jobs:
 
       - name: C++ test suites
         run: |
-          ./ns3 run "test-runner --test-name=gpu-cluster"
-          ./ns3 run "test-runner --test-name=gpu-cluster-integration"
+          for suite in gpu-cluster gpu-cluster-integration gpu-cluster-ibgda \
+            gpu-cluster-rdma-modes gpu-cluster-rdma-operations gpu-cluster-pcie \
+            gpu-cluster-time-conversions gpu-cluster-time-safety \
+            devices-point-to-point time data-rate error-model buffer drop-tail-queue; do
+            ./ns3 run "test-runner --test-name=$suite --fullness=EXTENSIVE"
+          done
 
       - name: Smoke (interconnect collective)
         run: |

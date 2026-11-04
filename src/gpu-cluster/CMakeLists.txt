@@ -135,5 +135,5 @@ build_lib(
     helper/hybrid-topology-helper.h
     helper/multi-node-topology-helper.h
   LIBRARIES_TO_LINK ${libnetwork} ${libpoint-to-point}
-  TEST_SOURCES test/gpu-cluster-test.cc test/integration-test.cc test/ibgda-test.cc test/rdma-modes-test.cc test/rdma-operations-test.cc test/pcie-test.cc
+  TEST_SOURCES test/gpu-cluster-test.cc test/integration-test.cc test/ibgda-test.cc test/rdma-modes-test.cc test/rdma-operations-test.cc test/pcie-test.cc test/time-safety-test.cc
 )

@@ -66,7 +66,7 @@ class PointToPointChannel : public Channel
      * @param p Packet to transmit
      * @param src Source PointToPointNetDevice
      * @param txTime Transmit time to apply
-     * @returns true if successful (currently always true)
+     * @returns true if delivery can be scheduled inside the simulation time horizon
      */
     virtual bool TransmitStart(Ptr<const Packet> p, Ptr<PointToPointNetDevice> src, Time txTime);
 
@@ -75,6 +75,9 @@ class PointToPointChannel : public Channel
      * @returns number of devices on this channel
      */
     std::size_t GetNDevices() const override;
+
+    /** Propagation delay used by the final transmit deadline check. */
+    Time GetDelay() const;
 
     /**
      * @brief Get PointToPointNetDevice corresponding to index i on this channel
@@ -91,12 +94,6 @@ class PointToPointChannel : public Channel
     Ptr<NetDevice> GetDevice(std::size_t i) const override;
 
   protected:
-    /**
-     * @brief Get the delay associated with this channel
-     * @returns Time delay
-     */
-    Time GetDelay() const;
-
     /**
      * @brief Check to make sure the link is initialized
      * @returns true if initialized, asserts otherwise

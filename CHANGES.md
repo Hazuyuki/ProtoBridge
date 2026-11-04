@@ -6,6 +6,31 @@ execution + NVSwitch + collective injectors + four-tier FEC/retry), a
 ns-3.47 framework whose change history follows after the separator. Only
 ProtoBridge-visible changes are listed here.
 
+### Time conversion and event horizon fixes
+
+Verified and fixed ten residual issues in the round-74 arithmetic and
+scheduling changes:
+
+- Rate guards no longer multiply before checking their range. Finite per-QP
+  ceilings use the floating-point range, and pacers retain nanosecond
+  accumulation across the full native Time range.
+- Nanosecond inputs are checked before conversion, including unsigned values
+  above INT64_MAX that fit coarse native units. Large finite services convert
+  directly to native ticks when the Seconds constructor cannot represent them.
+- Shared bounded-time helpers cover deferred sends, reloads, RDMA/PCIe work,
+  and switch pipelines. Point-to-point egress checks serialization, propagation,
+  and interframe completion both before admission and at actual transmit start.
+- Rejected receive posts deliver a failed completion without reserving an RQ
+  slot or advancing its availability ledger. Negative timing attributes and
+  direct latency setters reject invalid inputs before scheduling.
+- LLR and switch serialization are bounded before conversion. FEC wire-bit
+  arithmetic retains its high bits through serialization and busy accounting.
+
+These fixes supersede the round-74 claims about complete downstream horizon
+coverage and nanosecond conversion safety. Regression coverage includes
+FP-trap checks at all ten native resolutions, receive-post recovery, queued
+egress, and an unreachable PCIe propagation delay. See [CONFIG_GUIDE.md, section 6](doc/CONFIG_GUIDE.md#6-time-values-and-the-simulation-horizon).
+
 ### Reviewed — codex round 74: 15 findings, all 15 fixed
 
 Reviewed commit 614b74c (round-73 fixes). All 15 findings are instances of

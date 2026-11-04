@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include "rdma-operation-engine.h"
+#include "ns3/time-bounds.h"
 
 #include "ns3/abort.h"
 #include "ns3/simulator.h"
@@ -38,13 +39,7 @@ TxKey(const FabricHeader& h)
 Time
 SaturatedAddTime(Time a, Time b)
 {
-    const int64_t aTicks = a.GetTimeStep();
-    const int64_t bTicks = b.GetTimeStep();
-    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
-    {
-        return Time::Max();
-    }
-    return Time(aTicks + bTicks);
+    return TimeBounds::SaturatingAdd(a, b);
 }
 
 bool
@@ -106,7 +101,7 @@ RdmaOperationEngine::Configure(uint16_t rank,
     m_hold = std::move(hold);
 }
 
-void
+bool
 RdmaOperationEngine::Schedule(Time delay, std::function<void()> action)
 {
     // A large direct transfer can schedule thousands of packets at once.
@@ -125,9 +120,9 @@ RdmaOperationEngine::Schedule(Time delay, std::function<void()> action)
     // callback at -9223372036854775802), and clamping to Time::Max() still
     // EXECUTES the event at the end of time (same policy as the round-73/74
     // endpoint and LLR fixes). An unreachable action stays unarmed.
-    if (delay.IsStrictlyNegative() || delay >= Time::Max() - Simulator::Now())
+    if (!TimeBounds::CanSchedule(delay))
     {
-        return;
+        return false;
     }
     m_events.push_back(Simulator::Schedule(delay, [this, action = std::move(action)] {
         if (!m_disposed)
@@ -135,6 +130,7 @@ RdmaOperationEngine::Schedule(Time delay, std::function<void()> action)
             action();
         }
     }));
+    return true;
 }
 
 std::function<void()>
@@ -349,16 +345,27 @@ RdmaOperationEngine::PostReceive(uint64_t id,
                     "RDMA receive queue is full");
     NS_ABORT_MSG_IF(qp != UINT32_MAX && qp >= m_model->GetConfig().qpsPerPeer,
                     "Receive QP out of range");
-    ++m_receiveReserved;
     ++m_stats.postedReceives;
     auto receive = std::make_shared<PostedReceive>(
         PostedReceive{id, address, bytes, key, qp, peer, std::move(complete)});
-    m_receivePostFree =
+    const Time ready =
         SaturatedAddTime(std::max(Simulator::Now(), m_receivePostFree),
                          m_model->GetConfig().receivePost);
-    // The ledger is saturated, so the relative delay below cannot wrap.
-    Schedule(m_receivePostFree - Simulator::Now(),
-             [this, receive] { m_receives.push_back(receive); });
+    if (!Schedule(ready - Simulator::Now(),
+                  [this, receive] { m_receives.push_back(receive); }))
+    {
+        RdmaReceiveCompletion failed;
+        failed.receiveId = id;
+        failed.peer = peer;
+        failed.qp = qp;
+        failed.success = false;
+        failed.observed = Simulator::Now();
+        ++m_stats.receiveCompletions;
+        receive->complete(failed);
+        return;
+    }
+    m_receivePostFree = ready;
+    ++m_receiveReserved;
 }
 
 std::shared_ptr<RdmaOperationEngine::PostedReceive>

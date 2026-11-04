@@ -56,12 +56,12 @@ FecModel::GetTypeId()
                                           "FEC encode latency per codeword",
                                           TimeValue(NanoSeconds(50)),
                                           MakeTimeAccessor(&FecModel::m_encodeLatency),
-                                          MakeTimeChecker())
+                                          MakeTimeChecker(Time(0)))
                             .AddAttribute("DecodeLatency",
                                           "FEC decode latency per codeword",
                                           TimeValue(NanoSeconds(80)),
                                           MakeTimeAccessor(&FecModel::m_decodeLatency),
-                                          MakeTimeChecker())
+                                          MakeTimeChecker(Time(0)))
                             .AddAttribute("Enabled",
                                           "Whether FEC is enabled",
                                           BooleanValue(true),
@@ -209,6 +209,7 @@ FecModel::GetT() const
 void
 FecModel::SetEncodeLatency(Time latency)
 {
+    NS_ABORT_MSG_IF(latency.IsStrictlyNegative(), "Latency must be nonnegative");
     NS_LOG_FUNCTION(this << latency);
     m_encodeLatency = latency;
 }
@@ -222,6 +223,7 @@ FecModel::GetEncodeLatency() const
 void
 FecModel::SetDecodeLatency(Time latency)
 {
+    NS_ABORT_MSG_IF(latency.IsStrictlyNegative(), "Latency must be nonnegative");
     NS_LOG_FUNCTION(this << latency);
     m_decodeLatency = latency;
 }
