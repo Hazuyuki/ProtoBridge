@@ -72,6 +72,14 @@ public:
      */
     uint64_t GetSentDataBytes() const { return m_sentDataBytes; }
 
+    /// Test probe: the RESOLVED channel count (after the gpusPerNode rail
+    /// cap and the 16-bit flow-ID space clamp). The (channel, step) pair is
+    /// encoded into the flow ID, so channels*totalSteps must stay within
+    /// the 65,535 usable IDs — at N=182 an unclamped C=182 wrapped channel
+    /// 181's step 13 to flow ID 0 and stalled the collective (codex round
+    /// 26, finding 3).
+    uint32_t GetResolvedNumChannels() const { return m_numChannels; }
+
     /// Test probe: the chunk size (bytes) that `rank` transmits on `channel`
     /// at `step`. Keyed on the channel's RING POSITION (rotated channels
     /// permute ranks), so a chunk keeps its size as it travels the ring.

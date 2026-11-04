@@ -1052,6 +1052,12 @@ CsmaNetDevice::SetPromiscReceiveCallback(NetDevice::PromiscReceiveCallback cb)
     m_promiscRxCallback = cb;
 }
 
+NetDevice::PromiscReceiveCallback
+CsmaNetDevice::GetPromiscReceiveCallback() const
+{
+    return m_promiscRxCallback;
+}
+
 bool
 CsmaNetDevice::SupportsSendFrom() const
 {

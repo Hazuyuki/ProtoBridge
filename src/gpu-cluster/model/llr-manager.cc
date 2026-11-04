@@ -573,16 +573,57 @@ LlrManager::SetTimeoutCallback(TimeoutCallback cb)
 }
 
 void
-LlrManager::DetachFromEndpoint()
+LlrManager::DetachFromEndpoint(TimeoutCallback timeoutOwner,
+                               PermanentLossCallback lossOwner)
 {
     NS_LOG_FUNCTION(this);
+    // Identity-detach (codex round 31, finding 1): a disposing endpoint
+    // passes its own bindings; sever only those. If a successor endpoint
+    // has re-bound either callback, the manager is now the successor's —
+    // Clear() would drop the stores, taking the successor's outstanding
+    // packets with it. Null owners mean the unconditional legacy teardown.
+    bool successorTookOver = false;
+    if (!timeoutOwner.IsNull())
+    {
+        if (!m_timeoutCallback.IsNull() && !m_timeoutCallback.IsEqual(timeoutOwner))
+        {
+            successorTookOver = true; // re-bound by someone else: leave it
+        }
+        else
+        {
+            m_timeoutCallback = MakeNullCallback<void, uint32_t, uint16_t, uint16_t, uint8_t>();
+        }
+    }
+    if (!lossOwner.IsNull())
+    {
+        if (!m_permanentLossCallback.IsNull() &&
+            !m_permanentLossCallback.IsEqual(lossOwner))
+        {
+            successorTookOver = true; // re-bound by someone else: leave it
+        }
+        else
+        {
+            m_permanentLossCallback = MakeNullCallback<void, FabricHeader>();
+        }
+    }
+    if (successorTookOver)
+    {
+        // The successor owns the manager's lifecycle now — its own dispose
+        // will tear down. Touch the stores and timers nothing.
+        return;
+    }
     // Null callbacks first so nothing NEW can bind the endpoint, then
     // cancel every armed retry timer (Clear() also drops the stores, which
     // the endpoint's disappearance makes unrecoverable anyway — no ACK can
     // arrive to purge them, and no retransmission can be dispatched).
-    m_timeoutCallback = MakeNullCallback<void, uint32_t, uint16_t, uint16_t, uint8_t>();
-    m_permanentLossCallback =
-        MakeNullCallback<void, FabricHeader>();
+    if (timeoutOwner.IsNull())
+    {
+        m_timeoutCallback = MakeNullCallback<void, uint32_t, uint16_t, uint16_t, uint8_t>();
+    }
+    if (lossOwner.IsNull())
+    {
+        m_permanentLossCallback = MakeNullCallback<void, FabricHeader>();
+    }
     Clear();
 }
 

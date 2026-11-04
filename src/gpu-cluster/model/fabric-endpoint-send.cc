@@ -105,14 +105,17 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
             header.SetSourceMac(m_address);
             header.SetDestMac(ResolveDestMac(destRank));
 
-            // Check and consume credit before sending (credit-based flow
-            // control) — Su (local-dest) traffic only. So (remote-dest) DATA
-            // bypasses credits, mirroring SendBulkWireTransferSize /
+            // Admission through the virtual FlowControlGate (the documented
+            // send-gate seam) — Su (local-dest) traffic only. So (remote-dest)
+            // DATA bypasses credits, mirroring SendBulkWireTransferSize /
             // SendP2p: the receiver returns credits only for local sources
             // (OnPacketDelivered's IsLocalRank guard), so a credit-consuming
             // remote send would drain the VC pool with no return path and
-            // stall after vcCredits sends.
-            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
+            // stall after vcCredits sends. The gate performs the
+            // HasCredits/ConsumeCredit pair for the CREDIT policy, so a
+            // subclass override is no longer bypassed on this path (codex
+            // round 29, finding 3).
+            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
             {
                 NS_LOG_DEBUG("No credits for DATA chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -162,17 +165,21 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 TrySendQueuedPackets();
                 break;
             }
-            if (m_creditManager && IsLocalRank(destRank))
-            {
-                m_creditManager->ConsumeCredit(vcId, seqNum);
-            }
 
             chunkPacket->AddHeader(header);
 
             // Select device using round-robin with global offset
             uint32_t deviceIdx = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(chunkPacket, deviceIdx, destMac);
+            if (!SendPacketOnDevice(chunkPacket, deviceIdx, destMac))
+            {
+                // PFC-held: parked on the send queue by the chokepoint; do
+                // not count a transmission (the resume drains it). KEEP
+                // BUILDING the remaining fragments — each parks itself the
+                // same way — instead of dropping them (codex round 27,
+                // finding 1; same shape as SendBulkWireTransferSize's loop).
+                continue;
+            }
 
             m_txTrace(chunkPacket->GetSize(), seqNum);
             m_txPackets++;
@@ -229,8 +236,14 @@ IsCreditBypassType(FabricPacketType type)
 
 void
 FabricEndpoint::SendCollective(FabricPacketType type, uint16_t destRank,
-                                const uint8_t* data, uint32_t size)
+                                const uint8_t* data, uint64_t size)
 {
+    // (void)data — the body is dummy bytes (only sizes matter for timing);
+    // the parameter is uint64 so collective drivers computing uint64_t
+    // volumes (NVLS AllGather's chunk grid) don't truncate: a 4-GiB chunk
+    // through a uint32_t parameter became zero and SendCollectiveBulk
+    // aborted the upload (codex round 25, finding 3 — same widening
+    // SendBulkWireTransfer received in round 24, finding 5).
     (void)data;
     SendCollectiveBulk(type, destRank, size);
 }
@@ -342,8 +355,19 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             // sent chunk absorb whatever the skipped fragments would have
             // carried and the shares sum to exactly effectiveSize.
             uint64_t wireSpanEnd = std::min(offset + chunkSize, wireSize);
-            uint64_t effectiveBegin = effectiveSize * offset / std::max<uint64_t>(wireSize, 1);
-            uint64_t effectiveEnd = effectiveSize * wireSpanEnd / std::max<uint64_t>(wireSize, 1);
+            // 128-bit intermediates: effectiveSize * offset overflows uint64
+            // before the division at multi-GB scales (a 6-GiB upload over 18
+            // lanes advertised 9.3e9 effective bytes for 6.4e9 payload — the
+            // wrapped products inflated the effective ledger and could trip
+            // aggregation before the payload arrived; codex round 25,
+            // finding 2). __int128 is the codebase's established wide type
+            // (core/model/int64x64-128.h).
+            uint64_t effectiveBegin = static_cast<uint64_t>(
+                static_cast<__int128_t>(effectiveSize) * offset /
+                std::max<uint64_t>(wireSize, 1));
+            uint64_t effectiveEnd = static_cast<uint64_t>(
+                static_cast<__int128_t>(effectiveSize) * wireSpanEnd /
+                std::max<uint64_t>(wireSize, 1));
             uint32_t thisEffectiveSize =
                 static_cast<uint32_t>(effectiveEnd - effectiveBegin);
 
@@ -365,10 +389,14 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             header.SetDestMac(ResolveDestMac(destRank));
             header.SetEffectiveDataSize(thisEffectiveSize);
 
-            // Check and consume credit before sending (credit-based flow control)
-            // NVLS/SHARP packets bypass credits — switch SHARP engine has own buffer
+            // Admission through the virtual FlowControlGate (the documented
+            // send-gate seam). creditBypass stays as-is: NVLS/SHARP packets
+            // bypass credits — the switch SHARP engine has its own buffer.
+            // The gate performs the HasCredits/ConsumeCredit pair for the
+            // CREDIT policy, so a subclass override is no longer bypassed on
+            // this path (codex round 29, finding 3).
             uint8_t vcId = 0;
-            if (!creditBypass && m_creditManager && !m_creditManager->HasCredits(vcId))
+            if (!FlowControlGate(vcId, seqNum, creditBypass))
             {
                 NS_LOG_DEBUG("No credits for collective chunk " << i << " on VC " << static_cast<int>(vcId)
                              << ", queuing remaining chunks");
@@ -393,12 +421,15 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                     uint32_t remChunkSize = static_cast<uint32_t>(
                         std::min(chunkSize, wireSize - remOffset));
                     // Same wire-anchored proportional split as the main loop
-                    // (skipped trailing fragments must not eat a share).
+                    // (skipped trailing fragments must not eat a share) and
+                    // the same 128-bit intermediates (round 25, finding 2).
                     uint64_t remWireSpanEnd = std::min(remOffset + chunkSize, wireSize);
-                    uint64_t remEffectiveBegin =
-                        effectiveSize * remOffset / std::max<uint64_t>(wireSize, 1);
-                    uint64_t remEffectiveEnd =
-                        effectiveSize * remWireSpanEnd / std::max<uint64_t>(wireSize, 1);
+                    uint64_t remEffectiveBegin = static_cast<uint64_t>(
+                        static_cast<__int128_t>(effectiveSize) * remOffset /
+                        std::max<uint64_t>(wireSize, 1));
+                    uint64_t remEffectiveEnd = static_cast<uint64_t>(
+                        static_cast<__int128_t>(effectiveSize) * remWireSpanEnd /
+                        std::max<uint64_t>(wireSize, 1));
                     uint32_t remEffectiveSize =
                         static_cast<uint32_t>(remEffectiveEnd - remEffectiveBegin);
                     uint64_t remSeqKey = MakeSeqKey(destRank, 0, 0);
@@ -430,16 +461,20 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                 TrySendQueuedPackets();
                 break;
             }
-            if (!creditBypass && m_creditManager)
-            {
-                m_creditManager->ConsumeCredit(vcId, seqNum);
-            }
 
             chunkPacket->AddHeader(header);
 
             uint32_t deviceIdx = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(chunkPacket, deviceIdx, destMac);
+            if (!SendPacketOnDevice(chunkPacket, deviceIdx, destMac))
+            {
+                // PFC-held: parked on the send queue by the chokepoint; do
+                // not count a transmission (the resume drains it). KEEP
+                // BUILDING the remaining fragments — each parks itself the
+                // same way — instead of dropping them (codex round 27,
+                // finding 1; same shape as SendBulkWireTransferSize's loop).
+                continue;
+            }
 
             m_txTrace(chunkPacket->GetSize(), seqNum);
             m_txPackets++;
@@ -474,17 +509,43 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
 
         if (creditBypass)
         {
-            // NVLS/SHARP: send directly, bypassing credit queue
+            // NVLS/SHARP: send directly, bypassing the credit QUEUE — but
+            // still through the virtual FlowControlGate (the documented
+            // send-gate seam), so a subclass overriding the gate sees this
+            // admission too (codex round 30, finding 2; creditBypass skips
+            // the credit consume, not the gate dispatch).
+            if (!FlowControlGate(0, seqNum, true))
+            {
+                // A gate denial PARKS the packet on the send queue — the
+                // same recovery as the multi-fragment loops (codex round
+                // 33, finding 2): the pre-fix early return discarded it
+                // permanently (a temporary subclass gate denial of a
+                // single-packet collective transmitted 0 packets and stored
+                // 0 LLR entries; reopening the gate had nothing to drain).
+                // The drain re-admits through the same virtual gate with
+                // this entry's header-derived bypass (round 32, finding 2).
+                NS_LOG_DEBUG("FlowControlGate denied collective single packet; parking");
+                SendQueueEntry entry;
+                entry.packet = packet;
+                entry.header = header;
+                entry.vcId = 0;
+                entry.seqNum = seqNum;
+                m_sendQueue.push(entry);
+                return;
+            }
             packet->AddHeader(header);
             uint32_t deviceIdx = m_devices.empty() ? 0 : (m_globalSprayOffset % m_devices.size());
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(packet, deviceIdx, destMac);
-            if (!m_devices.empty())
+            const bool pfcHeld = !SendPacketOnDevice(packet, deviceIdx, destMac);
+            if (!pfcHeld && !m_devices.empty())
             {
                 m_globalSprayOffset = (m_globalSprayOffset + 1) % m_devices.size();
             }
-            m_txPackets++;
-            m_txBytes += packetSize;
+            if (!pfcHeld)
+            {
+                m_txPackets++;
+                m_txBytes += packetSize;
+            }
         }
         else
         {
@@ -530,9 +591,25 @@ FabricEndpoint::SendP2p(uint16_t destRank, const uint8_t* data, uint32_t size,
     // P2P would drain the local VC pool with no return path and stall once
     // vcCredits exhausts.
     // IsLocalRank alone decides (no m_localRankCount > 1 gate — one GPU per
-    // node still has remote ranks; see GetProtocolModelForDest).
+    // node still has remote ranks; see GetProtocolModelForDest). The
+    // admission still dispatches through the virtual FlowControlGate (the
+    // documented send-gate seam) with the credit-bypass arm set — a subclass
+    // overriding the gate sees remote P2P too (codex round 30, finding 2).
     if (!IsLocalRank(destRank))
     {
+        if (!FlowControlGate(vcId, seqNum, true))
+        {
+            NS_LOG_DEBUG("FlowControlGate denied remote P2P on VC "
+                         << static_cast<int>(vcId));
+            SendQueueEntry entry;
+            entry.packet = packet;
+            entry.header = header;
+            entry.vcId = vcId;
+            entry.seqNum = seqNum;
+            m_sendQueue.push(entry);
+            TrySendQueuedPackets();
+            return;
+        }
         packet->AddHeader(header);
         uint32_t deviceIndex = ResolveDeviceIndex(destRank);
         SendPacketOnDevice(packet, deviceIndex, ResolveDestMac(destRank));
@@ -638,27 +715,26 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control: check and consume credits before sending.
-    // Su (local-dest) traffic only — the receiver returns credits solely for
-    // local sources (OnPacketDelivered's IsLocalRank guard), so a remote
-    // memory write would drain the VC pool with no return path.
+    // Admission through the virtual FlowControlGate (the documented
+    // send-gate seam). Su (local-dest) traffic only — the receiver returns
+    // credits solely for local sources (OnPacketDelivered's IsLocalRank
+    // guard), so a remote memory write would drain the VC pool with no
+    // return path. The gate performs the HasCredits/ConsumeCredit pair for
+    // the CREDIT policy, so a subclass override is no longer bypassed on
+    // this path (codex round 29, finding 3).
     uint8_t vcId = 0;
-    if (m_creditManager && IsLocalRank(destRank))
+    if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
     {
-        if (!m_creditManager->HasCredits(vcId))
-        {
-            NS_LOG_DEBUG("No credits for MEMORY_WRITE on VC " << static_cast<int>(vcId)
-                         << ", queuing packet");
-            SendQueueEntry entry;
-            entry.packet = packet;
-            entry.header = header;
-            entry.vcId = vcId;
-            entry.seqNum = seqNum;
-            m_sendQueue.push(entry);
-            TrySendQueuedPackets();
-            return;
-        }
-        m_creditManager->ConsumeCredit(vcId, seqNum);
+        NS_LOG_DEBUG("No credits for MEMORY_WRITE on VC " << static_cast<int>(vcId)
+                     << ", queuing packet");
+        SendQueueEntry entry;
+        entry.packet = packet;
+        entry.header = header;
+        entry.vcId = vcId;
+        entry.seqNum = seqNum;
+        m_sendQueue.push(entry);
+        TrySendQueuedPackets();
+        return;
     }
 
     packet->AddHeader(header);
@@ -704,25 +780,21 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control for MEMORY_RESP — Su (local-dest) traffic
-    // only (see SendMemoryWrite for the So bypass rationale).
+    // Admission through the virtual FlowControlGate (see SendMemoryWrite;
+    // Su/So split and gate rationale, codex round 29 finding 3).
     uint8_t vcId = 0;
-    if (m_creditManager && IsLocalRank(destRank))
+    if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
     {
-        if (!m_creditManager->HasCredits(vcId))
-        {
-            NS_LOG_DEBUG("No credits for MEMORY_RESP on VC " << static_cast<int>(vcId)
-                         << ", queuing packet");
-            SendQueueEntry entry;
-            entry.packet = packet;
-            entry.header = header;
-            entry.vcId = vcId;
-            entry.seqNum = seqNum;
-            m_sendQueue.push(entry);
-            TrySendQueuedPackets();
-            return;
-        }
-        m_creditManager->ConsumeCredit(vcId, seqNum);
+        NS_LOG_DEBUG("No credits for MEMORY_RESP on VC " << static_cast<int>(vcId)
+                     << ", queuing packet");
+        SendQueueEntry entry;
+        entry.packet = packet;
+        entry.header = header;
+        entry.vcId = vcId;
+        entry.seqNum = seqNum;
+        m_sendQueue.push(entry);
+        TrySendQueuedPackets();
+        return;
     }
 
     packet->AddHeader(header);
@@ -801,37 +873,38 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     header.SetSourceMac(m_address);
     header.SetDestMac(ResolveDestMac(destRank));
 
-    // Credit-based flow control for memory semantic packets — Su (local-dest)
-    // traffic only (see SendMemoryWrite for the So bypass rationale).
+    // Admission through the virtual FlowControlGate (see SendMemoryWrite;
+    // Su/So split and gate rationale, codex round 29 finding 3).
     uint8_t vcId = 0;
-    if (m_creditManager && IsLocalRank(destRank))
+    if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
     {
-        if (!m_creditManager->HasCredits(vcId))
-        {
-            NS_LOG_DEBUG("No credits for MEMORY_SEMANTIC on VC " << static_cast<int>(vcId)
-                         << ", queuing packet");
-            SendQueueEntry entry;
-            entry.packet = packet;
-            entry.header = header;
-            entry.vcId = vcId;
-            entry.seqNum = seqNum;
-            m_sendQueue.push(entry);
-            TrySendQueuedPackets();
-            // Still schedule completion — the packet will be sent when credits arrive
-            // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
-            // bound member call targets raw `this` and fires into freed
-            // memory when the endpoint is disposed and released before the
-            // completion latency elapses (codex round 17, finding 2 — with a
-            // 100-us sync latency and dispose+release at 1 us, valgrind
-            // confirmed invalid reads in NotifyMemorySemanticComplete's
-            // callback member access at the 100-us firing).
-            m_deferredEgressEvents.push_back(
-                Simulator::Schedule(NanoSeconds(latencyNs),
-                                    &FabricEndpoint::NotifyMemorySemanticComplete,
-                                    this, destRank, address, accessType));
-            return;
-        }
-        m_creditManager->ConsumeCredit(vcId, seqNum);
+        NS_LOG_DEBUG("No credits for MEMORY_SEMANTIC on VC " << static_cast<int>(vcId)
+                     << ", queuing packet");
+        SendQueueEntry entry;
+        entry.packet = packet;
+        entry.header = header;
+        entry.vcId = vcId;
+        entry.seqNum = seqNum;
+        m_sendQueue.push(entry);
+        TrySendQueuedPackets();
+        // Still schedule completion — the packet will be sent when credits arrive
+        // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
+        // bound member call targets raw `this` and fires into freed
+        // memory when the endpoint is disposed and released before the
+        // completion latency elapses (codex round 17, finding 2 — with a
+        // 100-us sync latency and dispose+release at 1 us, valgrind
+        // confirmed invalid reads in NotifyMemorySemanticComplete's
+        // callback member access at the 100-us firing). Pruned before each
+        // append — a gate-denied memory request never reaches
+        // SendPacketOnDevice's entry-side prune, so without this the ledger
+        // retained one expired EventId per completed request forever
+        // (codex round 30, finding 3).
+        PruneDeferredEgressEvents();
+        m_deferredEgressEvents.push_back(
+            Simulator::Schedule(NanoSeconds(latencyNs),
+                                &FabricEndpoint::NotifyMemorySemanticComplete,
+                                this, destRank, address, accessType));
+        return;
     }
 
     packet->AddHeader(header);
@@ -848,7 +921,8 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     // Schedule completion callback at the memory-semantic latency.
     // Tracked in m_deferredEgressEvents so DoDispose cancels it (same
     // rationale as the credit-blocked path above — codex round 17,
-    // finding 2).
+    // finding 2). Pruned before each append (codex round 30, finding 3).
+    PruneDeferredEgressEvents();
     m_deferredEgressEvents.push_back(
         Simulator::Schedule(NanoSeconds(latencyNs),
                             &FabricEndpoint::NotifyMemorySemanticComplete,
@@ -955,11 +1029,14 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             // receiver's ProcessDataPacket dispatch reads.
             header.SetProtocolFramed(true);
 
-            // Credit-based flow control: check and consume credits before
-            // sending — Su (local-dest) traffic only (see SendData for the
-            // So bypass rationale; the receiver's return is IsLocalRank-
-            // guarded, so a remote consume would never come back).
-            if (m_creditManager && IsLocalRank(destRank) && !m_creditManager->HasCredits(vcId))
+            // Admission through the virtual FlowControlGate (the documented
+            // send-gate seam) — Su (local-dest) traffic only (see SendData
+            // for the So bypass rationale; the receiver's return is
+            // IsLocalRank-guarded, so a remote consume would never come
+            // back). The gate performs the HasCredits/ConsumeCredit pair
+            // for the CREDIT policy, so a subclass override is no longer
+            // bypassed on this path (codex round 29, finding 3).
+            if (!FlowControlGate(vcId, seqNum, !IsLocalRank(destRank)))
             {
                 NS_LOG_DEBUG("No credits for DATA_INTERNAL chunk on VC " << static_cast<int>(vcId)
                              << ", queuing packet");
@@ -973,10 +1050,6 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                 // Skip device selection for queued packets — TrySendQueuedPackets handles it
                 chunkIndex++;
                 continue;
-            }
-            if (m_creditManager && IsLocalRank(destRank))
-            {
-                m_creditManager->ConsumeCredit(vcId, seqNum);
             }
 
             pkt->AddHeader(header);
@@ -997,7 +1070,18 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
             }
 
             Mac48Address destMac = ResolveDestMac(destRank);
-            SendPacketOnDevice(pkt, deviceIdx, destMac);
+            if (!SendPacketOnDevice(pkt, deviceIdx, destMac))
+            {
+                // PFC-held: parked on the send queue by the chokepoint; do
+                // not count a transmission (the resume drains it). KEEP
+                // BUILDING the remaining sub-packets — each parks itself
+                // the same way — instead of dropping them (codex round 27,
+                // finding 1; same shape as SendBulkWireTransferSize's loop).
+                // The device-spray counter still advances so the parked
+                // sub-packets keep their per-lane assignment.
+                chunkIndex++;
+                continue;
+            }
 
             m_txTrace(pkt->GetSize(), seqNum);
             m_txPackets++;

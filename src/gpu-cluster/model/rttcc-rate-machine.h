@@ -44,10 +44,12 @@ namespace ns3
  * nothing, so an uncongested flow is byte-identical to the unmounted
  * baseline; the machine itself is only mounted under --rttcc (default off).
  *
- * The flow key is FabricEndpoint::MakeSeqKey(destRank, vcId, flowId). The key
- * carries no source rank, so one machine instance must serve a SINGLE sender
- * (mount per endpoint): a machine shared across senders would merge the
- * per-flow state of two sources targeting the same (dest, vc, flow).
+ * The flow key is FabricEndpoint::MakeRateFlowKey(sourceRank, destRank, vcId,
+ * flowId). The key carries the sender rank (codex round 23, finding 1 — the
+ * earlier MakeSeqKey(dest, vc, flow) form documented here had no source
+ * rank, and following the stale doc updated a key no send path reads), so a
+ * single machine may serve multiple senders through per-sender state, though
+ * the sim still mounts one machine per endpoint.
  */
 class RttccRateMachine : public Object
 {

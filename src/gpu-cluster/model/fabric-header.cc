@@ -322,7 +322,9 @@ FabricHeader::IsControlPacket() const
            type == FabricPacketType::PERMANENT_LOSS ||
            type == FabricPacketType::CNP ||
            type == FabricPacketType::RTT_PROBE ||
-           type == FabricPacketType::RTT_RESPONSE;
+           type == FabricPacketType::RTT_RESPONSE ||
+           type == FabricPacketType::PFC_PAUSE ||
+           type == FabricPacketType::PFC_RESUME;
 }
 
 bool
@@ -334,6 +336,14 @@ FabricHeader::IsCollectivePacket() const
            type == FabricPacketType::ALLTOALL ||
            type == FabricPacketType::REDUCESCATTER ||
            type == FabricPacketType::BROADCAST;
+}
+
+bool
+FabricHeader::IsCreditBypassPacket() const
+{
+    FabricPacketType type = GetPacketType();
+    return type == FabricPacketType::ALLREDUCE ||
+           type == FabricPacketType::ALLGATHER;
 }
 
 bool

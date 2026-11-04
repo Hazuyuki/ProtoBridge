@@ -1030,10 +1030,67 @@ class TheoryDerivedSurrogate:
                 # (codex round 23, finding 2): a single-link fabric's
                 # uploads stay whole packets while each result partition
                 # still fragments at ceil(D/P/128KiB) x 128-KiB chunks.
-                result_frags, result_frag_bytes = self._switch_multicast_fragments(
-                    data_bytes / num_partitions)
-                # Each dest receives every partition: P x frag(D/P) chunks.
-                result_frags_per_dest = num_partitions * result_frags
+                # The partition grid is the switch's INTEGER division
+                # (nvswitch.cc: partitionSize = dataSize / numPartitions as
+                # uint64, the LAST partition carrying the remainder -- NOT a
+                # uniform fractional D/P): D=18,874,369 / P=8 yields seven
+                # 2,359,296-B partitions of exactly 18 x 131,072-B fragments
+                # and one 2,359,297-B tail of 19 fragments. Modeling the
+                # uniform fraction 2,359,296.125 gave EVERY partition the
+                # tail's 19-fragment geometry (0.283 expected losses vs the
+                # grid's ~0.597 at BER 2.3e-6 / retry 10,000, wrongly
+                # passing the 0.5 strict-reliability cutoff -- codex round
+                # 26, finding 4).
+                partition_size = data_bytes // num_partitions
+                last_partition = (data_bytes
+                                  - partition_size * (num_partitions - 1))
+                if partition_size > 0:
+                    body_frags, body_frag_bytes = self._switch_multicast_fragments(
+                        partition_size)
+                    tail_frags, tail_frag_bytes = self._switch_multicast_fragments(
+                        last_partition)
+                else:
+                    # Degenerate grid (D < P): partitionSize == 0, so the
+                    # switch's spray loop emits NOTHING for the first P-1
+                    # partitions (MulticastAllReducePartition's
+                    # bytesRemaining > 0 guard never admits a chunk) and the
+                    # WHOLE D rides the last partition's spray geometry.
+                    # For effective=wire=7 B / P=8 / 18 lanes that is SEVEN
+                    # 1-B results per dest, not eight 7-B ones: the old
+                    # fallback modeled a full-size fragment per partition
+                    # (1.45 expected permanent losses at N=8 / BER 0.05 /
+                    # LLR / retry 10000 vs the true ~1.02e-29, wrongly
+                    # inf under strict reliability — codex round 27,
+                    # finding 7).
+                    body_frags, body_frag_bytes = 0, 1
+                    tail_frags, tail_frag_bytes = self._switch_multicast_fragments(
+                        last_partition)
+                # Each dest receives every partition: (P-1) x frag(D//P)
+                # chunks plus the remainder tail's fragments. The two grid
+                # positions have DIFFERENT fragment sizes (18 x 131,072-B body
+                # fragments vs the tail's 19 smaller ones), so keep their
+                # failure probabilities separate instead of collapsing to
+                # the max-size approximation (0.6466 vs the exact 0.5973 at
+                # the repro point).
+                p_upload_frag = self._packet_failure_probability(
+                    ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
+                p_path_upload = 1.0 - (1.0 - p_upload_frag) ** max(
+                    1.0, optical_hops)
+                p_body_frag = self._packet_failure_probability(
+                    ber, fec_enabled, fec_n, fec_k, fec_t, body_frag_bytes)
+                p_tail_frag = self._packet_failure_probability(
+                    ber, fec_enabled, fec_n, fec_k, fec_t, tail_frag_bytes)
+                p_body_path = 1.0 - (1.0 - p_body_frag) ** max(
+                    1.0, optical_hops)
+                p_tail_path = 1.0 - (1.0 - p_tail_frag) ** max(
+                    1.0, optical_hops)
+                return ((num_gpus * upload_frags
+                         * p_path_upload ** upload_attempts
+                         + num_gpus * ((num_partitions - 1) * body_frags
+                                       * p_body_path ** result_attempts
+                                       + tail_frags
+                                       * p_tail_path ** result_attempts))
+                        * min(1.0, max(0.0, optical_fraction)))
             p_upload_frag = self._packet_failure_probability(
                 ber, fec_enabled, fec_n, fec_k, fec_t, upload_frag_bytes)
             p_result_frag = self._packet_failure_probability(
@@ -1200,7 +1257,7 @@ class TheoryDerivedSurrogate:
 
     def _gbn_cascade(self, T_step, steps, D, N, algo, cr, ber, llr_enabled,
                      retry_mode='gobackn', retry_buffer_entries=None,
-                     collective=None, bw_eff=None):
+                     collective=None, bw_eff=None, optical_hops=1.0):
         """Link-retry overhead (additive, in microseconds).
 
         Only applies when llr_enabled=True AND ber>0 (after FEC reduction).
@@ -1228,7 +1285,14 @@ class TheoryDerivedSurrogate:
             return 0.0
 
         bits_per_chunk = self.chunk_size * 8
-        P_chunk = 1 - (1 - ber) ** bits_per_chunk
+        # Compound the per-chunk failure probability over optical_hops
+        # (codex round 33, finding 4): the SACK arm (_retry_overhead) already
+        # receives optical_hops and compounds per-hop; the legacy GBN term
+        # was passed only the per-hop effective_ber, so 4 hops at BER 1e-8
+        # and 1 hop at 1-(1-1e-8)^4 agreed in path failure probability but
+        # diverged in the GBN mean (43.32 vs 96.79 µs). optical_hops=1 (the
+        # default) is byte-identical to the legacy behavior.
+        P_chunk = 1 - (1 - ber) ** (bits_per_chunk * max(1.0, optical_hops))
         if P_chunk <= 0:
             return 0.0
 
@@ -1285,7 +1349,7 @@ class TheoryDerivedSurrogate:
 
     def _source_reload_penalty(self, D, N, algo, cr, ber, llr_enabled,
                                retry_mode, retry_buffer_entries,
-                               collective=None):
+                               collective=None, optical_hops=1.0):
         """Visible delay from reconstructing packets absent from the retry buffer."""
         resolved = self._validate_collective(collective)
         if ber <= 0 or not llr_enabled or retry_buffer_entries is None:
@@ -1297,7 +1361,9 @@ class TheoryDerivedSurrogate:
             return 0.0
         miss_fraction = 1.0 - max(0, retry_buffer_entries) / required
 
-        p_chunk = 1.0 - (1.0 - ber) ** (self.chunk_size * 8)
+        # Compound over optical_hops like the GBN and SACK arms (codex
+        # round 33, finding 4); optical_hops=1 is byte-identical to legacy.
+        p_chunk = 1.0 - (1.0 - ber) ** (self.chunk_size * 8 * max(1.0, optical_hops))
         if resolved == 'sendrecv':
             total_chunks = D / self.chunk_size
         else:
@@ -1323,13 +1389,24 @@ class TheoryDerivedSurrogate:
     def _step_variance(self, T_step, D, N, algo, cr, ber, competing_bw, llr_enabled,
                        fec_enabled=False, fec_n=None, fec_k=None, fec_t=None,
                        retry_mode='gobackn', retry_buffer_entries=None,
-                       optical_fraction=1.0, collective=None, topology=None):
+                       optical_fraction=1.0, optical_hops=1.0,
+                       collective=None, topology=None):
         """Per-step delay variance from retransmission + queuing.
 
         Uses post-FEC BER when FEC is enabled (variance from corrected errors
         is near-zero; only uncorrectable errors trigger retransmission).
         BER is scaled by optical_fraction to mirror predict()'s retransmission
         arm: only the optical (error-bearing) fraction of traffic retries.
+
+        The per-chunk failure probability compounds over optical_hops
+        (codex round 32, finding 4): P_path = 1 - (1-P_chunk)^hops — the
+        same path-probability form _retry_overhead and
+        expected_permanent_losses use. The mean scaled with hops while the
+        variance did not, so 4 hops at BER 2e-7 and 1 hop at the equivalent
+        BER 1-(1-2e-7)^4 agreed in the mean (5081.19 µs) but diverged in
+        p99 (5641.58 vs 8236.43 µs) despite identical path failure
+        probability. optical_hops=1 (the default) is byte-identical to the
+        legacy behavior.
 
         Pipeline absorption factor: the Binomial variance K*p*(1-p)*Δ²
         computes the FULL retransmission delay variance, but only a fraction
@@ -1374,7 +1451,13 @@ class TheoryDerivedSurrogate:
         # Retransmission variance (only when LLR enabled)
         if effective_ber > 0 and llr_enabled:
             bits_per_chunk = self.chunk_size * 8
-            P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk
+            # Path failure probability over the optical hops (round 32,
+            # finding 4): the mean's retry terms compound per-fragment
+            # failure over max(1, optical_hops); the variance must too, or
+            # N-hop and single-hop-equivalent paths agree in the mean but
+            # not in the tail.
+            P_chunk = 1 - (1 - effective_ber) ** (
+                bits_per_chunk * max(1.0, optical_hops))
             retry_chunks = (1.0 if retry_mode.lower() == 'sack'
                             else (window + 1.0) / 2.0)
             # Topology-capped retransmission rate (see docstring).
@@ -1401,11 +1484,21 @@ class TheoryDerivedSurrogate:
 
             var += K_step * P_chunk * (1 - P_chunk) * delay_per_error ** 2 * f_prop
 
-        # Queuing variance (M/M/1 Kingman)
+        # Queuing variance (M/M/1 Kingman) — evaluated at the topology-capped
+        # service rate (codex round 25, finding 7): both rho and mu came from
+        # the raw BW_link, so a 50-GB/s bisection cap left a 16-MiB/N=8 ring
+        # with 25 GB/s of competing traffic at p99-minus-mean 2.821 µs where
+        # the capped-rate evaluation gives 32.270 µs — the same capped
+        # contract the retransmission arm (round 24, finding 8), the mean
+        # path (round 22, finding 6) and the heavy-tail branch (round 23,
+        # finding 4) already follow. topology=None stays byte-identical.
         if competing_bw > 0:
-            bw_raw_GB = self.BW_link * 1e6 / 1e9
+            bw_cap = (topology.bisection_bw_bytes_per_us
+                      if topology is not None else float('inf'))
+            bw_eff = min(self.BW_link, bw_cap)
+            bw_raw_GB = bw_eff * 1e6 / 1e9
             rho = min(0.99, competing_bw / max(bw_raw_GB, 1))
-            mu = self.BW_link / self.chunk_size
+            mu = bw_eff / self.chunk_size
             var += rho / ((1 - rho) ** 2 * mu ** 2)
 
         return var
@@ -1448,7 +1541,8 @@ class TheoryDerivedSurrogate:
                                         credits, ber, competing_bw, llr_enabled,
                                         fec_enabled, fec_n, fec_k, fec_t,
                                         retry_mode, retry_buffer_entries,
-                                        optical_fraction, collective,
+                                        optical_fraction, optical_hops,
+                                        collective,
                                         topology)
 
         if var_step <= 0:
@@ -1462,7 +1556,13 @@ class TheoryDerivedSurrogate:
                          if fec_enabled else ber)
         effective_ber *= min(1.0, max(0.0, optical_fraction))
         bits_per_chunk = self.chunk_size * 8
-        P_chunk = 1 - (1 - effective_ber) ** bits_per_chunk if effective_ber > 0 else 0
+        # Path failure probability over the optical hops (round 32, finding
+        # 4): the heavy-tail cascade probability must compound per-hop like
+        # the mean's retry terms — 4 hops at BER 2e-7 and 1 hop at the
+        # equivalent BER 1-(1-2e-7)^4 then agree in BOTH mean and p99.
+        P_chunk = (1 - (1 - effective_ber) ** (
+            bits_per_chunk * max(1.0, optical_hops))
+            if effective_ber > 0 else 0)
         # The heavy-tail branch models a RETRANSMISSION cascade (expected
         # retry delay per chunk error). With LLR disabled there are no
         # retransmissions — a lost chunk is a permanent failure the mean
@@ -1655,7 +1755,8 @@ class TheoryDerivedSurrogate:
                     T_step, steps, data_bytes, num_gpus, algo, credits,
                     effective_ber, llr_enabled, retry_mode,
                     retry_buffer_entries, collective,
-                    bw_eff=min(self.BW_link, bsec))
+                    bw_eff=min(self.BW_link, bsec),
+                    optical_hops=optical_hops)
                 sack_floor = self._retry_overhead(
                     T_serial_step, steps, data_bytes, num_gpus, algo, credits,
                     ber, llr_enabled, fec_enabled and include_fec,
@@ -1667,7 +1768,8 @@ class TheoryDerivedSurrogate:
                 T_gbn = max(T_gbn_legacy, gbn_floor)
             T_reload = self._source_reload_penalty(
                 data_bytes, num_gpus, algo, credits, effective_ber, llr_enabled,
-                retry_mode, retry_buffer_entries, collective)
+                retry_mode, retry_buffer_entries, collective,
+                optical_hops=optical_hops)
         else:
             T_gbn = 0.0
             T_reload = 0.0

@@ -178,8 +178,9 @@ The plain (non-RoCE) Ethernet So fabric is the **lossy counterpart** to RoCEv2.
 Both ride the same 400GbE L2 wire; the difference is the congestion contract:
 
 - **RoCEv2** is *lossless*: ECN marks the SoHeader on VOQ pressure, DCQCN
-  backs the sender off, PFC would pause — drops are *avoided*, never
-  recovered by retransmission.
+  backs the sender off, and opt-in PFC (`--switchPfcMode`, 802.1Qbb-style)
+  pauses the sources feeding a congested egress before the queue overflows
+  — drops are *avoided*, never recovered by retransmission.
 - **Plain Ethernet** is *lossy*: the `EthernetSwitch` **tail-drops** at
   `VoqDropThreshold` and **emits a NACK back to the source**
   (`NvSwitch::EmitNackBack`, mirroring the BER-NACK path); the sender
@@ -212,6 +213,14 @@ Both ride the same 400GbE L2 wire; the difference is the congestion contract:
   can retransmit) **and** the So switch (so `EmitNackBack` does not early-return
   on `!m_llrEnabled`). Without switch-side LLR the drop is silent and the
   transfer stalls to the 3600s `Simulator::Stop` ceiling.
+- **PFC is the opt-in drop-avoidance arm for plain Ethernet too**:
+  `--switchPfcMode=1` (static) or `2` (dynamic) with
+  `--pfcPauseThreshold < voqDropThreshold` makes the switch PAUSE the sources
+  feeding a congested egress before the tail-drop fires — the same
+  no-drop backstop RoCE layers under ECN, giving the lossy fabric a
+  congestion-avoiding regime for HPCC-style comparisons. The endpoint parks
+  DATA sends toward the paused destination and resumes on the drain; LLR
+  timers keep running as the safety net.
 - `--ber=0 --packetLossRate=0` on the ns-3 command line (see the run examples
   in the `.cfg` headers) so the **only** loss source is VOQ tail-drop
   (deterministic), isolating the lossy-retransmit path from the BER model.

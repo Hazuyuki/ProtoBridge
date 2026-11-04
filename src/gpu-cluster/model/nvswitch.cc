@@ -107,6 +107,14 @@ NvSwitch::NvSwitch()
       m_routeUnavailableDrops(0)
 {
     NS_LOG_FUNCTION(this);
+    // Allocate a unique MAC from the global pool. Nothing else sets a
+    // switch address (SetAddress has no caller), so without this every
+    // switch shared the all-zero default — and the PFC pause-ownership key
+    // (dest, PAUSE SourceMac = the emitting switch's GetAddress) collapsed
+    // distinct switches' holds into one entry (codex round 30, finding 1).
+    // Mac48Address::Allocate is the same allocator NetDevices use, so
+    // switch and NIC MACs never collide.
+    m_address = Mac48Address::Allocate();
     // Default arbitration strategy: the historical non-blocking crossbar.
     // A config-provided "Arbiter" attribute or SetArbiter() overrides this.
     if (!m_arbiter)
@@ -143,16 +151,30 @@ NvSwitch::DoDispose()
     // round 16, finding 2 — a 64-B packet over a 100-us link, with the
     // receiving switch disposed and released at 1 us, produced
     // valgrind-confirmed invalid reads AND writes at the 100-us arrival).
+    // Identity-detach (codex round 31, finding 2): clear only the binding
+    // THIS switch installed — a successor switch (or endpoint) sharing the
+    // port keeps its own binding, exactly like FabricEndpoint's device
+    // detach.
     for (const auto& port : m_ports)
     {
         if (port)
         {
-            port->SetPromiscReceiveCallback(
-                MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+            const auto ours =
+                MakeCallback(&NvSwitch::ReceiveFromPort, this);
+            // Null-check first: Callback::IsEqual dereferences its impl, so
+            // comparing against an already-nulled binding (a successor
+            // sharing this port disposed before us) would assert.
+            const auto current = port->GetPromiscReceiveCallback();
+            if (!current.IsNull() && current.IsEqual(ours))
+            {
+                port->SetPromiscReceiveCallback(
+                    MakeNullCallback<bool, Ptr<NetDevice>, Ptr<const Packet>, uint16_t, const Address&, const Address&, NetDevice::PacketType>());
+            }
         }
     }
     m_ports.clear();
     m_voqs.clear();
+    m_vcVoqDepth.clear();
     m_portDegradationModels.clear();
     m_macTable.clear();
     m_sourceBasedTable.clear();
@@ -166,6 +188,9 @@ NvSwitch::DoDispose()
     m_allGatherBuffer.clear();
     m_allGatherReceivedBytes.clear();
     m_seenUploadSeqs.clear();
+    m_sharpResultStore.clear();
+    m_lastResultFlow.clear();
+    m_sharpCompletedFlows.clear();
     Simulator::Cancel(m_arbitrationEvent);
     NetDevice::DoDispose();
 }
@@ -177,6 +202,7 @@ NvSwitch::AddPort(Ptr<NetDevice> device)
     uint32_t portNum = m_ports.size();
     m_ports.push_back(device);
     m_voqs.push_back(std::queue<VoqEntry>());
+    m_vcVoqDepth.emplace_back();
     m_portDegradationModels.push_back(nullptr);
     m_outputBusyUntil.push_back(Seconds(0));
 
@@ -517,6 +543,48 @@ NvSwitch::InjectResultNack(uint16_t requestingRank, uint32_t seqNum)
     return HandleSwitchNack(nh, 0);
 }
 
+void
+NvSwitch::SeedResultFlow(uint16_t destRank, uint16_t flowId, uint32_t seqNum)
+{
+    FabricHeader h;
+    h.SetPacketType(FabricPacketType::ALLREDUCE);
+    h.SetFlowId(flowId);
+    h.SetSourceRank(0xFFFF); // switch sentinel (StoreMulticastResult's shape)
+    h.SetDestRank(destRank);
+    h.SetSequenceNumber(seqNum);
+    h.SetPayloadSize(8);
+    h.SetEffectiveDataSize(8);
+    Ptr<Packet> pkt = Create<Packet>(8);
+    pkt->AddHeader(h);
+    StoreMulticastResult(destRank, flowId, 0, seqNum, pkt);
+}
+
+void
+NvSwitch::CompleteResultFlow(uint16_t flowId)
+{
+    RetireSharpResultFlow(flowId);
+}
+
+void
+NvSwitch::EnqueueForTest(uint32_t outPort, const VoqEntry& entry)
+{
+    // Bypassing ReceiveFromPort skips its arbitration arming (line ~833);
+    // arm it here or the pushed packets sit in the VOQ forever and the
+    // resume watcher never sees the queue drain.
+    EnqueueToVoq(outPort, entry);
+    if (!m_arbitrationEvent.IsPending())
+    {
+        ScheduleArbitration();
+    }
+}
+
+void
+NvSwitch::PruneDeferredResultEvents()
+{
+    std::erase_if(m_deferredResultEvents,
+                  [](const EventId& ev) { return ev.IsExpired(); });
+}
+
 size_t
 NvSwitch::GetSharpResultStoreSize(uint16_t destRank) const
 {
@@ -589,12 +657,19 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
         isControlPacket = fabricHeader.IsControlPacket() || fabricHeader.IsRetryPacket();
     }
 
-    if (inPort < m_portDegradationModels.size() && m_portDegradationModels[inPort]
-        && !isControlPacket)
+    if (inPort < m_portDegradationModels.size() && m_portDegradationModels[inPort])
     {
         Ptr<LinkDegradationModel> linkModel = m_portDegradationModels[inPort];
         bool failed = false;
 
+        // Physical failures apply to EVERY packet — control and retry
+        // included (codex round 33, finding 3): a DOWN link or a physical
+        // packet-loss draw is not a CRC/FEC event the control plane can
+        // bypass; the pre-fix blanket !isControlPacket guard let ACK/CNP
+        // feedback cross a failed link (probe: DATA dropped, ACK forwarded
+        // through the same DOWN/lossy port). Only the BER/FEC sampling arm
+        // below keeps the control exemption (the documented NVLink-style
+        // "control traffic is reliable against BER corruption" contract).
         if (!linkModel->IsLinkUp())
         {
             failed = true;
@@ -604,13 +679,13 @@ NvSwitch::ReceiveFromPort(Ptr<NetDevice> device, Ptr<const Packet> packet,
         {
             failed = true;
         }
-        else if (PortUsesFec(inPort))
+        else if (!isControlPacket && PortUsesFec(inPort))
         {
             uint32_t payloadSize = hasFabricHeader ? fabricHeader.GetPayloadSize() : pkt->GetSize();
             failed = m_fecModel->DecodePacket(linkModel->GetBer(), payloadSize)
                      == FecResult::UNCORRECTABLE;
         }
-        else
+        else if (!isControlPacket)
         {
             // ProcessPacketBerOnly (not ProcessPacket): the loss-rate draw
             // already happened above — ProcessPacket would draw the loss
@@ -883,6 +958,15 @@ NvSwitch::EnqueueToVoq(uint32_t outPort, const VoqEntry& entry)
     }
 
     m_voqs[outPort].push(entry);
+    // Shadow per-VC occupancy (O(1) GetVoqSizeForVc for the per-priority
+    // PFC thresholds).
+    {
+        FabricHeader h;
+        if (entry.packet && entry.packet->PeekHeader(h))
+        {
+            m_vcVoqDepth[outPort][h.GetVirtualChannel()]++;
+        }
+    }
 }
 
 bool
@@ -952,6 +1036,20 @@ NvSwitch::Arbitrate()
             }
             VoqEntry entry = m_voqs[g.port].front();
             m_voqs[g.port].pop();
+            // Shadow per-VC occupancy: decrement at pop (erase the entry at
+            // zero so the map stays O(distinct live VCs)).
+            {
+                FabricHeader h;
+                if (entry.packet && entry.packet->PeekHeader(h))
+                {
+                    auto& vcMap = m_vcVoqDepth[g.port];
+                    auto it = vcMap.find(h.GetVirtualChannel());
+                    if (it != vcMap.end() && --(it->second) == 0)
+                    {
+                        vcMap.erase(it);
+                    }
+                }
+            }
             ForwardPacket(entry.packet, entry.srcAddr, entry.dstAddr, g.port);
         }
     }
@@ -1245,12 +1343,24 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
             {
                 ratioWhole = receivedWireBytes / receivedEffectiveBytes;
                 ratioRemainder = receivedWireBytes % receivedEffectiveBytes;
-                wirePartitionSize =
-                    thisPartitionSize * ratioWhole +
-                    (thisPartitionSize * ratioRemainder +
-                     receivedEffectiveBytes - 1) /
-                        receivedEffectiveBytes;
+                // 128-bit intermediates (codex round 32, finding 3): at a
+                // 16-GiB partition with LL128 expansion the 64-bit product
+                // thisPartitionSize * ratioRemainder overflowed BEFORE the
+                // divide — the partition multicast emitted ~2 GiB less wire
+                // data per destination than the uploads' expansion ratio
+                // implies (32-GiB effective / 128/120 wire / 2 partitions:
+                // result wire 34.5 GB instead of 36.65 GB), understating
+                // the serialization time. The same __int128 widening
+                // SendCollectiveBulk's effective split uses (round 25,
+                // finding 2).
+                wirePartitionSize = static_cast<uint64_t>(
+                    static_cast<__int128_t>(thisPartitionSize) * ratioWhole
+                    + (static_cast<__int128_t>(thisPartitionSize) * ratioRemainder
+                       + receivedEffectiveBytes - 1)
+                          / receivedEffectiveBytes);
             }
+            // Prune fired events at every append (codex round 28, finding 3).
+            PruneDeferredResultEvents();
             m_deferredResultEvents.push_back(
                 Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
                                     &NvSwitch::MulticastAllReducePartition, this,
@@ -1293,6 +1403,8 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
             // (empty begin() deref, SIGSEGV). The collective is one-shot;
             // once its result has gone out, later fragments are wire noise.
             m_allReduceLegacyMulticastDone.insert(flowId);
+            // Prune fired events at every append (codex round 28, finding 3).
+            PruneDeferredResultEvents();
             m_deferredResultEvents.push_back(
                 Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
                                     &NvSwitch::MulticastAllReduceResult, this,
@@ -1371,6 +1483,57 @@ NvSwitch::MulticastAllReduceResult(uint16_t flowId, uint32_t sourceCount)
     // finding 5). It is one uint32 per accepted upload, cleared in
     // DoDispose with the other per-flow state.
     m_allReduceReceivedBytes.erase(flowId);
+    RetireSharpResultFlow(flowId);
+}
+
+void
+NvSwitch::RetireSharpResultFlow(uint16_t flowId)
+{
+    // Flow retirement (codex round 25, finding 8): the store grew with every
+    // HISTORICAL flow — a completed flow's window stayed in the map forever
+    // (only DoDispose cleared it), so 100 completed flows kept 100 windows
+    // per destination alive until disposal. Per destination we keep the
+    // SHARP_RESULT_GENERATIONS most recently COMPLETED flows' windows (the
+    // completing flow's own window stays: its fragments may still be on the
+    // wire and a NACK racing the tail of delivery must find them — retiring
+    // the flow's OWN window at its own completion broke exactly that, and
+    // retiring at the NEXT flow's completion killed the older flow's
+    // in-flight repairs too). Anything older than the retained generations
+    // is gone: a NACK that late names a flow whose collective layer
+    // completed a full generation ago — a stale replay, and the named-flow
+    // miss (false) HandleSwitchNack already returns for unknown flows.
+    // DoDispose clears the whole store.
+    //
+    // "Most recently completed" is COMPLETION ORDER, not flow-id order
+    // (codex round 27, finding 6): the numeric-descending sort this replaces
+    // kept the numerically largest ids, so completing flows 100, 101, then 1
+    // evicted flow 1 AT ITS OWN COMPLETION — an immediate NACK for flow 1
+    // seq 0 then missed the just-retired window. m_sharpCompletedFlows
+    // tracks the actual completion sequence per destination, and ONLY
+    // completed flows compete for retention: a still-in-flight flow (a
+    // window with no completion yet) is never evicted here (round 24,
+    // finding 4's concurrency guarantee), only by its own window bound or
+    // DoDispose.
+    for (auto& kv : m_sharpResultStore)
+    {
+        if (static_cast<uint16_t>(kv.first & 0xFFFF) != flowId)
+        {
+            continue;
+        }
+        const uint16_t destRank = static_cast<uint16_t>(kv.first >> 16);
+        auto& order = m_sharpCompletedFlows[destRank];
+        order.erase(std::remove(order.begin(), order.end(), flowId), order.end());
+        order.push_back(flowId);
+        while (order.size() > SHARP_RESULT_GENERATIONS)
+        {
+            const uint16_t evicted = order.front();
+            order.pop_front();
+            m_sharpResultStore.erase((static_cast<uint64_t>(destRank) << 16) | evicted);
+        }
+    }
+    // Flows NOT in a destination's completion log are still in flight (their
+    // windows exist but their multicast has not completed) — keep them
+    // (round 24, finding 4: concurrent flows keep independent windows).
 }
 
 void
@@ -1413,17 +1576,40 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
         uint64_t chunkSize = (wirePartitionSize + numChunks - 1) / numChunks;
 
         uint64_t bytesRemaining = wirePartitionSize;
-        for (uint64_t chunkIdx = 0; chunkIdx < numChunks; chunkIdx++)
+        uint64_t offset = 0;
+        for (uint64_t chunkIdx = 0; chunkIdx < numChunks && bytesRemaining > 0; chunkIdx++)
         {
             uint32_t thisChunkSize = static_cast<uint32_t>(
                 std::min(static_cast<uint64_t>(chunkSize), bytesRemaining));
-            bytesRemaining -= thisChunkSize;
-            uint64_t effectiveBegin =
-                chunkIdx * effectivePartitionSize / numChunks;
-            uint64_t effectiveEnd =
-                (chunkIdx + 1) * effectivePartitionSize / numChunks;
+            // Effective bytes PROPORTIONAL TO THE WIRE BYTES ACTUALLY SENT
+            // (same rule as SendCollectiveBulk's wire-anchored split). The
+            // old chunkIdx*effective/numChunks split reserved a share for
+            // every chunk index INCLUDING the trailing zero-payload chunks
+            // (numChunks is floored up to the lane count, so with D=8 B /
+            // 8 partitions / 2 lanes every partition emitted (payload=1,
+            // effective=0) then (payload=0, effective=1) — a zero-payload
+            // fragment carried the effective bytes while the payload-bearing
+            // one carried none). Anchoring the boundaries to the wire offset
+            // keeps every effective byte on a fragment that also carries
+            // payload, and the shares still sum to exactly
+            // effectivePartitionSize (codex round 25, finding 1).
+            uint64_t wireSpanEnd = std::min(offset + chunkSize, wirePartitionSize);
+            // 128-bit intermediates, same as SendCollectiveBulk (round 25,
+            // finding 2): effectivePartitionSize * offset overflows uint64
+            // before the division at multi-GB scales — a 6-GiB partition
+            // over 18 lanes advertised 1,439,979,346 effective bytes on a
+            // fragment whose wire span was 8,323,581 B (codex round 26,
+            // finding 2). __int128 is the codebase's established wide type.
+            uint64_t effectiveBegin = static_cast<uint64_t>(
+                static_cast<__int128_t>(effectivePartitionSize) * offset /
+                std::max<uint64_t>(wirePartitionSize, 1));
+            uint64_t effectiveEnd = static_cast<uint64_t>(
+                static_cast<__int128_t>(effectivePartitionSize) * wireSpanEnd /
+                std::max<uint64_t>(wirePartitionSize, 1));
             uint32_t thisEffectiveSize =
                 static_cast<uint32_t>(effectiveEnd - effectiveBegin);
+            offset += thisChunkSize;
+            bytesRemaining -= thisChunkSize;
 
             Ptr<Packet> pkt = Create<Packet>(thisChunkSize);
 
@@ -1458,6 +1644,7 @@ NvSwitch::MulticastAllReducePartition(uint16_t flowId, uint32_t partitionIdx,
         m_allReduceBuffer.erase(flowId);
         m_allReduceReceivedBytes.erase(flowId);
         m_allReduceCompletedPartitions.erase(flowId);
+        RetireSharpResultFlow(flowId);
     }
 
     NS_LOG_INFO("SHARP AllReduce: multicast partition " << partitionIdx
@@ -1731,6 +1918,8 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
 
     if (allComplete)
     {
+        // Prune fired events at every append (codex round 28, finding 3).
+        PruneDeferredResultEvents();
         m_deferredResultEvents.push_back(
             Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
                                 &NvSwitch::MulticastAllGatherResult, this,
@@ -1802,8 +1991,10 @@ NvSwitch::MulticastAllGatherResult(uint16_t flowId, uint32_t sourceCount)
     // Flow complete: retire the byte ledger. m_seenUploadSeqs deliberately
     // survives the result multicast (see the AllReduce path's note): a late
     // replay of an accepted (flow, src, seq) must stay a rejected duplicate,
-    // not re-accumulate the ledger into a second result.
+    // not re-accumulate the ledger into a second result. The result store's
+    // windows retire with the flow (RetireSharpResultFlow's note).
     m_allGatherReceivedBytes.erase(flowId);
+    RetireSharpResultFlow(flowId);
 }
 
 void
@@ -1880,6 +2071,12 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
 
     if (codingLatency > Seconds(0))
     {
+        // Prune fired events at every append: this site fires once per FEC
+        // result fragment and its lambda captures pkt BY VALUE — without
+        // pruning, completed sends pin their packets until DoDispose
+        // (codex round 28, finding 3: 1,000 completed sends retained 1,000
+        // expired entries, the final packet's refcount stuck at 2).
+        PruneDeferredResultEvents();
         m_deferredResultEvents.push_back(
             Simulator::Schedule(codingLatency, [this, portIdx, pkt]() {
                 if (portIdx < m_ports.size() && m_ports[portIdx])

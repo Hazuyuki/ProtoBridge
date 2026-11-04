@@ -356,6 +356,59 @@ class NvSwitch : public FabricSwitch
     void DoDispose() override;
 
     /**
+     * @brief Test seam: total deferred-result-event ledger size (live +
+     *        expired). Tests measure the ledger's growth through this
+     *        accessor (codex round 28, finding 3 — completed FEC result
+     *        sends retained their EventIds and captured packet references
+     *        until DoDispose: 1,000 completed sends, 1,000 expired entries).
+     */
+    size_t GetDeferredResultEventCountForTest() const
+    {
+        return m_deferredResultEvents.size();
+    }
+
+    /// @brief Test seam: deferred-result-event entries still live (not
+    ///        IsExpired). Pruning keeps total == live in steady state.
+    size_t GetLiveDeferredResultEventCountForTest() const
+    {
+        size_t live = 0;
+        for (const EventId& ev : m_deferredResultEvents)
+        {
+            if (!ev.IsExpired())
+            {
+                live++;
+            }
+        }
+        return live;
+    }
+
+    /// Per-VOQ packet capacity (packets). Read accessor for congestion
+    /// subclasses (EthernetSwitch's dynamic PFC threshold scales against it).
+    uint32_t GetVoqDepth() const { return m_voqDepth; }
+
+    /// Current occupancy (packets) of a VOQ; 0 for an unknown port.
+    size_t GetVoqSize(uint32_t outPort) const
+    {
+        return outPort < m_voqs.size() ? m_voqs[outPort].size() : 0;
+    }
+
+    /// Current occupancy (packets) of a VOQ restricted to one priority
+    /// class (the FabricHeader's VirtualChannel) — the per-VC depth the
+    /// per-priority PFC thresholds compare against (802.1Qbb pauses a
+    /// class, not the whole port). O(1): a shadow per-(port, VC) counter
+    /// incremented at VOQ push and decremented at pop. 0 for unknown
+    /// ports/VCs.
+    size_t GetVoqSizeForVc(uint32_t outPort, uint8_t vcId) const
+    {
+        if (outPort >= m_vcVoqDepth.size())
+        {
+            return 0;
+        }
+        auto it = m_vcVoqDepth[outPort].find(vcId);
+        return it == m_vcVoqDepth[outPort].end() ? 0 : it->second;
+    }
+
+    /**
      * @brief Test seam: feed an upload packet straight into the SHARP/NVLS
      * aggregation path, bypassing ReceiveFromPort's routing/preamble.
      *
@@ -381,6 +434,34 @@ class NvSwitch : public FabricSwitch
      * destination rank in the switch-side LLR store.
      */
     size_t GetSharpResultStoreSize(uint16_t destRank) const;
+
+    /**
+     * @brief Test seam: seed a stored result window for a flow, then retire
+     *        it, exactly as MulticastAllReduceResult/Partition's completion
+     *        path would (seed + RetireSharpResultFlow in one step, or split
+     *        across calls). Used by the completion-order retirement
+     *        regression test (codex round 27, finding 6).
+     */
+    void SeedResultFlow(uint16_t destRank, uint16_t flowId, uint32_t seqNum);
+    void CompleteResultFlow(uint16_t flowId);
+
+    /**
+     * @brief Test seam: enqueue a packet through the REAL admission path
+     *        (congestion hook + VOQ push + arbitration arming), bypassing the
+     *        promiscuous receive routing. Used by the PFC watcher-ledger
+     *        regression test, which needs a genuinely filling/draining VOQ
+     *        (the resume watcher polls GetVoqSize) rather than synthetic
+     *        OnPacketEnqueue depth arguments.
+     */
+    void EnqueueForTest(uint32_t outPort, const VoqEntry& entry);
+
+    /// @brief Drop fired (IsExpired) deferred-result EventIds from the
+    ///        ledger. Called at every append site: completed multicast FEC
+    ///        sends retained their EventIds (and the packets the lambdas
+    ///        capture by value) until DoDispose — memory grew with completed
+    ///        traffic, 1,000 expired entries after 1,000 sends (codex round
+    ///        28, finding 3).
+    void PruneDeferredResultEvents();
 
     /**
      * @brief Congestion hook called when a packet is enqueued to a VOQ.
@@ -519,6 +600,11 @@ class NvSwitch : public FabricSwitch
     // Virtual Output Queues: outPort -> queue
     std::vector<std::queue<VoqEntry>> m_voqs;
     uint32_t m_voqDepth;                            ///< Max packets per VOQ
+    /// Shadow per-(port, VC) occupancy counters (packets), maintained at
+    /// VOQ push/pop so GetVoqSizeForVc is O(1). The FabricHeader's
+    /// VirtualChannel names the class; entries exist only for VCs that
+    /// have pushed. Resized with m_voqs.
+    std::vector<std::map<uint8_t, size_t>> m_vcVoqDepth;
 
     // Link degradation
     std::vector<Ptr<LinkDegradationModel>> m_portDegradationModels; ///< Per-port degradation models
@@ -579,6 +665,18 @@ class NvSwitch : public FabricSwitch
      */
     void StoreMulticastResult(uint16_t destRank, uint16_t flowId,
                               uint32_t portIdx, uint32_t seqNum, Ptr<Packet> pkt);
+
+    /**
+     * @brief Erase the flow's result-repair windows at multicast completion.
+     *
+     * Called when a flow's result multicast finishes (legacy single path and
+     * the partition path's last partition): keeps the store bounded by LIVE
+     * repair obligations instead of historical flows (codex round 25,
+     * finding 8). A later NACK naming the retired flow is a genuine
+     * named-flow miss (HandleSwitchNack returns false) — never a re-key onto
+     * another flow's window.
+     */
+    void RetireSharpResultFlow(uint16_t flowId);
 
     /**
      * @brief Egress helper for multicast result sends (FEC-aware).
@@ -681,7 +779,19 @@ class NvSwitch : public FabricSwitch
     // safety valve for absurd geometries; the observed scales fit well
     // inside it.
     static constexpr size_t SHARP_RESULT_WINDOW = 65536; ///< Max stored results per (dest, flow)
+    /// Completed flows whose repair windows stay retained per destination
+    /// (bounded history; older generations are retired at each completion —
+    /// codex round 25, finding 8).
+    static constexpr size_t SHARP_RESULT_GENERATIONS = 2;
     static constexpr uint32_t SHARP_RESULT_RETRY_LIMIT = 64; ///< Max retransmits per result
+    /// destRank -> completion-ordered flow ids (most recent last). The
+    /// retention policy keeps the SHARP_RESULT_GENERATIONS most recently
+    /// COMPLETED flows' windows; the numeric-sort it replaces kept the
+    /// numerically largest ids and could evict the just-completed flow's
+    /// own repair window (flows 100, 101, then 1: flow 1 was evicted at
+    /// its own completion and its immediate NACK missed — codex round 27,
+    /// finding 6).
+    std::unordered_map<uint16_t, std::deque<uint16_t>> m_sharpCompletedFlows;
 
     // Upload dedup: (flowId, srcRank) -> seen upload sequence numbers. A
     // retransmitted NVLS/SHARP upload (its LLR ack lost) must not count as a

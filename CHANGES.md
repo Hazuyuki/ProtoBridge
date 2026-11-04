@@ -87,6 +87,677 @@ Suite state: EXTENSIVE 141 PASS / 0 FAIL (5 new C++ tests), integration
 scripts (test_random_traffic.py extended with a goodput-excludes-losses
 check), valgrind QUICK exit 0 with zero errors.
 
+### Fixed — codex round 30: three defects — PFC PAUSE frames carrying the wrong switch identity, three more send paths bypassing the FlowControlGate, and the memory-semantic completion ledger
+
+1. **PFC PAUSE frames carried the mirrored end-to-end data MAC, not the
+   emitting switch's identity** (medium). Round 29 keyed endpoint pause
+   ownership by (dest, PAUSE SourceMac), but the switch stamped the PAUSE
+   with `fh.GetDestMac()` — the original data header's end-to-end
+   destination MAC, preserved unchanged across every hop. Two switches
+   pausing the same flow therefore emitted the SAME ownership key and
+   their holds collapsed back into one entry: the first switch's RESUME
+   (replaying the same MAC) cleared the endpoint latch while the second
+   switch was still paused (codex probe: two switches, distinct MACs,
+   same flow — both PAUSEs carried source `00:00:00:00:00:02`; A's
+   RESUME cleared the latch, tx=1 across still-paused B). The PAUSE now
+   stamps `GetAddress()` — the emitting switch's own MAC — and the RESUME
+   replays it verbatim, so the (dest, SourceMac) key actually
+   distinguishes switches. Since nothing ever assigned a switch address
+   (SetAddress has no caller; every switch defaulted to all-zero),
+   `NvSwitch`'s constructor now allocates a unique MAC from the global
+   `Mac48Address::Allocate()` pool (the same allocator NetDevices use, so
+   switch and NIC MACs never collide). Test: `PFC PAUSE carries the
+   emitting switch's own MAC`.
+2. **Three more send paths bypassed the virtual FlowControlGate**
+   (medium). Round 29 routed eight site-groups through the gate but
+   missed three: the windowed So bulk dispatch (`PumpBulkTxWindow` —
+   called the device chokepoint directly, so a denying gate subclass
+   transmitted a windowed transfer anyway), the single-packet
+   NVLS/SHARP collective branch (`SendCollectiveBulk`'s `creditBypass`
+   arm), and the remote-P2P branch (`SendP2p`'s So arm). All three now
+   dispatch through `FlowControlGate` — credit bypass is preserved where
+   it was (bypass skips the credit CONSUME, not the gate dispatch), and
+   the windowed dispatch keeps its slot/membership conventions (a denial
+   after the slot is taken just skips the wire; the release paths own the
+   slot). Test: `Windowed bulk, single collective, and remote P2P consult
+   the overridden FlowControlGate`.
+3. **Gate-denied memory-semantic completions accumulated in the egress
+   ledger** (low). The two `NotifyMemorySemanticComplete` append sites
+   (the gate-denied branch and the post-send branch) never pruned
+   `m_deferredEgressEvents`, and a gate-denied request never reaches
+   `SendPacketOnDevice`'s entry-side prune — 1,000 completed requests
+   retained 1,000 expired EventIds (probe: total=1000 live=0). Both
+   append sites now call `PruneDeferredEgressEvents` (the round-28/29
+   append-site convention). Test: `Gate-denied memory-semantic
+   completions prune the ledger`.
+
+Suite state: gpu-cluster EXTENSIVE 171 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 99 passed, 15/15 parity scripts,
+valgrind on all three modes of the codex round-30 probe (gate, ledger,
+pfc) 0 errors / no leaks.
+
+### Fixed — codex round 31: three defects — the LLR teardown destroying a successor's takeover, the shared-device promisc teardown disconnecting a successor, and the memory-response ledger
+
+1. **A disposing endpoint destroyed a successor's LLR takeover**
+   (medium). `LlrManager::DetachFromEndpoint` unconditionally nulled both
+   endpoint callbacks and `Clear()`ed the retry stores. When a successor
+   endpoint had re-bound the callbacks on the shared manager (external
+   `GetLlrManager()` holder), the predecessor's dispose erased the
+   successor's bindings AND its stored outstanding packets: codex probe —
+   store+arm a packet, re-bind callbacks, dispose the old endpoint, and the
+   successor's pending entry went 1→0 with zero timeout/loss callbacks
+   ever firing. Detach is now an identity-detach (the round-19
+   `CreditManager` pattern): the disposing endpoint passes its OWN
+   timeout/permanent-loss bindings as owners; each is severed only when it
+   is still the installed one, and any successor re-bind halts the teardown
+   (no null-out, no `Clear()`) — the successor's own dispose owns the
+   lifecycle from then on. Null owners (the default) keep the legacy
+   unconditional teardown.
+2. **A disposing endpoint disconnected a successor sharing its NetDevice**
+   (medium). `FabricEndpoint::DoDispose` and `NvSwitch::DoDispose`
+   unconditionally nulled the promisc callback on every device/port they
+   held. On a SHARED device — a successor endpoint that installed its own
+   binding over the predecessor's — the predecessor's dispose severed the
+   successor's binding instead of its own: codex probe — two endpoints on
+   one port, dispose the first, and the successor's deliveries dropped to
+   0 (1 without the dispose). Both teardowns are now identity-detaches:
+   they clear the binding only when `GetPromiscReceiveCallback().IsEqual`
+   matches the binding THEY installed. That required a new
+   `NetDevice::GetPromiscReceiveCallback()` virtual (null-callback
+   default; implemented by `PointToPointNetDevice` and `CsmaNetDevice` —
+   the two device models this module ships). The comparison null-checks
+   first: `Callback::IsEqual` dereferences its impl, so comparing against
+   a binding a predecessor already nulled would assert.
+3. **Gate-denied memory responses accumulated in the egress ledger**
+   (low). The MEMORY endpoint's local read service appended its
+   `SendMemoryResponse` deferral without pruning `m_deferredEgressEvents`
+   first — the last unpruned append site (rounds 28-30 pruned the rest).
+   With a short memory latency and a gate denying every response on the
+   wire, the ledger grew without bound: codex probe — 1,000 read requests
+   through an always-denying gate left total=1000 live=0 expired entries
+   (the entry-side prune in `SendPacketOnDevice` never ran because the
+   responses never got that far). The append site now calls
+   `PruneDeferredEgressEvents` like every other (post-fix: total=1
+   live=0). Test: `Gate-denied memory responses prune the egress ledger`.
+
+Suite state: gpu-cluster EXTENSIVE 175 PASS / 0 FAIL (3 new C++ tests:
+`LLR successor bindings and stores survive predecessor dispose`,
+`Device promisc callbacks survive a predecessor endpoint's dispose`,
+`Gate-denied memory responses prune the egress ledger`), integration 6
+PASS, surrogate pytest 99 passed, 15/15 parity scripts, valgrind on all
+four modes of the codex round-31 probe (llr, memory, device,
+device_control) 0 errors / no leaks.
+
+### Fixed — codex round 32: four defects — a lost PFC RESUME pausing an endpoint forever, queued collectives losing their credit bypass, a 64-bit overflow in the partition wire ratio, and the surrogate tail ignoring optical hops
+
+1. **A lost PFC RESUME left the endpoint paused forever** (medium). The
+   switch never re-sent a RESUME: the endpoint does not acknowledge it,
+   so the switch cannot distinguish delivered from lost, and once the
+   link degradation model dropped the single RESUME the endpoint stayed
+   paused for the rest of the run while the switch had cleared its
+   latch and dropped the mirrored header (codex probe at 50% loss:
+   switch_paused=0, endpoint_paused=1, delivered=0, and the LLR store
+   empty after 1 ms). The switch now keeps the mirrored PAUSE header
+   for a bounded re-send arm: `CheckPfcResume` arms a budget of 8
+   re-sends (`PFC_RESUME_RESEND_LIMIT`) scheduled at 500-ns intervals,
+   and `ResendPfcResume` replays the stored header verbatim while
+   budget remains. A duplicate RESUME at an unpaused endpoint is a
+   no-op (`ProcessPfcResumePacket` early-returns), so re-sending on a
+   healthy link is safe; a fresh `MaybeSendPfcPause` erases the stale
+   budget so a new pause cycle owns the hop (post-fix probe:
+   endpoint_paused=0, delivered=1). Two post-fix defects found by the
+   regression battery and fixed before commit: `erase` on the map's
+   `end()` iterator when the budget was already retired corrupted the
+   red-black tree (infinite loop inside `_Rb_tree_increment`), and
+   `PfcWatcherLedgerPruningTest`'s exact RESUME count needed updating
+   for the new bounded re-send semantics. Test: `A lost PFC RESUME is
+   re-sent until it lands`.
+2. **Queued NVLS/SHARP fragments lost their credit bypass on the
+   drain** (medium). `TrySendQueuedPackets` re-admitted parked entries
+   through `FlowControlGate(vcId, seqNum, false)` — a hard-coded
+   `false` bypass. An ALLREDUCE/ALLGATHER fragment that had parked on
+   the send queue (gate denied, then re-opened) was admitted as a
+   credit-consuming send even though its type never consumes credits
+   on the direct path: codex probe with exactly one credit in the pool
+   — deny, send a 2-fragment ALLREDUCE, re-open — only one fragment
+   drained and the credit pool went 1→0 (stalled forever). The drain
+   now derives bypass from the ENTRY's own header
+   (`IsCreditBypassPacket() || !IsLocalRank(dest)`), matching the
+   direct send path's dispatch. Test: `Queued NVLS fragments keep
+   their credit bypass on the drain`.
+3. **The partition multicast's wire/effective ratio overflowed a
+   64-bit intermediate** (medium). `MulticastAllReducePartition`
+   computed the wire size as `thisPartitionSize * ratioWhole +
+   (thisPartitionSize * ratioRemainder + receivedEffectiveBytes - 1) /
+   receivedEffectiveBytes` in `uint64_t` — the
+   `thisPartitionSize * ratioRemainder` product wraps at multi-GiB
+   scales (64-bit products overflow around 18.4e18, but the operands
+   here reach that regime with 128/120 LL128 wire expansion on 32-GiB
+   effective uploads). The multicast emitted ~2 GiB too little result
+   WIRE data per destination (34.50 GB instead of 36.65 GB),
+   understating serialization time. The products are now `__int128`
+   intermediates — the same widening `SendCollectiveBulk`'s effective
+   split already uses. Test: `Partition wire-size ratio does not
+   overflow at 32 GiB` (sixteen 2-GiB-effective injected fragments;
+   aggregate volumes exceed the 32-bit per-packet counters, so the
+   harness counts via a capture NetDevice).
+4. **The surrogate's tail ignored `optical_hops` while the mean
+   compounded it** (low). `_step_variance` and the heavy-tail
+   `P_chunk` used the per-hop BER directly, while the mean's retry
+   terms compounded `1-(1-p)^max(1, optical_hops)`: 4 hops at BER 2e-7
+   and 1 hop at the equivalent BER 1-(1-2e-7)^4 agreed in the mean
+   (5081.19 µs) but diverged in p99 (5641.58 vs 8236.43 µs). Both tail
+   paths now compound per-hop like the mean (post-fix: both p99
+   8236.43 µs). Regression in the surrogate pytest suite
+   (`surrogate/test/test_theory.py::test_tail_optical_hops_compounds`)
+   — the C++ harness has no Python bridge.
+
+Suite state: gpu-cluster EXTENSIVE 177 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 100 passed, 15/15 parity scripts,
+valgrind on the three C++ modes of the codex round-32 probe (pfc,
+gate_one, ratio) 0 errors / no leaks; the fourth finding's regression
+lives in the surrogate pytest suite.
+
+### Added — ns3-rdma PFC alignment comparison (task #235 follow-up)
+
+Matched 2:1 incast head-to-head (2×50 MB, 40 Gbps, 1 µs, pausetime 5 µs)
+against ns3-rdma (ns-3.17 qbb-net-device + BroadcomNode), both sides
+instrumented for PAUSE/RESUME counts. Findings in
+`doc/PFC_NS3RDMA_ALIGNMENT.md`; headline numbers:
+
+- The 2.1× FCT gap at 1000-B chunks is ProtoBridge's per-packet chunk
+  overhead, NOT PFC behavior: PB's FCT is identical with PFC on/off
+  (42,951,160 ns), and at 9000-B chunks the gap closes to 1.16× —
+  matching the p2p overhead control (2.15× vs 1.17×) almost exactly.
+- Pause cadence is the same order of magnitude (~600/ms per paused port
+  both sides). Mode 3 re-asserts while congested (qbb's pausetime/2
+  re-check analog: 51.5k pauses, 4 resumes); mode 1 is quiet (4 pauses,
+  36 resumes) with identical FCT. Zero drops everywhere.
+- ns3-rdma pays ~9% FCT for PFC at this scale (18.58 → 20.29 ms);
+  with DCQCN on it emits zero PAUSEs. PB has no DCQCN arm, and its PFC
+  is FCT-invariant under this workload.
+
+Also: `gpu-cluster-sim` RESULT output now reports `pfcPausesSent`/
+`pfcResumesSent` aggregate switch counters (used by the experiments).
+
+### Added — per-VC PFC (802.1Qbb priority classes) and mode 3 quanta (pause-time semantics), aligning the PFC arms with qbb-net-device
+
+Two feature arms requested for the ns3-rdma alignment (task #235):
+
+1. **Per-VC PFC** (`EthernetSwitch::SetPfcPauseThresholdForVc(vc, threshold)`).
+   The FabricHeader's existing 8-bit VirtualChannel field names the
+   priority class — no wire-format change. Switch latches are keyed
+   (inPort, outPort, vc) via a `PfcHopKey`; endpoint holds are keyed
+   (dest, vc, switch-MAC). With per-VC thresholds configured, each class
+   compares its OWN VOQ occupancy (`NvSwitch::GetVoqSizeForVc`, an O(1)
+   shadow counter maintained at VOQ push/pop) against its own threshold —
+   a pause on one VC never silences another VC toward the same hop, the
+   qbb-net-device per-priority analog. With NO per-VC thresholds
+   configured, the whole-port depth + global threshold semantics are
+   byte-identical to the pre-VC behavior (single-class fabrics unchanged).
+2. **PFC mode 3 (quanta / pause-time)** — `--switchPfcMode=3 --pfcPauseTime=T`
+   (µs, new CLI knob, wired through `MultiNodeTopologyHelper::
+   SetInterNodeSwitchPfcPauseTime`). The PAUSE carries T in the
+   FabricHeader CreditCount field (unused by PFC frames); the endpoint's
+   hold auto-expires after T (qbb's `PauseFinish`), and the switch
+   re-checks at T/2, re-PAUSEing while the VOQ is still past the resume
+   level and emitting a RESUME once drained (qbb's `CheckQueueFull`
+   contract). Supersede rules: a re-asserted PAUSE cancels and replaces
+   the pending expiry; an explicit RESUME cancels it. Modes 1/2 keep the
+   explicit-RESUME contract (`--pfcPauseTime=0` is inert there).
+
+Both park below the OTP/PEX seam (SendPacketOnDevice / the send queue),
+so the transaction graph is untouched. Tests: `PFC pauses isolate per VC
+(802.1Qbb priorities)`, `PFC mode 3 quanta expires and re-asserts while
+congested`, `PFC mode 3 RESUME lifts a quanta hold early on drain`.
+Docs: `doc/CONFIG_GUIDE.md` PFC section (mode 3 + per-VC paragraphs).
+
+Suite state: gpu-cluster EXTENSIVE 183 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 101 passed, 15/15 parity scripts,
+valgrind on the feature probe's four modes (pervc, quanta, drain,
+destroy_only) 0 errors / no leaks.
+
+### Fixed — codex round 33: four defects — the SimpleNetDevice teardown leaving a dangling callback, gate-denied single collectives discarded, control frames crossing failed links, and the mean GBN/reload terms ignoring optical hops
+
+1. **SimpleNetDevice's promisc callback survived an endpoint's dispose**
+   (medium). The round-31 identity-detach teardown compares
+   `GetPromiscReceiveCallback()` against the binding it installed, but
+   `SimpleNetDevice` (unlike `PointToPointNetDevice`/`CsmaNetDevice`)
+   did not override the new getter — the base `NetDevice` default returns
+   a null callback, so the comparison always saw "not ours", the detach
+   was skipped, and the device's callback stayed bound to the disposed
+   endpoint: codex probe — attach a SimpleNetDevice, dispose and release
+   the endpoint, deliver one ACK 1 µs later — nine Valgrind invalid-access
+   contexts and SIGSEGV. SimpleNetDevice now overrides the getter
+   (returning `m_promiscCallback`) like its two siblings. Test:
+   `SimpleNetDevice promisc callbacks detach at dispose`.
+2. **A gate denial of the single-packet collective branch discarded the
+   packet** (medium). `SendCollective`'s single-packet (no-spray) branch
+   returned early on a `FlowControlGate` denial — unlike the
+   multi-fragment loops, which park each fragment on the send queue
+   (round 27): a temporary subclass gate denial of a 64-byte ALLREDUCE
+   transmitted 0 packets and stored 0 LLR entries; reopening the gate had
+   nothing to drain (codex probe: single=0/0 vs the open control's 1/1).
+   The denial now parks the packet on the send queue; the drain
+   re-admits through the same virtual gate with the entry's
+   header-derived bypass. Test: `Gate-denied single-packet collective
+   parks for the drain`.
+3. **Switch control frames bypassed physical link failure** (medium).
+   The switch's degradation block guarded the ENTIRE failure cascade
+   (link-down, physical packet loss, BER/FEC sampling) behind
+   `!isControlPacket`: an ingress marked DOWN — or a port with loss rate
+   0.5 and a constant-zero draw — dropped DATA but forwarded the ACK
+   through the same failed port (codex probe: forwarded=1, the ACK; the
+   healthy control forwards 2). Feedback crossing a failed link breaks
+   the failure model the degradation arm exists to represent. Physical
+   failures (link-down, packet-loss draws) now apply to EVERY packet;
+   only the BER/FEC sampling arm keeps the control/retry exemption (the
+   documented NVLink-style "control traffic is reliable against BER"
+   contract). Test: `Control frames share the link's physical fate`.
+4. **The mean's legacy-GBN and source-reload terms ignored
+   optical_hops** (low). `_gbn_cascade` and `_source_reload_penalty`
+   received the per-hop effective_ber without compounding
+   `optical_hops`, while the SACK arm (`_retry_overhead`) did: 4 hops at
+   BER 1e-8 and 1 hop at the equivalent BER 1-(1-1e-8)^4 agreed in path
+   failure probability and the SACK mean (29.9112 µs) but diverged in
+   the GBN mean (43.3215 vs 96.7861 µs) and the finite-retry-buffer
+   reload term (934.70 vs 938.04 µs). Both terms now compound per-hop
+   like every other reliability term (post-fix: all pairs agree).
+   Regression in the surrogate pytest suite
+   (`test_mean_gbn_and_reload_compound_optical_hops`).
+
+Suite state: gpu-cluster EXTENSIVE 180 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 101 passed, 15/15 parity scripts,
+valgrind on the round-33 probe's single / switch_down / simple_dispose
+modes 0 errors / no leaks; the fourth finding's regression lives in the
+surrogate pytest suite.
+
+1. **One switch's PFC RESUME cleared another switch's outstanding pause**
+   (medium). The endpoint's pause state was a dest-only set
+   (`m_pfcPausedDests`), but switches pause per-(inPort,outPort) hop: on a
+   multi-hop path several switches can hold a pause for the same
+   destination, and the first switch's RESUME erased the shared entry —
+   the endpoint then transmitted across a switch that was still paused
+   (two-hop repro: A's RESUME cleared B's hold and a DATA crossed the
+   still-paused switch B). The pause state is now keyed by (dest,
+   originating-switch MAC): the PAUSE's SourceMac is the emitting
+   switch's MAC and the RESUME replays the PAUSE's MACs exactly, so each
+   RESUME lifts only its own switch's hold and the dest stays paused
+   while any switch still holds. Limitation: the header carries no port,
+   so two pauses from the same switch MAC share one entry (the first
+   RESUME lifts it; the switch re-pauses if its VOQ refills). Test:
+   `PFC pause ownership is per originating switch`.
+2. **The FEC receive-deferral append site never pruned the egress-event
+   ledger** (medium). The `ContinueReceiveAfterFec` schedule appended to
+   `m_deferredEgressEvents` without pruning (round 28 fixed only the
+   re-defer loop's appends), and a receive-only endpoint (remote DATA,
+   LLR off) never enters `SendPacketOnDevice`'s entry-side prune — 1,000
+   completed deliveries retained 1,000 expired EventIds, each pinning
+   its captured packet. The append site now calls
+   `PruneDeferredEgressEvents` like every other (the same convention as
+   round 28's fixes). Test: `FEC receive deferral prunes the
+   egress-event ledger`.
+3. **The bulk/collective/memory send paths bypassed the virtual
+   FlowControlGate** (medium). `FlowControlGate` is the documented
+   plug-in admission seam, but only the small-send path and the queue
+   drain dispatched through it: the bulk multi-chunk and single-chunk
+   paths (`SendBulkWireTransferSize`), the collective path
+   (`SendCollective`), the framed builder path (`SendDataInternal`), and
+   the memory paths (`SendMemoryWrite`/`SendMemoryResponse`/
+   `SendMemorySemantic`) inlined `HasCredits` + `ConsumeCredit` — a
+   subclass overriding the gate to deny admission was bypassed and the
+   denied bulk transfer transmitted anyway. All eight site-groups now
+   route admission through `FlowControlGate(vcId, seqNum,
+   !IsLocalRank(dest))` (the same fix the round-25 queue-drain received;
+   the So bypass arm and the NVLS/SHARP `creditBypass` are preserved).
+   Test: `Bulk and memory sends consult the overridden FlowControlGate`.
+4. **Config mode silently re-enabled FEC after `--fecEnabled=0`**
+   (medium). The `[stack]` profile's FEC model (always enabled —
+   `FecModel` defaults `m_enabled=true` and the profile key set has no
+   `fecEnabled`) unconditionally replaced the CLI-constructed model that
+   had honored the flag: with `--protocolConfig=p2p-single.cfg
+   --fecEnabled=0`, the run reported `fecNoError=18`, identical to
+   `--fecEnabled=1`, and paid the encode/decode latency the user had
+   explicitly disabled. The CLI flag is now applied to the bundle's
+   model after the swap, so the explicit CLI value always wins over the
+   model default. Parity gate: `test/parity/test_config_fec_enabled.py`
+   (config mode `--fecEnabled=0` must show zero FEC activity, differ in
+   sim time from `--fecEnabled=1`, and the enabled run must still
+   count decodes).
+
+Suite state: gpu-cluster EXTENSIVE 168 PASS / 0 FAIL (3 new C++ tests),
+integration 5 PASS, surrogate pytest 99 passed, 15/15 parity scripts
+(including the new config-FEC gate), valgrind on the three round-29
+probes (two-switch pause, FEC receive ledger, gate-deny bulk) 0 errors /
+no leaks.
+
+
+
+1. **A DEFERRED LLR repair lost its PFC exemption** (medium).
+   `SendRetransmission` raises `m_isRetransmitting` only around the
+   synchronous `SendPacketOnDevice` call; with FEC encode latency (or
+   WFQ/shaping delay) every egress is deferred, and the fire-time gate in
+   `SendDeferredEgress` read the already-reset member — the repair parked
+   for the whole pause while its retry budget burned (a NACK'd 4-KiB DATA
+   packet under FEC + PAUSE produced zero wire traffic until RESUME). The
+   retransmit exemption now rides through the deferral as a captured flag:
+   the three deferral sites capture `m_isRetransmitting` at schedule time
+   and the new `SendDeferredEgressInternal` re-checks the latch with it.
+   Test: `PFC pause does not park a DEFERRED LLR repair (FEC hold)`.
+2. **The PFC re-defer loop accumulated expired events in the endpoint
+   ledger** (medium). Each 500-ns re-defer appended another EventId to
+   `m_deferredEgressEvents` without pruning; pruning ran only at
+   `SendPacketOnDevice` entry, which a held callback never re-enters. One
+   held paced callback retained ~600k expired entries after a 10-ms pause
+   (~2M entries/s per held callback). The loop now prunes at every append
+   (`PruneDeferredEgressEvents`, `std::erase_if` on `IsExpired` — the same
+   convention as `TrackBacklogDecrement`). Tests: `PFC re-defer loop prunes
+   dead EventIds from the egress ledger` plus the new
+   `GetDeferredEgressEventCountForTest` /
+   `GetLiveDeferredEgressEventCountForTest` seams.
+3. **Completed multicast FEC events retained their packet references until
+   disposal** (medium). `NvSwitch::m_deferredResultEvents` was never pruned
+   during operation: 1,000 completed FEC result sends retained 1,000
+   expired entries, each pinning its captured `pkt` (the final packet's
+   refcount stayed 2 until DoDispose) — memory grew with completed traffic
+   despite result-store retirement. All four append sites now call the new
+   `PruneDeferredResultEvents`. Test: `NvSwitch result-event ledger prunes
+   dead EventIds` (via `SeedResultFlow`/`InjectResultNack` and the new
+   count seams).
+4. **`ApplyBundle` silently ignored `bundle.llrMode`** (medium). The
+   documented bundle contract ("gobackn | sack (applied to LlrManager)")
+   was never applied: a bundle with `llrEnabled=1, llrMode=sack` left the
+   manager in GO_BACK_N, so losses triggered suffix retransmissions
+   instead of selective repairs. The CLI masked this by setting the mode
+   separately. `ApplyBundle` now routes the bundle's mode to each
+   endpoint's manager. Test: `ApplyBundle applies bundle.llrMode to the
+   LlrManager`.
+5. **Transfer stencil ranks and VCs silently narrowed without validation**
+   (low). `src`/`dst`/`vc` were `static_cast` to their wire fields with no
+   range check: with `numGpus=2`, `src=65536, dst=1, vc=256` compiled to
+   (rank 0, rank 1, VC 0) and executed a different operation than the one
+   written. `Compile` now rejects values beyond the field widths AND ranks
+   `>= numGpus`, with the offending field named in the error. Test:
+   `Transfer stencil rejects out-of-range ranks and VCs` (three cases:
+   src overflow, dst beyond numGpus, in-range still compiles).
+
+Suite state: gpu-cluster EXTENSIVE 165 PASS / 0 FAIL (5 new C++ tests),
+integration 5 PASS, surrogate pytest 99 passed, 14/14 parity scripts,
+valgrind on the three round-28 probes (deferred repair, egress ledger,
+switch result ledger) 0 errors / no leaks.
+
+### Fixed — codex round 27: nine defects across PFC egress coordination, SHARP result retirement, the surrogate degenerate partition grid, and watcher-ledger growth
+
+1. **PFC-held bulk transfers drop every fragment after the first**
+   (medium). The PFC gate in `SendBulkWireTransferSize`'s spray loop,
+   `SendData`, `SendCollective`, and `SendDataInternal` treated a held
+   fragment as a loop abort (`break`): a 16-KiB transfer over a paused
+   dest parked fragment 0 and silently discarded fragments 1-7, so the
+   transfer never completed after the resume. All four loops now
+   `continue` — every fragment parks itself on the send queue and the
+   resume drains the whole message. Tests: `PFC resume delivers every
+   fragment of a held bulk transfer` (8 LL-inflated fragments × 2048 B
+   effective; LL maps 16 KiB→32 KiB wire), `PFC parks the packet body,
+   not the framed packet`.
+2. **Parked packets resumed with the header prepended twice** (medium).
+   Every caller `AddHeader`s before `SendPacketOnDevice`, and the queue
+   drain re-adds `entry.header` — parking a header-full copy produced a
+   4135-B body for a 4096-B `PayloadSize`, mis-serializing the frame and
+   corrupting protocol-framed payload extraction on the resume. The
+   chokepoint now strips the header before parking (`RemoveHeader`) so
+   the drain re-adds it exactly once. Test: body size == `PayloadSize`
+   assertion in the park/resume test above.
+3. **PFC-held chunks lost their So TX-window slots** (medium).
+   `PumpBulkTxWindow` erased the window membership and decremented
+   `m_bulkTxInflight` for a PFC-parked chunk, but a real NIC's TX window
+   counts parked-but-unsent descriptors against `tx_depth` too — the
+   parked chunk's post-resume ACK found no membership entry, never
+   released its slot, and the window stalled forever at `soTxWindow`
+   with `m_bulkTxQueue` nonempty. Membership and slot are now retained
+   on hold, and `ProcessPfcResumePacket` pumps the window after
+   draining. Test: `PFC resume restarts a stalled So TX window`
+   (soTxWindow=2, receiver LLR on, all 16 KiB effective delivered).
+4. **LLR repairs were parked by the PFC gate** (medium). Repairs
+   re-send the ORIGINAL packet type (DATA), so the gate's
+   `IsRetryPacket()` exemption never matched them: a NACK arriving
+   during a pause advanced the retry counter while the repair sat on
+   the send queue — disarming the wire-arm timeout backstop until an
+   indefinite resume. The gate now exempts `m_isRetransmitting` (the
+   flag `SendRetransmission` raises around its send). Test:
+   `PFC pause does not block LLR retransmissions` (egress-side MacTx
+   record — the receiver reports only first deliveries).
+5. **Deferred egress bypassed the PFC latch** (medium). The three
+   deferred-egress sites (WFQ service time, FEC encode latency, and
+   DCQCN/RTTCC shaping delay) called `dev->Send()` directly at fire
+   time, so a PAUSE arriving mid-pacing-hold let the pre-scheduled
+   callback sail through: two same-flow 1000-B LL sends at a 0.1-Gbps
+   per-QP ceiling with PAUSE at 1 µs put both on the wire at 0 µs. All
+   three now route through the new `SendDeferredEgress`, which re-checks
+   the latch at fire time and re-defers 500 ns while held. Test:
+   `PFC pause holds deferred (paced) egress at fire time`.
+6. **SHARP retirement kept the largest flow ids, not the latest
+   completions** (medium). `RetireSharpResultFlow` sorted each dest's
+   flows numerically and kept the top generations: completing flows
+   100, 101, then 1 evicted flow 1 AT ITS OWN COMPLETION, so an
+   immediate NACK for flow 1/seq 0 found no window and the loss was
+   unrecoverable. Retirement now tracks per-dest completion order
+   (`m_sharpCompletedFlows`) and evicts the OLDEST completion.
+   Test: `SHARP retirement keeps recent completions, not largest ids`
+   (flows 100, 101, 1 → store retains {101, 1}, NACK for flow 1
+   repairs; new `SeedResultFlow`/`CompleteResultFlow` test seams).
+7. **Surrogate AllReduce degenerate partition grid emitted phantom
+   fragments** (medium). With D < P (e.g. 7 B over 8 partitions) the
+   switch's spray loop emits NOTHING for partitions 0..P-2
+   (`bytesRemaining` guard) and the whole D rides the LAST partition's
+   geometry, but the model gave every partition the full-grid fragment
+   count — 8×7 B at BER 0.05 / retry 10000 predicted 1.454 expected
+   losses where the true value is 1.02e-29 (7×1 B on the tail
+   geometry). The degenerate branch now uses the last partition's
+   spray geometry. Test:
+   `test_nvls_allreduce_degenerate_partition_grid`.
+8. **Sim aborted on the armed-threshold invariant in the zero-drop
+   regime** (medium). `gpu-cluster-sim.cc`'s startup check compared
+   `pfcPauseThreshold >= voqDropThreshold` unconditionally; in the
+   default RoCE lossless regime `voqDropThreshold` is 0 (documented
+   "off"), so a legitimate PFC-enabled config aborted at startup. The
+   invariant now compares against the ARMED threshold (0 unless RoCE
+   opted into the lossy regime) and only fires when it is nonzero.
+9. **PFC resume-watcher ledger grew without bound** (medium).
+   `m_pfcResumeEvents` retained the initial watcher EventId plus one
+   per 500-ns poll — 10,000 completed pause/resume cycles kept 10,000
+   dead EventIds, and continuous congestion added ~2M entries/s per
+   paused hop. Both append sites now call the new
+   `PrunePfcResumeEvents` (`std::erase_if` on `IsExpired`) so the
+   ledger holds only live watchers. Test: `PFC resume-watcher ledger
+   prunes dead EventIds` (10 real admission-path cycles through the new
+   `EnqueueForTest` seam — the watcher polls the genuinely draining
+   VOQ; 10 pauses, 10 resumes, no accumulation).
+
+Suite state: gpu-cluster EXTENSIVE 160 PASS / 0 FAIL (7 new C++ tests),
+integration 5 PASS, surrogate pytest 99 passed (1 new round-27 test),
+14/14 parity scripts, valgrind on the PFC probes 0 errors / no leaks.
+
+### Fixed — codex round 26: four defects in multicast loop bounds, wide effective-byte products, flow-ID encoding space, and the surrogate partition grid
+
+1. **Partition multicast stops at the wire end** (medium).
+   `MulticastAllReducePartition`'s chunk loop never decremented
+   `bytesRemaining` and never tested the loop condition against it: with
+   effective=wire=8 B, 8 partitions, and 18 lanes (numChunks floored to
+   the lane count), chunks past the wire end kept firing — `thisChunkSize`
+   clamped to 0 but `offset` kept advancing, so `wireSpanEnd < offset` and
+   `effectiveEnd − effectiveBegin` underflowed to ~4.29e9 per trailing
+   chunk. One destination received 144 payload bytes advertising
+   549,755,812,808 effective bytes — enough to trip receive completion
+   long before the real data arrived. The loop now breaks at
+   `bytesRemaining == 0` (and decrements it). Test:
+   `Partition multicast stops at the wire end (no underflow)`.
+2. **Partition multicast effective-byte products are `__int128`**
+   (medium). The switch's proportional split multiplied
+   `effectivePartitionSize * offset` in `uint64` before dividing — the
+   endpoint-side `__int128` fix (round 25 #2) did not cover these
+   multiplications. At a 6-GiB partition over 18 lanes the coalesced
+   chunk size is 8,323,581 B and the first wrapped product made chunk 343
+   advertise 1,439,979,346 effective bytes instead of 8,323,581,
+   independently corrupting receive accounting before the trailing-chunk
+   issue above. The intermediates are now `__int128`, matching
+   `SendCollectiveBulk`. Test: `Partition multicast effective split does
+   not overflow at 6 GiB` (EXTENSIVE).
+3. **NcclRing channel count clamps to the 16-bit flow-ID space**
+   (medium). The ring encoded (channel, step) into the flow ID as
+   `base + channel*totalSteps + step`; at N=182 with C=182 channels the
+   65,884 encodings exceed the 65,535 usable IDs, so channel 181's step 13
+   wrapped to flow ID 0 — below `m_flowIdBase` — and `OnPacketReceived`
+   silently dropped every such chunk, stalling that channel and the
+   collective forever. `Initialize` now clamps
+   `C ≤ (65535 − base + 1) / totalSteps` (only reachable at N ≥ 182,
+   since the gpusPerNode rail cap binds first in every realistic
+   topology), and the below-base reject logs a warning so a future wrap
+   is visible. Tests: `NcclRing channel count clamps to the 16-bit
+   flow-ID space` + the new `GetResolvedNumChannels` probe.
+4. **Surrogate AllReduce reliability uses the switch's integer partition
+   grid** (medium). The model passed the uniform fraction `D/P` to the
+   fragment helper; the switch computes `partitionSize = dataSize /
+   numPartitions` in uint64 with the LAST partition carrying the
+   remainder. D=18,874,369 / P=8 is seven 2,359,296-B partitions of
+   exactly 18×131,072-B fragments plus one 2,359,297-B tail of 19; the
+   fractional model gave EVERY partition the tail's 19-fragment geometry
+   and estimated 0.283 expected losses where the grid gives ~0.597 at
+   BER 2.3e-6 / retry 10,000 — wrongly passing the 0.5
+   strict-reliability cutoff (~4,189 µs predicted for a config that
+   cannot complete). The body and tail fragment geometries are now
+   computed separately and their failure probabilities summed per size
+   (0.597278 at the repro point, matching the exact per-size accounting).
+   Test: `test_nvls_allreduce_partition_grid_is_integer`.
+
+Suite state: gpu-cluster EXTENSIVE 153 PASS (3 new C++ tests), integration
+5 PASS, surrogate pytest 98 passed (1 new round-26 test), 14/14 parity
+scripts, valgrind on the partition-multicast probe 0 errors / no leaks.
+One non-reproducible harness flake observed during the EXTENSIVE loop
+(`ProtocolTransactionExecutor::Start` asserting `m_graphSet` at t=0,
+~47 consecutive passes around it on both sides of the changes — tracked
+for observation, not attributed).
+
+### Added — PFC (802.1Qbb-style) priority flow control, the opt-in no-drop arm of the So congestion contract
+
+The So fabric's three congestion behaviors now match real RDMA Ethernet:
+ECN + DCQCN (mark-and-backoff, lossless), VOQ tail-drop + NACK→LLR
+retransmit (lossy), and **PFC** (pause the sources feeding a congested
+egress before the queue overflows — the no-drop backstop RoCE layers under
+ECN; HPCC's `qbb-net-device`/`SwitchMmu` is the reference). All opt-in and
+default-off (byte-identical to the pre-PFC baseline, stash round-trip
+verified: `simTimeNs=70337` both sides of the ETH host-topology smoke run).
+
+1. **Switch side** (`ethernet-switch.cc`): `--switchPfcMode=0|1|2`
+   (off / static threshold / dynamic HPCC-style headroom-scaled threshold),
+   `--pfcPauseThreshold` (default 64), `--pfcResumeOffset` (default 8 —
+   the `resume_offset` hysteresis against pause/resume thrash). The pause
+   latches per (inPort→outPort) hop, idempotently (re-crossing while paused
+   emits nothing, matching `CheckShouldPause`'s `paused[]` guard); the
+   RESUME fires from a self-rescheduling drain watcher once the VOQ falls
+   to `threshold − offset`. `PFC_PAUSE`/`PFC_RESUME` are new
+   `FabricPacketType` control frames, mirrored like `EmitNackBack`.
+2. **Endpoint side** (`fabric-endpoint.cc`): a received PAUSE latches the
+   paused destination; the `SendPacketOnDevice` chokepoint parks DATA-class
+   sends toward it on the send queue (control/retry/feedback exempt —
+   pausing them would deadlock the reliability loop; LLR timers keep
+   running as the safety net); RESUME lifts the latch and drains.
+   `SendPacketOnDevice` now returns whether the send completed so callers
+   skip tx/window accounting for parked packets — the bulk TX-window pump,
+   the unbounded spray, the collective spray, and the retry re-send loop
+   all honor it.
+3. **Invariant + wiring**: `pfcPauseThreshold < voqDropThreshold` when both
+   arms are armed (the sim aborts otherwise — pause must fire before drop);
+   `ecnThreshold < pfcPauseThreshold` is the documented intended ordering
+   (mark first, pause as backstop). `MultiNodeTopologyHelper` applies the
+   attributes to every So switch; inert on switchless topologies
+   (fullmesh/ring/torus2d/dragonfly, warned like the lossy path).
+4. **Tests + docs**: `EthernetSwitchPfcTriggerTest` (mode 0/1/2 trigger
+   semantics, idempotent latch, control bypass) and `PfcEndpointHoldTest`
+   (pause parks sends, resume drains); CONFIG_GUIDE's congestion-contract
+   paragraph and CALIBRATION's RoCEv2/ETH sections document the third arm.
+   Like DCQCN, PFC is ns-3-only congestion behavior — the surrogate stays
+   the uncongested mean. Suite state: gpu-cluster EXTENSIVE 150 PASS (2
+   new), integration 5 PASS, 14/14 parity scripts, valgrind on the
+   mid-watcher switch disposal 0 errors / no leaks.
+
+### Fixed — codex round 25: nine defects across multicast byte accounting, disposal safety, and API propagation
+
+1. **Partition multicast puts effective bytes on payload fragments**
+   (medium). `MulticastAllReducePartition` divided effective bytes
+   across every chunk index including the trailing zero-payload chunks
+   (numChunks floors up to the lane count): D=8 B / 8 partitions /
+   2 lanes emitted (payload=1, effective=0) + (payload=0, effective=1)
+   per partition — a zero-payload fragment carried the effective bytes.
+   The split is now anchored to the wire offset (the same rule
+   `SendCollectiveBulk` adopted in round 19). Test:
+   `Partition multicast puts effective bytes on payload fragments`.
+2. **Collective effective-byte split does not overflow at 6 GiB**
+   (medium). `SendCollectiveBulk`'s proportional split multiplied
+   `effectiveSize * offset` in uint64 before dividing: a 6-GiB / ~8-GiB
+   upload over 18 lanes advertised 9,305,762,474 effective bytes for
+   6,442,450,944 payload bytes (inflated ledgers can trip aggregation
+   before the payload arrives). Intermediates are now `__int128` — the
+   codebase's established wide type. Test: `Collective effective-byte
+   split does not overflow at 6 GiB`.
+3. **SendCollective carries 64-bit volumes** (medium). The wrapper's
+   size parameter was uint32_t while NVLS AllGather computes uint64_t
+   chunks — at N=2 / D=8 GiB each 4-GiB chunk truncated to zero and
+   `SendCollectiveBulk` aborted the upload. Now uint64_t, mirroring
+   `SendBulkWireTransfer`'s round-24 widening. Test: `SendCollective
+   carries 64-bit volumes`.
+4. **Gateway Dispose cancels pending gateway-delay forwardings**
+   (medium). `ScheduleForwarding` scheduled `ForwardToFabric` on raw
+   `this` without retaining the EventId: queueing a 100-µs forwarding
+   then disposing the gateway at 2 µs left the event armed to fire on
+   freed state (valgrind-confirmed UAF). Events are retained (pruned of
+   fired entries) and `DoDispose` cancels them. Test: `Gateway Dispose
+   cancels pending gateway-delay forwardings`; valgrind re-run exits 0.
+5. **Queued sends consult the overridden FlowControlGate** (medium).
+   `TrySendQueuedPackets` re-implemented the CREDIT policy inline
+   (`HasCredits` + `ConsumeCredit`) instead of dispatching through the
+   virtual `FlowControlGate`, so a subclass overriding the gate to deny
+   was bypassed — a denied MEMORY_READ was queued and then transmitted
+   on the drain pass. The drain now uses the same gate as every send
+   path (the creditBypass arm keeps So entries credit-free). Test:
+   `Queued sends consult the overridden FlowControlGate`.
+6. **SetLlrRetryLimit configures the active LLR manager** (medium).
+   The setter updated only the endpoint member while the active
+   `LlrManager` kept its own default (3): after `SetLlrRetryLimit(0)`
+   the endpoint reported zero while a NACK still produced a
+   retransmission. The setter propagates to the manager, and the
+   `LlrRetryLimit` attribute is routed through the setter pair instead
+   of writing the member directly. Test: `SetLlrRetryLimit configures
+   the active LLR manager`.
+7. **Queuing tail variance honors the topology cap** (low). The queuing
+   arm of `_step_variance` computed both utilization and service rate
+   from the raw `BW_link`: a 50-GB/s bisection cap left 16 MiB / N=8
+   ring / 32 credits / BER=0 / 25-GB/s competing traffic at
+   p99-minus-mean 2.821 µs where the capped-rate evaluation gives
+   32.270 µs — the same capped contract as the mean path (round 22 #6),
+   the heavy-tail branch (round 23 #4) and the retransmission arm
+   (round 24 #8). `topology=None` stays byte-identical. Test:
+   `test_queuing_variance_topology_cap`.
+8. **SHARP result store retires completed flows** (low). Repair windows
+   were never retired at flow completion and `DoDispose` never cleared
+   the store — 100 completed flows kept 100 windows per destination
+   until disposal. Each dest now retains only the
+   `SHARP_RESULT_GENERATIONS` (2) most recent flows' windows; retiring
+   the flow's OWN window at its own completion broke late-NACK repairs
+   racing the tail of delivery, and retiring at the NEXT flow's
+   completion killed in-flight repairs too, so the bound is a
+   generation count. `DoDispose` clears the store with the other
+   per-flow state. Test: `SHARP result store retires completed flows`.
+9. **Rate-machine docs prescribe MakeRateFlowKey** (low). The
+   DCQCN/RTTCC header docs still prescribed `MakeSeqKey` while the
+   endpoints key on `MakeRateFlowKey` (sender-ranked since round 23) —
+   following the stale doc updated a key no send path reads. Both docs
+   now prescribe the sender-ranked key with the round-23 context.
+
+Suite state: EXTENSIVE 148 PASS / 0 FAIL (7 new C++ tests), integration
+5 PASS, surrogate pytest 97 passed (1 new round-25 test), 14/14 parity
+scripts, valgrind on the gateway disposal scenario exit 0 with zero
+errors.
+
 ### Fixed — codex round 23: four defects in flow-key isolation and switch-side surrogate geometry
 
 1. **DCQCN/RTTCC flow keys carry the sender rank** (medium). The

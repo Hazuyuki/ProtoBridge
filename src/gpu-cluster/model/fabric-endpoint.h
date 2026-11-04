@@ -29,6 +29,7 @@
 #include "ns3/mac48-address.h"
 #include "ns3/traced-callback.h"
 #include "ns3/timer.h"
+#include <map>
 #include <set>
 
 #include <vector>
@@ -214,8 +215,11 @@ class FabricEndpoint : public Application
     void SendBulkWireTransferSize(uint16_t destRank, uint64_t dataSize,
                                   uint8_t protocolId, uint16_t flowId, uint8_t vcId = 0);
 
+    /** size is uint64: collective volumes reach multi-GiB and the 64-bit
+     *  path sends dummy bytes, so a narrowed parameter truncates 4-GiB
+     *  chunks to zero (codex round 25, finding 3). */
     void SendCollective(FabricPacketType type, uint16_t destRank,
-                        const uint8_t* data, uint32_t size);
+                        const uint8_t* data, uint64_t size);
     void SendCollectiveBulk(FabricPacketType type, uint16_t destRank, uint64_t size);
     void SendCollectiveBulk(FabricPacketType type,
                             uint16_t destRank,
@@ -493,8 +497,12 @@ class FabricEndpoint : public Application
      * @param packet The packet to send
      * @param deviceIndex Index of the device to use
      * @param dest Destination MAC address
+     * @return false when a PFC pause toward the packet's destination held it
+     *         on the send queue (the caller must NOT count the transmission
+     *         or consume a window/credit slot for it — the drain pass after
+     *         the RESUME re-invokes this and completes it); true otherwise.
      */
-    void SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
+    bool SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
                             const Address& dest);
     /**
      * @brief Forward a received packet whose DestRank is not this endpoint.
@@ -516,6 +524,27 @@ class FabricEndpoint : public Application
      */
     void ArmRetryTimeoutOnWire(Ptr<Packet> packet);
     bool LinkUsesFec() const;
+
+    /**
+     * \brief Egress a deferred (paced/FEC/WFQ-held) packet at fire time,
+     *        re-checking the PFC latch that may have latched AFTER the send
+     *        was deferred. A pause arriving mid-hold must still hold the
+     *        packet (re-defer by 500 ns) instead of letting the deferred
+     *        callback's dev->Send() bypass the chokepoint entirely (codex
+     *        round 27, finding 5). Exempt classes (control/retry/retransmit,
+     *        local dests) go straight to the device.
+     */
+    void SendDeferredEgress(Ptr<Packet> packet, uint32_t deviceIndex,
+                            const Address& dest);
+
+    /**
+     * @brief Fire-time core of SendDeferredEgress with the retransmit
+     *        exemption carried through the deferral as a captured flag
+     *        (m_isRetransmitting is already reset when a deferred egress
+     *        fires — codex round 28, finding 1).
+     */
+    void SendDeferredEgressInternal(Ptr<Packet> packet, uint32_t deviceIndex,
+                                    const Address& dest, bool isRetransmit);
 
     /**
      * @brief Get the next device index for spraying
@@ -689,7 +718,87 @@ class FabricEndpoint : public Application
     /// @brief Receive-side handler for an RTT_RESPONSE: turns the echo into
     ///        an RTT sample for the RTTCC machine. No-op when unmounted.
     void ProcessRttResponsePacket(const FabricHeader& respHeader);
+
     void TrySendQueuedPackets();
+
+    /// @brief Drop fired (IsExpired) deferred-egress EventIds from the
+    ///        ledger. Called at every append site — including the PFC
+    ///        re-defer loop in SendDeferredEgress, which appends a new
+    ///        EventId every 500 ns while a callback is held and never
+    ///        re-enters SendPacketOnDevice's entry-side prune (codex round
+    ///        28, finding 2: one held paced callback retained ~600k expired
+    ///        entries after a 10-ms pause, ~2M entries/s per held callback).
+    void PruneDeferredEgressEvents();
+
+  protected:
+    /// @brief Test seam: total deferred-egress ledger size (live + expired).
+    ///        The ledger itself is private; tests observe its growth through
+    ///        this accessor (codex round 28, finding 2 — the PFC re-defer
+    ///        loop appended without pruning, so one held paced callback
+    ///        retained ~19,976 expired EventIds after a 10-ms pause).
+    size_t GetDeferredEgressEventCountForTest() const
+    {
+        return m_deferredEgressEvents.size();
+    }
+
+    /// @brief Test seam: deferred-egress ledger entries that are still live
+    ///        (not IsExpired). Pruning keeps total == live in steady state.
+    size_t GetLiveDeferredEgressEventCountForTest() const
+    {
+        size_t live = 0;
+        for (const EventId& ev : m_deferredEgressEvents)
+        {
+            if (!ev.IsExpired())
+            {
+                live++;
+            }
+        }
+        return live;
+    }
+
+    /// @brief Receive-side handler for an inbound PFC_PAUSE (802.1Qbb analog,
+    ///        So-only): suspends new sends toward the paused destination rank
+    ///        (the switch's congested egress). In-flight retransmit timers
+    ///        keep running — PFC is a no-drop backstop, so the LLR deadline
+    ///        is the safety net, never the primary recovery.
+    void ProcessPfcPausePacket(const FabricHeader& pauseHeader);
+
+    /// @brief Receive-side handler for an inbound PFC_RESUME: lifts the pause
+    ///        on the destination rank and drains what queued up meanwhile.
+    void ProcessPfcResumePacket(const FabricHeader& resumeHeader);
+
+    /// @brief True while a PFC pause from the switch silences sends toward
+    ///        destRank (any VC). Consulted by the send paths and the queue
+    ///        drain when no VC context is at hand.
+    bool IsPfcPausedForDest(uint16_t destRank) const;
+
+    /// @brief True while a PFC pause silences sends toward destRank on the
+    ///        given VC. Per-VC PFC (the 802.1Qbb priority analog: the PAUSE
+    ///        frame's VirtualChannel field names the paused priority class,
+    ///        and traffic on OTHER VCs toward the same dest flows freely).
+    ///        A vc with no latched pause entry for this dest is unpaused.
+    bool IsPfcPausedForDest(uint16_t destRank, uint8_t vcId) const;
+
+    /// @brief Quanta-expiry handler (802.1Qbb pause-time semantics): lifts
+    ///        the named switch's hold on (destRank, vcId) when the pause
+    ///        time carried in the PAUSE frame elapses (qbb-net-device's
+    ///        PauseFinish analog). Only fires for the LIVE expiry — a
+    ///        re-asserted PAUSE cancels and replaces the pending entry, so
+    ///        a superseded expiry never lifts the refreshed hold.
+    void PfcPauseExpiredForDest(uint16_t destRank, uint8_t vcId,
+                                Mac48Address switchMac);
+
+    /// Quanta-expiry EventIds, one per live (dest, vc, switch) hold.
+    /// Pruned at each append (the fired entries drop out); DoDispose
+    /// cancels the live ones (the same ledger discipline as
+    /// m_deferredEgressEvents).
+    std::map<std::tuple<uint16_t, uint8_t, Mac48Address>, EventId> m_pfcPauseExpiry;
+
+    /// Drop fired quanta-expiry EventIds from m_pfcPauseExpiry so the
+    /// ledger tracks only LIVE timers (called at each append).
+    void PrunePfcPauseExpiryEvents();
+
+  private:
 
     /**
      * @brief Internal method to send data with NCCL protocol
@@ -744,6 +853,16 @@ class FabricEndpoint : public Application
     FlowControlPolicy m_flowControlPolicy{FlowControlPolicy::CREDIT}; ///< Policy seam (default: credit)
     Ptr<DcqcnRateMachine> m_dcqcnRate{nullptr}; ///< DCQCN rate machine (So-only; null=dormant)
     Ptr<RttccRateMachine> m_rttccRate{nullptr}; ///< RTTCC rate machine (So-only; null=dormant)
+    /// Destination ranks a switch PFC pause has silenced (So-only), with
+    /// per-VC pause holds: dest -> (VC -> the set of originating switch
+    /// MACs still holding that VC's pause). The PAUSE's SourceMac is the
+    /// emitting switch (the RESUME replays it — keying per switch keeps
+    /// one switch's RESUME from lifting another's outstanding hold) and
+    /// its VirtualChannel names the paused priority class (per-VC PFC,
+    /// the 802.1Qbb priority analog). A (dest, vc) is paused iff its MAC
+    /// set is nonempty; a dest entry with no VCs left is erased. Cleared
+    /// by PFC_RESUME; DoDispose empties it with the rest of the send state.
+    std::map<uint16_t, std::map<uint8_t, std::set<Mac48Address>>> m_pfcPausedDests;
     std::unordered_map<uint64_t, Ptr<ReorderBuffer>> m_reorderBuffers; ///< Per-(sourceRank,VC,flowId) reorder buffers, key=(srcRank<<32)|(vcId<<16)|flowId
 
     // Send queue

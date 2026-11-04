@@ -393,6 +393,17 @@ main(int argc, char* argv[])
     // NACK path fires before the base hard-cap drop. Default 8 = the
     // EthernetSwitch Attribute default (parity-neutral).
     uint32_t voqDropThreshold = 8;
+    // PFC (IEEE 802.1Qbb-style) priority flow control on the So switch
+    // (opt-in, default off = byte-identical legacy). mode 1 = static pause
+    // threshold, 2 = dynamic (HPCC SwitchMmu-style headroom-scaled). The
+    // intended threshold ordering when all three arms are armed:
+    // ecnThreshold < pfcPauseThreshold < voqDropThreshold (mark first, pause
+    // as the no-drop backstop, drop never — with PFC holding the queue below
+    // the drop threshold the lossy path should stay unfired).
+    uint32_t switchPfcMode = 0;
+    uint32_t pfcPauseThreshold = 64;
+    uint32_t pfcResumeOffset = 8;
+    uint32_t pfcPauseTimeUs = 0;
     // DCQCN rate machine (Phase B). Off by default: with no DcqcnRateMachine
     // mounted, CNPs are no-ops and SendPacketOnDevice adds zero shaping delay,
     // so all So runs stay bit-identical to the Phase-A baseline. On, a shared
@@ -652,6 +663,10 @@ main(int argc, char* argv[])
     cmd.AddValue("interNodeStartup", "Inter-node phase startup delay in ns", interNodeStartupNs);
     cmd.AddValue("ecnThreshold", "Ethernet (RoCEv2) ECN threshold: VOQ depth (pkts) to mark SoHeader ECN (0=off; Phase-B reaction pending)", ecnThreshold);
     cmd.AddValue("voqDropThreshold", "Lossy VOQ tail-drop threshold (pkts); 0=off. Plain ETH: always applied (default 8). RoCE: an EXPLICIT flag opts into the lossy/no-PFC regime (unset = lossless). Must be < switchVoqDepth (default 10000); keep > ecnThreshold for mark-before-drop", voqDropThreshold);
+    cmd.AddValue("switchPfcMode", "PFC (802.1Qbb-style) flow control on So switches: 0=off (default), 1=static pause threshold, 2=dynamic (HPCC SwitchMmu-style, scales with remaining VOQ headroom), 3=quanta (802.1Qbb pause-time semantics via --pfcPauseTime). Keep pfcPauseThreshold < voqDropThreshold so the pause fires before the tail-drop", switchPfcMode);
+    cmd.AddValue("pfcPauseThreshold", "PFC: VOQ depth (pkts) at which the switch PAUSEs the ingress feeding the congested egress (default 64; inert when switchPfcMode=0)", pfcPauseThreshold);
+    cmd.AddValue("pfcResumeOffset", "PFC resume hysteresis (pkts): the pause lifts once the VOQ drains to pfcPauseThreshold - offset (default 8; inert when switchPfcMode=0)", pfcResumeOffset);
+    cmd.AddValue("pfcPauseTime", "PFC mode 3 only: 802.1Qbb pause time (us) carried by each PAUSE. The endpoint auto-expires after this and the switch re-asserts at pausetime/2 while congested (qbb-net-device semantics). 0 with modes 1/2 = pause until explicit RESUME (default)", pfcPauseTimeUs);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
     cmd.AddValue("dcqcnTFastNs", "DCQCN fast-recovery timer interval in ns (0=default 50000)", dcqcnTFastNs);
@@ -780,6 +795,11 @@ main(int argc, char* argv[])
             if (!s.empty()) llrEnabled = (s == "1" || s == "true");
         }
         applyS(llrModeStr, "llrMode");
+        // ApplyBundle now routes bundle.llrMode to the endpoints' LLR
+        // managers (codex round 28, finding 4), so the bundle must carry
+        // the RESOLVED mode (CLI --llrMode, overridden by the profile) or
+        // it would clobber it with Build()'s default.
+        pbundle.llrMode = llrModeStr;
 
         // A `.cfg` whose [op] declares `collective =` / `algorithm =` (and
         // optionally `topology =`) overrides the CLI values, then falls through
@@ -1016,7 +1036,20 @@ main(int argc, char* argv[])
     {
         protoModel = pbundle.protocol;
         payloadBuilder = pbundle.payloadBuilder;
-        if (pbundle.fec) { fecModel = pbundle.fec; }
+        if (pbundle.fec)
+        {
+            fecModel = pbundle.fec;
+            // The profile key set has no fecEnabled (RESERVED only covers
+            // fecN/fecK/fecT/fecEncodeLatencyNs/fecDecodeLatencyNs) and
+            // FecModel defaults m_enabled=true, so an unconditional swap
+            // silently re-enabled FEC after the CLI's --fecEnabled=0 had
+            // disabled the model built at line ~945 — config mode then ran
+            // with the encode/decode latency and BER-protection behavior
+            // the user had explicitly turned off, indistinguishable in the
+            // counters from --fecEnabled=1 (codex round 29, finding 4).
+            // The explicit CLI flag wins over the model default.
+            fecModel->SetEnabled(fecEnabled);
+        }
         llrEnabled = pbundle.llrEnabled;
         if (forceProtocol != 0)
         {
@@ -1116,6 +1149,54 @@ main(int argc, char* argv[])
         multiTopo.SetInterNodeDataRate(std::to_string(interNodeBandwidthGbps) + "Gbps");
         multiTopo.SetInterNodeDelay(std::to_string(interNodeLatencyNs) + "ns");
         multiTopo.SetInterNodeFabricType(interNodeFabricType);
+        // PFC (802.1Qbb-style, opt-in): applies to both So switch fabrics
+        // (RoCE lossless backstop and plain-Ethernet drop avoidance). The
+        // helper routes the attributes onto every So switch it builds; mode
+        // 0 (default) leaves everything byte-identical.
+        if (switchPfcMode != 0)
+        {
+            // Pause must fire BEFORE the tail-drop or the lossy path wins
+            // the race and PFC is dead weight: pfcPauseThreshold <
+            // voqDropThreshold whenever both are armed (the same
+            // invariant shape as voqDropThreshold < switchVoqDepth).
+            // The ARMED threshold, not the raw CLI value:
+            // --voqDropThreshold defaults to 8 (the plain-ETH legacy
+            // default), but RoCE stays lossless (threshold 0) unless the
+            // flag was passed EXPLICITLY — testing the raw default rejected
+            // `--switchPfcMode=1` alone on a lossless two-node RoCE/ToR
+            // run (64 >= 8 abort; codex round 27, finding 8). Plain ETH
+            // always arms the drop; for RoCE `lossyRoce` is exactly the
+            // explicit-flag arm.
+            const uint32_t armedDropThreshold =
+                (interNodeFabricType == FabricType::ROCE && !lossyRoce)
+                    ? 0
+                    : voqDropThreshold;
+            if (armedDropThreshold != 0 && pfcPauseThreshold >= armedDropThreshold)
+            {
+                NS_ABORT_MSG_IF(
+                    true,
+                    "pfcPauseThreshold (" << pfcPauseThreshold
+                    << ") must be < voqDropThreshold (" << armedDropThreshold
+                    << ") when --switchPfcMode>0 and the lossy drop is armed, "
+                    << "else the tail-drop fires before the pause and PFC "
+                    << "never engages.");
+            }
+            multiTopo.SetInterNodeSwitchPfcMode(switchPfcMode);
+            multiTopo.SetInterNodeSwitchPfcPauseThreshold(pfcPauseThreshold);
+            multiTopo.SetInterNodeSwitchPfcResumeOffset(pfcResumeOffset);
+            multiTopo.SetInterNodeSwitchPfcPauseTime(pfcPauseTimeUs);
+            // A pause needs a switch in the path to ORIGINATE it -- the same
+            // inert-topology warning shape as the lossy drop below.
+            if (interNodeTopology == "fullmesh" || interNodeTopology == "ring" ||
+                interNodeTopology == "torus2d" || interNodeTopology == "dragonfly")
+            {
+                std::cerr << "Warning: --switchPfcMode=" << switchPfcMode
+                          << " with --interNodeTopology=" << interNodeTopology
+                          << " has no switch in the inter-node path, so PFC "
+                             "is INERT. Use --interNodeTopology=host, tor, "
+                             "rail, or leafspine to exercise PFC.\n";
+            }
+        }
         if (interNodeFabricType == FabricType::ROCE)
         {
             // Real Ethernet RoCEv2 So fabric: switched inter-node topologies
@@ -2777,6 +2858,8 @@ main(int argc, char* argv[])
     uint64_t switchVoqDrops = 0;
     uint64_t switchRouteUnavailableDrops = 0;
     uint64_t ecnMarkedPackets = 0;
+    uint64_t pfcPausesSent = 0;
+    uint64_t pfcResumesSent = 0;
     for (auto node = NodeList::Begin(); node != NodeList::End(); ++node)
     {
         for (uint32_t device = 0; device < (*node)->GetNDevices(); ++device)
@@ -2795,6 +2878,8 @@ main(int argc, char* argv[])
             if (ethSwitch)
             {
                 ecnMarkedPackets += ethSwitch->GetEcnMarkedPackets();
+                pfcPausesSent += ethSwitch->GetPfcPausesSent();
+                pfcResumesSent += ethSwitch->GetPfcResumesSent();
             }
         }
     }
@@ -2809,6 +2894,8 @@ main(int argc, char* argv[])
     std::cout << "switchVoqDrops=" << switchVoqDrops << std::endl;
     std::cout << "switchRouteUnavailableDrops="
               << switchRouteUnavailableDrops << std::endl;
+    std::cout << "pfcPausesSent=" << pfcPausesSent << std::endl;
+    std::cout << "pfcResumesSent=" << pfcResumesSent << std::endl;
     uint64_t retransmittedPackets = 0;
     uint64_t retryBufferOverflows = 0;
     uint64_t permanentLosses = 0;

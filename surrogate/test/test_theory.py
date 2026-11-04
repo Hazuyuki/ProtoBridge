@@ -1594,3 +1594,175 @@ def test_tail_variance_topology_cap_scales_retransmission():
     t99_no = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
                                topology=None, **kw)
     assert (t99_no - m_no) == pytest.approx(1.528577, rel=1e-4)
+
+
+def test_queuing_variance_topology_cap():
+    """The queuing arm of _step_variance computed both utilization and
+    service rate from the raw BW_link, so a 50-GB/s bisection cap left a
+    16-MiB / N=8 ring / 32 credits / BER=0 with 25 GB/s of competing
+    traffic at p99-minus-mean 2.821 µs where evaluating the M/M/1
+    equations at the capped rate gives 32.270 µs (codex round 25,
+    finding 7) — the same capped-rate contract the retransmission arm
+    (round 24, finding 8), the mean path (round 22, finding 6) and the
+    heavy-tail branch (round 23, finding 4) already follow. topology=None
+    stays byte-identical."""
+    ring = wb.make_h200_ring_theory()
+    kw = dict(ber=0, competing_bw=25, collective="allreduce", percentile=99)
+    mean_kw = dict(ber=0, competing_bw=25, collective="allreduce")
+    cap = wb.make_topology(bisection_gbps=50)
+
+    m_cap = ring.predict(16 * 1024 * 1024, 8, "ring", 32, topology=cap,
+                         **mean_kw)
+    t99_cap = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                                topology=cap, **kw)
+    assert (t99_cap - m_cap) == pytest.approx(32.270, rel=1e-3), \
+        t99_cap - m_cap
+
+    # No cap -> byte-identical legacy behavior (the raw-rate evaluation).
+    m_no = ring.predict(16 * 1024 * 1024, 8, "ring", 32, topology=None,
+                        **mean_kw)
+    t99_no = ring.predict_tail(16 * 1024 * 1024, 8, "ring", 32,
+                               topology=None, **kw)
+    assert (t99_no - m_no) == pytest.approx(2.821, rel=1e-2), \
+        t99_no - m_no
+
+
+def test_nvls_allreduce_partition_grid_is_integer():
+    """The AllReduce reliability model must fragment the switch's INTEGER
+    partition grid, not a uniform fractional D/P. NvSwitch computes
+    partitionSize = dataSize / numPartitions in uint64 with the LAST
+    partition carrying the remainder: D=18,874,369 / P=8 gives seven
+    2,359,296-B partitions (exactly 18 x 131,072-B fragments) plus one
+    2,359,297-B tail of 19 smaller fragments. The pre-fix model passed
+    data_bytes / num_partitions (a float) to the fragment helper, handing
+    EVERY partition the tail's 19-fragment geometry — 0.283 expected
+    losses instead of ~0.597 at BER 2.3e-6 / retry 10,000 / LLR on, wrongly
+    passing the 0.5 strict-reliability cutoff (codex round 26, finding 4).
+    The exact per-size accounting (body and tail fragments kept separate)
+    gives 0.597278."""
+    nvls = wb.make_h200_nvls_theory()
+    D, N = 18874369, 2
+    # Grid geometry: 7 body partitions at 18 x 131,072 B + 1 tail at 19
+    # fragments of 124,174 B (ceil(2,359,297/19)).
+    body_frags, body_bytes = nvls._switch_multicast_fragments(D // 8)
+    tail_frags, tail_bytes = nvls._switch_multicast_fragments(D - (D // 8) * 7)
+    assert body_frags == 18 and body_bytes == 131072
+    assert tail_frags == 19 and tail_bytes == 124174
+    # Exact expected losses: N * [(P-1) * 18 * p_body^65 + 19 * p_tail^65]
+    # (uploads at retry 10,000 contribute ~0 at this BER).
+    ber = 2.3e-6
+    p_body = 1 - (1 - ber) ** (131072 * 8)
+    p_tail = 1 - (1 - ber) ** (124174 * 8)
+    expected = N * (7 * 18 * p_body ** 65 + 19 * p_tail ** 65)
+    losses = nvls.expected_permanent_losses(
+        D, N, "nvls", ber, 10000,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce",
+        llr_enabled=True)
+    assert abs(losses - expected) < 1e-12, losses
+    assert abs(losses - 0.597278) < 1e-4, losses
+    # The strict gate must REJECT: expected losses exceed the 0.5 cutoff.
+    t = nvls.predict(D, N, "nvls", 128, ber=ber, retry_limit=10000,
+                     strict_reliability=True, collective="allreduce",
+                     llr_enabled=True)
+    assert not math.isfinite(t)
+    # Aligned partitions (D % P == 0) are unchanged: body == tail.
+    losses_aligned = nvls.expected_permanent_losses(
+        16 * 1024 * 1024, 8, "nvls", 1e-10, 0,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce")
+    assert losses_aligned == pytest.approx(0.107369, rel=1e-3), \
+        losses_aligned
+
+
+def test_nvls_allreduce_degenerate_partition_grid():
+    """Degenerate partition grid (D < P): partitionSize = D // P == 0, so
+    NvSwitch's MulticastAllReducePartition emits NOTHING for the first P-1
+    partitions (the bytesRemaining > 0 guard never admits a chunk) and the
+    WHOLE D rides the LAST partition's spray geometry. For effective=wire=7
+    B, 8 partitions, 18 lanes the switch emits SEVEN 1-B results per
+    destination. The pre-fix fallback modeled a full-size fragment per
+    partition (eight 7-B fragments), predicting 1.454 expected permanent
+    losses at N=8 / BER 0.05 / LLR / retry 10,000 — where the true geometry
+    gives ~1.02e-29 — and wrongly returned infinity under strict reliability
+    (codex round 27, finding 7)."""
+    nvls = wb.make_h200_nvls_theory()
+    nvls.num_lanes = 18
+    D, N, ber = 7, 8, 0.05
+    # Geometry: the tail (last partition = the whole 7 B) sprays at the
+    # 18-lane geometry: 7 sent fragments of 1 B each; body partitions emit 0.
+    tail_frags, tail_bytes = nvls._switch_multicast_fragments(D)
+    assert tail_frags == 7 and tail_bytes == 1
+    losses = nvls.expected_permanent_losses(
+        D, N, "nvls", ber, 10000,
+        optical_fraction=1.0, optical_hops=1, collective="allreduce",
+        llr_enabled=True)
+    p_tail = 1 - (1 - ber) ** (tail_bytes * 8)
+    expected = N * (7 * tail_frags * p_tail ** 10001)
+    assert losses == pytest.approx(expected), losses
+    assert abs(losses - 1.02e-29) < 1e-30, losses
+    # Strict reliability must stay finite (pre-fix: 1.454 -> inf).
+    t = nvls.predict(D, N, "nvls", 128, ber=ber, retry_limit=10000,
+                     strict_reliability=True, collective="allreduce",
+                     llr_enabled=True)
+    assert math.isfinite(t)
+
+
+def test_tail_optical_hops_compounds():
+    """The tail paths must compound BER over optical_hops like the mean.
+
+    A 4-hop path at BER 2e-7 has the same per-chunk path failure
+    probability as a 1-hop path at BER 1-(1-2e-7)^4. The mean's retry
+    terms already compound per-hop (_retry_overhead /
+    expected_permanent_losses), so the two agree in the mean — but the
+    per-step variance and the heavy-tail P_chunk omitted optical_hops, so
+    the p99s diverged (5641.58 vs 8236.43 µs at 16 MiB / N=8 ring / 32
+    credits / SACK / LLR, codex round 32, finding 4). Both tail terms now
+    compound per-hop, so equivalent paths agree in mean AND p99.
+    """
+    s = wb.make_h200_ring_theory()
+    kw = dict(data_bytes=16 << 20, num_gpus=8, algo="ring", credits=32,
+              llr_enabled=True, retry_mode="sack", collective="allreduce")
+    ber1, hops1 = 2e-7, 4
+    ber2 = 1 - (1 - 2e-7) ** 4  # the 4-hop equivalent single-hop BER
+    mean1 = s.predict(ber=ber1, optical_hops=hops1, **kw)
+    tail1 = s.predict_tail(ber=ber1, optical_hops=hops1, **kw)
+    mean2 = s.predict(ber=ber2, optical_hops=1, **kw)
+    tail2 = s.predict_tail(ber=ber2, optical_hops=1, **kw)
+    # The premise: the mean already treats these as equivalent.
+    assert mean1 == pytest.approx(mean2, rel=1e-9)
+    # The tail must too (pre-fix: tail1 ~5641.58 vs tail2 ~8236.43).
+    assert tail1 == pytest.approx(tail2, rel=1e-9)
+
+
+def test_mean_gbn_and_reload_compound_optical_hops():
+    """The mean's legacy-GBN and source-reload terms compound hops too.
+
+    Round 33, finding 4: _gbn_cascade and _source_reload_penalty received
+    the per-hop effective_ber without compounding optical_hops, while the
+    SACK arm (_retry_overhead) did — so hop/BER renormalizations agreed in
+    path failure probability and in the SACK mean but diverged in the GBN
+    mean (43.32 vs 96.79 µs at 64 MiB / N=32 fullmesh AllReduce / 128
+    credits / LLR / no FEC) and in the finite-retry-buffer reload term
+    (934.70 vs 938.04 µs at 16 MiB / N=8 / 64 credits / buffer=1). Both
+    terms now compound per-hop like every other reliability term.
+    """
+    s = wb.make_h200_fullmesh_theory()
+    # GBN mean: hops=4 at BER 1e-8 vs hops=1 at the equivalent BER.
+    kw = dict(data_bytes=64 << 20, num_gpus=32, algo="fullmesh", credits=128,
+              llr_enabled=True, retry_mode="gobackn", collective="allreduce",
+              fec_enabled=False)
+    ber1, hops1 = 1e-8, 4
+    ber2 = 1 - (1 - 1e-8) ** 4
+    mean1 = s.predict(ber=ber1, optical_hops=hops1, **kw)
+    mean2 = s.predict(ber=ber2, optical_hops=1, **kw)
+    assert mean1 == pytest.approx(mean2, rel=1e-6), (mean1, mean2)
+
+    # Source-reload (finite retry buffer) with SACK: the reload term is the
+    # only hops-sensitive addend that differs between the two calls.
+    kw_r = dict(data_bytes=16 << 20, num_gpus=8, algo="ring", credits=64,
+                llr_enabled=True, retry_mode="sack", collective="allreduce",
+                fec_enabled=False, retry_buffer_entries=1)
+    ber1r, hops1r = 1e-7, 4
+    ber2r = 1 - (1 - 1e-7) ** 4
+    r1 = s.predict(ber=ber1r, optical_hops=hops1r, **kw_r)
+    r2 = s.predict(ber=ber2r, optical_hops=1, **kw_r)
+    assert r1 == pytest.approx(r2, rel=1e-6), (r1, r2)

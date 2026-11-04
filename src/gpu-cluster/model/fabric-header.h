@@ -43,7 +43,10 @@ enum class FabricPacketType : uint8_t
     PERMANENT_LOSS = 15,
     CNP = 16, ///< Congestion Notification Packet (RoCEv2 ECN echo, scale-out only)
     RTT_PROBE = 17,   ///< RTTCC RTT probe (scale-out only; receiver reflects it)
-    RTT_RESPONSE = 18 ///< RTTCC probe reflection (echoes the probe's sequence number)
+    RTT_RESPONSE = 18, ///< RTTCC probe reflection (echoes the probe's sequence number)
+    PFC_PAUSE = 19,   ///< IEEE 802.1Qbb-style pause (scale-out only; sequence
+                      ///< number carries the paused VOQ's depth in packets)
+    PFC_RESUME = 20   ///< PFC resume (zero quanta: unpause the sender immediately)
 };
 
 /**
@@ -113,6 +116,12 @@ class FabricHeader : public Header
 
     bool IsControlPacket() const;
     bool IsCollectivePacket() const;
+    // NVLS/SHARP upload types (ALLREDUCE/ALLGATHER): the switch's SHARP
+    // engine has its own buffer pool separate from per-VC credits, so these
+    // bypass credit CONSUMPTION (not the FlowControlGate dispatch). Narrower
+    // than IsCollectivePacket — ALLTOALL/REDUCESCATTER/BROADCAST ride the
+    // DATA bulk path and DO consume credits.
+    bool IsCreditBypassPacket() const;
     bool IsP2pPacket() const;
     bool IsMemoryPacket() const;
     bool IsRetryPacket() const;

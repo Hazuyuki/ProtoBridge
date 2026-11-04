@@ -600,6 +600,50 @@ ProtocolConfig::Compile(ProtocolTransactionGraph& graph,
             if (!evalField("vc", 0, vc)) return PROTOCOL_TRANSACTION_INVALID_NODE;
             if (!evalField("response", 0, response)) return PROTOCOL_TRANSACTION_INVALID_NODE;
 
+            // Rank/VC values must fit their wire fields and the fabric: a
+            // rank >= numGpus or a value past the field width silently
+            // narrowed (src=65536 became rank 0, vc=256 became VC 0) and the
+            // op ran as a DIFFERENT transfer than the one written (codex
+            // round 28, finding 5). Fail loudly at compile time instead.
+            auto checkField = [&](const std::string& field, uint64_t value,
+                                  uint64_t max, const char* what) -> bool
+            {
+                if (value > max)
+                {
+                    if (error) *error = "transfer." + std::to_string(tidx)
+                        + "." + field + " = " + std::to_string(value)
+                        + ": " + what + " out of range (max "
+                        + std::to_string(max) + ")";
+                    return false;
+                }
+                return true;
+            };
+            if (!checkField("src", src, std::numeric_limits<uint16_t>::max(),
+                            "source rank"))
+                return PROTOCOL_TRANSACTION_INVALID_NODE;
+            if (!checkField("dst", dst, std::numeric_limits<uint16_t>::max(),
+                            "destination rank"))
+                return PROTOCOL_TRANSACTION_INVALID_NODE;
+            if (!checkField("vc", vc, std::numeric_limits<uint8_t>::max(),
+                            "virtual channel"))
+                return PROTOCOL_TRANSACTION_INVALID_NODE;
+            if (src >= numGpus)
+            {
+                if (error) *error = "transfer." + std::to_string(tidx)
+                    + ".src = " + std::to_string(src)
+                    + ": source rank exceeds numGpus ("
+                    + std::to_string(numGpus) + ")";
+                return PROTOCOL_TRANSACTION_INVALID_NODE;
+            }
+            if (dst >= numGpus)
+            {
+                if (error) *error = "transfer." + std::to_string(tidx)
+                    + ".dst = " + std::to_string(dst)
+                    + ": destination rank exceeds numGpus ("
+                    + std::to_string(numGpus) + ")";
+                return PROTOCOL_TRANSACTION_INVALID_NODE;
+            }
+
             ProtocolTransactionRequest req;
             req.kind = kind;
             req.packetType = ptype;
