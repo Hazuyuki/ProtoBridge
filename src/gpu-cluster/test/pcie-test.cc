@@ -530,6 +530,30 @@ class PcieRdmaAddressTest : public TestCase
     }
 };
 
+class PcieHorizonTest : public TestCase
+{
+  public:
+    PcieHorizonTest() : TestCase("PCIe propagation beyond the horizon remains pending") {}
+
+    void DoRun() override
+    {
+        PcieConfig config;
+        config.linkLatency = Time::Max();
+        auto fabric = CreateObject<PcieFabric>();
+        fabric->Configure(config);
+        auto nic = fabric->AddEndpoint("nic"), gpu = fabric->AddEndpoint("gpu");
+        fabric->AddLink(nic, gpu);
+        bool completed = false;
+        fabric->Write(nic, gpu, 64, [&] { completed = true; });
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(completed, false, "An unreachable write cannot complete");
+        NS_TEST_ASSERT_MSG_EQ(fabric->HasPending(), true, "Keep the outstanding transfer record");
+        NS_TEST_ASSERT_MSG_EQ(Simulator::Now() < Time::Max(), true, "Do not execute at the saturation marker");
+        fabric->Dispose();
+        Simulator::Destroy();
+    }
+};
+
 class PcieSuite : public TestSuite
 {
   public:
@@ -549,5 +573,6 @@ class PcieSuite : public TestSuite
         AddTestCase(new PcieLifetimeTest, TestCase::Duration::QUICK);
         AddTestCase(new PcieLegacySubtickTest, TestCase::Duration::QUICK);
         AddTestCase(new PcieRdmaAddressTest, TestCase::Duration::QUICK);
+        AddTestCase(new PcieHorizonTest, TestCase::Duration::QUICK);
     }
 } g_pcieSuite;

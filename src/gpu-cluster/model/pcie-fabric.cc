@@ -3,6 +3,7 @@
 
 #include "ns3/abort.h"
 #include "ns3/simulator.h"
+#include "ns3/time-bounds.h"
 #include "ns3/trace-source-accessor.h"
 
 #include <algorithm>
@@ -368,6 +369,10 @@ struct PcieFabric::Impl
     EventId Schedule(Time delay, Ready ready)
     {
         NS_ABORT_MSG_IF(delay.IsStrictlyNegative(), "Negative PCIe service time");
+        if (!TimeBounds::CanSchedule(delay))
+        {
+            return EventId();
+        }
         if (events.size() % 1024 == 0)
         {
             events.erase(std::remove_if(events.begin(),
@@ -375,7 +380,6 @@ struct PcieFabric::Impl
                                         [](const auto& e) { return e.IsExpired(); }),
                          events.end());
         }
-        delay = std::min(delay, Time::Max() - Simulator::Now());
         events.push_back(Simulator::Schedule(delay, [this, ready = std::move(ready)] {
             if (!disposed)
             {

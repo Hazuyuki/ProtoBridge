@@ -26,6 +26,8 @@
 #include <cmath>
 #include <limits>
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 
@@ -66,17 +68,7 @@ namespace
 Time
 SaturatedAdd(Time a, Time b)
 {
-    if (a <= Time(0) || b <= Time(0))
-    {
-        return (a <= Time(0)) ? b : a;
-    }
-    const int64_t aTicks = a.GetTimeStep();
-    const int64_t bTicks = b.GetTimeStep();
-    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
-    {
-        return Time::Max();
-    }
-    return Time(aTicks + bTicks);
+    return TimeBounds::SaturatingAdd(a, b);
 }
 
 // Round 69 (codex finding 3): a saturated far-future delay passed directly
@@ -169,7 +161,7 @@ FabricEndpoint::GetTypeId()
                       "Memory access latency (for MEMORY device type)",
                       TimeValue(NanoSeconds(100)),
                       MakeTimeAccessor(&FabricEndpoint::m_memoryLatency),
-                      MakeTimeChecker())
+                      MakeTimeChecker(Time(0)))
         .AddAttribute("SyncMemLatencyNs",
                       "Sync load/store latency in nanoseconds (500 for NVLink, 200 for UB)",
                       UintegerValue(500),
@@ -1100,6 +1092,7 @@ FabricEndpoint::GetMemorySize() const
 void
 FabricEndpoint::SetMemoryLatency(Time latency)
 {
+    NS_ABORT_MSG_IF(latency.IsStrictlyNegative(), "Memory latency must be nonnegative");
     m_memoryLatency = latency;
 }
 
@@ -1693,7 +1686,7 @@ FabricEndpoint::ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packe
             // Time::Max(), MacRx at tick 104, callback at tick
             // -9223372036854775705).
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(ClampEgressDelay(decodeLatency),
+                TimeBounds::Schedule(ClampEgressDelay(decodeLatency),
                                     &FabricEndpoint::ContinueReceiveAfterFec,
                                     this, pkt, header));
             return true;
@@ -2234,7 +2227,7 @@ FabricEndpoint::ProcessRetryPacket(Ptr<Packet> packet, const FabricHeader& heade
                     // into freed memory at the 100-us mark after the
                     // endpoint was disposed and released at 1 us).
                     m_deferredEgressEvents.push_back(
-                        Simulator::Schedule(retransmission.readyDelay,
+                        TimeBounds::Schedule(retransmission.readyDelay,
                                             [this, retransmission]() {
                                                 SendRetransmission(retransmission);
                                             }));
@@ -2313,7 +2306,7 @@ FabricEndpoint::DispatchRetransmissions(
             // be far in the future (codex round 16, finding 1 — see the
             // matching comment in ProcessRetryPacket).
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(retransmission.readyDelay,
+                TimeBounds::Schedule(retransmission.readyDelay,
                                     [this, retransmission]() {
                                         SendRetransmission(retransmission);
                                     }));
@@ -2676,7 +2669,7 @@ FabricEndpoint::ProcessMemoryPacket(Ptr<Packet> packet, const FabricHeader& head
             if (m_memoryLatency < Time::Max() - Simulator::Now())
             {
                 m_deferredEgressEvents.push_back(
-                    Simulator::Schedule(ClampEgressDelay(m_memoryLatency),
+                    TimeBounds::Schedule(ClampEgressDelay(m_memoryLatency),
                                         &FabricEndpoint::SendMemoryResponse,
                                         this, header.GetSourceRank(),
                                         dataPtr, availSize));
@@ -3073,7 +3066,7 @@ FabricEndpoint::ProcessPfcPausePacket(const FabricHeader& pauseHeader)
             Simulator::Cancel(pit->second);
             m_pfcPauseExpiry.erase(pit);
         }
-        EventId expiry = Simulator::Schedule(
+        EventId expiry = TimeBounds::Schedule(
             MicroSeconds(quantaUs),
             &FabricEndpoint::PfcPauseExpiredForDest, this,
             pausedDest, vc, pauseHeader.GetSourceMac());
@@ -3598,151 +3591,49 @@ FabricEndpoint::SendPacketOnDevice(Ptr<Packet> packet, uint32_t deviceIndex,
         }
     }
 
-    // Now apply WFQ scheduling after LLR/FEC processing.
-    // When multiple classes have backlog, each gets its weighted share.
-    if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
+    // A deferred send and its backlog release must both finish within the
+    // horizon. Reject before scheduling either event so the accounting balances.
+    Time delay = shapingDelay;
+    if (m_contentionModel && tc != TrafficClass::NUM_CLASSES &&
+        m_contentionModel->GetNumActiveClasses() > 1)
     {
-        uint32_t numActive = m_contentionModel->GetNumActiveClasses();
-        if (numActive > 1)
-        {
-            Time serviceTime = m_contentionModel->ComputeServiceTime(packet->GetSize(), tc);
-            Time encodeLatency = LinkUsesFec()
-                                     ? m_fecModel->GetEncodeLatency()
-                                     : Time(0);
-            Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-            // Round 66 (codex finding 4, deferred chain from round 65): a
-            // saturated pacer slot (INT64_MAX ns — reachable at 1 MiB with a
-            // 2^-40 Gbps configured rate) overflows the signed Time storage
-            // in these sums. Saturate the composed delay at Time::Max():
-            // any saturated component already means "never" for scheduling
-            // purposes, and the far-future bound keeps the addition in range.
-            // Normal inputs are untouched (each positive component is well
-            // below the horizon, so the pairwise-saturated sum is exact).
-            const Time totalDelay = SaturatedAdd(SaturatedAdd(serviceTime, encodeLatency),
-                                                 shapingDelay);
-            if (totalDelay > Time(0))
-            {
-                NS_LOG_DEBUG("WFQ contention: class=" << static_cast<int>(tc)
-                             << " numActive=" << numActive
-                             << " serviceTime=" << serviceTime.GetNanoSeconds() << "ns"
-                             << " encodeLatency=" << encodeLatency.GetNanoSeconds() << "ns");
-                // Capture the retransmit flag: m_isRetransmitting is reset
-                // before a deferred egress fires (codex round 28, finding 1).
-                const bool retransmit = m_isRetransmitting;
-                m_deferredEgressEvents.push_back(
-                    // Round 69 (codex finding 3): clamp the saturated
-                    // far-future delay to Time::Max() - Now(); Schedule
-                    // adds Now() and Time::Max() + 1 wraps past INT64_MAX.
-                    Simulator::Schedule(ClampEgressDelay(totalDelay),
-                                        [this, packet, deviceIndex, dest, retransmit]() {
-                                            SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
-                                        }));
-                // Decrement backlog after packet finishes transmission
-                // (serialization). Tracked like the deferred send itself:
-                // the lambda captures raw `this`, so DoDispose must cancel
-                // it or it fires on freed memory (codex round 14, finding 1).
-                // Capture the model the INCREMENT ran on (codex round 20,
-                // finding 7): reading m_contentionModel at fire time
-                // dereferences whatever is installed THEN — a mid-flight
-                // SetContentionModel(nullptr) aborts on the null pointer and
-                // a replacement model gets debited for backlog it never
-                // accrued.
-                Ptr<ContentionModel> model = m_contentionModel;
-                // Round 67 (codex finding 4): totalDelay can be the
-                // saturated far-future bound; adding serialization to it
-                // overflows the signed Time storage. Saturate the sum.
-                Time txDone = SaturatedAdd(totalDelay, serialization);
-                EventId decrEv = Simulator::Schedule(ClampEgressDelay(txDone), [model, tc]() {
-                    if (model)
-                    {
-                        model->DecrementBacklog(tc);
-                    }
-                });
-                m_deferredEgressEvents.push_back(decrEv);
-                TrackBacklogDecrement(decrEv, model, tc);
-                return true;
-            }
-        }
+        delay = SaturatedAdd(delay, m_contentionModel->ComputeServiceTime(packet->GetSize(), tc));
     }
-
-    // No WFQ contention or single class: apply FEC encode latency only
     if (LinkUsesFec())
     {
-        Time encodeLatency = m_fecModel->GetEncodeLatency();
-        // Round 66 (codex finding 4): same saturated-pacer composition as
-        // the WFQ branch above — saturate at Time::Max() instead of
-        // overflowing the signed Time addition.
-        const Time delay = SaturatedAdd(encodeLatency, shapingDelay);
-        if (delay > Seconds(0))
-        {
-            // Capture the retransmit flag (codex round 28, finding 1).
-            const bool retransmit = m_isRetransmitting;
-            m_deferredEgressEvents.push_back(
-                Simulator::Schedule(ClampEgressDelay(delay),
-                                    [this, packet, deviceIndex, dest, retransmit]() {
-                                        SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
-                }));
-            // Decrement backlog after serialization. Tracked for DoDispose
-            // like the deferred send above (raw-`this` capture; codex round
-            // 14, finding 1). Capture the model the increment ran on
-            // (codex round 20, finding 7 — see the WFQ branch above).
-            if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
-            {
-                Ptr<ContentionModel> model = m_contentionModel;
-                Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-                // Round 67 (codex finding 4): saturate — delay can be the
-                // saturated far-future bound (see the WFQ branch above).
-                EventId decrEv = Simulator::Schedule(
-                    ClampEgressDelay(SaturatedAdd(delay, serialization)),
-                    [model, tc]() {
-                        if (model)
-                        {
-                            model->DecrementBacklog(tc);
-                        }
-                    });
-                m_deferredEgressEvents.push_back(decrEv);
-                TrackBacklogDecrement(decrEv, model, tc);
-            }
-            return true;
-        }
+        delay = SaturatedAdd(delay, m_fecModel->GetEncodeLatency());
     }
-
-    // Immediate send (no FEC latency, no WFQ contention). DCQCN rate backoff
-    // (shapingDelay > 0) defers the egress; otherwise the send is synchronous
-    // (parity-identical to the unmounted baseline).
-    if (shapingDelay > Time(0))
+    const bool counted = m_contentionModel && tc != TrafficClass::NUM_CLASSES;
+    const Time done = counted
+                          ? SaturatedAdd(delay, m_contentionModel->GetSerializationTime(packet->GetSize()))
+                          : delay;
+    if (!TimeBounds::CanSchedule(delay) || !TimeBounds::CanSchedule(done))
     {
-        // Capture the retransmit flag (codex round 28, finding 1).
+        if (counted)
+        {
+            m_contentionModel->DecrementBacklog(tc);
+        }
+        return false;
+    }
+    if (delay > Time(0))
+    {
         const bool retransmit = m_isRetransmitting;
         m_deferredEgressEvents.push_back(
-            Simulator::Schedule(shapingDelay, [this, packet, deviceIndex, dest, retransmit]() {
+            TimeBounds::Schedule(delay, [this, packet, deviceIndex, dest, retransmit] {
                 SendDeferredEgressInternal(packet, deviceIndex, dest, retransmit);
             }));
     }
     else
     {
-        Ptr<NetDevice> dev = m_devices[deviceIndex];
         ArmRetryTimeoutOnWire(packet);
-        dev->Send(packet, dest, 0x0800);
+        m_devices[deviceIndex]->Send(packet, dest, 0x0800);
     }
-    if (m_contentionModel && tc != TrafficClass::NUM_CLASSES)
+    if (counted)
     {
-        // Tracked for DoDispose like the deferred sends above (raw-`this`
-        // capture; codex round 14, finding 1). Capture the model the
-        // increment ran on (codex round 20, finding 7 — see the WFQ branch).
         Ptr<ContentionModel> model = m_contentionModel;
-        Time serialization = m_contentionModel->GetSerializationTime(packet->GetSize());
-        // Round 67 (codex finding 4): saturate — shapingDelay can be the
-        // saturated far-future bound (see the WFQ branch above).
-        EventId decrEv = Simulator::Schedule(ClampEgressDelay(SaturatedAdd(shapingDelay, serialization)),
-                                             [model, tc]() {
-                                                 if (model)
-                                                 {
-                                                     model->DecrementBacklog(tc);
-                                                 }
-                                             });
-        m_deferredEgressEvents.push_back(decrEv);
-        TrackBacklogDecrement(decrEv, model, tc);
+        EventId event = TimeBounds::Schedule(done, [model, tc] { model->DecrementBacklog(tc); });
+        m_deferredEgressEvents.push_back(event);
+        TrackBacklogDecrement(event, model, tc);
     }
     return true;
 }
@@ -3803,7 +3694,7 @@ FabricEndpoint::SendDeferredEgressInternal(Ptr<Packet> packet, uint32_t deviceIn
             // callback (codex round 28, finding 2).
             PruneDeferredEgressEvents();
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(NanoSeconds(500), [this, packet, deviceIndex, dest, isRetransmit]() {
+                TimeBounds::Schedule(NanoSeconds(500), [this, packet, deviceIndex, dest, isRetransmit]() {
                     SendDeferredEgressInternal(packet, deviceIndex, dest, isRetransmit);
                 }));
             return;

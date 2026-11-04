@@ -5,6 +5,7 @@
  */
 
 #include "point-to-point-net-device.h"
+#include "ns3/time-bounds.h"
 
 #include "point-to-point-channel.h"
 #include "ppp-header.h"
@@ -234,12 +235,18 @@ PointToPointNetDevice::TransmitStart(Ptr<Packet> p)
     // schedule an event that will be executed when the transmission is complete.
     //
     NS_ASSERT_MSG(m_txMachineState == READY, "Must be READY to transmit");
+    const Time txTime = TimeBounds::FromBitRate(TimeBounds::Wide{p->GetSize()} * 8,
+                                              m_bps.GetBitRate());
+    const Time txCompleteTime = TimeBounds::SaturatingAdd(txTime, m_tInterframeGap);
+    if (!TimeBounds::CanSchedule(txCompleteTime) ||
+        !TimeBounds::CanSchedule(TimeBounds::SaturatingAdd(txTime, m_channel->GetDelay())))
+    {
+        m_phyTxDropTrace(p);
+        return false;
+    }
     m_txMachineState = BUSY;
     m_currentPkt = p;
     m_phyTxBeginTrace(m_currentPkt);
-
-    Time txTime = m_bps.CalculateBytesTxTime(p->GetSize());
-    Time txCompleteTime = txTime + m_tInterframeGap;
 
     NS_LOG_LOGIC("Schedule TransmitCompleteEvent in " << txCompleteTime.As(Time::S));
     Simulator::Schedule(txCompleteTime, &PointToPointNetDevice::TransmitComplete, this);
@@ -271,19 +278,16 @@ PointToPointNetDevice::TransmitComplete()
     m_phyTxEndTrace(m_currentPkt);
     m_currentPkt = nullptr;
 
-    Ptr<Packet> p = m_queue->Dequeue();
-    if (!p)
+    while (Ptr<Packet> p = m_queue->Dequeue())
     {
-        NS_LOG_LOGIC("No pending packets in device queue after tx complete");
-        return;
+        m_snifferTrace(p);
+        m_promiscSnifferTrace(p);
+        TransmitStart(p);
+        if (m_txMachineState == BUSY)
+        {
+            return;
+        }
     }
-
-    //
-    // Got another packet off of the queue, so start the transmit process again.
-    //
-    m_snifferTrace(p);
-    m_promiscSnifferTrace(p);
-    TransmitStart(p);
 }
 
 bool
@@ -520,6 +524,15 @@ PointToPointNetDevice::Send(Ptr<Packet> packet, const Address& dest, uint16_t pr
     // shoving it out the door.
     //
     AddHeader(packet, protocolNumber);
+
+    const Time txTime = TimeBounds::FromBitRate(TimeBounds::Wide{packet->GetSize()} * 8,
+                                              m_bps.GetBitRate());
+    if (!TimeBounds::CanSchedule(TimeBounds::SaturatingAdd(txTime, m_tInterframeGap)) ||
+        !TimeBounds::CanSchedule(TimeBounds::SaturatingAdd(txTime, m_channel->GetDelay())))
+    {
+        m_macTxDropTrace(packet);
+        return false;
+    }
 
     m_macTxTrace(packet);
 

@@ -98,7 +98,7 @@ class RttccRateMachine : public Object
     struct FlowState
     {
         double rateBps{0.0};      ///< Current rate (B/s); 0 = at line rate
-        int64_t nextSendNs{0};    ///< Earliest next-chunk egress (pacer), ns
+        __uint128_t nextSendNs{0}; ///< Nanosecond ledger spanning every native Time resolution.
         int64_t lastProbeNs{-1};  ///< Last probe send time (-1 = never)
         uint32_t nextProbeSeq{0}; ///< Next probe sequence number
         std::unordered_map<uint32_t, int64_t> inflightProbes; ///< seq -> sentNs

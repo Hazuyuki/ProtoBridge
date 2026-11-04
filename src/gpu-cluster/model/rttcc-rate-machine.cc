@@ -14,31 +14,18 @@
 #include <algorithm>
 #include <limits>
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 
 namespace
 {
-
-// Round 74 (codex findings 6+15): the pacer ledger's nanosecond count
-// saturates at INT64_MAX, but NanoSeconds(count) multiplies by 1e3 at PS
-// and 1e6 at FS before Schedule sees the result, so a count above
-// INT64_MAX/1e3 wraps to a negative Time and bypasses the endpoint
-// shaping gate (probe: PS, 1-MiB chunks, 2^-40-Gbps floor -> second
-// chunk paced at -2000 ticks). Saturate at the remaining horizon
-// instead; a wrapped/negative count clamps there too.
 Time
-ClampedNanoSeconds(int64_t delayNs)
+ClampedNanoSeconds(TimeBounds::Wide ns)
 {
-    const Time horizon = Time::Max() - Simulator::Now();
-    const Time t = NanoSeconds(delayNs);
-    if (t.IsStrictlyNegative() || t > horizon)
-    {
-        return horizon;
-    }
-    return t;
+    return std::min(TimeBounds::FromNanoseconds(ns), TimeBounds::Horizon());
 }
-
 } // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("RttccRateMachine");
@@ -60,13 +47,13 @@ RttccRateMachine::GetTypeId()
                           "Target RTT: samples above back the rate off.",
                           TimeValue(NanoSeconds(10000)),
                           MakeTimeAccessor(&RttccRateMachine::m_targetRtt),
-                          MakeTimeChecker())
+                          MakeTimeChecker(Time(0)))
             // Minimum spacing between RTT probes on one flow.
             .AddAttribute("ProbeInterval",
                           "Minimum spacing between RTT probes per flow.",
                           TimeValue(NanoSeconds(5000)),
                           MakeTimeAccessor(&RttccRateMachine::m_probeInterval),
-                          MakeTimeChecker())
+                          MakeTimeChecker(Time(0)))
             // Additive rate increase per below-target sample.
             .AddAttribute("AdditiveIncreaseGbps",
                           "Rate increase per below-target RTT sample (Gbps).",
@@ -115,8 +102,9 @@ RttccRateMachine::GetOrCreate(FlowKey flowKey)
 double
 RttccRateMachine::LineRateBps() const
 {
-    // 1 Gbps = 1.25e8 B/s (same convention as DcqcnRateMachine).
-    return m_lineRateGbps * 1.25e8;
+    double rate;
+    return TimeBounds::TryBytesPerSecond(m_lineRateGbps, rate)
+               ? rate : std::numeric_limits<double>::max();
 }
 
 bool
@@ -192,60 +180,16 @@ RttccRateMachine::ShapingDelay(uint32_t chunkBytes, FlowKey flowKey)
     auto it = m_flows.find(flowKey);
     if (it == m_flows.end() || it->second.rateBps <= 0.0)
     {
-        // Unknown flow or at line rate: un-paced (the NetDevice serializes at
-        // the line rate anyway), byte-identical to the unmounted baseline.
         return Time(0);
     }
-    FlowState& s = it->second;
-    int64_t nowNs = Simulator::Now().GetNanoSeconds();
-    int64_t delayNs = (s.nextSendNs > nowNs) ? (s.nextSendNs - nowNs) : 0;
-    // The rate slot this chunk occupies (ns); the next chunk may egress one
-    // slot after this chunk's egress start (same pacer as the per-QP ceiling).
-    // Round 65 (codex finding 9): same saturated slot conversion and
-    // deadline addition as the DCQCN pacer. A positive configured rate can
-    // still make (chunkBytes / rateBps) * 1e9 overflow binary64 (rate
-    // 2^-1022 Gbps, 1-MiB chunk), raising SIGFPE under floating-point
-    // diagnostics before the saturation comparison can run, so guard the
-    // product with a pre-check on the seconds quotient; the guarded product
-    // is bit-identical to the historical (bytes / rate) * 1e9 on every
-    // non-overflow input. A NaN rate saturates too: !(NaN <= x) is true.
-    // Round 74 (codex finding 15): the same must hold for the DIVISION
-    // itself — a subnormal s.rateBps makes chunkBytes / rateBps overflow to
-    // +inf (FE_OVERFLOW under fenv traps) before the bound check runs.
-    // Pre-check the division: chunkBytes <= rateBps * (INT64_MAX / 1e9)
-    // keeps the quotient inside the nanosecond bound the second guard
-    // already enforces. Any slower or NaN rate saturates.
-    const double maxSlotSec = 9223372036854775807.0 / 1e9;
-    double slotNsD;
-    if (!(static_cast<double>(chunkBytes) <= s.rateBps * maxSlotSec))
-    {
-        // chunkBytes/rateBps overflows, is +inf, or is NaN — the slot is
-        // unrepresentable either way.
-        slotNsD = 9223372036854775807.0;
-    }
-    else
-    {
-        const double slotSec = static_cast<double>(chunkBytes) / s.rateBps;
-        slotNsD = (slotSec <= maxSlotSec) ? slotSec * 1e9 : 9223372036854775807.0;
-    }
-    if (!(slotNsD <= 9223372036854775807.0))
-    {
-        // +inf from the division itself, or a NaN rate — saturate.
-        slotNsD = 9223372036854775807.0;
-    }
-    int64_t slotNs = (slotNsD >= 9223372036854775807.0)
-                         ? std::numeric_limits<int64_t>::max()
-                         : static_cast<int64_t>(slotNsD);
-    slotNs = std::max<int64_t>(1, slotNs);
-    s.nextSendNs = (slotNs > std::numeric_limits<int64_t>::max() - (nowNs + delayNs))
-                       ? std::numeric_limits<int64_t>::max()
-                       : (nowNs + delayNs) + slotNs;
-    // Round 74 (codex finding 6): NanoSeconds(delayNs) multiplies the count
-    // by 1e3 at PS and 1e6 at FS before Schedule sees the result, so a
-    // delayNs below INT64_MAX but above INT64_MAX/1e3 wraps to a negative
-    // Time and bypasses the endpoint shaping gate. Saturate at the
-    // remaining horizon instead (same clamp as the DCQCN pacer).
-    return (delayNs > 0) ? ClampedNanoSeconds(delayNs) : Time(0);
+    auto& state = it->second;
+    const auto now = TimeBounds::ToNanoseconds(Simulator::Now());
+    const auto start = std::max(now, state.nextSendNs);
+    const auto delay = start - now;
+    const auto slot = TimeBounds::PacingSlot(chunkBytes, state.rateBps);
+    const auto limit = TimeBounds::NanosecondLimit();
+    state.nextSendNs = slot > limit - start ? limit : start + slot;
+    return delay > 0 ? ClampedNanoSeconds(delay) : Time(0);
 }
 
 double

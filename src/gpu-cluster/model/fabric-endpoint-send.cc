@@ -20,37 +20,18 @@
 #include <limits>
 #include <cmath>
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 
 namespace
 {
-
-// Round 74 (codex finding 9): m_syncMemLatencyNs / m_asyncMemLatencyNs are
-// uint64_t config values fed to NanoSeconds(latencyNs). NanoSeconds takes
-// int64_t, so a configured latency above INT64_MAX wraps the count negative
-// BEFORE the ×1e3/×1e6 resolution multiply — and a count below INT64_MAX
-// but above INT64_MAX/1e3 wraps at PS/FS — producing a negative Time the
-// completion callback then schedules in the past. Clamp the converted
-// Time against the remaining horizon the same way the rate machines do;
-// an unreachable completion stays unscheduled (the request was already
-// sent / queued, so the transfer's wire side is unaffected).
 Time
-ClampedSemanticLatencyNs(uint64_t latencyNs)
+ClampedSemanticLatencyNs(uint64_t ns)
 {
-    const Time horizon = Time::Max() - Simulator::Now();
-    if (latencyNs > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-    {
-        return horizon;
-    }
-    const Time t = NanoSeconds(static_cast<int64_t>(latencyNs));
-    if (t.IsStrictlyNegative() || t > horizon)
-    {
-        return horizon;
-    }
-    return t;
+    return std::min(TimeBounds::FromNanoseconds(ns), TimeBounds::Horizon());
 }
-
 } // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("FabricEndpointSend");
@@ -1126,7 +1107,7 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
         if (completionDelay < Time::Max() - Simulator::Now())
         {
             m_deferredEgressEvents.push_back(
-                Simulator::Schedule(completionDelay,
+                TimeBounds::Schedule(completionDelay,
                                     &FabricEndpoint::NotifyMemorySemanticComplete,
                                     this, destRank, address, accessType));
         }
@@ -1157,7 +1138,7 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
     if (completionDelay < Time::Max() - Simulator::Now())
     {
         m_deferredEgressEvents.push_back(
-            Simulator::Schedule(completionDelay,
+            TimeBounds::Schedule(completionDelay,
                                 &FabricEndpoint::NotifyMemorySemanticComplete,
                                 this, destRank, address, accessType));
     }

@@ -9,6 +9,8 @@
 #include <cmath>
 #include <limits>
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 NS_OBJECT_ENSURE_REGISTERED(RdmaSubmissionModel);
@@ -146,12 +148,13 @@ ParseNanoseconds(Time* dest, const std::string& value)
     try
     {
         size_t pos = 0;
-        long long number = std::stoll(value, &pos);
-        if (pos != value.size() || number < 0)
+        unsigned long long number = std::stoull(value, &pos);
+        const auto first = value.find_first_not_of(" \t\r\n\f\v");
+        if (pos != value.size() || first == std::string::npos || value[first] == '-')
         {
             return false;
         }
-        *dest = NanoSeconds(number);
+        *dest = TimeBounds::FromNanoseconds(number);
         return true;
     }
     catch (const std::exception&)
@@ -590,19 +593,6 @@ RdmaSubmissionModel::SetObserver(Observer observer)
     m_observer = std::move(observer);
 }
 
-// Round 68 (codex finding 3): a large RELATIVE delay wraps inside
-// DefaultSimulatorImpl::Schedule's `delay + TimeStep(now)` — Time::Max()
-// at now >= 1 exceeds INT64_MAX. Clamp every relative delay to the safe
-// horizon Time::Max() - now; the event then lands at Time::Max(), the
-// latest timestamp the simulator can represent (a delay beyond it is the
-// same modeling outcome as saturation: effectively never).
-static Time
-ClampRelativeDelay(Time delay)
-{
-    const Time horizon = Time::Max() - Simulator::Now();
-    return delay > horizon ? horizon : delay;
-}
-
 void
 RdmaSubmissionModel::Schedule(Time delay, std::function<void()> fn)
 {
@@ -610,11 +600,11 @@ RdmaSubmissionModel::Schedule(Time delay, std::function<void()> fn)
                                   m_events.end(),
                                   [](const EventId& e) { return e.IsExpired(); }),
                    m_events.end());
-    // Round 69 (codex finding 1): clamp inside the common wrapper so no
-    // call site can pass a saturated delay that wraps in Schedule's
-    // `delay + TimeStep(now)` (a saturated Time::Max() delay at now >= 1
-    // exceeds INT64_MAX). The clamped event lands at Time::Max().
-    m_events.push_back(Simulator::Schedule(ClampRelativeDelay(delay), [this, fn = std::move(fn)] {
+    if (!TimeBounds::CanSchedule(delay))
+    {
+        return;
+    }
+    m_events.push_back(TimeBounds::Schedule(delay, [this, fn = std::move(fn)] {
         if (!m_disposed)
         {
             fn();
@@ -633,17 +623,7 @@ RdmaSubmissionModel::Schedule(Time delay, std::function<void()> fn)
 static Time
 SaturatedAddTime(Time a, Time b)
 {
-    if (a <= Time(0) || b <= Time(0))
-    {
-        return (a <= Time(0)) ? b : a;
-    }
-    const int64_t aTicks = a.GetTimeStep();
-    const int64_t bTicks = b.GetTimeStep();
-    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
-    {
-        return Time::Max();
-    }
-    return Time(aTicks + bTicks);
+    return TimeBounds::SaturatingAdd(a, b);
 }
 
 // (the Schedule-wrapper clamp lives above with the wrapper itself).
@@ -651,217 +631,11 @@ SaturatedAddTime(Time a, Time b)
 Time
 RdmaSubmissionModel::Reserve(uint64_t bytes, double gbps, Time& free, Time earliest)
 {
-    Time start = std::max(earliest, free);
-    // Round 66 (codex finding 7): an individually oversized service
-    // overflows Time's signed ns storage inside Seconds() (the checked
-    // multiplication asserts, and under floating-point diagnostics the
-    // conversion is undefined) BEFORE the ledger saturation below can run:
-    // wqeBytes=125000000 at pcieReadGbps=2^-34 already exceeds INT64_MAX
-    // ns. Saturate the service at Time::Max().
-    Time service(0);
-    if (gbps > 0)
-    {
-        // Round 71 (codex findings 1-3): the round-70 resolution switch
-        // still multiplied before bounding, double-rounded against ns-3's
-        // int64x64 conversion, and silently absorbed Y/D/H/MIN into the FS
-        // branch:
-        //   - FS multiply overflow (finding 1): the bound check ran on the
-        //     PRODUCT, so `sec * 1e15` overflowed to +inf (FE_OVERFLOW,
-        //     SIGFPE under traps) before the guard could fire for finite
-        //     sec as small as ~5.12e293 (probe: 64 B @ 1e-300 gbps, FS ->
-        //     sec * 1e15 = inf). The pre-multiply bound must compare sec
-        //     itself against the largest representable service.
-        //   - Double-rounding mismatch (finding 2): `llround(sec * tps)`
-        //     rounds the binary64 product, not the real value; ns-3's
-        //     Seconds() converts through 64.64 fixed point and rounds
-        //     that, so the two can disagree by one tick (probe at NS:
-        //     64 B @ 204.8 Gbps -> double path gives llround(2.5) = 3,
-        //     Seconds() gives 2; exact fixed-point value 2.499999...).
-        //     Fixed by delegating every in-range service to Seconds().
-        //   - Resolution fall-through (finding 3): the round-70 switch
-        //     handled S/MS/US/NS/PS and let default take FS — but ns-3's
-        //     Time::Y/D/H/MIN also fall into default, where the FS scale
-        //     was wrong (probe at MIN: 7.5e9 B @ 1 Gbps, sec = 60 s ->
-        //     6e16 FS ticks where Seconds(60) = 1 tick of 60 s). All ten
-        //     units are now explicit, with the MIN/H/D/Y ticks-per-second
-        //     derived from ns-3's Scale(): MIN 1/60, H 1/3600, D 1/86400,
-        //     Y 1/31536000.
-        // Round 70's history (codex findings 2-5 of that round) is kept
-        // verbatim below for the record; note that its per-resolution
-        // numbers were corrected in round 71 (finding 4 of that round):
-        //   - S/MS: GetNanoSeconds() wraps int64 (I * 10^k overflows), so
-        //     the round-69 denominator was negative and an ordinary
-        //     service became a huge NEGATIVE Time (probe: 32 B @ 400 Gbps
-        //     at MS -> -5.9e24 ticks);
-        //   - US: GetNanoSeconds() at US wraps to -1000 (native probe of
-        //     Time::Max().GetNanoSeconds(), not INT64_MAX as round 70
-        //     claimed), so the round-69 tps projection was meaningless;
-        //   - NS/PS/FS: the integer division inside GetNanoSeconds()
-        //     truncates the tick count first, so the scale factor was
-        //     wrong (native probe at PS: 1000 B @ 8 Gbps with the
-        //     round-69 formula -> 1000000 ticks, i.e. 1 us of service
-        //     where the true value is 1 ns... the formula mixed tick
-        //     scales; Seconds(1e-6 s) at PS = 10^6 ticks);
-        //   - the round-69 guard `ticksNeeded > (double)INT64_MAX` used
-        //     strict > while binary64((double)INT64_MAX) == 2^63 exactly,
-        //     so a service whose product rounds to exactly 2^63 slipped
-        //     through (probe: 64 B at gbps ~= 5.55e-14 -> sec*1e12 == 2^63
-        //     exactly at PS; at NS the same input gives 9.223372036854776e+18
-        //     < 2^63);
-        //   - the unguarded `sec * 2^63` multiply overflows to +inf for
-        //     finite sec as small as ~5.12e293 (probe: 64 B @ 1e-300).
-        // Wall-clock horizons of Time::Max() for reference (native
-        // probes): PS = 9223372.036854776 s, FS = 9223.3720368547765 s.
-        //
-        // Current conversion: derive ticks-per-second from the resolution
-        // (1 tick = 10^(9-k) ns at 10^-k s resolution; MIN/H/D/Y from
-        // ns-3's Scale() coefficients), compare sec against the largest
-        // in-range service BEFORE any multiply (no overflowable
-        // multiply), saturate at the inclusive 2^63 bound, and delegate
-        // every in-range service to Seconds() so the tick count matches
-        // ns-3's int64x64 rounding exactly.
-        // Round 72 (codex finding 1): finite gbps can still overflow the
-        // multiply below (gbps = 1e300 is accepted by the isfinite check but
-        // gbps * 1e9 = inf, raising FE_OVERFLOW -> SIGFPE under fenv traps
-        // before any guard sees it). Dividing by 1e9 first makes the
-        // expression overflow-free for every finite gbps: bitRatio <=
-        // 0x1p+64, 1e9 is exact, so bitRatio / 1e9 <= 0x1p+38.
-        // Round 73 (codex finding 1): the reassociated division still
-        // overflows binary64 when the ROUNDED intermediate bitRatio pushes
-        // the quotient past DBL_MAX even though the exact quotient is
-        // representable (bytes = 500000002, gbps = 0x1.000000112e0bfp-1022:
-        // exact sec = DBL_MAX*(1+2.1e-18) is representable, but bitRatio's
-        // ~2^-29 relative rounding makes the binary64 quotient exceed
-        // DBL_MAX*(1+2^-53) -> FE_OVERFLOW -> SIGFPE under fenv traps
-        // before the bound check runs). Pre-divide the saturation
-        // threshold into gbps units and skip the divide entirely when the
-        // rate is at or below it (gbps <= 0 is validated above, so the
-        // branch covers zero, subnormal, and small-enough-that-the-exact-
-        // sec-exceeds-every-representable-bound rates); only an in-range
-        // gbps reaches `bitRatio / gbps`, which then cannot overflow.
-        const double bitRatio = static_cast<double>(bytes) * 8 / 1e9;
-        double ticksPerSecond;
-        switch (Time::GetResolution())
-        {
-        case Time::S:
-            ticksPerSecond = 1;
-            break;
-        case Time::MS:
-            ticksPerSecond = 1e3;
-            break;
-        case Time::US:
-            ticksPerSecond = 1e6;
-            break;
-        case Time::NS:
-            ticksPerSecond = 1e9;
-            break;
-        case Time::PS:
-            ticksPerSecond = 1e12;
-            break;
-        case Time::FS:
-            ticksPerSecond = 1e15;
-            break;
-        case Time::MIN:
-            ticksPerSecond = 1.0 / 60;
-            break;
-        case Time::H:
-            ticksPerSecond = 1.0 / 3600;
-            break;
-        case Time::D:
-            ticksPerSecond = 1.0 / 86400;
-            break;
-        case Time::Y:
-            ticksPerSecond = 1.0 / 31536000;
-            break;
-        default: // Time::LAST and any future unit added by ns-3
-            ticksPerSecond = 1;
-            break;
-        }
-        // Inclusive pre-multiply bound: the largest finite sec whose
-        // Seconds() conversion stays below 2^63 ticks. The margin of one
-        // ULP at the bound absorbs double-rounding of the division that
-        // produced sec, so Seconds() can never reach the checked 2^63
-        // multiply inside ns-3. Everything at or beyond the bound is a
-        // degenerate service and pins the ledger at Time::Max().
-        const double saturateGbps =
-            bitRatio / ((0x1p63 - 0x1p11) / ticksPerSecond);
-        if (!(gbps > saturateGbps))
-        {
-            // gbps <= 0 (validated above), subnormal, or small enough
-            // that the exact sec exceeds every representable bound:
-            // saturate without performing the overflowing divide.
-            service = Time::Max();
-        }
-        else
-        {
-            const double sec = bitRatio / gbps;
-            // Round 72 (codex finding 1): at coarse resolutions (MIN/H/D/Y)
-            // Seconds() can return a NEGATIVE Time for a large finite sec.
-            // ns-3's int64x64(double) builds hi = (int64)sec by C++
-            // float-to-int conversion; that conversion is out of range for
-            // sec >= 2^63, so hi truncates to INT64_MIN, and
-            // lo = (uint64)((sec - hi) * 2^64) is then built from that
-            // garbage hi. Multiplying by Scale(MIN) = 6e16
-            // (INT64X64_USE_128 build) computes lo * 6e16 in signed
-            // __int128: negative x positive wraps to a large positive
-            // 128-bit value whose low 64 bits are a NEGATIVE tick count,
-            // so the checked 2^63 multiply passes and Round() emits
-            // negative ticks (UBSan probe: MIN 64 B @
-            // gbps = 5.551115123125783e-26 -> service = -153722867280912930
-            // ticks, then the ledger subtraction
-            // INT64_MAX - serviceTicks overflows signed int64). The clamp
-            // below pins a negative service at Time::Max() as well: a
-            // degenerate rate should pin the ledger at the far-future
-            // bound, not wrap it past Time(0). The bound already compares
-            // sec itself, so the clamp only fires for the coarse-unit
-            // Seconds() window 2^63 s <= sec < bound (at MIN that window
-            // spans [2^63, 60*(2^63-2^11)) s; at S/MS/US/NS/PS/FS the
-            // window is empty because Seconds() asserts before 2^63).
-            // Round 74 (codex finding 1): Seconds() accepts any sec < the
-            // tick bound above, but at coarse resolutions (MIN/H/D/Y) the
-            // bound is >> 2^63 and ns-3's int64x64(double) constructor
-            // wraps its hi = (int64)trunc(sec) conversion modulo 2^128 for
-            // sec >= 2^63 (out-of-range float-to-int conversion): sec =
-            // 2^64 returns EXACTLY ZERO ticks (probe: MIN, 64 B @
-            // 0x1.12e0be826d695p-85 -> sec = 2^64 -> ticks = 0), and the
-            // IsStrictlyNegative clamp below accepts zero, so a degenerate
-            // nonzero rate yields ZERO service instead of Time::Max().
-            // Other sec >= 2^63 wrap to arbitrary-sign garbage (probe: 3e19
-            // -> negative). Only sec < 2^63 converts sanely. Tighten the
-            // bound to min(tickBound, 2^63): at S..FS the tick bound is
-            // already < 2^63 so this is a no-op; at MIN/H/D/Y every sec in
-            // [2^63, tickBound) now saturates, covering both the zero-wrap
-            // and the positive-garbage windows.
-            service = (sec >= std::min((0x1p63 - 0x1p11) / ticksPerSecond, 0x1p63))
-                          ? Time::Max()
-                          : Seconds(sec);
-            if (service.IsStrictlyNegative())
-            {
-                // Zero is valid when a small memory access rounds below one tick.
-                service = Time::Max();
-            }
-        }
-    }
-    // Round 65 (codex finding 8): saturate the free ledger instead of
-    // wrapping. The saturating bound is a no-op for every realistic service
-    // (start + service wrapping needs ~292 years of queued PCIe service at
-    // pcieReadGbps=2^-32), but a degenerate gbps pins the ledger at the
-    // far-future bound below instead of wrapping it past Time(0).
-    // wqeBytes=125000000 @ pcieReadGbps=2^-32 is the probe.
-    // Round 68 (codex finding 1): the ledger must be saturated in RAW TICKS,
-    // not nanoseconds. The round-65/66 ns-based ledger was correct only at
-    // the NS default resolution: GetNanoSeconds() divides by 10^3 per
-    // coarser step, so at PS a 1 us service (10^6 ticks) collapsed to
-    // 10^3 ns and free was reconstructed 10^3x too small
-    // (ReserveSourceRead(1000) @ pcieReadGbps=8 returned 1000 ticks
-    // instead of 10^6 — a negative Publish delay). The tick form is exact
-    // at every resolution; GetNanoSeconds() itself overflows at MS and
-    // coarser (INT64_MAX ticks x 10^6), which the tick form never touches.
-    const int64_t startTicks = start.GetTimeStep();
-    const int64_t serviceTicks = service.GetTimeStep();
-    free = Time(std::numeric_limits<int64_t>::max() - serviceTicks < startTicks
-                    ? std::numeric_limits<int64_t>::max()
-                    : startTicks + serviceTicks);
+    const Time start = std::max(earliest, free);
+    const Time service = gbps > 0.0
+                             ? TimeBounds::FromRate(static_cast<double>(bytes) * 8 / 1e9, gbps)
+                             : Time(0);
+    free = TimeBounds::SaturatingAdd(start, service);
     return free;
 }
 
@@ -1289,11 +1063,9 @@ RdmaSubmissionModel::Pump(const QpKey& key)
             std::max(buildEnd, qp.publishFree),
             m_config.initiator == "cpu" ? m_config.cpuPublish : m_config.publish);
         qp.publishFree = publishEnd;
-        // Round 68 (codex finding 3): publishEnd can be the saturated
-        // Time::Max(); the relative form exceeds INT64_MAX and wraps
-        // inside DefaultSimulatorImpl::Schedule — clamp to the safe
-        // horizon (lands at Time::Max(), never executes anyway).
-        Schedule(ClampRelativeDelay(publishEnd - Simulator::Now()),
+        // A saturated publication ledger leaves the work pending; the
+        // bounded scheduler does not execute it at Time::Max().
+        Schedule(publishEnd - Simulator::Now(),
                  [this, key, id] { Publish(key, id); });
         m_stats.peakQpOutstanding = std::max<uint64_t>(m_stats.peakQpOutstanding, qp.occupied);
         uint64_t occupied = 0;
@@ -1318,7 +1090,7 @@ RdmaSubmissionModel::Publish(const QpKey& key, uint64_t id)
     else if (!qp.batchEvent.IsPending())
     {
         qp.batchEvent =
-            Simulator::Schedule(ClampRelativeDelay(m_config.batchTimeout), [this, key] {
+            TimeBounds::Schedule(m_config.batchTimeout, [this, key] {
             if (!m_disposed)
             {
                 Ring(key);
@@ -1401,7 +1173,7 @@ RdmaSubmissionModel::Ring(const QpKey& key)
         qp.fetchFree = fetched;
         // Round 68 (codex finding 3): fetched can be the saturated
         // Time::Max() — clamp the relative delay (see Pump above).
-        Schedule(ClampRelativeDelay(fetched - Simulator::Now()),
+        Schedule(fetched - Simulator::Now(),
                  [this, id] { ExecuteWork(id); });
     }
 }

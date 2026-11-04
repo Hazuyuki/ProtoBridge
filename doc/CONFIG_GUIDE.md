@@ -431,3 +431,54 @@ Author a `.cfg` with an `[op]` transfer stencil (no `collective=`/`algorithm=`).
 The stencil runs through the generic runner with the profile's PEX bundle
 applied — see [ARCHITECTURE.md](ARCHITECTURE.md#config-driven-protocol-stack-cfg)
 and `h200-request-response.cfg`.
+
+## 6. Time values and the simulation horizon
+
+ns-3 stores time in signed 64-bit ticks. A tick is one nanosecond by default;
+`Time::SetResolution()` can select Y, D, H, MIN, S, MS, US, NS, PS, or FS.
+Changing resolution also changes the largest representable simulation duration.
+
+ProtoBridge's bounded schedulers reserve `Time::Max()` as an unreachable marker.
+They schedule only nonnegative delays whose deadlines are strictly before that
+marker. Clamping a deadline to `Time::Max()` is insufficient: the raw ns-3
+scheduler can execute an event there, and its next transmission can wrap time.
+
+The shared `ns3/time-bounds.h` helpers apply these rules:
+
+- Check integer nanoseconds before scaling. Unsigned inputs remain valid when
+  they fit the selected native unit: `2^63` ns is `9223372036854775` US ticks.
+  At PS or FS resolution, `2^61` ns saturates instead of wrapping to zero.
+- Preserve ordinary ns-3 fixed-point rounding. Large finite seconds use native
+  ticks when needed: `2^64` seconds is `307445734561825860` MIN ticks.
+- Check quotients before dividing and rate products before multiplying. Pacers
+  keep the existing minimum one-nanosecond slot, using a wide nanosecond ledger
+  so sub-tick slots can accumulate at coarse resolutions.
+- Keep FEC wire counts wide through serialization. Encoding `2^30` payload
+  bytes with `n=2147483647, k=1` gives `2305843010287435775` encoded bytes;
+  converting this count to bits must retain values above UINT64_MAX.
+- Check actual point-to-point egress as well as deferred callbacks. The wire
+  frame includes its PPP header. Serialization plus propagation, and
+  serialization plus the interframe gap, must both fit. A queued frame is
+  checked again when its transmission would start.
+- Reject negative timing attributes and direct latency settings at the input
+  boundary. No negative delay is passed to the raw scheduler.
+
+An unreachable receive post reports `RdmaReceiveCompletion.success=false`
+immediately. It consumes no receive-queue slot and leaves the post-availability
+ledger unchanged. `postedReceives` counts validated post attempts;
+`receiveCompletions` includes these failed completions. Other work whose next
+step cannot occur within the horizon stays unfinished; it does not gain a
+successful completion at the maximum timestamp.
+
+Run the focused checks after building tests:
+
+```bash
+./ns3 build gpu-cluster-sim test-runner
+./ns3 run "test-runner --test-name=gpu-cluster-time-safety --verbose"
+python -m pytest test/parity/test_time_safety.py -q
+```
+
+The Python test starts a separate process for each resolution. On glibc it
+enables traps for floating-point overflow, invalid operations, and division by
+zero. The ordinary collective, RDMA, PCIe, and WebUI regression suites cover
+the usual parameter ranges.

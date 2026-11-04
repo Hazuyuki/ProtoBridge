@@ -17,6 +17,8 @@
 #include <limits>
 #include <utility>
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 
@@ -39,7 +41,7 @@ namespace
 bool
 IsUnrepresentableTimeout(Time timeout)
 {
-    return timeout >= Time::Max() - Simulator::Now();
+    return !TimeBounds::CanSchedule(timeout);
 }
 
 // Saturating add for Time (raw-tick) ledgers: a sum that would pass
@@ -50,13 +52,7 @@ IsUnrepresentableTimeout(Time timeout)
 Time
 SaturatedAddTime(Time a, Time b)
 {
-    const int64_t aTicks = a.GetTimeStep();
-    const int64_t bTicks = b.GetTimeStep();
-    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
-    {
-        return Time::Max();
-    }
-    return Time(aTicks + bTicks);
+    return TimeBounds::SaturatingAdd(a, b);
 }
 
 } // unnamed namespace
@@ -81,7 +77,7 @@ LlrManager::GetTypeId()
                       "Timeout before retrying a packet",
                       TimeValue(NanoSeconds(1000)),
                       MakeTimeAccessor(&LlrManager::m_retryTimeout),
-                      MakeTimeChecker())
+                      MakeTimeChecker(Time(0)))
         .AddAttribute("LlrMode",
                       "Retransmission mode",
                       EnumValue<LlrMode>(LlrMode::GO_BACK_N),
@@ -108,7 +104,7 @@ LlrManager::GetTypeId()
                       "Fixed access latency for reconstructing an evicted packet",
                       TimeValue(NanoSeconds(300)),
                       MakeTimeAccessor(&LlrManager::m_sourceReloadLatency),
-                      MakeTimeChecker())
+                      MakeTimeChecker(Time(0)))
         .AddAttribute("OverflowPolicy",
                       "Buffer overflow policy",
                       EnumValue<LlrOverflowPolicy>(LlrOverflowPolicy::DROP_OLDEST),
@@ -245,7 +241,7 @@ LlrManager::StorePacket(uint32_t seqNum, Ptr<Packet> packet, uint16_t destRank)
     // which DefaultSimulatorImpl executes (see IsUnrepresentableTimeout).
     else if (m_retryTimeout > Time(0) && !IsUnrepresentableTimeout(m_retryTimeout))
     {
-        sourceIt->second.timeoutEvent = Simulator::Schedule(
+        sourceIt->second.timeoutEvent = TimeBounds::Schedule(
             m_retryTimeout, &LlrManager::OnRetryTimeout,
             this, seqNum, destRank, flowId, vcId);
     }
@@ -320,7 +316,7 @@ LlrManager::ArmRetryTimeoutAtTransmission(uint32_t seqNum, uint16_t destRank,
         Simulator::Cancel(sourceIt->second.timeoutEvent);
     }
     sourceIt->second.wireArmed = true;
-    sourceIt->second.timeoutEvent = Simulator::Schedule(
+    sourceIt->second.timeoutEvent = TimeBounds::Schedule(
         m_retryTimeout, &LlrManager::OnRetryTimeout,
         this, seqNum, destRank, flowId, vcId);
 }
@@ -765,6 +761,7 @@ LlrManager::GetSourceReloadBandwidth() const
 void
 LlrManager::SetSourceReloadLatency(Time latency)
 {
+    NS_ABORT_MSG_IF(latency.IsStrictlyNegative(), "Latency must be nonnegative");
     m_sourceReloadLatency = latency;
 }
 
@@ -832,8 +829,8 @@ LlrManager::ReserveSourceReload(uint32_t bytes)
     Time transferTime = Seconds(0);
     if (m_sourceReloadBandwidth > 0 && bytes > 0)
     {
-        transferTime = Seconds(static_cast<double>(bytes) /
-                               static_cast<double>(m_sourceReloadBandwidth));
+        transferTime = TimeBounds::FromRate(static_cast<double>(bytes),
+                                                static_cast<double>(m_sourceReloadBandwidth));
     }
     // Round 74 (codex finding 3): saturate every time addition so the
     // ledgers and the returned readyDelay cannot wrap (probe: 64 B evicted

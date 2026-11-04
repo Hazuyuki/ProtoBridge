@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include "fabric-endpoint.h"
+#include "ns3/time-bounds.h"
 
 #include "ns3/abort.h"
 #include "ns3/ppp-header.h"
@@ -216,7 +217,7 @@ FabricEndpoint::PrepareIbgdaPacket(Ptr<Packet> packet, uint32_t deviceIndex, con
     {
         return false;
     }
-    m_deferredEgressEvents.push_back(Simulator::Schedule(delay, [this, packet, deviceIndex, dest] {
+    m_deferredEgressEvents.push_back(TimeBounds::Schedule(delay, [this, packet, deviceIndex, dest] {
         SendPacketOnDevice(packet, deviceIndex, dest);
     }));
     return true;
@@ -288,7 +289,7 @@ FabricEndpoint::DeferIbgdaReceive(Ptr<Packet> packet, const FabricHeader& header
         m_ibgda->NotifyDataReady();
         return false;
     }
-    m_deferredEgressEvents.push_back(Simulator::Schedule(delay, [this, packet, header, ackKey] {
+    m_deferredEgressEvents.push_back(TimeBounds::Schedule(delay, [this, packet, header, ackKey] {
         m_rdmaPendingAck.erase(ackKey);
         m_ibgda->NotifyDataReady();
         OnPacketDelivered(packet, header.GetSequenceNumber(), header);

@@ -13,75 +13,18 @@
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 
 namespace
 {
-
-// Round 74 (codex finding 10): Seconds(sec) constructs an int64x64 from a
-// long double and wraps mod 2^128 once sec >= 2^63 — at FS resolution a
-// 16384-B packet on a 1-B/s contention model already gives sec = 16384,
-// and the *tick* bound is 2^63/1e15 ≈ 9.2 seconds, so every packet past a
-// few seconds of serialization aborts inside int64x64-128.cc:106 (the
-// 2^63 multiply check) or silently wraps to a negative/past deadline.
-// Same bound shape as the round-74 rdma-submission-model guard: at S the
-// only representable seconds are below 2^63 anyway, so the cap is a no-op
-// for sane inputs; at coarser units (MIN..Y) every sec >= 2^63 saturates.
 Time
-ClampedSerializationSeconds(double sec)
+ClampedSerializationSeconds(double seconds)
 {
-    if (!(sec > 0.0))
-    {
-        return Time(0); // zero, negative, NaN — no serialization
-    }
-    double ticksPerSecond;
-    switch (Time::GetResolution())
-    {
-    case Time::S:
-        ticksPerSecond = 1;
-        break;
-    case Time::MS:
-        ticksPerSecond = 1e3;
-        break;
-    case Time::US:
-        ticksPerSecond = 1e6;
-        break;
-    case Time::NS:
-        ticksPerSecond = 1e9;
-        break;
-    case Time::PS:
-        ticksPerSecond = 1e12;
-        break;
-    case Time::FS:
-        ticksPerSecond = 1e15;
-        break;
-    case Time::MIN:
-        ticksPerSecond = 1.0 / 60;
-        break;
-    case Time::H:
-        ticksPerSecond = 1.0 / 3600;
-        break;
-    case Time::D:
-        ticksPerSecond = 1.0 / 86400;
-        break;
-    case Time::Y:
-        ticksPerSecond = 1.0 / 31536000;
-        break;
-    default:
-        ticksPerSecond = 1;
-        break;
-    }
-    // Largest finite sec whose Seconds() conversion stays below 2^63
-    // ticks AND below the int64x64 ctor's own 2^63 wrap threshold.
-    const double maxSec = std::min((0x1p63 - 0x1p11) / ticksPerSecond, 0x1p63);
-    if (!(sec < maxSec))
-    {
-        return Time::Max();
-    }
-    return Seconds(sec);
+    return TimeBounds::FromSeconds(seconds);
 }
-
 } // unnamed namespace
 
 NS_LOG_COMPONENT_DEFINE("ContentionModel");

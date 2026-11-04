@@ -21,6 +21,8 @@
 #include "ns3/point-to-point-channel.h"
 #include "ns3/ppp-header.h"
 
+#include "ns3/time-bounds.h"
+
 namespace ns3
 {
 
@@ -36,13 +38,7 @@ namespace
 Time
 SaturatedAddTime(Time a, Time b)
 {
-    const int64_t aTicks = a.GetTimeStep();
-    const int64_t bTicks = b.GetTimeStep();
-    if (bTicks > std::numeric_limits<int64_t>::max() - aTicks)
-    {
-        return Time::Max();
-    }
-    return Time(aTicks + bTicks);
+    return TimeBounds::SaturatingAdd(a, b);
 }
 
 } // unnamed namespace
@@ -1115,12 +1111,12 @@ NvSwitch::Arbitrate()
         if (delay <= Seconds(0))
         {
             // Some ports are free now with queued packets
-            m_arbitrationEvent = Simulator::Schedule(NanoSeconds(1), &NvSwitch::Arbitrate, this);
+            m_arbitrationEvent = TimeBounds::Schedule(NanoSeconds(1), &NvSwitch::Arbitrate, this);
         }
         else
         {
             // All ports with queued packets are busy; schedule when earliest becomes free
-            m_arbitrationEvent = Simulator::Schedule(delay, &NvSwitch::Arbitrate, this);
+            m_arbitrationEvent = TimeBounds::Schedule(delay, &NvSwitch::Arbitrate, this);
         }
     }
 }
@@ -1129,7 +1125,7 @@ void
 NvSwitch::ScheduleArbitration()
 {
     NS_LOG_FUNCTION(this);
-    m_arbitrationEvent = Simulator::Schedule(NanoSeconds(m_arbitrationIntervalNs),
+    m_arbitrationEvent = TimeBounds::Schedule(TimeBounds::FromNanoseconds(m_arbitrationIntervalNs),
                                               &NvSwitch::Arbitrate, this);
 }
 
@@ -1183,7 +1179,11 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
         p2pOut->GetAttribute("DataRate", rateValue);
         DataRate outputRate = rateValue.Get();
         // packet size in bytes * 8 bits/byte / output rate in bits/s
-        serializationTime = Seconds(static_cast<double>(wireSize * 8) / outputRate.GetBitRate());
+        const TimeBounds::Wide wireBits = TimeBounds::Wide{wireSize} * 8;
+        serializationTime = wireBits <= std::numeric_limits<uint64_t>::max()
+                                ? TimeBounds::FromRate(static_cast<double>(wireBits),
+                                                       static_cast<double>(outputRate.GetBitRate()))
+                                : TimeBounds::FromBitRate(wireBits, outputRate.GetBitRate());
     }
 
     // Update port busy time: logical egress service availability. Only the
@@ -1244,7 +1244,7 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
                 SaturatedAddTime(
                     SaturatedAddTime(
                         SaturatedAddTime(startTime - Simulator::Now(),
-                                         NanoSeconds(m_cutThroughDelayNs)),
+                                         TimeBounds::FromNanoseconds(m_cutThroughDelayNs)),
                         serializationTime),
                     codingLatency),
                 propDelay);
@@ -1256,7 +1256,7 @@ NvSwitch::ForwardPacket(Ptr<Packet> packet, Mac48Address srcAddr,
                 Ptr<Packet> pppPacket = packet->Copy();
                 pppPacket->AddHeader(ppp);
 
-                Simulator::ScheduleWithContext(dstDevice->GetNode()->GetId(),
+                TimeBounds::ScheduleWithContext(dstDevice->GetNode()->GetId(),
                                                totalDelay,
                                                &PointToPointNetDevice::Receive,
                                                dstDevice,
@@ -1431,7 +1431,7 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
             // Prune fired events at every append (codex round 28, finding 3).
             PruneDeferredResultEvents();
             m_deferredResultEvents.push_back(
-                Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+                TimeBounds::Schedule(TimeBounds::FromNanoseconds(m_allReduceAggregationDelayNs),
                                     &NvSwitch::MulticastAllReducePartition, this,
                                     flowId, k, thisPartitionSize, wirePartitionSize,
                                     numPartitions));
@@ -1475,7 +1475,7 @@ NvSwitch::ProcessAllReduce(Ptr<Packet> packet, const FabricHeader& header,
             // Prune fired events at every append (codex round 28, finding 3).
             PruneDeferredResultEvents();
             m_deferredResultEvents.push_back(
-                Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+                TimeBounds::Schedule(TimeBounds::FromNanoseconds(m_allReduceAggregationDelayNs),
                                     &NvSwitch::MulticastAllReduceResult, this,
                                     flowId, sourceCount));
         }
@@ -1996,7 +1996,7 @@ NvSwitch::ProcessAllGather(Ptr<Packet> packet, const FabricHeader& header,
         // Prune fired events at every append (codex round 28, finding 3).
         PruneDeferredResultEvents();
         m_deferredResultEvents.push_back(
-            Simulator::Schedule(NanoSeconds(m_allReduceAggregationDelayNs),
+            TimeBounds::Schedule(TimeBounds::FromNanoseconds(m_allReduceAggregationDelayNs),
                                 &NvSwitch::MulticastAllGatherResult, this,
                                 flowId, sourceCount));
     }
@@ -2218,7 +2218,7 @@ NvSwitch::SendMulticastResultOnPort(uint32_t portIdx, Ptr<Packet> pkt)
         // expired entries, the final packet's refcount stuck at 2).
         PruneDeferredResultEvents();
         m_deferredResultEvents.push_back(
-            Simulator::Schedule(codingLatency, [this, portIdx, pkt]() {
+            TimeBounds::Schedule(codingLatency, [this, portIdx, pkt]() {
                 if (portIdx < m_ports.size() && m_ports[portIdx])
                 {
                     m_ports[portIdx]->Send(pkt, Mac48Address::GetBroadcast(), 0x0800);
