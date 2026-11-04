@@ -17,11 +17,23 @@ Two senders → one receiver (2:1 incast):
   packets × 1000 B), 40 Gbps links, 1 µs latency, PAUSE_TIME 5 µs, QCN off.
   Flows start at t = 1.0 s; FCT measured as the time the seq-49999 packet
   of each flow is enqueued at the receiver.
-- **ProtoBridge**: `--topology=switched --collective=incast --numNodes=3
+- **ProtoBridge**: `--topology=switched --collective=incast --numGpus=3
+  --numNodes=3 --gpusPerNode=1 --interNodeTopology=host
   --interNodeBandwidth=40 --interNodeLatency=1000 --dataSize=50000000
   --bulkChunkSize=1000 --switchPfcMode=<mode> --pfcPauseThreshold=20
-  --pfcPauseTime=5 --pfcResumeOffset=8` (mode 1 omits the pause time).
-  Same 2× 50 MB of payload, same 40 Gbps, same 1 µs links.
+  --pfcPauseTime=5 --pfcResumeOffset=8 --soTxWindow=64` (mode 1 omits the
+  pause time). `--gpusPerNode=1 --interNodeTopology=host` are REQUIRED: the
+  defaults (8 GPUs/node, inter-node fullmesh) build a 24-rank fullmesh
+  fabric with no leaf switch, where PFC is inert. `--soTxWindow=64` is
+  REQUIRED at 1000-B chunks: it bounds the in-flight bulk chunks (the
+  perftest tx_depth analog) so the senders' injection is ACK-clocked.
+  Without it the unbounded window dumps the whole transfer into the
+  network before the first PAUSE can propagate, and the receiver's VOQ
+  hits the 10,000-chunk hard cap → silent drops → (lossless RoCE, no
+  retransmit) an incomplete transfer pinned at the 3600-s ceiling. The
+  9000-B rows below ran without it (their BDP fits the cap) and are
+  byte-identical with or without it. Same 2× 50 MB of payload, same
+  40 Gbps, same 1 µs links.
 
 Both sides carry PAUSE instrumentation: ns3-rdma via `PAUSE_SENT`/
 `RESUME_SENT` prints added to `qbb-net-device.cc` `CheckQueueFull()`;
@@ -39,51 +51,73 @@ therefore compared per ingress/port, not as a global equivalence.
 |---|---|---|---|---|
 | ns3-rdma, static thr | 20.29 ms | 27,035 | 2,254 | 0 |
 | ns3-rdma, dynamic thr (α=16) | 19.51 ms | 24,936 | 2,078 | 0 |
-| ns3-rdma, PFC off (control) | 18.58 ms | 0 | 0 | 0 |
+| ns3-rdma, PFC off (control) | 20.29 ms | 0 | 0 | 0 |
 | ns3-rdma, DCQCN on (control) | ~20.3 ms | 0 | 0 | 0 |
-| PB mode 1 (explicit RESUME) | 42.95 ms | 4 | 36 | 0 |
-| PB mode 3 (quanta 5 µs) | 42.95 ms | 51,518 | 4 | 0 |
-| PB mode 1, 9000-B chunks | 23.49 ms | 4 | 36 | 0 |
-| PB mode 3, 9000-B chunks, | 23.49 ms | 27,821 | 4 | 0 |
-| PB, PFC off (control) | 42.95 ms | — | — | 0 |
+| PB mode 1 (explicit RESUME) | 23.60 ms | 1,548 | 13,932 | 0 |
+| PB mode 3 (quanta 5 µs) | 24.38 ms | 13,932 | 13,932 | 0 |
+| PB, PFC off (control) | 21.90 ms | — | — | 0 |
+| PB mode 1, 9000-B chunks | 21.15 ms | 182 | 1,638 | 0 |
+| PB mode 3, 9000-B chunks | 21.15 ms | 16,871 | 18 | 0 |
+| PB, PFC off, 9000-B chunks | 21.15 ms | — | — | 0 |
+
+All PB 1000-B rows use `--soTxWindow=64`; the 9000-B rows are identical
+with or without it (21.153216 ms in every run), so the window is a no-op
+for a BDP-sized transfer that never approaches the VOQ cap.
 
 (PB FCT is `simTimeNs` for the same 2×50 MB incast. "PFC off" on the
-ns3-rdma side was produced by raising the ingress PG limit for the
-control run only.)
+ns3-rdma side raises the SwitchMmu ingress limits coherently — PG shared
+limit, headroom, SP limit, and max buffer all to 400 MB — so no XOFF is
+emitted and no admission path overflows. An earlier control that raised
+ONLY the PG shared limit overflowed the ingress headroom: 2.46 M drops
+and endless retransmission, which briefly produced a bogus "PFC costs 9%
+FCT" reading; the coherent control shows FCT is PFC-INVARIANT on ns3-rdma
+at this workload, same as ProtoBridge.)
 
 ### FCT
 
-- At matched 1000-B packets, ProtoBridge's FCT is 2.1× ns3-rdma's. **This
-  is not a PFC difference**: ProtoBridge's FCT is *identical* with PFC on
-  or off (42,951,160 ns in both runs, and identical again at 9000-B
-  chunks in both modes). The gap tracks the known per-packet processing
-  overhead of the chunked-transfer path — the p2p control shows 2.15×
-  over theoretical transfer time at 1000-B chunks vs 1.17× at 9000-B
-  chunks. At 9000-B chunks the ProtoBridge FCT is 23.49 ms vs ns3-rdma's
-  20.3 ms, a 1.16× residual that matches the p2p overhead factor almost
-  exactly.
-- On the ns3-rdma side, PFC costs ~9% FCT (18.58 → 20.29 ms). That cost
-  comes with 0 drops in both configurations here (9 MB switch buffer
-  absorbs the incast), so at this scale PFC is purely a latency cost.
+- At matched 1000-B packets, ProtoBridge's FCT (21.90 ms, PFC off) is
+  1.08× ns3-rdma's 20.29 ms. **This is not a PFC difference**:
+  ProtoBridge's FCT is PFC-slightly-variant (21.90 ms off → 23.60 ms
+  mode 1 → 24.38 ms mode 3): the ACK-clocked window (soTxWindow=64)
+  paces injection, and each pause/resume episode parks the window,
+  adding a bounded restart cost — the price of backpressure actually
+  engaging, visible now that the unbounded window no longer masks it.
+  Before the cut-through accounting fix, the serial pipeline charge
+  derated first-hop egress by ~2× at 1000-B chunks, which accidentally
+  rate-limited the senders below the receiver's drain rate; FCT was
+  42.95 ms (2.1× ns3-rdma) and PFC-invariant because congestion never
+  truly formed. At 9000-B chunks the FCT is 21.15 ms vs ns3-rdma's
+  20.3 ms (1.04×), PFC-invariant — the larger serialization per chunk
+  keeps the queue shallow and pause episodes are rare.
+- On the ns3-rdma side, FCT is also PFC-invariant (20.29 ms with the
+  static threshold, 20.29 ms with PFC off) — the 9 MB switch buffer
+  absorbs the incast with 0 drops either way, so PFC's pause parking
+  costs no transfer time at this workload on either simulator. (The
+  dynamic threshold runs marginally faster, 19.51 ms, because its
+  admission accounting admits slightly more in flight — a threshold
+  effect, not a PFC effect.)
 
 ### PAUSE/RESUME counts
 
 - ns3-rdma emits ~27k PAUSEs and ~2.2k RESUMEs over a ~20 ms transfer —
-  roughly 670 pauses/ms summed over 2 paused ingresses, and about one
-  RESUME per 12 PAUSEs. With the dynamic threshold the counts drop ~8%
-  (24.9k/2.1k) and FCT improves ~4%.
-- ProtoBridge mode 3 emits a comparable pause *cadence* at matched packet
-  size (51.5k pauses over 43 ms ≈ 600/ms per paused port, vs ~335/ms per
-  ingress on ns3-rdma — same order of magnitude) but almost never lifts
-  the pause: 4 RESUMEs total, because the mode-3 re-check at
-  `pausetime/2` re-asserts PAUSE whenever the output queue still exceeds
-  the threshold, and under sustained 2:1 incast it never drains below it
-  mid-run.
-- ProtoBridge mode 1 pauses only 4 times and resumes 36 times: the
-  hysteresis pair (threshold 20 / offset 8) trips once per congestion
-  episode and is lifted as soon as the queue drains past the resume
-  point. Mode 1 is thus far quieter on the control plane while achieving
-  the same FCT and 0 drops.
+  roughly 1,332 pauses/ms summed over 2 paused ingresses (≈666 per
+  ingress), and about one RESUME per 12 PAUSEs. With the dynamic
+  threshold the counts drop ~8% (24.9k/2.1k) and FCT improves ~4%.
+- ProtoBridge mode 3 at 1000-B chunks emits 13,932 PAUSEs and 13,932
+  RESUMEs over 24.4 ms — 571/ms summed over 2 paused ingresses, roughly
+  one PAUSE/RESUME pair per quanta window per ingress: the ACK-clocked
+  window drains the VOQ past the resume offset within each 5-µs quanta,
+  so the pause lifts and re-asserts continuously instead of latching.
+  (Pre-window, mode 3 latched: 51.5k pauses / 4 resumes over 43 ms —
+  the unbounded sender kept the VOQ pinned above threshold so the
+  re-check never lifted.) At 9000-B chunks the old latching pattern
+  persists (16,871 / 18) because 9000-B backlogs drain slowly relative
+  to the quanta.
+- ProtoBridge mode 1 at 1000-B chunks: 1,548 pauses / 13,932 resumes —
+  the hysteresis pair (threshold 20 / offset 8) trips per congestion
+  episode and lifts as soon as the window-paced queue drains past the
+  resume point, so the control plane stays ~10× quieter than mode 3
+  while achieving the same 0 drops.
 
 ### Structural differences (by design, not defects)
 
@@ -109,6 +143,32 @@ control run only.)
    threshold. ProtoBridge has no DCQCN arm; its PFC is the only
    congestion backpressure, and (as the controls show) it does not
    change the transfer time.
+5. **XOFF in-flight absorption (headroom).** ns3-rdma's SwitchMmu keeps
+   a dedicated ingress headroom (`m_pg_hdrm_limit` = 100 cells = 103 KB
+   in the mix config) so the data still in flight when the XOFF leaves
+   the switch — link RTT plus the source's already-serialized burst —
+   has somewhere to land under PFC's no-drop contract (credit-based
+   fabrics never oversend; lossy fabrics drop instead). ProtoBridge's
+   original semantics admitted unbounded toward the VOQ hard cap while
+   a hop was paused, which is behaviorally an infinite headroom.
+   `--pfcHeadroomChunks` (EthernetSwitch attribute
+   `PfcHeadroomChunks`, default 0 = legacy unbounded) now models the
+   budget explicitly: while a hop is PAUSE-latched, each post-XOFF data
+   admission draws the per-hop budget; exhaustion drops with a NACK
+   (the "ingress headroom full" analog) and the LLR/SACK path
+   retransmits — with a finite headroom the sim forces `llrEnabled=1`
+   exactly like the lossy tail-drop regime, because a silent drop in a
+   lossless fabric is unrecoverable. Verified on the matched workload:
+   headroom ≥ 12 chunks is FCT-identical to the legacy (21.899-ms
+   PFC-off / 24.378-ms mode-3 values, byte-identical counters) — the
+   budget simply never exhausts at this BDP, which reproduces ns3-rdma's
+   PFC-invariance; headroom 10 chunks exhausts (99k drops) and completes
+   only via 536k LLR retransmissions (115.3 ms) — the drop+retry cost
+   of an undersized headroom. This closes the mechanism inventory: the
+   earlier "PB lacks headroom" hypothesis for the mode-3 residual is
+   disproven (the residual is quanta quantization, threshold vs quanta
+   sizing), and the knob's value is mechanism isomorphism with
+   `m_pg_hdrm_limit`, not FCT.
 
 ## Reproduction
 
@@ -122,4 +182,7 @@ control run only.)
   --collective=incast --numNodes=3 --interNodeBandwidth=40
   --interNodeLatency=1000 --dataSize=50000000 --bulkChunkSize=1000
   --switchPfcMode=3 --pfcPauseThreshold=20 --pfcPauseTime=5
-  --pfcResumeOffset=8` and the mode-1 / 9000-B variants.
+  --pfcResumeOffset=8` and the mode-1 / 9000-B variants. The headroom
+  control adds `--soTxWindow=64 --pfcHeadroomChunks=<N>`
+  (0 = legacy, ≥12 = ns3-rdma-like never-exhausts at this BDP, 10 =
+  undersized: drop + LLR retransmit recovery).

@@ -3636,6 +3636,13 @@ class ProtocolProfileBundleTest : public TestCase
                               "credit-based flow control selected");
         NS_TEST_ASSERT_MSG_EQ(b.llrEnabled, false, "LLR disabled for H200 NVLink");
         NS_TEST_ASSERT_MSG_EQ(b.llrMode, "gobackn", "GBN retry mode");
+        NS_TEST_ASSERT_MSG_EQ(b.fec->IsEnabled(), true, "FEC defaults to enabled");
+        profile.Set("fecEnabled", "0");
+        ProtocolBundle disabled = profile.Build();
+        NS_TEST_ASSERT_MSG_EQ(disabled.fec->IsEnabled(), false,
+                              "profile switch disables FEC on stencil endpoints");
+        NS_TEST_ASSERT_MSG_EQ(disabled.fec->GetEncodedSize(1024), 1024u,
+                              "disabled FEC has no wire expansion");
     }
 };
 
@@ -9133,6 +9140,7 @@ class EthernetSwitchPfcHarness : public EthernetSwitch
     }
     EthernetSwitchPfcHarness() = default;
     using EthernetSwitch::OnPacketEnqueue; // public on the base already; keep parity
+    using EthernetSwitch::RecheckPfcPauseForTest; // drive the mode-3 re-latch
     /// Drive the full admission path exactly as EnqueueToVoq would (the
     /// pre-push congestion hook + the VOQ push), minus port bookkeeping.
     bool Admit(Ptr<Packet> p, uint32_t outPort, uint32_t inPort)
@@ -9251,6 +9259,140 @@ class EthernetSwitchPfcTriggerTest : public TestCase
             NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 64), true,
                                   "mode 2 at depth 64: pause fires");
             NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), 1u, "dynamic pause fired");
+            sw->Dispose();
+        }
+        Simulator::Destroy();
+    }
+};
+
+// PFC headroom (XOFF in-flight absorption, ns3-rdma m_pg_hdrm_limit analog):
+// while a hop is PAUSE-latched, data admissions draw a finite per-hop budget;
+// exhaustion drops + NACKs. The budget resets at each fresh latch, control /
+// retry bypass the gate, and headroom=0 keeps the legacy unbounded admission
+// (byte-identical default).
+class PfcHeadroomBudgetTest : public TestCase
+{
+  public:
+    PfcHeadroomBudgetTest()
+        : TestCase("EthernetSwitch PFC headroom budget (XOFF in-flight absorption)")
+    {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        auto makeSwitch = []() {
+            NodeContainer nodes;
+            nodes.Create(2);
+            PointToPointHelper p2p;
+            p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+            p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+            NetDeviceContainer devs = p2p.Install(nodes.Get(0), nodes.Get(1));
+            Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+            nodes.Get(0)->AddDevice(sw);
+            sw->AddPort(devs.Get(0));
+            return sw;
+        };
+        auto makeEthData = []() {
+            Ptr<Packet> pkt = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetProtocol(0);
+            fh.SetSourceRank(1);
+            fh.SetDestRank(0);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            pkt->AddHeader(fh);
+            return pkt;
+        };
+
+        // (1) Default 0 = off: admission while paused is unbounded (legacy).
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            sw->SetAttribute("PfcMode", UintegerValue(1));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(10));
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 10), true,
+                                  "threshold crossing admits + latches a pause");
+            NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 0), true, "pause latched");
+            for (int i = 0; i < 1000; i++)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 10 + i),
+                                      true,
+                                      "headroom 0 = legacy unbounded admission");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 0u,
+                                  "headroom 0 must never drop on the budget");
+            sw->Dispose();
+        }
+
+        // (2) Finite budget: exactly N admissions after the latch, then
+        // drop + NACK. Control and retry packets bypass (feedback must flow
+        // even at exhaustion).
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            sw->SetAttribute("PfcMode", UintegerValue(1));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(10));
+            sw->SetAttribute("PfcHeadroomChunks", UintegerValue(4));
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 10), true,
+                                  "the latch-triggering packet itself admits");
+            for (int i = 0; i < 4; i++)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), true,
+                                      "in-budget admission while paused");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 0u, "budget not yet spent");
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), false,
+                                  "budget exhausted: drop");
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), false,
+                                  "and stays dropped while paused");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 2u,
+                                  "each over-budget admission counts a drop");
+            // Control bypasses the budget even at exhaustion.
+            Ptr<Packet> ctrl = Create<Packet>(16);
+            FabricHeader cfh;
+            cfh.SetPacketType(FabricPacketType::CREDIT);
+            cfh.SetFabricType(FabricType::ETHERNET);
+            ctrl->AddHeader(cfh);
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(ctrl, 0, 0, 11), true,
+                                  "control bypasses the headroom budget");
+            sw->Dispose();
+        }
+
+        // (3) Budget resets at a fresh latch (each XOFF in flight owns its
+        // own absorption window), e.g. after a mode-3 re-PAUSE.
+        {
+            Ptr<EthernetSwitchPfcHarness> sw = makeSwitch();
+            sw->SetAttribute("PfcMode", UintegerValue(3));
+            sw->SetAttribute("PfcPauseThreshold", UintegerValue(10));
+            sw->SetAttribute("PfcPauseTime", UintegerValue(5));
+            sw->SetAttribute("PfcHeadroomChunks", UintegerValue(3));
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 10), true,
+                                  "latch");
+            for (int i = 0; i < 3; i++)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), true,
+                                      "spend the budget");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), false,
+                                  "exhausted");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 1u, "one drop");
+            // The re-check with a (here synthetic-empty) real VOQ drains: it
+            // unlatches AND retires the spent budget (both reset sites).
+            sw->RecheckPfcPauseForTest(0, 0, 0);
+            NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 0), false,
+                                  "drained re-check lifts the pause");
+            // Re-crossing the threshold latches a FRESH pause cycle — which
+            // owns a FRESH budget (an XOFF in flight is a new absorption
+            // window, not a continuation of the old one).
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), true,
+                                  "re-crossing re-PAUSEs and admits");
+            for (int i = 0; i < 3; i++)
+            {
+                NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), true,
+                                      "fresh latch = fresh budget");
+            }
+            NS_TEST_ASSERT_MSG_EQ(sw->OnPacketEnqueue(makeEthData(), 0, 0, 11), false,
+                                  "exhausts again at the same size");
+            NS_TEST_ASSERT_MSG_EQ(sw->GetPfcHeadroomDrops(), 2u, "second cycle's drop");
             sw->Dispose();
         }
         Simulator::Destroy();
@@ -9623,6 +9765,57 @@ class PfcLlrRetransmitExemptTest : public TestCase
             "the LLR repair must transmit under the pause (pre-fix: parked "
             "on the send queue; the retry counter advanced with no wire "
             "traffic)");
+        s.a->Dispose();
+        s.b->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (the 2:1 incast stall investigation) The So TX window must be ACK-clocked
+// with LLR OFF too — lossless RoCE's default. Pre-fix, two coupled defects
+// starved the clock: SendLlrAckPacket returned early on !m_llrEnabled (the
+// receiver never ACKed), and ProcessAckPacket's slot release lived inside
+// the llrEnabled block (even a delivered ACK freed nothing). A windowed
+// lossless transfer delivered exactly soTxWindow chunks and then the event
+// queue drained — a pure deadlock (the 50-MB 1000-B incast pinned at the
+// 3600-s ceiling with status=incomplete).
+class SoTxWindowLlrOffClockTest : public TestCase
+{
+  public:
+    SoTxWindowLlrOffClockTest()
+        : TestCase("So TX window is ACK-clocked with LLR off (lossless RoCE)") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", StringValue("1000000p"));
+        PfcPairScaffold s;
+        s.MakeLinks();
+        s.a->SetBulkChunkSize(4096);
+        s.a->SetSoTxWindow(2);
+        // The window is a fabric-wide setting (gpu-cluster-sim wires it on
+        // EVERY endpoint): the RECEIVER's ACK emission keys on its own
+        // m_soTxWindow, so both sides must carry it for the clock to run.
+        s.b->SetSoTxWindow(2);
+        // LLR stays DISABLED on both endpoints — the lossless default. The
+        // window's clock is the plain per-packet ACK, not the LLR store.
+        s.a->SendBulkWireTransferSize(1, 16384, 1, 0, 0);
+        Simulator::Stop(MicroSeconds(2000));
+        Simulator::Run();
+        uint64_t effectiveSum = 0;
+        for (const auto& delivered : s.wire)
+        {
+            if (delivered.second.GetPacketType() == FabricPacketType::DATA)
+            {
+                effectiveSum += delivered.second.GetEffectiveDataSize();
+            }
+        }
+        // 16 KiB in 4-KiB chunks = 4 chunks through a window of 2: the ACKs
+        // for the first pair must re-open the window for the second pair
+        // (pre-fix: exactly 8192 effective bytes — one window's worth — and
+        // then the transfer deadlocked).
+        NS_TEST_ASSERT_MSG_EQ(effectiveSum, 16384u,
+            "the window must re-open on ACK with LLR off "
+            "(pre-fix: the first soTxWindow chunks delivered, then deadlock)");
         s.a->Dispose();
         s.b->Dispose();
         Simulator::Destroy();
@@ -10867,6 +11060,9 @@ class R32PfcEndpoint : public FabricEndpoint
     }
     using FabricEndpoint::IsPfcPausedForDest;
     using FabricEndpoint::StartApplication;
+    using FabricEndpoint::ProcessPfcPausePacket;
+    using FabricEndpoint::ProcessPfcResumePacket;
+    using FabricEndpoint::SendPacketOnDevice;
 };
 
 unsigned g_r32Delivered = 0;
@@ -11688,11 +11884,313 @@ class PfcQuantaDrainResumeTest : public TestCase
         Simulator::Stop(MicroSeconds(15));
         Simulator::Run();
 
-        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcResumesSent(), 1u,
-            "the drained re-check must emit the RESUME");
+        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcResumesSent(), 9u,
+            "the drained re-check emits the RESUME plus the 8 bounded "
+            "re-sends (the mode-3 drain arms the same re-send budget as "
+            "mode 1, codex round 34 finding 3 — a healthy link makes the "
+            "duplicates no-ops)");
         NS_TEST_ASSERT_MSG_EQ(src->IsPfcPausedForDest(1, 0), false,
             "the explicit RESUME lifts the endpoint's hold before the "
             "20-us quanta expires (supersede semantics)");
+        sw->Dispose();
+        src->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 34, findings 1+2) Two endpoint-side per-VC drain defects.
+// F1: ProcessPfcResumePacket's early returns skipped the queue drain on a
+// PARTIAL release (another VC or switch still latched) — the released
+// class's parked packets stranded until an unrelated drain trigger. F2: the
+// strict-FIFO drain stopped at the first PFC-held entry, so a paused class
+// head-of-line blocked every OTHER class (the cross-class starvation PFC
+// exists to prevent). The drain now runs on partial releases and SKIPS
+// still-paused (dest, vc) entries instead of stopping at them.
+class PfcPartialResumeDrainsTest : public TestCase
+{
+  public:
+    PfcPartialResumeDrainsTest()
+        : TestCase("PFC RESUME drains the released class while another VC "
+                   "stays paused (no cross-class HOL)") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(2);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto link = p2p.Install(nodes.Get(0), nodes.Get(1));
+        Ptr<R32PfcEndpoint> ep = CreateObject<R32PfcEndpoint>();
+        nodes.Get(0)->AddApplication(ep);
+        ep->SetRank(0);
+        // Single-rank local range: dest 1 is REMOTE (a So dest) so the PFC
+        // throttle applies (local Su dests are never paused).
+        ep->SetLocalRankRange(0, 1);
+        ep->AddNetDevice(link.Get(0));
+        ep->SetRoutingEntry(1, 0);
+        ep->StartApplication();
+
+        // Latch a PAUSE on BOTH VC 0 and VC 1 toward dest 1 (two switches'
+        // worth of MACs is not needed — one switch, two classes).
+        auto pauseFor = [](uint8_t vc) {
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::PFC_PAUSE);
+            h.SetFabricType(FabricType::ETHERNET);
+            h.SetSourceRank(1);
+            h.SetDestRank(0);
+            h.SetVirtualChannel(vc);
+            h.SetSourceMac(Mac48Address("00:00:00:00:02:00"));
+            h.SetDestMac(Mac48Address("00:00:00:00:00:01"));
+            return h;
+        };
+        ep->ProcessPfcPausePacket(pauseFor(0));
+        ep->ProcessPfcPausePacket(pauseFor(1));
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1, 0), true,
+            "VC 0 latched");
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1, 1), true,
+            "VC 1 latched");
+
+        // Park a VC-0 packet, then a VC-1 packet behind it (the FIFO that
+        // used to let the paused VC-0 head block the unpaused VC-1).
+        auto dataFor = [](uint8_t vc) {
+            Ptr<Packet> p = Create<Packet>(64);
+            FabricHeader h;
+            h.SetPacketType(FabricPacketType::DATA);
+            h.SetFabricType(FabricType::ETHERNET);
+            h.SetSourceRank(0);
+            h.SetDestRank(1);
+            h.SetVirtualChannel(vc);
+            h.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            h.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            p->AddHeader(h);
+            return p;
+        };
+        NS_TEST_ASSERT_MSG_EQ(
+            ep->SendPacketOnDevice(dataFor(0), 0, link.Get(1)->GetAddress()),
+            false, "the VC-0 packet parks under the pause");
+        NS_TEST_ASSERT_MSG_EQ(
+            ep->SendPacketOnDevice(dataFor(1), 0, link.Get(1)->GetAddress()),
+            false, "the VC-1 packet parks behind it");
+
+        // RESUME only VC 1: the partial release must drain VC 1's parked
+        // packet even though VC 0 stays paused AND sits ahead of it in the
+        // queue (finding 1: the drain must fire; finding 2: it must skip
+        // the paused VC-0 head instead of stopping there).
+        FabricHeader resume1 = pauseFor(1);
+        resume1.SetPacketType(FabricPacketType::PFC_RESUME);
+        ep->ProcessPfcResumePacket(resume1);
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1, 0), true,
+            "VC 0 stays latched (its hold was not resumed)");
+        NS_TEST_ASSERT_MSG_EQ(ep->IsPfcPausedForDest(1, 1), false,
+            "VC 1's hold lifted");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 1u,
+            "the released VC-1 packet transmitted despite the paused "
+            "VC-0 head ahead of it in the queue");
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxBytes() > 0, true,
+            "the transmitted packet carried payload bytes");
+
+        // VC 0's parked entry is still queued (skipped, not dropped).
+        ep->ProcessPfcResumePacket([&pauseFor]() {
+            FabricHeader r = pauseFor(0);
+            r.SetPacketType(FabricPacketType::PFC_RESUME);
+            return r;
+        }());
+        NS_TEST_ASSERT_MSG_EQ(ep->GetTxPackets(), 2u,
+            "resuming VC 0 drains its parked entry too");
+
+        ep->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 34, finding 3) Mode 3's drain-side RESUME (RecheckPfcPause
+// finding the VOQ drained) never armed the bounded re-send budget that the
+// mode-1 drain watcher arms (round 32, finding 1). With pfcPauseTime=0
+// (explicit-RESUME semantics) a lost RESUME left the endpoint paused
+// forever — the switch had cleared its latch and no quanta expiry was
+// coming. The mode-3 drain now arms the same 8-re-send budget.
+class PfcQuantaResumeResendTest : public TestCase
+{
+  public:
+    PfcQuantaResumeResendTest()
+        : TestCase("PFC mode 3 RESUME is re-sent until it lands") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto linkA = p2p.Install(nodes.Get(0), nodes.Get(1));
+        auto linkB = p2p.Install(nodes.Get(2), nodes.Get(1));
+        Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+        nodes.Get(1)->AddDevice(sw);
+        sw->AddPort(linkA.Get(1));
+        sw->AddPort(linkB.Get(1));
+        // Mode 3 with pause time 0: explicit-RESUME timing — the re-check
+        // at 500 ns (the pausetime=0 fallback) is the only thing that can
+        // lift the endpoint's hold, so a lost RESUME is fatal without the
+        // re-send arm.
+        sw->SetAttribute("PfcMode", UintegerValue(3));
+        sw->SetAttribute("PfcPauseTime", UintegerValue(0));
+        sw->SetAttribute("PfcPauseThreshold", UintegerValue(2));
+        sw->SetAttribute("VoqDropThreshold", UintegerValue(0));
+
+        Ptr<R32PfcEndpoint> src = CreateObject<R32PfcEndpoint>();
+        nodes.Get(0)->AddApplication(src);
+        src->SetRank(0);
+        src->SetLocalRankRange(0, 2);
+        src->AddNetDevice(linkA.Get(0));
+        src->SetRoutingEntry(1, 0);
+        src->StartApplication();
+
+        // A loss window covering the first RESUME (and the first few
+        // re-sends): everything toward rank 0 drops between 400 ns and
+        // 4.6 us; the loss lifts before the budget is exhausted (8
+        // re-sends at 500 ns apart = 4 us of coverage).
+        auto err = CreateObject<LinkDegradationModel>();
+        err->SetBer(0);
+        auto rng = CreateObject<ConstantRandomVariable>();
+        rng->SetAttribute("Constant", DoubleValue(0));
+        err->SetRandomStream(rng);
+        src->SetLinkDegradationModel(err);
+        Simulator::Schedule(NanoSeconds(400), [err]() { err->SetPacketLossRate(0.5); });
+        Simulator::Schedule(NanoSeconds(4600), [err]() { err->SetPacketLossRate(0); });
+
+        // Latch the pause through the real admission path (depth crossing
+        // the threshold at 3 with threshold 2).
+        auto entry = []() {
+            VoqEntry e;
+            e.packet = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetSourceRank(0);
+            fh.SetDestRank(1);
+            fh.SetVirtualChannel(0);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            e.packet->AddHeader(fh);
+            e.srcAddr = fh.GetSourceMac();
+            e.dstAddr = fh.GetDestMac();
+            e.inPort = 0;
+            return e;
+        };
+        sw->EnqueueForTest(1, entry()); // fast path out
+        sw->EnqueueForTest(1, entry()); // depth 0
+        sw->EnqueueForTest(1, entry()); // depth 1
+        sw->EnqueueForTest(1, entry()); // depth 2 -> PAUSE
+
+        Simulator::Stop(MicroSeconds(15));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcResumesSent() > 1u, true,
+            "the mode-3 re-check re-sent the RESUME (bounded budget), not "
+            "the single-shot emit that a loss window strands");
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 1, 0), false,
+            "the switch drained and cleared its latch");
+        NS_TEST_ASSERT_MSG_EQ(src->IsPfcPausedForDest(1, 0), false,
+            "a re-sent RESUME landed after the loss window lifted — the "
+            "endpoint is not stranded");
+
+        sw->Dispose();
+        src->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// (codex round 34, finding 4) SetPfcPauseThresholdForVc used to ERASE an
+// entry whose value equaled the global threshold, silently flipping that
+// VC back to the legacy WHOLE-PORT depth comparison when it was the only
+// entry: with global 2 and SetPfcPauseThresholdForVc(0, 2), a VC-1 backlog
+// of 3 paused VC 0 at zero VC-0 occupancy. The entry is now retained —
+// its mere presence selects the per-class comparison.
+class PfcEqualThresholdPerVcTest : public TestCase
+{
+  public:
+    PfcEqualThresholdPerVcTest()
+        : TestCase("Per-VC threshold equal to the global still isolates the "
+                   "class") {}
+    void DoRun() override
+    {
+        DisableLinkErrorsGlobally();
+        NodeContainer nodes;
+        nodes.Create(3);
+        PointToPointHelper p2p;
+        p2p.SetDeviceAttribute("DataRate", StringValue("400Gbps"));
+        p2p.SetChannelAttribute("Delay", TimeValue(NanoSeconds(100)));
+        auto linkA = p2p.Install(nodes.Get(0), nodes.Get(1));
+        auto linkB = p2p.Install(nodes.Get(2), nodes.Get(1));
+        Ptr<EthernetSwitchPfcHarness> sw = CreateObject<EthernetSwitchPfcHarness>();
+        nodes.Get(1)->AddDevice(sw);
+        sw->AddPort(linkA.Get(1));
+        sw->AddPort(linkB.Get(1));
+        sw->SetAttribute("PfcMode", UintegerValue(1));
+        sw->SetAttribute("PfcPauseThreshold", UintegerValue(2));
+        // Equal to the global on purpose: the entry must still select the
+        // per-class comparison.
+        sw->SetPfcPauseThresholdForVc(0, 2);
+        // No VC-1 entry: VC 1 keeps the global threshold value but the
+        // per-class comparison is armed for VC 0 (any entry selects the
+        // per-VC arm for the classes that have entries; VC 1 falls back to
+        // the global VALUE compared against its own class depth).
+
+        Ptr<R32PfcEndpoint> src = CreateObject<R32PfcEndpoint>();
+        nodes.Get(0)->AddApplication(src);
+        src->SetRank(0);
+        src->SetLocalRankRange(0, 2);
+        src->AddNetDevice(linkA.Get(0));
+        src->SetRoutingEntry(1, 0);
+        src->StartApplication();
+
+        auto entry = [](uint8_t vc) {
+            VoqEntry e;
+            e.packet = Create<Packet>(64);
+            FabricHeader fh;
+            fh.SetPacketType(FabricPacketType::DATA);
+            fh.SetFabricType(FabricType::ETHERNET);
+            fh.SetSourceRank(0);
+            fh.SetDestRank(1);
+            fh.SetVirtualChannel(vc);
+            fh.SetSourceMac(Mac48Address("00:00:00:00:00:01"));
+            fh.SetDestMac(Mac48Address("00:00:00:00:00:02"));
+            e.packet->AddHeader(fh);
+            e.srcAddr = fh.GetSourceMac();
+            e.dstAddr = fh.GetDestMac();
+            e.inPort = 0;
+            return e;
+        };
+        // Backlog VC 1 past the global threshold: whole-port depth 3 with
+        // VC-0 occupancy ZERO. Under the erased-entry regression this
+        // paused VC 0 (whole-port comparison); with the retained entry it
+        // must not (VC 0's own class depth is 0 < 2).
+        sw->EnqueueForTest(1, entry(1)); // fast path out
+        sw->EnqueueForTest(1, entry(1)); // vc1 depth 0
+        sw->EnqueueForTest(1, entry(1)); // vc1 depth 1
+        sw->EnqueueForTest(1, entry(1)); // vc1 depth 2 -> PAUSE vc 1 only
+        Simulator::Stop(NanoSeconds(300));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 1, 1), true,
+            "VC 1's own class depth crossed its (global-valued) threshold");
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPfcPaused(0, 1, 0), false,
+            "VC 0 at zero occupancy of its own class must NOT pause off "
+            "VC 1's backlog (the equal-valued entry still isolates)");
+
+        // And the direct converse: VC-0 occupancy alone at 2 must pause
+        // VC 0 (its entry's value governs its own class). Four pushes: the
+        // first takes the empty-VOQ fast path out, then class depths
+        // 0, 1, 2 — the fourth crosses the threshold.
+        uint64_t pausesBefore = sw->GetPfcPausesSent();
+        sw->EnqueueForTest(1, entry(0)); // fast path out
+        sw->EnqueueForTest(1, entry(0)); // vc0 depth 0
+        sw->EnqueueForTest(1, entry(0)); // vc0 depth 1
+        sw->EnqueueForTest(1, entry(0)); // vc0 depth 2 -> PAUSE vc 0
+        Simulator::Stop(NanoSeconds(300));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(sw->GetPfcPausesSent(), pausesBefore + 1,
+            "VC 0 pauses on its OWN class depth reaching its threshold");
+
         sw->Dispose();
         src->Dispose();
         Simulator::Destroy();
@@ -14569,6 +15067,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
 
     // PFC (802.1Qbb-style) opt-in congestion arm.
     AddTestCase(new EthernetSwitchPfcTriggerTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcHeadroomBudgetTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcEndpointHoldTest, TestCase::Duration::QUICK);
 
     // Codex round 26 regressions.
@@ -14581,6 +15080,7 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new PfcParkBodyNotFramedTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcBulkFragmentResumeDeliversAllTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcSoTxWindowResumeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SoTxWindowLlrOffClockTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcLlrRetransmitExemptTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcDeferredEgressLatchTest, TestCase::Duration::QUICK);
     AddTestCase(new SharpRetireCompletionOrderTest, TestCase::Duration::QUICK);
@@ -14631,6 +15131,9 @@ GpuClusterTestSuite::GpuClusterTestSuite()
     AddTestCase(new PfcPerVcIsolationTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcQuantaExpiryTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcQuantaDrainResumeTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcPartialResumeDrainsTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcQuantaResumeResendTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcEqualThresholdPerVcTest, TestCase::Duration::QUICK);
 
     // P1: NvSwitch microarchitecture.
     AddTestCase(new NvSwitchForwardingTest, TestCase::Duration::EXTENSIVE);

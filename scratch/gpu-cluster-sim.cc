@@ -404,6 +404,14 @@ main(int argc, char* argv[])
     uint32_t pfcPauseThreshold = 64;
     uint32_t pfcResumeOffset = 8;
     uint32_t pfcPauseTimeUs = 0;
+    // PFC headroom (XOFF in-flight absorption, 802.1Qbb / ns3-rdma
+    // m_pg_hdrm_limit analog): while a hop is PAUSE-latched its admissions
+    // draw this per-hop budget (packets) instead of queueing unbounded
+    // toward the VOQ hard cap — the XOFF needs a link RTT (+ source burst)
+    // to stop the source, and that in-flight data is what the budget holds.
+    // Exhaustion drops (the "ingress headroom full" analog). 0 = off
+    // (legacy unbounded admission, default).
+    uint32_t pfcHeadroomChunks = 0;
     // DCQCN rate machine (Phase B). Off by default: with no DcqcnRateMachine
     // mounted, CNPs are no-ops and SendPacketOnDevice adds zero shaping delay,
     // so all So runs stay bit-identical to the Phase-A baseline. On, a shared
@@ -570,8 +578,11 @@ main(int argc, char* argv[])
     cmd.AddValue("soTxWindow",
                  "Bound the number of in-flight So bulk chunks per endpoint "
                  "(NIC send-queue depth, perftest tx_depth analog; ACK-clocked "
-                 "via LLR per-packet ACKs, so it requires --llrEnabled). "
-                 "Default 0 = legacy unbounded synchronous dispatch.",
+                 "with or without LLR). Set this for congested incast "
+                 "scenarios: the default unbounded dispatch dumps the whole "
+                 "transfer at t=0, which overruns the switch VOQ hard cap "
+                 "under multi-sender incast. Default 0 = legacy unbounded "
+                 "synchronous dispatch.",
                  soTxWindow);
     cmd.AddValue("soGbnStrict",
                  "Strict go-back-N receive semantics for So flows in "
@@ -667,6 +678,7 @@ main(int argc, char* argv[])
     cmd.AddValue("pfcPauseThreshold", "PFC: VOQ depth (pkts) at which the switch PAUSEs the ingress feeding the congested egress (default 64; inert when switchPfcMode=0)", pfcPauseThreshold);
     cmd.AddValue("pfcResumeOffset", "PFC resume hysteresis (pkts): the pause lifts once the VOQ drains to pfcPauseThreshold - offset (default 8; inert when switchPfcMode=0)", pfcResumeOffset);
     cmd.AddValue("pfcPauseTime", "PFC mode 3 only: 802.1Qbb pause time (us) carried by each PAUSE. The endpoint auto-expires after this and the switch re-asserts at pausetime/2 while congested (qbb-net-device semantics). 0 with modes 1/2 = pause until explicit RESUME (default)", pfcPauseTimeUs);
+    cmd.AddValue("pfcHeadroomChunks", "PFC headroom (pkts) per paused hop: the XOFF in-flight absorption budget (802.1Qbb / ns3-rdma m_pg_hdrm_limit analog). While a hop is PAUSE-latched its admissions draw this budget instead of queueing unbounded toward the VOQ hard cap; exhausting it drops. Size it >= the path BDP (e.g. 40 Gbps x (2x1us + source burst) ~ 10). 0 = off (legacy, default)", pfcHeadroomChunks);
     cmd.AddValue("dcqcn", "Enable DCQCN rate machine on So endpoints (Phase B; off=parity-safe baseline)", enableDcqcn);
     cmd.AddValue("perQpCeilingGbps", "Per-QP sustained throughput ceiling in Gbps (0=off; ~49 = single-QP ib_write_bw)", perQpCeilingGbps);
     cmd.AddValue("dcqcnTFastNs", "DCQCN fast-recovery timer interval in ns (0=default 50000)", dcqcnTFastNs);
@@ -785,6 +797,13 @@ main(int argc, char* argv[])
         applyU32(fecT, "fecT");
         applyU64(fecEncodeLatencyNs, "fecEncodeLatencyNs");
         applyU64(fecDecodeLatencyNs, "fecDecodeLatencyNs");
+        {
+            const std::string s = prof.Get("fecEnabled", "");
+            if (!s.empty()) fecEnabled = (s == "1" || s == "true");
+            // ApplyBundle later installs this FEC instance on stencil
+            // endpoints. Preserve the resolved CLI/profile switch there too.
+            if (pbundle.fec) pbundle.fec->SetEnabled(fecEnabled);
+        }
         // Link BER.
         applyD(berIntraNodeElectrical, "berIntraNodeElectrical");
         applyD(berIntraRackElectrical, "berIntraRackElectrical");
@@ -1082,6 +1101,12 @@ main(int argc, char* argv[])
         const bool lossyRoce = interNodeFabricType == FabricType::ROCE
                                    && voqDropThresholdSet
                                    && voqDropThreshold != 0;
+        // PFC headroom drops need the same LLR retransmit path as the lossy
+        // tail-drop (NACK -> SACK/GBN retry): exhaustion in a lossless fabric
+        // without LLR is a silent permanent loss (verified: h=10 stalls
+        // incomplete with retransmittedPackets=0). Force LLR exactly like
+        // the lossy-Ethernet case above when a finite headroom is armed.
+        const bool headroomDropsPossible = switchPfcMode != 0 && pfcHeadroomChunks > 0;
 
         // Plain (non-RoCE) lossy Ethernet REQUIRES link-level retry: the
         // EthernetSwitch tail-drops at VoqDropThreshold and emits a NACK back
@@ -1096,17 +1121,19 @@ main(int argc, char* argv[])
         // pbundle.llrEnabled to every endpoint (protocol-config-runner.cc:53),
         // so the bundle must carry true or it clobbers this force after the
         // endpoint loop sets m_llrEnabled.
-        if (interNodeFabricType == FabricType::ETHERNET || lossyRoce)
+        if (interNodeFabricType == FabricType::ETHERNET || lossyRoce
+            || headroomDropsPossible)
         {
             const bool wasLlr = llrEnabled;
             llrEnabled = true;
             pbundle.llrEnabled = true;
             if (!wasLlr)
             {
-                std::cerr << "Note: the So fabric is lossy (VOQ tail-drop at "
-                             "threshold " << voqDropThreshold
-                             << ") and requires LLR retransmission; forcing "
-                             "llrEnabled=1.\n";
+                std::cerr << "Note: the fabric drops packets that need LLR "
+                             "retransmission (lossy VOQ tail-drop at threshold "
+                          << voqDropThreshold << " and/or finite PFC headroom "
+                          << pfcHeadroomChunks
+                          << "); forcing llrEnabled=1.\n";
             }
         }
 
@@ -1185,6 +1212,17 @@ main(int argc, char* argv[])
             multiTopo.SetInterNodeSwitchPfcPauseThreshold(pfcPauseThreshold);
             multiTopo.SetInterNodeSwitchPfcResumeOffset(pfcResumeOffset);
             multiTopo.SetInterNodeSwitchPfcPauseTime(pfcPauseTimeUs);
+            multiTopo.SetInterNodeSwitchPfcHeadroomChunks(pfcHeadroomChunks);
+            // Finite PFC headroom drops ride the lossy drop's NACK ->
+            // LLR/SACK retransmit path (the headroom-full drop in
+            // EthernetSwitch::OnPacketEnqueue calls EmitNackBack, which
+            // returns early unless the switch's m_llrEnabled is true).
+            // The endpoint-side force in pbundle arms the sender; this
+            // arms the NACK-originating switch.
+            if (headroomDropsPossible)
+            {
+                multiTopo.SetInterNodeSwitchLlrEnabled(true);
+            }
             // A pause needs a switch in the path to ORIGINATE it -- the same
             // inert-topology warning shape as the lossy drop below.
             if (interNodeTopology == "fullmesh" || interNodeTopology == "ring" ||
@@ -1867,15 +1905,25 @@ main(int argc, char* argv[])
                 {
                     ep->EnableLlrTimeoutRetransmit();
                 }
-                if (soTxWindow > 0)
-                {
-                    ep->SetSoTxWindow(soTxWindow);
-                }
-                if (soGbnStrict)
-                {
-                    ep->SetSoGbnStrict(true);
-                }
             }
+        }
+    }
+
+    // soTxWindow / soGbnStrict are independent LLR-free opt-ins (the perftest
+    // tx_depth analog). They used to live inside the llrEnabled block, so a
+    // run with LLR off (lossless RoCE) silently ignored --soTxWindow — an
+    // unbounded bulk TX window that dumped the whole transfer before the
+    // first PFC PAUSE could arrive (the 2:1 incast stall: switchVoqDrops
+    // 42633, status=incomplete). Wire them unconditionally here.
+    for (auto& ep : endpoints)
+    {
+        if (soTxWindow > 0)
+        {
+            ep->SetSoTxWindow(soTxWindow);
+        }
+        if (soGbnStrict)
+        {
+            ep->SetSoGbnStrict(true);
         }
     }
 
@@ -2860,6 +2908,7 @@ main(int argc, char* argv[])
     uint64_t ecnMarkedPackets = 0;
     uint64_t pfcPausesSent = 0;
     uint64_t pfcResumesSent = 0;
+    uint64_t pfcHeadroomDrops = 0;
     for (auto node = NodeList::Begin(); node != NodeList::End(); ++node)
     {
         for (uint32_t device = 0; device < (*node)->GetNDevices(); ++device)
@@ -2880,6 +2929,7 @@ main(int argc, char* argv[])
                 ecnMarkedPackets += ethSwitch->GetEcnMarkedPackets();
                 pfcPausesSent += ethSwitch->GetPfcPausesSent();
                 pfcResumesSent += ethSwitch->GetPfcResumesSent();
+                pfcHeadroomDrops += ethSwitch->GetPfcHeadroomDrops();
             }
         }
     }
@@ -2896,6 +2946,7 @@ main(int argc, char* argv[])
               << switchRouteUnavailableDrops << std::endl;
     std::cout << "pfcPausesSent=" << pfcPausesSent << std::endl;
     std::cout << "pfcResumesSent=" << pfcResumesSent << std::endl;
+    std::cout << "pfcHeadroomDrops=" << pfcHeadroomDrops << std::endl;
     uint64_t retransmittedPackets = 0;
     uint64_t retryBufferOverflows = 0;
     uint64_t permanentLosses = 0;

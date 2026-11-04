@@ -193,6 +193,26 @@ the stencil example; the ring/tree/nvls `.cfg`s above use
 [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the `.cfg` schema and the
 OTP/PEX transaction-graph seam.
 
+## Browser-based simulation lab
+
+Select a communication scenario, edit/import `.cfg` and `.profile` inputs, and
+run the actual ns-3 simulator from a local web interface:
+
+```bash
+python -m pip install -r webui/requirements.txt
+./ns3 build gpu-cluster-sim
+python -m webui --port 8080
+```
+
+Open **http://127.0.0.1:8080**. The lab includes a topology schematic, queued
+execution with cancellation/timeouts, native results and step-completion traces,
+persistent history, comparison of completed runs, and CSV/run-archive downloads.
+Inputs are copied per run; generated data stays outside the repository.
+The interface defaults to English; **EN / 中文** in the header switches language
+without resetting inputs or results, and remembers the preference in the browser.
+See the [English guide](webui/README.md) or [中文使用说明](webui/README.zh-CN.md)
+for configuration, Docker/Mac SSH access, troubleshooting, and checks.
+
 ## Surrogate model
 
 A latency surrogate lives under `surrogate/`, grounded in H200 NVLink4

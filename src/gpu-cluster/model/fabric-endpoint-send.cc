@@ -126,7 +126,7 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                 entry.vcId = vcId;
                 entry.seqNum = seqNum;
                 entry.deviceIndex = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
-                m_sendQueue.push(entry);
+                m_sendQueue.push_back(entry);
 
                 // Queue remaining chunks
                 for (uint32_t j = i + 1; j < numChunks; j++)
@@ -160,7 +160,7 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
                     remEntry.vcId = vcId;
                     remEntry.seqNum = remSeqNum;
                     remEntry.deviceIndex = sendDevices[(m_globalSprayOffset + j) % sendDevices.size()];
-                    m_sendQueue.push(remEntry);
+                    m_sendQueue.push_back(remEntry);
                 }
                 TrySendQueuedPackets();
                 break;
@@ -216,7 +216,7 @@ FabricEndpoint::SendData(uint16_t destRank, const uint8_t* data, uint32_t size,
         entry.vcId = vcId;
         entry.seqNum = header.GetSequenceNumber();
 
-        m_sendQueue.push(entry);
+        m_sendQueue.push_back(entry);
         TrySendQueuedPackets();
     }
 }
@@ -408,7 +408,7 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                 entry.vcId = vcId;
                 entry.seqNum = seqNum;
                 entry.deviceIndex = sendDevices[(m_globalSprayOffset + i) % sendDevices.size()];
-                m_sendQueue.push(entry);
+                m_sendQueue.push_back(entry);
 
                 // Queue remaining chunks too
                 for (uint64_t j = i + 1; j < numChunks; j++)
@@ -455,7 +455,7 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                     remEntry.vcId = vcId;
                     remEntry.seqNum = remSeqNum;
                     remEntry.deviceIndex = sendDevices[(m_globalSprayOffset + j) % sendDevices.size()];
-                    m_sendQueue.push(remEntry);
+                    m_sendQueue.push_back(remEntry);
                 }
                 // Try to send any queued packets that might have credits
                 TrySendQueuedPackets();
@@ -530,7 +530,7 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
                 entry.header = header;
                 entry.vcId = 0;
                 entry.seqNum = seqNum;
-                m_sendQueue.push(entry);
+                m_sendQueue.push_back(entry);
                 return;
             }
             packet->AddHeader(header);
@@ -555,7 +555,7 @@ FabricEndpoint::SendCollectiveBulk(FabricPacketType type,
             entry.vcId = 0;
             entry.seqNum = seqNum;
 
-            m_sendQueue.push(entry);
+            m_sendQueue.push_back(entry);
             TrySendQueuedPackets();
         }
     }
@@ -606,7 +606,7 @@ FabricEndpoint::SendP2p(uint16_t destRank, const uint8_t* data, uint32_t size,
             entry.header = header;
             entry.vcId = vcId;
             entry.seqNum = seqNum;
-            m_sendQueue.push(entry);
+            m_sendQueue.push_back(entry);
             TrySendQueuedPackets();
             return;
         }
@@ -622,7 +622,7 @@ FabricEndpoint::SendP2p(uint16_t destRank, const uint8_t* data, uint32_t size,
     entry.vcId = vcId;
     entry.seqNum = header.GetSequenceNumber();
 
-    m_sendQueue.push(entry);
+    m_sendQueue.push_back(entry);
     TrySendQueuedPackets();
 }
 
@@ -669,7 +669,7 @@ FabricEndpoint::SendMemoryRead(uint16_t destRank, uint64_t address, uint32_t siz
         entry.header = header;
         entry.vcId = vcId;
         entry.seqNum = seqNum;
-        m_sendQueue.push(entry);
+        m_sendQueue.push_back(entry);
         TrySendQueuedPackets();
         return;
     }
@@ -732,7 +732,7 @@ FabricEndpoint::SendMemoryWrite(uint16_t destRank, uint64_t address,
         entry.header = header;
         entry.vcId = vcId;
         entry.seqNum = seqNum;
-        m_sendQueue.push(entry);
+        m_sendQueue.push_back(entry);
         TrySendQueuedPackets();
         return;
     }
@@ -792,7 +792,7 @@ FabricEndpoint::SendMemoryResponse(uint16_t destRank, const uint8_t* data, uint3
         entry.header = header;
         entry.vcId = vcId;
         entry.seqNum = seqNum;
-        m_sendQueue.push(entry);
+        m_sendQueue.push_back(entry);
         TrySendQueuedPackets();
         return;
     }
@@ -885,7 +885,7 @@ FabricEndpoint::SendMemorySemantic(uint16_t destRank, uint64_t address,
         entry.header = header;
         entry.vcId = vcId;
         entry.seqNum = seqNum;
-        m_sendQueue.push(entry);
+        m_sendQueue.push_back(entry);
         TrySendQueuedPackets();
         // Still schedule completion — the packet will be sent when credits arrive
         // Tracked in m_deferredEgressEvents so DoDispose cancels it: the
@@ -1045,7 +1045,7 @@ FabricEndpoint::SendDataInternal(uint16_t destRank, const uint8_t* data, uint32_
                 entry.header = header;
                 entry.vcId = vcId;
                 entry.seqNum = seqNum;
-                m_sendQueue.push(entry);
+                m_sendQueue.push_back(entry);
                 TrySendQueuedPackets();
                 // Skip device selection for queued packets — TrySendQueuedPackets handles it
                 chunkIndex++;

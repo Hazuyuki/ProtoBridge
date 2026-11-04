@@ -28,9 +28,11 @@ the fitted pair. A dedicated additive fill term (commit a1fa05d) bought the
 MAPE down to 3.96% but made the formula a 5-constant curve fit; that trade
 was rejected in favor of the physical form.
 
-FIT RESULT at this convention: t_min_switch = 4.10 us, tree_bw = 275400
-B/us (eta = 0.72 vs the 382500 B/us trunk physics), MAPE 12.65% all-36
-(per-N 10.6/11.0/14.0/15.1%).
+FIT RESULT at this convention (post cut-through accounting fix): t_min_switch
+= 1.06 us, tree_bw = 308300 B/us (eta = 0.81 vs the 382500 B/us trunk
+physics), MAPE 1.88% all-36 (per-N 2.4/1.3/1.6/2.3%). The pre-fix fit
+(4.10 us / 275400 B/us, MAPE 12.65%) was absorbing the per-packet
+cut-through serialization derate into both constants.
 
 Run:  python3 configs/calibration/tree_ns3_sweep.py
 """
@@ -61,8 +63,8 @@ SIMPLE_CHUNK_BYTES = 2 << 20  # chunk D/N >= 2 MB => SIMPLE wire regime
 
 # Shipped surrogate constants (surrogate/theory/whitebox_surrogate_v2.py);
 # the sweep re-derives them and asserts agreement.
-SHIPPED = dict(t_min_switch_us=4.10,
-               tree_bw_per_level_bytes_per_us=275400)
+SHIPPED = dict(t_min_switch_us=1.06,
+               tree_bw_per_level_bytes_per_us=308300)
 
 
 def alpha_of(n: int) -> float:

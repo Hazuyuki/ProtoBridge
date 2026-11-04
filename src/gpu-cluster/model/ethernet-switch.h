@@ -90,19 +90,28 @@ class EthernetSwitch : public NvSwitch
      * Configure a per-VC PFC pause threshold (the 802.1Qbb per-priority
      * headroom analog): traffic on vcId pauses at this VOQ depth instead of
      * the global PfcPauseThreshold. VCs without an entry keep the global
-     * threshold. Inert when PfcMode=0. Setting a VC to the global value
-     * (or erasing it) restores the shared-threshold behavior.
+     * threshold. Inert when PfcMode=0.
+     *
+     * The entry is RETAINED even when threshold == the global value: the
+     * mere PRESENCE of any entry selects the per-VC occupancy comparison
+     * (per-class VOQ depth) over the legacy whole-port comparison. Erasing
+     * an equal-valued entry silently flipped that selection back (codex
+     * round 34, finding 4): with only equal-valued entries configured, the
+     * class compared the WHOLE-PORT depth against the threshold, so another
+     * class's backlog paused this class at zero occupancy of its own. Use
+     * ClearPfcPauseThresholdForVc to restore shared-threshold behavior.
      */
     void SetPfcPauseThresholdForVc(uint8_t vcId, uint32_t threshold)
     {
-        if (threshold == m_pfcPauseThreshold)
-        {
-            m_pfcPerVcThresholds.erase(vcId);
-        }
-        else
-        {
-            m_pfcPerVcThresholds[vcId] = threshold;
-        }
+        m_pfcPerVcThresholds[vcId] = threshold;
+    }
+
+    /// Erase a per-VC threshold entry: the VC reverts to the global
+    /// PfcPauseThreshold (and the legacy whole-port comparison when no
+    /// entries remain).
+    void ClearPfcPauseThresholdForVc(uint8_t vcId)
+    {
+        m_pfcPerVcThresholds.erase(vcId);
     }
 
     /**
@@ -115,6 +124,12 @@ class EthernetSwitch : public NvSwitch
 
     /// Compatibility overload: paused on ANY VC toward this hop.
     bool IsPfcPaused(uint32_t inPort, uint32_t outPort) const;
+
+    /// PFC headroom drops (packets dropped because a paused hop's headroom
+    /// budget was exhausted) — the analog of ns3-rdma's "Drop because
+    /// ingress headroom full". Zero unless PfcMode>0 with a finite
+    /// PfcHeadroomChunks.
+    uint64_t GetPfcHeadroomDrops() const { return m_pfcHeadroomDrops; }
 
   private:
     /// PFC trigger: past the (static or dynamic) threshold, PAUSE the ingress
@@ -157,6 +172,15 @@ class EthernetSwitch : public NvSwitch
 
   protected:
     void DoDispose() override;
+    /// Test seam: the mode-3 re-check (re-PAUSE while congested, RESUME once
+    /// drained) is a private scheduler callback; the headroom-budget
+    /// regression test drives the re-latch directly to pin the fresh-cycle
+    /// budget reset. Protected rather than public for the harness's
+    /// using-declaration (same pattern as NvSwitch::EnqueueForTest).
+    void RecheckPfcPauseForTest(uint32_t inPort, uint32_t outPort, uint8_t vcId)
+    {
+        RecheckPfcPause(inPort, outPort, vcId);
+    }
 
   private:
     uint32_t m_ecnThreshold;     ///< VOQ depth (packets) at which ECN is marked
@@ -220,6 +244,23 @@ class EthernetSwitch : public NvSwitch
     /// Latched pause state per (inPort -> outPort, VC) hop; a hop+class is
     /// paused once and resumed once (idempotent re-trigger suppression).
     std::map<PfcHopKey, bool> m_pfcPaused;
+    /// PFC headroom (802.1Qbb XOFF in-flight absorption, ns3-rdma's
+    /// m_pg_hdrm_limit analog): per-hop budget of packets admitted AFTER the
+    /// hop's PAUSE was latched. The XOFF needs a link RTT to reach and stop
+    /// the source; packets already on the wire (and any source-side burst
+    /// already serialized) keep arriving — the headroom holds them instead of
+    /// dropping (PFC's no-drop contract) or letting them pile the VOQ into
+    /// the VoqDepth hard cap. 0 = off (legacy behavior).
+    uint32_t m_pfcHeadroomChunks{0};
+    /// Per-hop headroom consumption since the hop's last PAUSE latch:
+    /// incremented per admission while paused, reset at (re-)latch and at
+    /// RESUME (a fresh pause cycle owns a fresh budget, like qbb's headroom
+    /// returning to the pool when the PG drains).
+    std::map<PfcHopKey, uint32_t> m_pfcHeadroomUsed;
+    /// Packets dropped because a paused hop's headroom budget was exhausted
+    /// (the "ingress headroom full" analog; only nonzero with a finite
+    /// PfcHeadroomChunks under sustained oversubscription).
+    uint64_t m_pfcHeadroomDrops{0};
     /// The mirrored header each PAUSE carried, per hop+class — the RESUME
     /// replays its reversal so it reaches the exact endpoint the pause
     /// silenced. Kept for a bounded number of re-sends AFTER the first

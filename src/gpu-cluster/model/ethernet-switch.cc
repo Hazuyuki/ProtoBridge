@@ -83,10 +83,16 @@ EthernetSwitch::GetTypeId()
                           "switch re-checks every PfcPauseTime/2 and "
                           "re-PAUSEs while the VOQ is still past the "
                           "threshold. 0 = pause until an explicit RESUME "
-                          "(modes 1/2 semantics). Inert unless PfcMode=3.",
+                          "(modes 1/2 semantics). Inert unless PfcMode=3. "
+                          "Upper bound 65535: the quanta rides the "
+                          "FabricHeader's 16-bit CreditCount field, so a "
+                          "larger configured value would truncate on the "
+                          "wire while the switch's re-check used the full "
+                          "value (endpoint expiring at T mod 65536 while "
+                          "the switch waits T/2).",
                           UintegerValue(0),
                           MakeUintegerAccessor(&EthernetSwitch::m_pfcPauseTimeUs),
-                          MakeUintegerChecker<uint32_t>(0))
+                          MakeUintegerChecker<uint32_t>(0, 65535))
             .AddAttribute("PfcResumeOffset",
                           "PFC resume hysteresis (packets): the pause "
                           "lifts once the VOQ drains to "
@@ -95,6 +101,24 @@ EthernetSwitch::GetTypeId()
                           "threshold. Inert when PfcMode=0.",
                           UintegerValue(8),
                           MakeUintegerAccessor(&EthernetSwitch::m_pfcResumeOffset),
+                          MakeUintegerChecker<uint32_t>(0))
+            .AddAttribute("PfcHeadroomChunks",
+                          "PFC headroom (packets) per paused hop: the "
+                          "in-flight absorption budget for packets that "
+                          "arrive AFTER the PAUSE (XOFF) was sent but "
+                          "before the source actually stops — the link "
+                          "RTT's worth of data plus any already-"
+                          "serialized source burst. The 802.1Qbb / "
+                          "ns3-rdma m_pg_hdrm_limit analog (qbb headroom). "
+                          "While a hop is paused, its admissions draw "
+                          "this budget instead of comparing the VOQ "
+                          "threshold (already crossed); exhausting it "
+                          "drops (the headroom-full drop). 0 = off "
+                          "(legacy threshold comparisons). Size it >= "
+                          "the path BDP: e.g. 40 Gbps x (2x1us + source "
+                          "burst) is ~10 packets per hop.",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&EthernetSwitch::m_pfcHeadroomChunks),
                           MakeUintegerChecker<uint32_t>(0));
     return tid;
 }
@@ -305,6 +329,12 @@ EthernetSwitch::MaybeSendPfcPause(const FabricHeader& fh, uint32_t outPort,
     GetPort(inPort)->Send(pausePkt, fh.GetSourceMac(), 0x0800);
 
     m_pfcPaused[{inPort, outPort, vcId}] = true;
+    // Fresh pause cycle, fresh headroom budget: the XOFF just left this
+    // switch, so the packets that will arrive before the source stops are
+    // exactly the in-flight absorption this cycle is allowed to hold
+    // (m_pfcHeadroomChunks; a re-latch after a mode-3 quanta expiry starts
+    // a new cycle, not a continuation of the old one).
+    m_pfcHeadroomUsed[{inPort, outPort, vcId}] = 0;
     // Retain the mirrored header so the eventual RESUME (CheckPfcResume)
     // reverses exactly this pause: same ranks/MACs/fabric type.
     m_lastPfcPauseHeader[{inPort, outPort, vcId}] = pause;
@@ -388,6 +418,9 @@ EthernetSwitch::RecheckPfcPause(uint32_t inPort, uint32_t outPort, uint8_t vcId)
             m_pfcPausesSent++;
         }
         m_pfcQuantaArmed.insert({inPort, outPort, vcId});
+        // Fresh quanta cycle, fresh headroom budget (mirrors the latch in
+        // MaybeSendPfcPause — the re-PAUSE is a new XOFF in flight).
+        m_pfcHeadroomUsed[{inPort, outPort, vcId}] = 0;
         const uint64_t recheckNs = m_pfcPauseTimeUs > 0
                                        ? (m_pfcPauseTimeUs * 1000ULL) / 2
                                        : 500;
@@ -402,6 +435,9 @@ EthernetSwitch::RecheckPfcPause(uint32_t inPort, uint32_t outPort, uint8_t vcId)
     // already expired is a no-op). No re-check re-arm — the next congestion
     // crossing re-PAUSEs from MaybeSendPfcPause.
     m_pfcPaused[{inPort, outPort, vcId}] = false;
+    // The pause cycle is over — retire any leftover headroom accounting so
+    // the next cycle (a fresh latch in MaybeSendPfcPause) starts clean.
+    m_pfcHeadroomUsed.erase({inPort, outPort, vcId});
     auto it = m_lastPfcPauseHeader.find({inPort, outPort, vcId});
     if (it != m_lastPfcPauseHeader.end())
     {
@@ -418,6 +454,19 @@ EthernetSwitch::RecheckPfcPause(uint32_t inPort, uint32_t outPort, uint8_t vcId)
         Ptr<Packet> resumePkt = Create<Packet>(0);
         resumePkt->AddHeader(resume);
         GetPort(inPort)->Send(resumePkt, it->second.GetDestMac(), 0x0800);
+        // Bounded re-send arm — the same contract as the mode-1 drain
+        // watcher (codex round 32, finding 1; missing here per codex round
+        // 34, finding 3): the endpoint never acknowledges a RESUME, so a
+        // lost mode-3 RESUME with pfcPauseTime=0 left the endpoint paused
+        // forever (the switch had cleared its latch with no expiry coming).
+        // With positive quanta the expiry eventually lifts the hold, but
+        // recovery waits the full quanta instead of 500 ns.
+        m_pfcResumeResends[{inPort, outPort, vcId}] = PFC_RESUME_RESEND_LIMIT;
+        EventId resend = Simulator::Schedule(
+            NanoSeconds(500), &EthernetSwitch::ResendPfcResume,
+            this, inPort, outPort, vcId);
+        PrunePfcResumeEvents();
+        m_pfcResumeEvents.push_back(resend);
         m_pfcResumesSent++;
     }
 }
@@ -455,6 +504,8 @@ EthernetSwitch::CheckPfcResume(uint32_t inPort, uint32_t outPort, uint8_t vcId)
     }
     // Drained past the hysteresis level: RESUME the paused source.
     m_pfcPaused[{inPort, outPort, vcId}] = false;
+    // Pause cycle over — retire the headroom accounting with the latch.
+    m_pfcHeadroomUsed.erase({inPort, outPort, vcId});
 
     // The RESUME re-targets whichever source the PAUSE silenced. The PAUSE
     // mirrored the ORIGINAL data header's ranks/MACs; replay that reversal
@@ -571,6 +622,49 @@ EthernetSwitch::OnPacketEnqueue(Ptr<Packet> packet, uint32_t outPort,
     }
     FabricHeader fh;
     packet->PeekHeader(fh);
+
+    // PFC headroom (XOFF in-flight absorption, ns3-rdma m_pg_hdrm_limit
+    // analog): while this hop is PAUSEd, data-class admissions draw a finite
+    // per-hop budget instead of admitting unbounded toward the base VoqDepth
+    // hard cap. The XOFF needs a link RTT (+ any already-serialized source
+    // burst) to actually stop the source; those packets are exactly what the
+    // budget holds. Checked BEFORE the pause trigger so the threshold-
+    // crossing packet itself (admitted to the shared buffer in ns3-rdma's
+    // model) does not draw the budget — only post-XOFF arrivals do.
+    // Exhaustion drops (m_pfcHeadroomDrops — the "ingress headroom full"
+    // analog). Control/retry bypass: pausing feedback would deadlock the
+    // loop, same exemption as every other congestion hook. 0 = off (legacy
+    // unbounded admission while paused).
+    if (m_pfcHeadroomChunks > 0 && !fh.IsControlPacket() && !fh.IsRetryPacket())
+    {
+        const PfcHopKey key{inPort, outPort, fh.GetVirtualChannel()};
+        if (IsPfcPaused(inPort, outPort, fh.GetVirtualChannel()))
+        {
+            auto it = m_pfcHeadroomUsed.find(key);
+            const uint32_t used = (it != m_pfcHeadroomUsed.end()) ? it->second : 0;
+            if (used >= m_pfcHeadroomChunks)
+            {
+                m_pfcHeadroomDrops++;
+                NS_LOG_WARN("PFC headroom exhausted for hop " << inPort << "->"
+                              << outPort << " vc " << static_cast<int>(fh.GetVirtualChannel())
+                              << ", dropping packet");
+                // NACK like the lossy drop below: a silent drop in a
+                // lossless fabric is an unrecoverable loss (h=10 with no
+                // NACK deadlocks the transfer — verified). The LLR/SACK
+                // retry path is the recovery, exactly as for tail-drops.
+                EmitNackBack(fh, inPort, fh.GetSourceMac());
+                return false; // drop: caller skips the push + counts m_voqDrops
+            }
+            if (it != m_pfcHeadroomUsed.end())
+            {
+                it->second = used + 1;
+            }
+            else
+            {
+                m_pfcHeadroomUsed[key] = 1;
+            }
+        }
+    }
 
     // PFC (opt-in, default off): past the pause threshold, PAUSE the ingress
     // feeding this egress instead of dropping — the no-drop backstop RoCE

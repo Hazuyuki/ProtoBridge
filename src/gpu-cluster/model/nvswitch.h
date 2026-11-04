@@ -617,7 +617,7 @@ class NvSwitch : public FabricSwitch
     uint64_t m_cutThroughDelayNs = 200;              ///< Cut-through forwarding delay (ns), 0=store-and-forward
     EventId m_arbitrationEvent;                     ///< Scheduled arbitration event
     uint32_t m_currentArbitrationPort;              ///< Current port for RR arbitration
-    std::vector<Time> m_outputBusyUntil;            ///< Per-port egress busy time (serialization)
+    std::vector<Time> m_outputBusyUntil;            ///< Per-port logical service availability (serialization only; cut-through pipeline latency is excluded — it overlaps the serializer)
     Ptr<Arbiter> m_arbiter;                         ///< Crossbar arbitration strategy (default: RoundRobinArbiter)
     /// Deferred collective-result multicasts (aggregation delay + FEC-coding
     /// egress holds). Each callback targets raw `this` (bound member call or

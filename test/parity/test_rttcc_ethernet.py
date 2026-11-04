@@ -22,17 +22,14 @@ a voqDropThreshold=2 ToR switch -- the congestion RTTCC exists to sense):
   machine is mounted, no probe is emitted, the new code is invisible. This
   is the parity foundation for every existing calibration.
 
-* ``test_rttcc_on_incast`` -- with ``--rttcc=1 --rttccTargetRttNs=3000`` the
+* ``test_rttcc_on_incast`` -- with ``--rttcc=1 --rttccTargetRttNs=1000`` the
   full loop must light up: probes sent, RTT samples collected, and at least
-  one flow throttled below the 400G line rate (rttccMinRateGbps=244.1) while
-  the run still COMPLETES. The 3 us target is REQUIRED under true SACK (the
-  cfg's [stack] llrMode=sack override): selective retransmit recovers each
-  drop with one retransmit, so the incast's max RTT (5849 ns) never exceeds
-  the 10 us default target and the machine never throttles. Under SACK the
-  throttle costs more than it saves at this burst size (15.5 -> 16.2 us) --
-  unlike the earlier GBN regime (blanket retransmits, drops 149 / retx 314)
-  where pacing the initial burst halved completion (106.9 -> 54.8 us). The
-  gate's purpose is that the loop demonstrably engages, not that it wins at
+  one flow throttled below the 400G line rate (rttccMinRateGbps=354.9) while
+  the run still COMPLETES. The non-default 1 us target is REQUIRED to engage
+  the loop: selective SACK retransmit recovers each drop with one retransmit
+  and (post cut-through accounting fix) the incast's max RTT is only
+  1164 ns, below the 10 us default target. The gate's purpose is that the
+  loop demonstrably engages, not that it wins at
   this size.
 
 Run:
@@ -64,27 +61,32 @@ INCAST_CFG = "configs/protocol_configs/p2p-eth-incast.cfg"
 # override the tests' --llrMode=sack silently ran GBN (blanket retransmits:
 # 149 drops / 314 retx). True SACK retransmits selectively (27/27) and halves
 # completion (106.9 -> 15.5 us).
+# Re-pinned (cut-through accounting fix: serialization-only egress
+# busy-until; the 200-ns pipeline overlaps the serializer). The 192-KiB
+# incast now drains ~30% faster, the VOQ tail-drop pattern is smaller
+# (27 -> 11), and the max RTT fell 5849 -> 1164 ns.
 BASELINE = {
-    "simTimeNs": 15480,
-    "switchVoqDrops": 27,
-    "retransmittedPackets": 27,
+    "simTimeNs": 10880,
+    "switchVoqDrops": 11,
+    "retransmittedPackets": 11,
     "permanentLosses": 0,
 }
 
-# Observed deterministic values with --rttcc=1 --rttccTargetRttNs=3000
-# (RngRun=1). The non-default 3us target is REQUIRED to engage the loop under
-# SACK: selective retransmit recovers each VOQ drop with one retransmit, so the
-# incast's max RTT (5849ns) never exceeds the 10us default target and the
-# controller never throttles (rttccMinRateGbps stays at line rate 400). The
-# GBN-era pins (rttcc halved completion by pacing the initial burst) do not
-# carry over: under SACK the retransmit storm is 10x smaller, so throttling
-# costs more than it saves at this size (54.8 -> 16.2us baseline vs on).
+# Observed deterministic values with --rttcc=1 --rttccTargetRttNs=1000
+# (RngRun=1; post cut-through accounting fix). The non-default 1us target is
+# REQUIRED to engage the loop: selective SACK retransmit recovers each VOQ
+# drop with one retransmit, and the incast's max RTT (1164 ns post-fix;
+# 5849 ns pre-fix) never exceeds the 10us default target.
+# Re-pinned with BASELINE (cut-through accounting fix). Target moved
+# 3000 -> 1000 ns: the fix dropped the incast's max RTT to 1164 ns, so the
+# old 3-us target sat above the observed RTT and the controller never
+# throttled. 1000 ns engages the loop (rate 400 -> 354.9).
 RTTCC_ON = {
-    "simTimeNs": 16184,
-    "switchVoqDrops": 30,
-    "retransmittedPackets": 30,
+    "simTimeNs": 10881,
+    "switchVoqDrops": 11,
+    "retransmittedPackets": 11,
     "permanentLosses": 0,
-    "rttccMinRateGbps": 244.1,
+    "rttccMinRateGbps": 354.9,
 }
 
 
@@ -125,7 +127,7 @@ def run_incast(rttcc, timeout=600):
         args.append("--rttcc=1")
         # Below the incast's observed max RTT (5849ns): the 10us default never
         # throttles under SACK (see RTTCC_ON comment).
-        args.append("--rttccTargetRttNs=3000")
+        args.append("--rttccTargetRttNs=1000")
     if binary:
         cmd = [binary] + args
     else:

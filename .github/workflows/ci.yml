@@ -22,10 +22,9 @@ jobs:
       - name: Install Python deps
         run: |
           # ubuntu-24.04 marks pip as externally-managed, so
-          # --break-system-packages is required to install pytest (the only
-          # dependency in surrogate/requirements.txt) into the system
-          # interpreter that runs the tests.
-          pip3 install --break-system-packages -r surrogate/requirements.txt
+          # --break-system-packages installs test dependencies into the system
+          # interpreter that runs both the surrogate and WebUI checks.
+          pip3 install --break-system-packages -r surrogate/requirements.txt -r webui/requirements-dev.txt
 
       - name: ccache env
         run: |
@@ -76,3 +75,6 @@ jobs:
         # and the surrogate-vs-ns3 lower-bound anchor; both invoke the
         # gpu-cluster-sim binary built in the "Build" step above.
         run: python3 -m pytest surrogate/test/ test/parity/ -q
+
+      - name: WebUI API, translations and native options
+        run: python3 -m pytest webui/tests/ -q

@@ -133,8 +133,11 @@ SINGLE_BASE = [
 SINGLE_BG = SINGLE_BASE + BG_COMMON + ["--bgP2pDst=2"]
 
 PINNED = {
-    "multi-base": 1248928, "multi-bg-cross": 2776201,
-    "multi-bg-intra": 1330831, "multi-bg-intra-w1": 1315771,
+    # Multi-node pins re-pinned (cut-through accounting fix: serialization-only
+    # egress busy-until; the pipeline overlaps the serializer). Single-node
+    # values unchanged -- the Su fabric has no switch egress hop.
+    "multi-base": 1246928, "multi-bg-cross": 2734229,
+    "multi-bg-intra": 1311036, "multi-bg-intra-w1": 1295976,
     # single-bg-w1 re-pinned 468378 -> 405462 (codex round 15, finding 3):
     # the old pin captured the pre-fix transaction graph, which chained each
     # rank's next send on its OWN outgoing delivery instead of input receipt.

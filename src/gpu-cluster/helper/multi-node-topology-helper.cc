@@ -37,6 +37,7 @@ MultiNodeTopologyHelper::MultiNodeTopologyHelper()
       m_switchPfcPauseThreshold(64),
       m_switchPfcResumeOffset(8),
       m_switchPfcPauseTimeUs(0),
+      m_switchPfcHeadroomChunks(0),
       m_arbiter(nullptr),
       m_intraNodeDataRate("3600Gbps"),
       m_intraNodeDelay("400ns"),
@@ -76,6 +77,7 @@ void MultiNodeTopologyHelper::SetInterNodeSwitchPfcMode(uint32_t mode) { m_switc
 void MultiNodeTopologyHelper::SetInterNodeSwitchPfcPauseThreshold(uint32_t threshold) { m_switchPfcPauseThreshold = threshold; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchPfcResumeOffset(uint32_t offset) { m_switchPfcResumeOffset = offset; }
 void MultiNodeTopologyHelper::SetInterNodeSwitchPfcPauseTime(uint32_t pauseTimeUs) { m_switchPfcPauseTimeUs = pauseTimeUs; }
+void MultiNodeTopologyHelper::SetInterNodeSwitchPfcHeadroomChunks(uint32_t headroomChunks) { m_switchPfcHeadroomChunks = headroomChunks; }
 void MultiNodeTopologyHelper::SetInterNodeSpines(uint32_t spines) { m_interNodeSpines = spines; }
 void MultiNodeTopologyHelper::SetInterNodeTorusWidth(uint32_t width) { m_interNodeTorusWidth = width; }
 void MultiNodeTopologyHelper::SetInterNodeDragonflyGroupSize(uint32_t groupSize) { m_interNodeDragonflyGroupSize = groupSize; }
@@ -123,6 +125,15 @@ MultiNodeTopologyHelper::ApplyPfcAttributes(Ptr<NvSwitch> sw) const
         {
             sw->SetAttributeFailSafe("PfcPauseTime",
                                      UintegerValue(m_switchPfcPauseTimeUs));
+        }
+        // PFC headroom (XOFF in-flight absorption): per-paused-hop admission
+        // budget while latched; 0 = legacy unbounded admission. Applied under
+        // any nonzero mode (a headroom without a PAUSE is meaningless, so it
+        // stays inside this gate).
+        if (m_switchPfcHeadroomChunks > 0)
+        {
+            sw->SetAttributeFailSafe("PfcHeadroomChunks",
+                                     UintegerValue(m_switchPfcHeadroomChunks));
         }
     }
 }

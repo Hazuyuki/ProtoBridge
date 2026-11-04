@@ -128,6 +128,14 @@ class MultiNodeTopologyHelper
     void SetInterNodeSwitchPfcPauseThreshold(uint32_t threshold);
     void SetInterNodeSwitchPfcResumeOffset(uint32_t offset);
     void SetInterNodeSwitchPfcPauseTime(uint32_t pauseTimeUs);
+    /// PFC headroom (XOFF in-flight absorption, 802.1Qbb / ns3-rdma
+    /// m_pg_hdrm_limit analog): per-paused-hop admission budget in packets.
+    /// While a hop is PAUSE-latched its admissions draw this budget instead
+    /// of queueing unbounded toward the VOQ hard cap; exhausting it drops
+    /// (the "ingress headroom full" analog). Size it >= the path BDP: e.g.
+    /// 40 Gbps x (2x1us link RTT + source burst) is ~10 packets per hop.
+    /// 0 = off (legacy unbounded admission, default).
+    void SetInterNodeSwitchPfcHeadroomChunks(uint32_t headroomChunks);
 
   private:
     /// Apply the PFC attributes to an So switch (no-op for mode 0 and for
@@ -176,6 +184,8 @@ class MultiNodeTopologyHelper
     uint32_t m_switchPfcPauseThreshold;
     uint32_t m_switchPfcResumeOffset;
     uint32_t m_switchPfcPauseTimeUs;
+    /// PFC headroom per paused hop (0 = off) — see the setter above.
+    uint32_t m_switchPfcHeadroomChunks;
     Ptr<Arbiter> m_arbiter;
 
     std::string m_intraNodeDataRate;

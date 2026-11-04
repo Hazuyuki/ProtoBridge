@@ -1,22 +1,22 @@
 {
-  "source": "ns-3 TreeAllReduce (chunk-pipelined full-volume, post volume-fix + post local-rank-fix e1cdd9c) on --topology=switched; TRUE H200 fabric: --linksPerGpu=18 separate point-to-point NVLink4 lanes @ 170 Gbps each, spray-routed (128 KiB chunks round-robin), aggregate trunk 3060 Gbps; credits unconstrained (--vcCredits=104857600)",
+  "source": "ns-3 TreeAllReduce (chunk-pipelined full-volume) on --topology=switched; TRUE H200 fabric: --linksPerGpu=18 separate point-to-point NVLink4 lanes @ 170 Gbps each, spray-routed (128 KiB chunks round-robin), aggregate trunk 3060 Gbps; credits unconstrained (--vcCredits=104857600). Swept AFTER the cut-through accounting fix (egress busy-until = serialization-only logical service availability; the pipeline delay overlaps the serializer).",
   "model": "T = S(D) + 2*log2(N)*t_min_switch + alpha(N)*D/tree_bw; alpha(N) = STRUCTURAL busiest GPU<->NVSwitch trunk load in D units (1/2/3); the pipeline-fill residual is absorbed into the fitted pair, not modeled",
   "fit_set": "all points, relative-error weighted (1/T^2); N in {4,8,16,32} x 1-256 MB; TWO free constants (t_min_switch, tree_bw), joint LS",
-  "tree_bw_per_level_bytes_per_us": 275365.8751498439,
-  "t_min_switch_us": 4.102709880062105,
+  "tree_bw_per_level_bytes_per_us": 308264.6767056469,
+  "t_min_switch_us": 1.0632151562583905,
   "alpha_structural": {
     "4": 2.0,
     "8": 3.0,
     "16": 3.0,
     "32": 3.0
   },
-  "mape_all_pct": 12.65,
-  "mape_simple_pct": 6.97,
+  "mape_all_pct": 1.88,
+  "mape_simple_pct": 2.0,
   "mape_per_n_pct": {
-    "4": 10.61,
-    "8": 10.98,
-    "16": 13.98,
-    "32": 15.05
+    "4": 2.39,
+    "8": 1.28,
+    "16": 1.63,
+    "32": 2.25
   },
   "n_fit_points": 36,
   "ns3_config": {
@@ -33,7 +33,7 @@
   "trunk_physics_bytes_per_us": 382500.0,
   "sweep_csv": "tree_sweep.csv",
   "shipped_constants": {
-    "t_min_switch_us": 4.1,
-    "tree_bw_per_level_bytes_per_us": 275400
+    "t_min_switch_us": 1.06,
+    "tree_bw_per_level_bytes_per_us": 308300
   }
 }
