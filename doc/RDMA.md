@@ -201,10 +201,9 @@ signal wait has its own observation delay.
 
 ## User parameters
 
-These names work as native CLI flags and `[stack]` / `.profile` keys.
-`[stack]` overrides the profile, and resolved profile/stack values override CLI
-values for the same keys. To switch a config-based run, change its `[stack]`
-`rdmaSubmission`; a conflicting CLI flag does not override it.
+Submission controls work as native CLI flags and profile/`[stack]` keys.
+Use the common [configuration precedence](CONFIG_GUIDE.md#configuration-precedence)
+when overriding a shipped example.
 
 | Group | Parameters | Meaning |
 |---|---|---|
@@ -235,8 +234,7 @@ registration and kernel launch belong in the upper simulator's ready times.
 
 ### Operation parameters and results
 
-All operation controls work as CLI flags and profile/`[stack]` keys; stack and
-profile precedence follows the submission controls above.
+Operation controls follow the same configuration precedence as submission controls.
 
 | Parameter | Default | Meaning |
 |---|---:|---|
@@ -424,25 +422,16 @@ receive callbacks and aggregate results, not per-WR in this source-side CSV.
 
 ## GPU-initiated RDMA (IBGDA)
 
-`rdmaSubmission=ibgda` selects detailed GPU initiation with GPUDirect payloads.
-The GPU producer constructs and publishes the WQE, rings the NIC doorbell, and
-observes completion in HBM. Producers can map to separate QPs; WR depth and
-doorbell batching determine how much work can overlap.
+`rdmaSubmission=ibgda` is the detailed GPU/GPUDirect preset described in
+[Choose a mode](#choose-a-mode). Run `ibgda-p2p.cfg` from the example table
+and set producer/QP costs and batching with the submission controls above.
+CPU-issued perftest data does not identify GPU WQE construction/publication
+costs. Startup and completion measurements are defined in
+[Results and WebUI](#results-and-webui).
 
-```bash
-./ns3 run "gpu-cluster-sim --protocolConfig=configs/protocol_configs/ibgda-p2p.cfg --numNodes=2 --gpusPerNode=2 --dataSize=1048576 --rdmaTraceFile=/tmp/ibgda.csv"
-```
-
-Use the same submission, memory and PCIe controls described above. The preset's
-costs are illustrative; CPU-issued perftest data does not identify GPU WQE
-construction or publication costs. Startup is measured from logical readiness
-to the first physical packet transmission and includes queueing and batching.
-
-The compatibility API `FabricEndpoint::SubmitIbgdaWrite` accepts an explicit
-producer ID and completion callback. `IbgdaSubmissionModel` retains `Quiet`,
-`Fence`, and observer support. GPU initiation also works with all addressed
-operations in this guide. DCI/DCT switching, GPU instructions, cache effects
-and SM scheduling are outside the model.
+The compatibility API `FabricEndpoint::SubmitIbgdaWrite` accepts a producer
+ID and completion callback. `IbgdaSubmissionModel` retains `Quiet`, `Fence`
+and observer support. Addressed operations use the same GPU submission path.
 
 ## Compatibility and scope
 

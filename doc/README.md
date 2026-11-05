@@ -1,26 +1,33 @@
 # ProtoBridge documentation
 
-Start with the repository [quickstart](../README.md), then choose a guide:
+Choose a reading path for the task:
+
+| Task | Reading path |
+|---|---|
+| Run an experiment | Repository [quickstart](../README.md) → [Configuration](CONFIG_GUIDE.md) → [example catalog](../examples/gpu-cluster/README.md). |
+| Understand or extend simulation | [Architecture](ARCHITECTURE.md) → [RDMA/IBGDA](RDMA.md) and [PCIe](PCIE.md) for the relevant device path. |
+| Sweep designs analytically | [Surrogate](SURROGATE.md) → [Calibration](CALIBRATION.md) for reference conditions and validation. |
+| Use the browser interface | WebUI [English](../webui/README.md) or [Chinese](../webui/README.zh-CN.md) guide. |
+
+## Guides
 
 | Guide | Contents |
 |---|---|
-| [Configuration](CONFIG_GUIDE.md) | `.cfg` and `.profile` inputs, precedence, topology and protocol parameters, time bounds. |
-| [Architecture](ARCHITECTURE.md) | OTP/PEX, packet execution, resilience, topology and extension interfaces. |
-| [RDMA and IBGDA](RDMA.md) | CPU/GPU submission, host/staged/GPUDirect memory paths, operations, completion and C++ integration. |
-| [PCIe](PCIE.md) | Bandwidth and TLP models, shared paths, queues, credits, tags and traces. |
-| [Surrogate](SURROGATE.md) | Python API, topology and hierarchical predictions, mechanism equations and limits. |
-| [Calibration and validation](CALIBRATION.md) | Measurement provenance, fitted parameters, independent comparisons and reproduction commands. |
+| [Configuration](CONFIG_GUIDE.md) | Input syntax, precedence, units/defaults, authoring and the simulation time horizon. |
+| [Architecture](ARCHITECTURE.md) | OTP/PEX, execution paths, packet metadata, network mechanisms and extension interfaces. |
+| [RDMA and IBGDA](RDMA.md) | Submission/memory events, operation and completion semantics, parameters/results and C++ integration. |
+| [PCIe](PCIE.md) | Local TLP topology, execution, credits/tags/queues, API, traces and scope. |
+| [Surrogate](SURROGATE.md) | Python API, analytical composition and equations. |
+| [Calibration and validation](CALIBRATION.md) | Dataset provenance, fitted values, recorded metrics, limits and reproduction commands. |
 
-Runnable configurations, C++ examples and experiment scripts are listed in
-the [example catalog](../examples/gpu-cluster/README.md). WebUI setup, SSH/Docker
-access and controls are covered in its [English](../webui/README.md) and
-[Chinese](../webui/README.zh-CN.md) guides.
+The [example catalog](../examples/gpu-cluster/README.md) lists configurations
+and scripts. The root [README](../README.md) covers installation and the first
+run; [CONTRIBUTING.md](../CONTRIBUTING.md) covers development and test requirements. [CHANGES.md](../CHANGES.md) summarizes user-visible changes;
+Git retains detailed development history.
 
-For development, use [CONTRIBUTING.md](../CONTRIBUTING.md) and the project
-[change summary](../CHANGES.md). Detailed development history is available in
-Git.
+## Bundled ns-3 documentation
 
-The other subdirectories here contain the bundled ns-3 framework's
+The other subdirectories contain the framework's
 [manual](manual/source/index.rst), [tutorial](tutorial/source/index.rst),
 [installation](installation/source/index.rst),
 [model documentation](models/source/index.rst) and

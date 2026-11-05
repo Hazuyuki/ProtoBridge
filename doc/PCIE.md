@@ -17,9 +17,9 @@ stencils, and detailed multi-node collectives. Change `rdmaOperation` to `read`,
 `signal` for the native RDMA workload. Use `rdmaDataPath=staged` to include copies
 through host DRAM.
 
-CLI flags, profile keys, and `[stack]` keys use the same parameter names. Resolved
-profile/stack values override corresponding CLI values. For example, add
-`pcieModel = tlp` to `[stack]` to override a profile's bandwidth model.
+PCIe controls work as CLI flags and profile/`[stack]` keys. Apply the
+common [configuration precedence](CONFIG_GUIDE.md#configuration-precedence)
+when switching an existing profile to `pcieModel=tlp`.
 
 ## Paths and shared resources
 

@@ -123,7 +123,7 @@ uncalibrated estimate.
 
 ## 4. Query a latency — `predict()`
 
-```python
+```text
 s.predict(data_bytes, num_gpus, algo, credits, ber=0, ..., topology=None, *, collective)
 ```
 
@@ -159,7 +159,7 @@ The algorithm alone no longer fixes the collective. `collective=` names the
 operation and, with `algo`, fixes the step count and per-step volume. The
 mapping is:
 
-| `collective` | `algo` | steps | per-step volume | per-GPU volume |
+| `collective` | `algo` | steps | modeled work per step | modeled per-GPU work |
 |---|---|---|---|---|
 | `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
 | `allgather` | `ring` | `N-1` (one pass) | `D(N-1)/N / steps` | `D(N-1)/N` |
@@ -171,20 +171,11 @@ mapping is:
 | `alltoall` | `tree` | `⌈log₂N⌉` | `D(N-1)/N / steps` | `D(N-1)/N` |
 | `sendrecv` | any | `1` | `D` | `D` (single hop) |
 
-Full-mesh is the one algorithm where `N` does **not** scale the step volume:
-the `N-1` peer sends are **concurrent** on dedicated per-pair bundles (one
-phase ships `D/N` per bundle), not `2(N-1)` sequential hops like ring. AR = 2
-phases (barrier-gated reduce-scatter + all-gather), AG = 1; `fullmesh_bw` is
-ns-3-calibrated (recipe M) — structurally it is NVLS **without** the N-fold
-serialization factor.
-
-AlltoAll moves `D(N-1)/N` per GPU across `N-1` partner phases (ring) or
-`⌈log₂N⌉` recursive-doubling rounds (tree) — the volume correction the DSE's
-analytical model describes but does not apply. Its per-step serialization uses
-the per-link ring rate; the cross-section **contention** (every GPU talks to
-every other) is captured by the **topology bisection cap** (§5), so without a
-topology AlltoAll is an optimistic lower bound. Send-Recv is one point-to-point
-hop: `steps=1`, full payload, no pipeline credit pressure.
+The table describes the surrogate's schedule accounting. Full-mesh peers
+transfer concurrently on dedicated bundles, so one phase serializes `D/N` on
+each bundle. AlltoAll uses the ring rate plus an optional topology bisection
+cap. Send-Recv uses one hop and no pipeline credit-pressure term. Fit conditions
+are recorded in [Calibration](CALIBRATION.md).
 
 ```python
 from surrogate.theory.whitebox_surrogate_v2 import make_h200_alltoall_theory
@@ -276,68 +267,35 @@ Per-family formulas are implemented by `make_topology_from_name` in
 
 ## 6. Scale-out (So) fabric + hierarchical (Su→So) collectives
 
-When a job spans more than one node, NCCL runs the collective **hierarchically**:
-each node does it locally over NVLink (Su, scale-up), one representative per node
-does it across nodes over Ethernet RoCEv2 (So, scale-out), then the result is
-redistributed locally (Su). The `HierarchicalSurrogate` class composes **any** Su
-sub-surrogate with **any** So sub-surrogate under a So topology. It is
-**model-agnostic** — H200 is just one preset; A800 / B200 / MI300 / any NVLink
-plus any Ethernet fabric work the same way by building `su` and `so` from your
-own hardware numbers.
+A hierarchy composes a local stage and a remote stage with their own rates,
+startup and topology inputs. The shipped scale-out preset approximates an
+uncongested path; packet queues, PFC and detailed synchronization execute in
+ns-3. Validate the analytical composition against the selected workload and
+reference conditions.
 
-The So term is an **uncalibrated lower bound** anchored to ns-3 (spec-derived
-RoCEv2 params — 400GbE wire rate, 40 µs RDMA startup, 0.95 wire efficiency — not
-real-HW calibration). The analytical model omits per-packet credit flow, VOQ
-arbitration, PFC/MTU overhead, and per-phase barrier syncs that ns-3 models, so
-the hierarchical latency sits below the ns-3 packet-level simulation.
+### Compose a hierarchy
 
-### Entry point — the class, not a factory
+Construct a `TheoryDerivedSurrogate` for each local/remote stage using the
+[factories or custom inputs](#3-build-a-surrogate) above, then compose them:
 
 ```python
-from surrogate.theory.whitebox_surrogate_v2 import HierarchicalSurrogate
+from surrogate.theory.whitebox_surrogate_v2 import (
+    HierarchicalSurrogate, TheoryDerivedSurrogate, make_surrogate_from_wire,
+)
 
-h = HierarchicalSurrogate(su, so, gpus_per_node=8, num_nodes=4, so_topology=so_topo)
-lat_us = h.predict(data_bytes, "ring", credits=128, collective="allreduce")
+su = make_surrogate_from_wire(20000, 6, "ring", startup_us=10.0)
+so = TheoryDerivedSurrogate(
+    ring_bw_bytes_per_us=100000, num_lanes=4, startup_us=40.0,
+    link_latency_us=1.0, t_min_switch_us=1.5, wire_efficiency=0.95,
+)
+h = HierarchicalSurrogate(su, so, gpus_per_node=8, num_nodes=4)
+lat_us = h.predict(1 << 20, "ring", credits=128, collective="allreduce")
 ```
 
-`su` and `so` are **any** `TheoryDerivedSurrogate` instances (§3). The convenience
-factory `make_h200_hierarchical_theory(gpus_per_node, num_nodes,
-so_topology_family, ...)` is one H200 preset for this; for any other platform,
-build `su`/`so` yourself and compose — the class is the general entry point.
-
-### Build `su` (NVLink) and `so` (Ethernet RoCEv2) — three levels, most general first
-
-| Level | How | When |
-|---|---|---|
-| **1 full custom** | `TheoryDerivedSurrogate(ring_bw_bytes_per_us=..., startup_us=..., ...)` | every knob explicit, any vendor |
-| **2 wire-derived** | `make_surrogate_from_wire(b_link_bytes_per_us, num_lanes, algo, **overrides)` | only the per-link wire rate known (preferred for new platforms) |
-| **3 preset** | `make_h200_ring_theory()` / `make_1024_optical_fattree_theory()` / `make_connectx7_p2p_perftest_theory()` | reuse a shipped anchor |
-
-The So sub-surrogate is a `TheoryDerivedSurrogate` with **Ethernet-flavored**
-values — no H200 lock-in. The knobs that distinguish a So (RoCEv2) stage from a
-Su (NVLink) stage:
-
-| Knob | Su (NVLink) | So (Ethernet RoCEv2) | Why |
-|---|---|---|---|
-| `ring_bw_bytes_per_us` | NVLink schedule bw | Ethernet schedule bw (e.g. 160000 = 400GbE × 8 NIC) | per-fabric wire rate |
-| `num_lanes` | NVLink links/GPU (18) | NICs/node (8) | So counts NICs, not NVLink lanes |
-| `link_latency_us` | 0.4 | ~1.0 | per-hop propagation |
-| `t_min_switch_us` | 1.06 (NVSwitch) | ~1.5 (Ethernet pipeline) | switch fill |
-| `startup_us` | 15 (NCCL) | ~40 (RDMA) | software launch |
-| `wire_efficiency` | 1.0 (no L3/L4 header) | 0.95 (Eth+IP+UDP+IB) | header overhead on T_serial |
-| `tree_bw` / `nvls_bw` | used on Su | inherited, unused on So | So stage runs the ring path |
-
-**Plain (non-RoCE) lossy Ethernet So fabric.** `make_h200_ethernet_theory()`
-is the lossy counterpart to `make_h200_roce_theory()`: the same 400GbE L2 wire
-(`ring_bw=160000`), but a **store-and-forward** switch pipeline
-(`link_latency_us=3.0`, `t_min_switch_us=3.0` vs RoCE's cut-through 1.0/1.5)
-and `wire_efficiency=1.0` (plain L2 data carries no RoCE IP/UDP/IB headers —
-mirroring the ns-3 `EthernetProtocolModel`, which locks `WireEfficiency=1.0`).
-The lossy drop/NACK/LLR-retransmit behavior is **ns-3-only** — the surrogate
-is the uncongested mean (the same split as RoCE/DCQCN). To use it as the So
-stage of a hierarchical collective, pass it via the `so_factory` seam:
-`make_h200_hierarchical_theory(so_factory=make_h200_ethernet_theory)` (the
-default is `make_h200_roce_theory`). See recipe N.
+The local stage uses per-GPU links; the remote stage uses NICs per node,
+Ethernet bandwidth/efficiency and RDMA startup. `make_h200_hierarchical_theory`
+is a preset for this composition. Pass `so_factory=make_h200_ethernet_theory`
+to that preset for the plain-Ethernet stage described below.
 
 ### So topology — `so_topology`
 
@@ -370,7 +328,7 @@ how the Su and So stages compose:
 | `alltoall` | Su + So — 2 phases | full `D` (each GPU sends its `D/(n_su·n_so)` chunk to every GPU on the other nodes: `D·(n_so−1)/n_so` per GPU; the Su stage moves `D/n_so` total — the local-peer share `D·(n_su−1)/(n_su·n_so)` per GPU) |
 | `sendrecv` | So only — 1 phase | no Su stage (single inter-node hop) |
 
-Worked examples (non-H200) are recipes J/K/L below.
+The composition example above uses explicit non-H200 stage inputs.
 
 ---
 
@@ -400,7 +358,7 @@ overhead). The profile is a spec-derived **lower bound anchored to ns-3** (no
 perftest/blog ground truth for plain Ethernet, unlike RoCE's `ib_write_lat`);
 the parity test asserts surrogate ≤ ns-3 with a sanity floor. Calibration +
 the ns-3 lossy model (VOQ tail-drop → switch NACK → LLR/SACK retransmit) are
-in [Calibration](CALIBRATION.md#plain-ethernet-scale-out--lossy-ns-3-anchored-lower-bound).
+in [Calibration](CALIBRATION.md#plain-ethernet).
 
 ## Scope
 
@@ -465,57 +423,12 @@ Serialized time is
 T_serial = B_step / BW_eff
 ```
 
-The current H200 profile uses:
-
-| Schedule | Effective transfer quantity |
-|---|---:|
-| Ring | 177,000 bytes/us |
-| Tree | 308,300 bytes/us per active level (ns-3-calibrated trunk; 0.685 × B_agg) |
-| NVLS | 535,500 bytes/us aggregate work bandwidth |
-
-Ring uses link propagation for `T_fixed`. Tree uses the switched-path pipeline
-delay. NVLS uses its multicast schedule and startup profile.
-
-The ring preset uses 177,000 B/us. The wire-rate factory gives 180,000 B/us
-from `0.40 * num_lanes * b_link` at 18 lanes and 25,000 B/us per lane;
-the preset retains its fitted value.
-
-#### Collective and step model
-
-`predict()` takes a required `collective` (`allreduce` / `allgather` /
-`alltoall` / `sendrecv`); together with `algorithm` it fixes `steps` and
-`B_step`. It is not inferred from `algorithm` — the caller must name it
-explicitly (omitting it raises `TypeError`; an invalid name raises `ValueError`).
-
-| `collective` | `algorithm` | `steps` | `B_step` (bytes/step) | per-GPU volume |
-|---|---|---:|---|---|
-| `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
-| `allreduce` | `tree` | `2⌊log₂N⌋` | `α(N)·D / steps` | `α(N)·D` |
-| `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
-| `alltoall` | `ring` / `collnetdirect` | `N-1` | `D/N` | `D(N-1)/N` |
-| `alltoall` | `tree` | `⌈log₂N⌉` | `D(N-1)/N / steps` | `D(N-1)/N` |
-| `sendrecv` | any | `1` | `D` | `D` (single hop) |
-
-AllReduce scatters `D(N-1)/N` per GPU over its `2(N-1)` ring steps
-(reduce-scatter + all-gather); the tree's per-step volume is `α(N)·D/steps`
-with the STRUCTURAL trunk-load `α(N)` = 1/2/3 (N≤2 single edge / N≤4 root
-with two children / N≥5 interior node — the busiest GPU↔switch trunk of the
-heap-shaped chunk-pipelined tree; zero free parameters, the tree analogue of
-ring's (N-1)/N); AllGather via NVLS multicast moves `D/N` per
-step over 2 steps; AlltoAll permutes `D(N-1)/N` per GPU — the volume
-correction the DSE analytical model (`bw_model_predict`) describes in comments
-but does not apply. The AlltoAll step count is `N-1` permutation phases
-(ring / `collnetdirect`) or `⌈log₂N⌉` recursive-doubling rounds (tree), not the
-`2(N-1)` an AllReduce routing would imply. Send-Recv is a single
-point-to-point hop: `steps=1`, the full payload, no pipeline credit pressure
-(`Phi_credit = 1`, `C_bdp = ∞`).
-
-The per-step serialization `T_serial = B_step / BW_eff` uses the per-link ring
-rate for AlltoAll and Send-Recv (they serialize over the per-link wire, like
-the ring schedule); AlltoAll's cross-section contention — every GPU exchanges
-with every other simultaneously — is captured by the **topology bisection
-cap** of Section 12 (`min(ring_bw, bisection)`), not a separate bandwidth
-constant, so without a topology AlltoAll is a per-link lower bound.
+`B_step` and `steps` are defined once in the
+[collective schedule table](#collective--alltoall-and-send-recv).
+The [factory parameter table](#custom-hardware) gives the shipped effective
+rates. Ring uses link propagation for fixed service; tree uses switched-path
+service; NVLS uses its multicast schedule. AlltoAll and Send-Recv use the ring
+rate. A supplied topology caps serialization by the available bisection rate.
 
 ### Credit Pressure
 
