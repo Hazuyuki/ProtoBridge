@@ -191,7 +191,7 @@ remains available for upper-level dependencies. A Read/atomic on an RC SQ also
 waits for preceding writes on that SQ to become visible, preventing its control
 request from overtaking a payload DMA.
 
-The new operation API reports logical completion after the selected destination
+The addressed operation API reports logical completion after the selected destination
 memory path, followed by issuer CQ observation. Staged Read includes local H2D;
 addressed Write/Send includes target H2D. This is a composite operation timing
 model. The legacy timing-only `SubmitRdmaWrite(peer, bytes, ...)` and automatic

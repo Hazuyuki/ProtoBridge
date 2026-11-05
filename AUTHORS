@@ -1,14 +1,13 @@
 # ProtoBridge module authors
 #
-# The self-authored GPU-fabric code in this repository lives in
-# src/gpu-cluster/, surrogate/, configs/protocol_profiles/, and the two
-# scratch/ entry points. The authors of that module are listed below; they
-# are the right contacts for the fabric models, surrogates, and config
-# format. For everything else in the tree (stock ns-3 framework), see the
-# ns-3 contributor list that follows.
+# ProtoBridge is maintained by NICS-EFC. Project code includes src/gpu-cluster/,
+# the main scratch/gpu-cluster-sim.cc application, surrogate/, configs/ and
+# webui/. The module's C++ examples live in src/gpu-cluster/examples/.
+# Project questions and contributions use this repository's GitHub Issues
+# and pull requests. Upstream framework contributors are credited below.
 #
 # ProtoBridge module:
-#   GPU Cluster Simulator Team
+#   NICS-EFC
 #
 # ---------------------------------------------------------------------------
 # Below: upstream ns-3 contributors (framework portions of this repo).

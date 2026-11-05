@@ -136,7 +136,7 @@ PFC/ECN/丢包阈值顺序会在启动进程前报错。Ethernet、部分 lossy 
 构建 WQE、发布、doorbell 和完成观测耗时分别设置。中转路径会实际安排 D2H/H2D
 事件，并受分块大小、拷贝带宽和有限缓冲容量限制。
 
-这些模式都使用现有的 RoCE RC RDMA Write 网络，示例耗时未经硬件校准。
+这四个路径示例采用 RoCE RC RDMA Write，示例耗时未经硬件校准。
 
 其他操作可选择“RDMA 读取 / Get”“RDMA 发送 / 接收”“RDMA 原子操作”或“RDMA Put +
 信号”模板。操作下拉框还提供 Write/Send with immediate 及单独信号更新。可以调整

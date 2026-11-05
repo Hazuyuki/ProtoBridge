@@ -155,7 +155,8 @@ Choose a host-memory RDMA, GPU staging, GPUDirect, or IBGDA example under
 **Multi-node network**. Open **RDMA submission** to select detailed timing,
 CPU/GPU initiation, and the payload path. CPU and GPU stage costs are separate;
 staging adds D2H/H2D copies with configurable chunks, bandwidth and finite buffers.
-All examples use RC RDMA Write over RoCE. The example costs are uncalibrated.
+These four path examples use RC RDMA Write over RoCE. The example costs are
+uncalibrated.
 
 For other operations, choose **RDMA Read / Get**, **RDMA Send / Recv**, **RDMA
 atomics**, or **RDMA Put with signal**. The operation selector also offers

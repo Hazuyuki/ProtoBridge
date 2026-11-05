@@ -1,10 +1,11 @@
 # Config Guide — the `.cfg` / `.profile` primary input
 
-ProtoBridge's primary user input is a **protocol config** (`.cfg`) that names a
-calibrated collective + algorithm and the fabric it runs on, plus a **protocol
-profile** (`.profile`) that bundles the protocol / FEC / credit / BER / hardware
-values. A one-line run reproduces a measured H200 latency with no per-run CLI
-flags:
+ProtoBridge's primary input is a **protocol config** (`.cfg`) describing an
+operation and its fabric. A reusable **protocol profile** (`.profile`) supplies
+protocol, hardware, FEC, credit and error settings. Configurations can select a
+collective algorithm or define a custom transfer stencil.
+
+The shipped H200 ring configuration runs with:
 
 ```bash
 ./ns3 run "gpu-cluster-sim --protocolConfig=\
@@ -14,6 +15,9 @@ configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
 
 `numGpus` and `dataSize` stay on the CLI (they are the experiment knobs); the
 `.cfg` carries the protocol + operation + hardware.
+Calibration applies to the workload and conditions recorded in
+[CALIBRATION.md](CALIBRATION.md); a configuration file alone does not establish
+hardware accuracy.
 
 For CPU/GPU RDMA Write, `[stack]` also selects submission and payload memory:
 
@@ -78,9 +82,46 @@ profile's values as flags (same code, same values, same `RngRun`).
 Leave `collective`/`algorithm` unset and declare `param` / `replicate` /
 `transfer.*` lines. A compiler (`ProtocolConfig::Compile`) expands the stencil
 through the vendor `ProtocolModel` into a transaction graph run by the generic
-runner. See [ARCHITECTURE.md](ARCHITECTURE.md#configuration-boundary)
-for the full stencil schema; `h200-request-response.cfg` is a worked two-leg
-ping-pong example.
+runner. A minimal one-transfer stencil is:
+
+```ini
+[stack]
+profile = configs/protocol_profiles/h200-ll128.profile
+
+[op]
+param.N = numGpus
+replicate.gpu = 0 .. 0
+startup = 0
+per_step_delay = 0
+transfer.0.kind = P2P
+transfer.0.src = 0
+transfer.0.dst = 1 mod N
+transfer.0.bytes = dataSize
+transfer.0.vc = 0
+complete = all
+```
+
+This is the shipped `p2p-single.cfg`. Run it with at least two GPUs:
+
+```bash
+./ns3 run "gpu-cluster-sim --protocolConfig=configs/protocol_configs/p2p-single.cfg --numGpus=2 --dataSize=65536 --topology=switched" --no-build
+```
+
+| Key | Meaning |
+|---|---|
+| `param.<name>` | Integer expression using `numGpus`, `dataSize` and previously defined parameters. Expressions support `+`, `-`, `*`, `/`, `mod` and parentheses. |
+| `replicate.<var>` | Inclusive integer domain `lo .. hi`. The first dimension identifies independent chains; instances within a chain and their numbered transfers execute in order. |
+| `startup` | Per-chain startup in ns, or `auto` to use the protocol model's startup for the operation size and GPU count. |
+| `per_step_delay` | Additional ns between transfer actions in a chain. |
+| `transfer.<id>.*` | Numbered transfer fields: `kind` (`DATA` or `P2P`), `src`, `dst`, `bytes` and `vc`. Expressions may refer to replication variables. |
+| `complete` | `all` waits for every terminal chain; `any` waits for one. |
+
+`h200-request-response.cfg` is a two-leg example in which the response waits
+for request delivery. Addressed RDMA operations use the
+[operation API](RDMA.md#operations). The parser and compiler are defined in
+[`protocol-config.h`](../src/gpu-cluster/model/protocol-config.h); the
+[architecture guide](ARCHITECTURE.md#configuration-boundary) explains the
+OTP/PEX boundary.
 
 ## 3. The `.profile` keys
 

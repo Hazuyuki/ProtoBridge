@@ -7,6 +7,17 @@ experiment scripts and WebUI live in their named directories. Start with
 [the documentation index](doc/README.md) and
 [example catalog](examples/gpu-cluster/README.md).
 
+## Issues and pull requests
+
+Use [GitHub Issues](https://github.com/Hazuyuki/ProtoBridge/issues) for bugs,
+usage questions and feature proposals. For a simulation problem, include the
+commit, exact command, `.cfg`/`.profile` inputs, seed, expected behavior and
+actual RESULT/log output. Include OS and tool versions for a build failure.
+
+A pull request should describe the problem, resulting behavior and validation.
+Link its issue when there is one. State changes to defaults, calibration inputs
+or completion semantics, and keep unrelated changes in separate PRs.
+
 ## Build and test
 
 ```bash

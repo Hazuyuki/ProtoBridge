@@ -1,6 +1,9 @@
 # ProtoBridge
 
 ProtoBridge simulates GPU collective, point-to-point and RDMA communication.
+Use it to compare interconnect topologies, collective algorithms, flow control,
+loss recovery and host/GPU data paths under the same workload.
+
 Its **Operation-to-Packet (OTP)** layer describes transfers and dependencies;
 its **Packet-Execution (PEX)** layer runs queues, flow control, congestion,
 FEC/retry and switching on ns-3 events. A Python latency surrogate supports
@@ -10,19 +13,59 @@ The repository bundles ns-3.47 and builds standalone. It models interconnect
 communication; an upper-level simulator supplies compute and data-ready times.
 No physical GPU, CUDA installation or RDMA hardware is required.
 
-## Build and run
+## Requirements
 
-Run commands from the repository root:
+The native simulator and WebUI are tested in Linux CI. You need:
+
+- A C++23 compiler: GCC 11 or later, or Clang 17 or later.
+- CMake 3.20 or later and Ninja or Make.
+- Python 3.10 or later, with `venv` and `pip` for the optional Python tools.
+- Git to clone the repository.
+
+On Ubuntu/Debian, install the build tools with:
 
 ```bash
-./ns3 configure --enable-examples --enable-tests -d debug
-./ns3 build gpu-cluster-sim protocol-profile-demo
+sudo apt-get update
+sudo apt-get install -y git g++ cmake ninja-build python3 python3-venv python3-pip
+```
+
+Other platform prerequisites are covered by the bundled
+[ns-3 installation guide](doc/installation/source/index.rst).
+
+## Quickstart
+
+Clone the repository and create a Python environment:
+
+```bash
+git clone https://github.com/Hazuyuki/ProtoBridge.git
+cd ProtoBridge
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Build the ProtoBridge module and its ns-3 dependencies, then run the H200 ring
+example. Run subsequent commands from the repository root:
+
+```bash
+./ns3 configure --enable-modules=gpu-cluster --enable-examples --enable-tests -d debug
+./ns3 build gpu-cluster-sim protocol-profile-demo -j 2
 ./ns3 run "gpu-cluster-sim --protocolConfig=configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576" --no-build
 ```
 
-Results appear between `RESULT_START` and `RESULT_END`, including `simTimeNs`
-and `simTimeUs`. The example uses the H200 ring profile. Measurement provenance,
-fit conditions and accuracy limits are in [Calibration](doc/CALIBRATION.md).
+The run prints a `RESULT_START` / `RESULT_END` block. Representative fields
+from this example are shown below; the complete block contains more counters:
+
+```text
+RESULT_START
+status=complete
+simTimeNs=38308
+simTimeUs=38.3
+RESULT_END
+```
+
+`simTimeNs` and `simTimeUs` are simulated durations. `status=incomplete` means
+the operation did not finish within the simulated workload limit; inspect the
+resolved settings and counters before interpreting its duration.
 
 For addressed RDMA Read with the error-free PCIe packet model:
 
@@ -30,10 +73,10 @@ For addressed RDMA Read with the error-free PCIe packet model:
 ./ns3 run "gpu-cluster-sim --protocolConfig=configs/protocol_configs/rdma-read.cfg --numNodes=2 --gpusPerNode=2 --dataSize=9000 --pcieModel=tlp --pcieTraceFile=/tmp/pcie.csv" --no-build
 ```
 
-RDMA defaults to the legacy startup model. Detailed timing independently
-selects CPU/GPU initiation and host/staged/GPUDirect memory paths. The IBGDA
-preset selects GPU initiation with GPUDirect. Detailed RDMA/PCIe timing inputs
-are configurable and have not been fitted to a particular GPU/NIC.
+RDMA uses the RoCE packet path and defaults to the legacy startup model.
+Detailed timing independently selects CPU/GPU initiation and
+host/staged/GPUDirect memory paths. The IBGDA preset selects GPU initiation
+with GPUDirect.
 
 ## WebUI
 
@@ -85,6 +128,31 @@ primitives used by its packet path; see [CHANGES.md](CHANGES.md).
 configuration-parity requirements. The [CI workflow](.github/workflows/ci.yml)
 runs the full build, C++ suites, surrogate/parity checks and WebUI tests.
 
+## Validation and model scope
+
+The [calibration guide](doc/CALIBRATION.md) records hardware references,
+third-party measurements and fits to packet simulation separately. Check its
+workload, topology, credit window and fit conditions when reusing a parameter.
+Detailed RDMA/IBGDA and PCIe defaults are illustrative mechanism inputs.
+Record the Git commit and resolved configuration with reported results.
+
+GPU kernel execution, device firmware and application compute are represented
+by configured costs or upper-simulator ready times. PCIe TLP execution covers
+error-free Gen3–5 traffic on established links. The analytical surrogate has
+its own scope; selecting detailed RDMA/PCIe does not add those state machines
+to its predictions.
+
+## Support and contributions
+
+ProtoBridge is maintained by **NICS-EFC**. Use
+[GitHub Issues](https://github.com/Hazuyuki/ProtoBridge/issues) for questions,
+bug reports and feature requests. Include the commit, command, configuration
+and relevant result/log output so others can reproduce a problem.
+
+For contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). Project and bundled
+framework credits are recorded in [AUTHORS](AUTHORS).
+
 ## License
 
-GPL-2.0; see [LICENSE](LICENSE) and [AUTHORS](AUTHORS).
+The primary license is GPL-2.0-only. See [LICENSE](LICENSE) and the component
+license notices in [LICENSES/](LICENSES/).
