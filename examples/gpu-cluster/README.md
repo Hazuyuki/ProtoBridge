@@ -1,72 +1,134 @@
-# GPU-cluster alignment examples
+# ProtoBridge example catalog
 
-Runnable demonstrations of every scenario where the simulator (and the
-theory surrogate) has been aligned against a measured or independent
-reference. Each script runs the pinned ns-3 commands, compares against the
-reference data committed next to it, and regenerates the comparison
-artifacts (`.json` results, `.pdf`/`.png` figures) in place.
-
-The **fit machinery** that produced the calibrated constants (sweep +
-least-squares scripts and their raw CSV/JSON outputs) lives in
-`configs/calibration/`; the provenance of every constant is documented in
-[doc/CALIBRATION.md](../../doc/CALIBRATION.md). C++ API examples for the
-`gpu-cluster` module are under `src/gpu-cluster/examples/`.
-
-All sweeps drive the debug build of `scratch/gpu-cluster-sim.cc` — build
-first (`./ns3 configure -d debug --enable-tests --enable-examples &&
-./ns3 build`). Individual ns-3 points take seconds to minutes; the full
-sweeps run tens of points.
-
-## Aligned scenarios
-
-| Example | Reference | Alignment |
-|---|---|---|
-| `surrogate_ns3_consistency.py` | this repo's ns-3 (4 surrogate presets, N=8) | ring MAPE 1.87 % (a HW back-fit, see below), tree 11.13 % (original 2-parameter physical form at the 18-link spray fabric — the residual is the unmodeled pipeline fill), fullmesh 0.12 %; nvls preset sits 1.07–1.17× ABOVE ns-3 (its η=1.2 multicast amplification exceeds the 382500 B/µs trunk — not a lower bound) |
-| H200 ring AllReduce (no script — single command below) | real NCCL H200-SXM5 scan (`surrogate/calibration/`, doc/CALIBRATION.md) | 8 GPU / 256 MiB: `simTimeUs=1353.58` vs HW 1347.65 µs (+0.44 %) |
-| `demystify_nccl_sweep.py` | Demystifying NCCL (arXiv:2507.04786) Fig. 6, 4× GH200 measured LL/LL128/Simple × Ring/Tree | tree large-size ratios ≤ 3 % (confirms LL 0.5 / LL128 0.9375 wire efficiency); ring LL −21 % documented deviation |
-| `roce_p2p_ns3_sweep.py` | ConnectX-7 400G `ib_write_lat` perftest curve (kubernetes.recipes blog) | latency-sweep MAPE 5.26 % |
-| `roce_p2p_bw_sweep.py` | ConnectX-7 `ib_write_bw` single-QP ceiling (~49 Gbps) | with opt-in `--perQpCeilingGbps=49`: MAPE 3.20 % at ≥ 64 MB |
-| `eth_gbn_loss_sweep.py` | SRNIC (NSDI'23) Fig. 11, ConnectX-6 go-back-N vs SRNIC selective repeat under injected loss | GBN arm within ~3 pts of CX-6 up to 0.5 % loss (no-RTO gap +10 pts at 1–2 %); SACK arm reproduces the flat SRNIC curve, no arm inversion |
-| `plot_measured_anchors.py` | (plots only) | regenerates `srnic_fig11_comparison`, `crusoe_nccl_busbw`, `roce_p2p_perftest_comparison` from the committed `.json` results — fast, no ns-3 runs |
-
-The H200 ring command (the one hardware-calibrated operating point; note the
-collective/algorithm path runs credit-UNCONSTRAINED — the profile's
-`vcCredits` PEX value is consumed only by the stencil runner's `ApplyBundle`,
-not the collective injector (scratch `gpu-cluster-sim.cc` sourcing comment /
-doc/CALIBRATION.md "vcCredits sourcing"), so the run logs
-`vcCredits=104857600` and the calibration is at the unconstrained window):
+Run commands from the repository root. The main command-line simulator lives
+at [`scratch/gpu-cluster-sim.cc`](../../scratch/gpu-cluster-sim.cc); the examples
+below use that application or show how to call the module from C++.
 
 ```bash
-./ns3 run "gpu-cluster-sim --protocolConfig=\
-configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=268435456"
-# simTimeUs=1353.58   (HW: 1347.65 us, +0.44 %)
+./ns3 configure --enable-examples --enable-tests -d debug
+./ns3 build gpu-cluster-sim gpu-cluster-example ring-topology-example hybrid-cluster-example protocol-profile-demo
 ```
 
-Tree and NVLS run over the switched fabric and need the full GPU↔NVSwitch
-trunk on the CLI (`--linksPerGpu=18 --bandwidth=170` builds the 18 separate
-point-to-point NVLink4 lanes, spray-routed, aggregate 3060 Gbps; see the
-`.cfg` headers).
+The C++ examples require `--enable-examples`. Several experiment scripts call
+the debug simulator directly, so use the debug build above for those scripts.
+Full sweeps run many simulations and regenerate their recorded CSV/JSON or
+figures; the single-configuration examples are the quickest starting point.
 
-## Topology-comparison experiments
+## C++ API examples
 
-Not alignments against a measured reference — sweeps that compare
-simulator configurations against each other:
+All four live in [`src/gpu-cluster/examples/`](../../src/gpu-cluster/examples/)
+and are registered with the module build.
 
-| Experiment | What it compares |
+| Executable | Purpose |
 |---|---|
-| [`random_traffic_dcqcn/`](random_traffic_dcqcn/) | delivered throughput vs injection rate for the 8 `--interNodeTopology` values under uniform-random cross-node traffic (`--randTraffic`), RoCE 400G with DCQCN on; plus the ECN-mark congestion signal per topology |
-| [`collective_topology_dcqcn/`](collective_topology_dcqcn/) | hierarchical allreduce + alltoall completion time and bus bandwidth vs data size (1–256 MiB) for the 8 `--interNodeTopology` values, 16 nodes × 8 GPUs (128 ranks), RoCE 400G with DCQCN on (via the So payload-builder seam); plus the `--algorithm=ncclring` (real-NCCL global pipelined ring) vs hierarchical comparison; plus the DCQCN parameter-sensitivity sweep (7 rate-machine knobs + marking threshold, two regimes); plus the lossy-RoCE (no-PFC, explicit `--voqDropThreshold`) sweep where those knobs actually move completion time |
-| [`credit_bdp_sweep/`](credit_bdp_sweep/) | credit-window vs bandwidth-delay-product on the Su fabric: does the credit return delay cap utilization as bandwidth rises (5 bw × 5 latency × 6 windows, 8-GPU ring allreduce)? knee scales with W·chunk/(serialization + 2·lat) as predicted; the sawtooth panel shows the burst-drain-refill oscillation itself; plus the 1200-run pattern sweep (p2p/incast/fanout/alltoall × fullmesh/switched) — one shared per-endpoint window makes fanout/alltoall 7× p2p at W=1; on fullmesh (every pair a direct 1-hop link) p2p == incast exactly and the shared-window penalty shows up in utilization most sharply (fanout/alltoall still 0.26/0.23 at W=24) |
-| [`surrogate_tree_validation/`](surrogate_tree_validation/) | revalidation of the paper fork's tree surrogate against the FIXED tree injector: 90 stratified paper-grid tree commands re-run on the post-`de16a7c` binary — the June paper tree ground truth is stale (mean sim drift 49.9%, volume fix ≈ 4-6× tree traffic) AND the paper grid uses the retired `--linkDataRate=80` guidance (256 MiB: 15775 µs @80 G vs 704 µs @3060 G on the same cell); follow-up fresh 36-point sweep (`tree_sweep_current.csv`, vcCredits=64 inline convention) exposed the 9/18 fit's structural defect (implied α_eff decays with D ⇒ pipeline fill is additive), absorbed into the surrogate as the structural α(N)=1/2/3 trunk-load model refit at the 18-link spray fabric (`configs/calibration/tree_ns3_sweep.py`, original 2-parameter form, MAPE 12.65%) |
-| [`datasize_injection_sweeps/`](datasize_injection_sweeps/) | ProtoBridge-side characterization on the ns3-rdma-matched fabric (single-leaf tor, 40 Gbps, 1 µs, 1000-B chunks — same parameters as `doc/PFC_NS3RDMA_ALIGNMENT.md`/`doc/SCALEOUT_ALIGNMENT.md`, whose head-to-head numbers these cross-read): five single-knob sweeps — DCQCN incast data size (strictly linear, R²=1.000), random-traffic injection rate (loss-free DCQCN saturation knee at rate 0.8, ~96.8 Gbps pinned, all drop counters 0), rate × message size (128-KiB messages degrade earliest), node scaling (per-sender flat at ~38.5 Gbps 2→8 nodes), bulk chunk size (larger packets → fewer ECN marks, faster completion) |
+| `gpu-cluster-example` | Build endpoints and exchange packets on point-to-point links. |
+| `ring-topology-example` | Build a ring with an optional link-degradation model. |
+| `hybrid-cluster-example` | Connect GPU fabrics through Ethernet gateways. |
+| `protocol-profile-demo` | Load a `.profile` and inspect the protocol/FEC/credit bundle; no traffic is simulated. |
 
-## Notes
+```bash
+./ns3 run "gpu-cluster-example --numGpus=2 --numPackets=4" --no-build
+./ns3 run "ring-topology-example --numGpus=4" --no-build
+./ns3 run "hybrid-cluster-example --gpusPerNode=2" --no-build
+./ns3 run "protocol-profile-demo --profile=configs/protocol_profiles/h200-ll128.profile" --no-build
+```
 
-- Every script writes its outputs next to itself, so a re-run regenerates
-  the committed artifacts in place; `git diff` shows any drift.
-- These are alignment *reports*, not pass/fail gates. The enforced gates
-  are `test/parity/` (bit-identity + regression pins) and the C++/pytest
-  suites — see [CONTRIBUTING.md](../../CONTRIBUTING.md).
-- The surrogate presets have different anchoring (HW back-fit vs ns-3
-  back-fit vs derivation); `surrogate_ns3_consistency.py`'s docstring and
-  doc/CALIBRATION.md spell out which is which.
+## Runnable configurations
+
+The 19 files in [`configs/protocol_configs/`](../../configs/protocol_configs/)
+are inputs to `gpu-cluster-sim`, not separate programs.
+
+| Configuration | Scenario |
+|---|---|
+| `h200-ring-allreduce.cfg` | Calibrated H200 ring allreduce. |
+| `h200-tree-allreduce.cfg` | H200 tree allreduce. |
+| `h200-nvls-allgather.cfg` | H200 NVLS allgather. |
+| `h200-request-response.cfg` | Request/response transfer stencil. |
+| `p2p-single.cfg` | One scale-up point-to-point transfer. |
+| `p2p-roce.cfg` | Scale-out RoCE point-to-point transfer. |
+| `p2p-roce-lossy.cfg` | RoCE with loss and go-back-N recovery. |
+| `p2p-roce-lossy-sack.cfg` | RoCE with loss and selective recovery. |
+| `p2p-eth.cfg` | Plain Ethernet point-to-point transfer. |
+| `p2p-eth-incast.cfg` | Plain Ethernet incast. |
+| `eth-hierarchical.cfg` | Hierarchical collective over Ethernet scale-out. |
+| `rdma-host-p2p.cfg` | CPU initiation, host-memory payload. |
+| `rdma-staged-p2p.cfg` | CPU initiation, GPU payload through host staging. |
+| `rdma-gpudirect-p2p.cfg` | CPU initiation, direct GPU-memory payload. |
+| `ibgda-p2p.cfg` | GPU initiation with GPUDirect payload. |
+| `rdma-read.cfg` | Addressed RDMA Read/Get. |
+| `rdma-send.cfg` | Send/Recv with posted receives. |
+| `rdma-atomic.cfg` | 64-bit RDMA atomic. |
+| `rdma-put-signal.cfg` | Payload followed by a signal update. |
+
+Single-node example:
+
+```bash
+./ns3 run "gpu-cluster-sim --protocolConfig=configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576" --no-build
+```
+
+Detailed multi-node RDMA example, with optional PCIe TLP execution:
+
+```bash
+./ns3 run "gpu-cluster-sim --protocolConfig=configs/protocol_configs/rdma-read.cfg --numNodes=2 --gpusPerNode=2 --dataSize=9000 --pcieModel=tlp --pcieTraceFile=/tmp/pcie.csv" --no-build
+```
+
+The three reusable profiles are `h200-ll128.profile`, `rdma-common.profile`
+and `ibgda-roce.profile`. See [Configuration](../../doc/CONFIG_GUIDE.md) for
+precedence and authoring, [RDMA](../../doc/RDMA.md) for operations and memory
+paths, and [PCIe](../../doc/PCIE.md) for TLP settings. RDMA/IBGDA example costs
+are illustrative; the calibration guide records which other inputs are fitted.
+
+## Reference comparisons
+
+For Python sweeps and figures, install the calibration and plotting dependencies:
+
+```bash
+python -m pip install -r surrogate/requirements.txt matplotlib
+```
+
+| Script | Reference and output |
+|---|---|
+| [`surrogate_ns3_consistency.py`](surrogate_ns3_consistency.py) | Compare ring/tree/fullmesh/NVLS surrogate predictions with packet simulation; writes CSV/JSON. |
+| [`roce_p2p_ns3_sweep.py`](roce_p2p_ns3_sweep.py) | Compare RoCE P2P latency against a third-party perftest curve. |
+| [`roce_p2p_bw_sweep.py`](roce_p2p_bw_sweep.py) | Sweep the per-QP bandwidth ceiling against the perftest bandwidth curve. |
+| [`eth_gbn_loss_sweep.py`](eth_gbn_loss_sweep.py) | Compare go-back-N and selective recovery with the SRNIC loss-recovery reference. |
+| [`demystify_nccl_sweep.py`](demystify_nccl_sweep.py) | Compare NCCL protocol shapes with digitized Ring/Tree measurements. |
+| [`plot_measured_anchors.py`](plot_measured_anchors.py) | Plot the recorded SRNIC, NCCL and perftest comparisons. |
+
+Measured-reference CSVs, recorded JSON/CSV results and comparison figures stay
+beside their scripts. Their assumptions and fit limits are in
+[Calibration and validation](../../doc/CALIBRATION.md).
+
+## Parameter-sweep studies
+
+| Directory | What to run and inspect |
+|---|---|
+| [`collective_topology_dcqcn/`](collective_topology_dcqcn/README.md) | Collective/topology, NCCL-ring, DCQCN-parameter and lossy-RoCE sweeps; plotting scripts reproduce each comparison. |
+| [`random_traffic_dcqcn/`](random_traffic_dcqcn/README.md) | Random-traffic injection rate and congestion-control throughput. |
+| [`credit_bdp_sweep/`](credit_bdp_sweep/README.md) | Credit-window versus BDP, traffic patterns and completion latency. |
+| [`datasize_injection_sweeps/`](datasize_injection_sweeps/README.md) | Data size, injection rate, message size, node count and chunk size on the matched scale-out fabric. |
+
+The per-study README lists its run and plotting scripts. Some stored results
+predate model changes; use their recorded parameters and the calibration guide
+when interpreting them. The other directories under repository `examples/`
+contain bundled ns-3 examples.
+
+## Calibration scripts
+
+Executable fitting scripts live in [`calibration/`](calibration/). Their
+parameter JSON and sweep CSV data remain in
+[`configs/calibration/`](../../configs/calibration/).
+
+| Script | Action |
+|---|---|
+| [`fullmesh_ns3_sweep.py`](calibration/fullmesh_ns3_sweep.py) | Run the full-mesh sweep and fit schedule bandwidth. |
+| [`tree_ns3_sweep.py`](calibration/tree_ns3_sweep.py) | Run the tree sweep and fit bandwidth/pipeline cost; `--refit` uses the cached CSV. |
+| [`roce_p2p_calib.py`](calibration/roce_p2p_calib.py) | Fit scalar RoCE parameters to the embedded perftest reference. |
+
+```bash
+python examples/gpu-cluster/calibration/tree_ns3_sweep.py --refit
+```
+
+This refits and writes `configs/calibration/tree_calib.json`. See
+[Calibration](../../doc/CALIBRATION.md) before treating a fitted parameter as a
+hardware measurement.

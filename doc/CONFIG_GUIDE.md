@@ -78,7 +78,7 @@ profile's values as flags (same code, same values, same `RngRun`).
 Leave `collective`/`algorithm` unset and declare `param` / `replicate` /
 `transfer.*` lines. A compiler (`ProtocolConfig::Compile`) expands the stencil
 through the vendor `ProtocolModel` into a transaction graph run by the generic
-runner. See [ARCHITECTURE.md](ARCHITECTURE.md#config-driven-protocol-stack-cfg)
+runner. See [ARCHITECTURE.md](ARCHITECTURE.md#configuration-boundary)
 for the full stencil schema; `h200-request-response.cfg` is a worked two-leg
 ping-pong example.
 
@@ -429,7 +429,7 @@ new `(collective, algorithm)` pair only by extending that inline dispatch.
 
 Author a `.cfg` with an `[op]` transfer stencil (no `collective=`/`algorithm=`).
 The stencil runs through the generic runner with the profile's PEX bundle
-applied — see [ARCHITECTURE.md](ARCHITECTURE.md#config-driven-protocol-stack-cfg)
+applied — see [ARCHITECTURE.md](ARCHITECTURE.md#configuration-boundary)
 and `h200-request-response.cfg`.
 
 ## 6. Time values and the simulation horizon

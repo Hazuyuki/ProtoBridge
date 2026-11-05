@@ -1,7 +1,9 @@
 # Calibration
 
-All calibration is against **NVIDIA H200 NVLink4** hardware. There is no A800
-calibration in this release.
+The local GPU-fabric reference is **NVIDIA H200 NVLink4**. Other sections
+identify third-party measurements and ns-3/ns3-rdma comparisons separately.
+Agreement with another simulator is not a hardware measurement. Detailed
+RDMA/IBGDA and PCIe timing defaults remain uncalibrated mechanism inputs.
 
 ## Hardware reference
 
@@ -23,7 +25,7 @@ recipe below carries the exact runtime values it uses.
 |-----------|-----------------|--------|-------|
 | Theory-derived (`surrogate/theory/`) | calibrated — ring_bw=177000 B/µs back-fit to the H200 HW point (first-principles wire derivation = 180000; 177000 sits 1.7% below), not a pure physical derivation | vs ns-3 | lower bound vs the 4-GPU ring baseline (≈0.20–0.57× at vcCredits=64; the baseline JSON records no credit value); ring (8-GPU/256MB) credit-sensitive — cr=128 reproduces HW 1347.65 µs (−0.003%), cr=64 → +42.3%; nvls credit-insensitive; against the 18-link spray fabric (the profile's linksPerGpu=18, the same convention the tree calibration anchors) the preset sits ≈1.07–1.17× ABOVE ns-3 — not a lower bound (the η_nvls=1.2 multicast amplification exceeds the 382500 B/µs trunk); the historical "≈0.566×" note's run conditions were unrecorded and match no current convention — 2026-09 drift finding, see `examples/gpu-cluster/surrogate_ns3_consistency.py` |
 | Theory-derived full-mesh (`surrogate/theory/`) | ns-3-calibrated — `fullmesh_bw=449890 B/µs` back-fit to the ns-3 `FullMeshAllReduce`/`FullMeshAllGather` sweep (η=0.9998 vs the 18×25000 dedicated-bundle physics) | vs ns-3 | MAPE 0.10% on the SIMPLE-regime sweep points (N∈{4,8,16}, 1–256 MiB); parity within 0.3% at N=8 AR+AG {16,64,256} MiB (see the Full-mesh section below) |
-| Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — the ORIGINAL two-parameter form: serial term = α(N)·D/trunk with the STRUCTURAL α(N) = 1/2/3 (single edge / root with two children / interior node; `tree_bw_per_level=308300 B/µs`, η=0.81 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs; `t_min_switch=1.06 µs`) — both constants back-fit jointly to the post-cut-through-accounting-fix ns-3 `TreeAllReduce` at the TRUE H200 fabric — `--linksPerGpu=18` separate point-to-point NVLink4 lanes @ 170 Gbps each, spray-routed, aggregate 3060 Gbps trunk, credits unconstrained (`configs/calibration/tree_ns3_sweep.py`; the retired `--linkDataRate=3060` convention collapsed the 18 lanes into ONE pipe — no spray, no per-link queues). The pre-fix fit (275400 B/µs, 4.10 µs, MAPE 12.65%) was absorbing the per-packet cut-through serialization derate into both constants; the old "pipeline-fill residual absorbed into the fitted pair" caveat is gone | vs ns-3 | MAPE 1.88% over all 36 fresh sweep points (N∈{4,8,16,32} × 1–256 MiB), 2.00% on the SIMPLE regime, per-N 2.39/1.28/1.63/2.25%; relative-error-weighted (1/T²) joint least squares — no H200 tree HW ground truth exists in this repo |
+| Theory-derived tree (`surrogate/theory/`) | ns-3-calibrated — the ORIGINAL two-parameter form: serial term = α(N)·D/trunk with the STRUCTURAL α(N) = 1/2/3 (single edge / root with two children / interior node; `tree_bw_per_level=308300 B/µs`, η=0.81 vs the 18×170 Gbps GPU↔NVSwitch trunk = 382500 B/µs; `t_min_switch=1.06 µs`) — both constants back-fit jointly to the post-cut-through-accounting-fix ns-3 `TreeAllReduce` at the TRUE H200 fabric — `--linksPerGpu=18` separate point-to-point NVLink4 lanes @ 170 Gbps each, spray-routed, aggregate 3060 Gbps trunk, credits unconstrained (`examples/gpu-cluster/calibration/tree_ns3_sweep.py`; the retired `--linkDataRate=3060` convention collapsed the 18 lanes into ONE pipe — no spray, no per-link queues). The pre-fix fit (275400 B/µs, 4.10 µs, MAPE 12.65%) was absorbing the per-packet cut-through serialization derate into both constants; the old "pipeline-fill residual absorbed into the fitted pair" caveat is gone | vs ns-3 | MAPE 1.88% over all 36 fresh sweep points (N∈{4,8,16,32} × 1–256 MiB), 2.00% on the SIMPLE regime, per-N 2.39/1.28/1.63/2.25%; relative-error-weighted (1/T²) joint least squares — no H200 tree HW ground truth exists in this repo |
 
 ## Generate fresh ns-3 baselines
 
@@ -69,7 +71,7 @@ separately for the Su fabric); the perftest does **not** exercise it.
 
 ### Calibration script + extracted constants
 
-[`configs/calibration/roce_p2p_calib.py`](../configs/calibration/roce_p2p_calib.py)
+[`examples/gpu-cluster/calibration/roce_p2p_calib.py`](../examples/gpu-cluster/calibration/roce_p2p_calib.py)
 encodes the blog data and fits two models; the extracted constants land in
 [`configs/calibration/roce_p2p_calib.json`](../configs/calibration/roce_p2p_calib.json):
 
@@ -292,7 +294,7 @@ T_AG = startup + 1·(lat + (D/N)/fullmesh_bw)
 
 ### Sweep + fit
 
-[`configs/calibration/fullmesh_ns3_sweep.py`](../configs/calibration/fullmesh_ns3_sweep.py)
+[`examples/gpu-cluster/calibration/fullmesh_ns3_sweep.py`](../examples/gpu-cluster/calibration/fullmesh_ns3_sweep.py)
 sweeps `N ∈ {4,8,16}` × `{allreduce, allgather}` × 1 MiB–256 MiB (54 points,
 [`fullmesh_sweep.csv`](../configs/calibration/fullmesh_sweep.csv)), parses
 `simTimeUs`, then back-fits the single scalar on the SIMPLE-regime points
@@ -401,7 +403,7 @@ two-parameter form now fits ns-3 at **MAPE 1.88%** (below the rejected fill
 form's 3.96%!) with NO extra constants. The fill-term experiment is
 historically documented above; it was fitting a simulator artifact.
 
-### Sweep + fit (`configs/calibration/tree_ns3_sweep.py`)
+### Sweep + fit (`examples/gpu-cluster/calibration/tree_ns3_sweep.py`)
 
 N ∈ {4,8,16,32} × 1–256 MiB (36 points). The constants have been re-fit
 TWICE: after the 9/30 local-rank fix e1cdd9c, and again after the
@@ -687,7 +689,7 @@ Note: the historical H200 `h200-tree-allreduce.cfg` per-protocol
 `linkDataRate` values (80/100/50) were fitted against the *old* under-
 transferring model and were compensating the volume deficit; they are
 retired. The recalibration (2026-09, refreshed 2026-10,
-`configs/calibration/tree_ns3_sweep.py`)
+`examples/gpu-cluster/calibration/tree_ns3_sweep.py`)
 anchors the cfg at the TRUE H200 fabric — `--linksPerGpu=18` separate
 point-to-point NVLink4 lanes × 170 Gbps effective (the full GPU↔NVSwitch
 trunk, 382500 B/µs, spray-routed) — and back-fits the surrogate tree
@@ -726,3 +728,90 @@ cancelled to a misleading −4.3%. The one qualitative miss: at ≥2^28 the sim
 has LL128 marginally *faster* than Simple on ring (0.996 vs measured 1.089 —
 a chunk-granularity artifact); ordering elsewhere (LL best small, Simple
 best large, LL crossover at ~2^22, tree slower than ring) all reproduces.
+
+
+## PFC and scale-out cross-checks
+
+These recorded comparisons use ns3-rdma as an independent simulator. The
+external ns3-rdma patches, trace fixtures and temporary run directories are not
+included in this repository. The commands below reproduce the ProtoBridge
+side; the recorded tables are historical reference results, not a fresh run of
+the current branch.
+
+The matched workload uses 40 Gb/s links, 1 us link latency, 50 MB per sender,
+1000-byte chunks and an ACK-clocked `soTxWindow=64`. A `tor` topology with one
+GPU per node matches the reference star. `host` and `leafspine` add forwarding
+depth and are separate comparisons.
+
+### Two-sender PFC comparison
+
+| Scenario | FCT | PAUSEs | RESUMEs | Drops |
+|---|---|---|---|---|
+| ns3-rdma, static thr | 20.29 ms | 27,035 | 2,254 | 0 |
+| ns3-rdma, dynamic thr (α=16) | 19.51 ms | 24,936 | 2,078 | 0 |
+| ns3-rdma, PFC off (control) | 20.29 ms | 0 | 0 | 0 |
+| ns3-rdma, DCQCN on (control) | ~20.3 ms | 0 | 0 | 0 |
+| PB mode 1 (explicit RESUME), tor | 21.90 ms | 1,584 | 14,253 | 0 |
+| PB mode 1 (explicit RESUME), host | 23.60 ms | 1,548 | 13,932 | 0 |
+| PB mode 3 (quanta 5 µs), tor | 22.35 ms | 13,932 | 13,928 | 0 |
+| PB mode 3 (quanta 5 µs), host | 24.38 ms | 13,932 | 13,932 | 0 |
+| PB, PFC off (control), tor/host | 21.90 ms | — | — | 0 |
+| PB mode 1, 9000-B chunks, tor | 21.15 ms | 2 | 18 | 0 |
+| PB mode 1, 9000-B chunks, host | 21.15 ms | 182 | 1,638 | 0 |
+| PB mode 3, 9000-B chunks, tor/host | 21.15 ms | 16,871 | 18 | 0 |
+| PB, PFC off, 9000-B chunks, tor/host | 21.15 ms | — | — | 0 |
+
+All PB 1000-B rows use `--soTxWindow=64`; the 9000-B rows are identical
+with or without it (21.153216 ms in every run), so the window is a no-op
+for a BDP-sized transfer that never approaches the VOQ cap. The `tor`
+rows use the shared-switch topology (the structural twin of the ns3-rdma
+star, and the topology used for the scale-out alignment); the previously
+published `host` rows are retained for reference — `host` gives each
+node its own switch (one extra hop), which adds PFC-drain time at
+1000-B chunks (mode 1: 23.60 vs 21.90 ms) and slightly different pause
+counts, but is byte-identical at 9000-B chunks where queues stay shallow.
+
+(PB FCT is `simTimeNs` for the same 2×50 MB incast. "PFC off" on the
+ns3-rdma side raises the SwitchMmu ingress limits coherently — PG shared
+limit, headroom, SP limit, and max buffer all to 400 MB — so no XOFF is
+emitted and no admission path overflows. An earlier control that raised
+ONLY the PG shared limit overflowed the ingress headroom: 2.46 M drops
+and endless retransmission, which briefly produced a bogus "PFC costs 9%
+FCT" reading; the coherent control shows FCT is PFC-INVARIANT on ns3-rdma
+at this workload, same as ProtoBridge.)
+
+### Incast scaling
+
+| Scenario | 2:1 | 4:1 | 8:1 | Drops |
+|---|---|---|---|---|
+| ns3-rdma, static thr | 20.29 | 40.58 | 81.17 | 0 |
+| ns3-rdma, dynamic thr (α=16) | 19.51 | 39.79 | 80.37 | 0 |
+| ns3-rdma, PFC off (control) | 20.29 | 40.58 | 81.17 | 0 |
+| PB tor, PFC off | 21.90 | 43.79 | 87.58 | 0 |
+| PB tor, mode 1 (static) | 21.90 | 43.79 | 87.58 | 0 |
+| PB tor, mode 2 (dynamic) | 21.97 | 43.80 | 87.59 | 0 |
+| PB tor, mode 3 (quanta) | 22.35 | 44.31 | 87.88 | 0 |
+| PB host, PFC off | 21.90 | 43.79 | 87.58 | 0 |
+| PB host, mode 1 | 23.60 | 45.60 | 89.40 | 0 |
+| PB leafspine, PFC off | 21.90 | 43.80 | 87.58 | 0 |
+| PB leafspine, mode 1 | 23.85 | 45.74 | 89.45 | 0 |
+| PB leafspine, mode 3 | 23.85 | 46.48 | 90.05 | 0 |
+
+The stacks use different pause criteria: ns3-rdma uses ingress priority-group
+occupancy, while ProtoBridge uses output-port/destination congestion. Compare
+FCT and recovery behavior under matched inputs; pause counts are not directly
+equivalent. ProtoBridge's mode 1 uses a threshold pause/resume gate, mode 2 adds
+dynamic thresholds, and mode 3 uses timed pause quanta. Credit and packet
+framing differences also affect the baseline FCT.
+
+```bash
+./ns3 run "gpu-cluster-sim --topology=switched --collective=incast --numNodes=3 --gpusPerNode=1 --interNodeTopology=tor --interNodeBandwidth=40 --interNodeLatency=1000 --dataSize=50000000 --bulkChunkSize=1000 --soTxWindow=64 --switchPfcMode=3 --pfcPauseThreshold=20 --pfcPauseTime=5 --pfcResumeOffset=8"
+```
+
+For the scaling table, sweep `numNodes` over 3, 5 and 9; vary `switchPfcMode`
+over 0–3 and `interNodeTopology` over `tor`, `host` and `leafspine`. Reproduce
+data-size, injection-rate and chunk-size studies with
+[`datasize_injection_sweeps`](../examples/gpu-cluster/datasize_injection_sweeps/README.md).
+Use `pfcHeadroomChunks` for headroom experiments and report packet loss and
+completion along with latency. The remaining comparison figures and scripts
+are listed in the [example catalog](../examples/gpu-cluster/README.md).

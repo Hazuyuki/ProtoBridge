@@ -3,9 +3,8 @@
  *
  * Demonstrates the ProtocolProfile config interface: load one profile
  * file, get back a ready-to-use {ProtocolModel, FecModel, CreditManager,
- * BER} bundle, and print its configuration. This scratch program does
- * not run a simulation -- it shows the "make the protocol ready to use"
- * step.
+ * BER} bundle, and print its configuration. This example loads and
+ * inspects the bundle before attaching it to a simulated fabric.
  *
  *   ./ns3 run "protocol-profile-demo --profile=configs/protocol_profiles/h200-ll128.profile"
  */

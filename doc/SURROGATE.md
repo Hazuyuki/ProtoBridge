@@ -1,28 +1,18 @@
-# ProtoBridge Latency Surrogate — User Guide
+# Latency surrogate
 
-This guide shows how to **use** the latency surrogate to estimate collective
-communication latency in microseconds. It is the fast screening model that
-filters the broad design space before selected candidates are simulated in
-full ns-3. For the full mathematical derivation, see
-[`WHITEBOX_SURROGATE.md`](WHITEBOX_SURROGATE.md); for how the H200 anchor numbers
-were measured, see [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md).
+The Python surrogate estimates collective and point-to-point communication
+latency in microseconds. Build a model once, then call `predict()` with the
+operation, algorithm, size and GPU count. Optional inputs describe topology,
+credits, errors and competing traffic.
 
-The model predicts the latency of one collective operation — AllReduce,
-AllGather, AlltoAll, or point-to-point Send-Recv — scheduled as ring / tree /
-NVLS / full-mesh. The **collective name and the algorithm together** select the
-step model:
-pass `collective=` to `predict()` (`'allreduce'` / `'allgather'` /
-`'alltoall'` / `'sendrecv'`). It is a **required** argument — not inferred from
-the algorithm, so the caller must name the operation explicitly. It is a
-first-principles physical derivation fitted to ns-3, not a one-sided bound:
-ring sits below ns-3 in the calibrated range, while tree can sit ABOVE it
-(e.g. +15% at N=4/D=256 MiB — see [CALIBRATION.md](../../doc/CALIBRATION.md)).
-Use it for **ordering and trend analysis across a design space**, not for
-absolute single-point prediction.
+The required `collective` argument selects `allreduce`, `allgather`, `alltoall`
+or `sendrecv`; the schedule is selected separately. Calibration and accuracy
+conditions are recorded in [CALIBRATION.md](CALIBRATION.md). The equations are
+[below](#mechanism-equations).
 
 ---
 
-## 1. 30-second quickstart
+## 1. Quickstart
 
 ```python
 from surrogate.theory.whitebox_surrogate_v2 import make_surrogate_from_wire
@@ -35,8 +25,7 @@ lat_us = s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective=
 # lat_us == 1325.5  (the H200 reference point)
 ```
 
-That is the whole core usage: **build** a surrogate, then **query** it.
-Everything else on this page is optional.
+Build a surrogate once, then query it for each operation.
 
 ---
 
@@ -76,24 +65,23 @@ efficiency factors. No per-bandwidth calibration needed.
 | `algo` | `ring` / `tree` / `nvls` / `fullmesh` (`fm`) | — |
 | `eta_ring` / `eta_tree` / `eta_nvls` / `eta_fullmesh` | efficiency factors (defaulted) | 0.40 / 0.685 / 1.20 / 1.0 |
 
-Derived bandwidths land within ~2% of the calibrated H200 values (see §11 of
-`WHITEBOX_SURROGATE.md`). This is the entry point for any new platform where
-only the per-link wire rate is known.
+The wire-rate factory derives schedule bandwidths from the per-link rate and
+efficiency factors. Use it when describing a platform from its link parameters;
+use the presets below to retain the shipped calibration constants.
 
-### H200 measured presets
+### H200 presets
 
 ```python
 from surrogate.theory.whitebox_surrogate_v2 import make_h200_ring_theory, make_h200_tree_theory, make_h200_nvls_theory, make_h200_fullmesh_theory
 s = make_h200_ring_theory()      # ships the exact calibrated H200 ring numbers
 ```
 
-Use these when you want the measured H200 values rather than the wire-rate
-derivation. They accept `**overrides` too (any `__init__` keyword). For
+The presets retain their recorded calibration values and accept `**overrides`
+(any `__init__` keyword). Calibration sources differ by schedule. For
 AlltoAll and Send-Recv use `make_h200_alltoall_theory()` (SIMPLE 46 µs
 startup) and `make_h200_sendrecv_theory()` (15 µs startup); both reuse the
 H200 ring anchor with a protocol-appropriate startup. For the full-mesh
-algorithm use `make_h200_fullmesh_theory()` — it is **ns-3-calibrated** (not a
-wire-rate derivation); see recipe M.
+algorithm use `make_h200_fullmesh_theory()`; its bandwidth is fitted to ns-3.
 
 ### Custom hardware
 
@@ -129,7 +117,7 @@ under link degradation (ber>0) or with FEC/LLR enabled. The bandwidth
 parameters are *effective* transfer rates already incorporating protocol
 efficiency and spray (not raw per-link × lanes products); the H200 values are
 the calibrated anchor, so custom values yield a physically-plausible but
-uncalibrated lower bound.
+uncalibrated estimate.
 
 ---
 
@@ -169,7 +157,7 @@ five required inputs (`data_bytes`, `num_gpus`, `algo`, `credits`,
 
 The algorithm alone no longer fixes the collective. `collective=` names the
 operation and, with `algo`, fixes the step count and per-step volume. The
-mapping (full formulas in §6 of `WHITEBOX_SURROGATE.md`):
+mapping is:
 
 | `collective` | `algo` | steps | per-step volume | per-GPU volume |
 |---|---|---|---|---|
@@ -281,7 +269,8 @@ t = Topology(bisection_bw_bytes_per_us=50000.0, hop_count=1.0)   # raw B/us
 | `3d_torus` / `mesh2d` / `2dfullmesh` | `(N/min_dim) * per_link / 2` | 1 | may cap |
 | `leafspine` / `fattree` / `dragonflyplus` / ... | `N * lpg * per_link / 8` | `_leaftier_hop` > 1 | cap + extra hops |
 
-Full per-family formulas: §13 of `WHITEBOX_SURROGATE.md`.
+Per-family formulas are implemented by `make_topology_from_name` in
+[`whitebox_surrogate_v2.py`](../surrogate/theory/whitebox_surrogate_v2.py).
 
 ---
 
@@ -385,175 +374,7 @@ Worked examples (non-H200) are recipes J/K/L below.
 
 ---
 
-## 7. Recipes
-
-### A. H200 ring AllReduce, default (ideal) fabric
-
-```python
-s = make_surrogate_from_wire(25000, 18, "ring")
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce")        # 1325.5 us
-```
-
-### B. Same ring algorithm on a real 8-GPU ring fabric (topology bites)
-
-```python
-from surrogate.theory.whitebox_surrogate_v2 import make_topology_from_family
-t = make_topology_from_family("ring", N=8, per_link_gbps=25)
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", topology=t)   # ~4718 us
-```
-
-### C. Non-blocking NVSwitch fabric (== default, no per_link needed)
-
-```python
-t = make_topology_from_family("switched", N=8)
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", topology=t)   # == topology=None
-```
-
-### D. Link degradation — BER + FEC
-
-```python
-# Pre-FEC BER 1e-3 (residual post-FEC error > 0), RS(544,514,15) FEC + LLR
-# Go-Back-N retransmission: the ~370us tail is dominated by GBN retransmission
-# (at ber<=1e-4 or without llr_enabled, retransmission is 0).
-s.predict(64 * 1024 * 1024, 8, "ring", credits=128, ber=1e-3,
-         llr_enabled=True, fec_enabled=True, fec_n=544, fec_k=514, fec_t=15,
-         retry_mode="gobackn", collective="allreduce")
-```
-
-### E. Contention from a concurrent flow
-
-```python
-# A background flow offering ~10% of the ring schedule bandwidth (177 GB/s),
-# i.e. ~17.7 GB/s, on the shared bottleneck. competing_bw is in GB/s.
-s.predict(16 * 1024 * 1024, 8, "ring", credits=128, ber=0, competing_bw=17.7, collective="allreduce")
-```
-
-### F. Custom (non-H200) platform from one wire rate
-
-```python
-# A hypothetical 8-link fabric at 50 GB/s/link unidirectional.
-s = make_surrogate_from_wire(b_link_bytes_per_us=50000, num_lanes=8, algo="ring")
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce")
-```
-
-### G. Tail (p99) latency
-
-```python
-s.predict_tail(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="allreduce", percentile=99)
-```
-
-### H. AlltoAll — and why a topology matters for it
-
-```python
-from surrogate.theory.whitebox_surrogate_v2 import (
-    make_h200_alltoall_theory, make_topology_from_family)
-s = make_h200_alltoall_theory()
-# Ideal fabric: 7 partner phases, D/N each — a lower bound (no cross-section cap).
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="alltoall")
-# Real 8-GPU ring fabric: the tight bisection caps the rate -> much slower.
-t = make_topology_from_family("ring", N=8, per_link_gbps=25)
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0,
-          collective="alltoall", topology=t)
-```
-
-### I. Send-Recv (point-to-point)
-
-```python
-from surrogate.theory.whitebox_surrogate_v2 import make_h200_sendrecv_theory
-s = make_h200_sendrecv_theory()
-# One hop: latency = startup(15us) + D/ring_bw + link_lat. No credit, no FEC.
-s.predict(256 * 1024 * 1024, 8, "ring", credits=128, ber=0, collective="sendrecv")
-```
-
-### J. Scale-out + hierarchical — wire-derived stages (non-H200)
-
-```python
-from surrogate.theory.whitebox_surrogate_v2 import (
-    make_surrogate_from_wire, make_topology_from_family, HierarchicalSurrogate)
-D = 1 << 24  # 16 MiB
-
-# Su: a non-H200 NVLink platform — 20 GB/s/link, 6 lanes, 10us startup
-su = make_surrogate_from_wire(b_link_bytes_per_us=20000, num_lanes=6, algo="ring",
-        startup_us=10.0, link_latency_us=0.5)
-# So: 200GbE RoCE — 25 GB/s/link, 4 NICs, 40us RDMA startup, 0.95 wire-eff
-so = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=4, algo="ring",
-        startup_us=40.0, link_latency_us=1.0, wire_efficiency=0.95, t_min_switch_us=1.5)
-so_topo = make_topology_from_family("so_spineleaf", N=4, links_per_gpu=4, per_link_gbps=25.0)
-h = HierarchicalSurrogate(su, so, gpus_per_node=6, num_nodes=4, so_topology=so_topo)
-h.predict(D, "ring", 128, collective="allreduce")     # ~809.92 us
-```
-
-### K. Hierarchical — full-custom stages (every knob explicit)
-
-```python
-from surrogate.theory.whitebox_surrogate_v2 import (
-    TheoryDerivedSurrogate, make_topology_from_family, HierarchicalSurrogate)
-D = 1 << 24
-
-su = TheoryDerivedSurrogate(packet_bw_bytes_per_us=120000, ring_bw_bytes_per_us=120000,
-        startup_us=8.0, num_lanes=6, link_latency_us=0.5)
-so = TheoryDerivedSurrogate(packet_bw_bytes_per_us=40000, ring_bw_bytes_per_us=40000,
-        startup_us=40.0, num_lanes=4, link_latency_us=1.0,
-        wire_efficiency=0.95, t_min_switch_us=1.5)
-so_topo = make_topology_from_family("so_fullmesh", N=4, links_per_gpu=4, per_link_gbps=25.0)
-h = HierarchicalSurrogate(su, so, gpus_per_node=6, num_nodes=4, so_topology=so_topo)
-h.predict(D, "ring", 128, collective="allreduce")     # ~450.39 us
-h.predict(D, "ring", 128, collective="allgather")     # ~413.76 us
-```
-
-### L. Hierarchical — reuse a non-H200 preset as the Su stage
-
-```python
-from surrogate.theory.whitebox_surrogate_v2 import (
-    make_1024_optical_fattree_theory, make_surrogate_from_wire,
-    make_topology_from_family, HierarchicalSurrogate)
-D = 1 << 24
-
-su = make_1024_optical_fattree_theory()              # 1024-GPU 600G optical study profile
-so = make_surrogate_from_wire(b_link_bytes_per_us=25000, num_lanes=4, algo="ring",
-        startup_us=40.0, link_latency_us=1.0, wire_efficiency=0.95, t_min_switch_us=1.5)
-so_topo = make_topology_from_family("so_spineleaf", N=4, links_per_gpu=4, per_link_gbps=25.0)
-h = HierarchicalSurrogate(su, so, gpus_per_node=8, num_nodes=4, so_topology=so_topo)
-h.predict(D, "ring", 128, collective="allreduce")     # ~701.85 us
-```
-
-### M. Full-mesh — ns-3-calibrated (the 4th algorithm shape)
-
-The full-mesh algorithm ships its own preset, `make_h200_fullmesh_theory()`,
-whose `fullmesh_bw=449890` is back-fit to the ns-3 `FullMeshAllReduce` /
-`FullMeshAllGather` sweep (η=0.9998 vs the `18×25000` dedicated-bundle
-physics, MAPE 0.10%). Unlike ring/tree/NVLS (wire-rate derivations with
-fitted constants — ring runs below ns-3 in the calibrated range, tree can
-run above it), this one is **ground-truth-calibrated to ns-3** — a
-least-squares back-fit that straddles ns-3 within ~0.1% (above at some
-points, below at others). It still omits
-per-packet credit flow, VOQ arbitration and the inter-phase barrier ns-3
-models; the residual is the ~0.1% gap in either direction.
-
-```python
-from surrogate.theory.whitebox_surrogate_v2 import make_h200_fullmesh_theory
-s = make_h200_fullmesh_theory()                       # ns-3-calibrated preset
-# 256 MiB full-mesh AllReduce on 8 GPUs: 2 phases, D/N per phase.
-s.predict(256 * 1024 * 1024, 8, "fullmesh", credits=128, ber=0, collective="allreduce")   # ~165 us
-# AllGather: 1 phase -> ~90 us (T_AR ~ 2*T_AG - startup).
-s.predict(256 * 1024 * 1024, 8, "fullmesh", credits=128, ber=0, collective="allgather")   # ~90 us
-```
-
-The wire-derived entry (a non-H200 full-mesh platform) uses the same η=1.0
-default — `make_surrogate_from_wire(25000, 18, "fullmesh")` derives
-`fullmesh_bw = 1.0 × 25000 × 18 = 450000`, matching the ns-3 fit to 0.02%:
-
-```python
-s = make_surrogate_from_wire(25000, 18, "fullmesh")  # fullmesh_bw=450000
-s.predict(256 * 1024 * 1024, 8, "fullmesh", credits=128, ber=0, collective="allreduce")   # ~165 us
-```
-
-Full-mesh needs no topology: the per-phase bundle rate is far below the
-full-mesh bisection, so the bisection cap never binds and `topology=None` is
-byte-identical. Calibration details + the ns-3 sweep are in
-[`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Full-mesh”.
-
-### N. Plain (non-RoCE) Ethernet So fabric — the lossy RoCE counterpart
+### Plain Ethernet scale-out
 
 `make_h200_ethernet_theory()` is the lossy counterpart to
 `make_h200_roce_theory()`: the same 400GbE L2 wire (`ring_bw=160000`) but a
@@ -579,40 +400,26 @@ overhead). The profile is a spec-derived **lower bound anchored to ns-3** (no
 perftest/blog ground truth for plain Ethernet, unlike RoCE's `ib_write_lat`);
 the parity test asserts surrogate ≤ ns-3 with a sanity floor. Calibration +
 the ns-3 lossy model (VOQ tail-drop → switch NACK → LLR/SACK retransmit) are
-in [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) §“Plain Ethernet”.
+in [Calibration](CALIBRATION.md#plain-ethernet-scale-out--lossy-ns-3-anchored-lower-bound).
 
----
+## Scope
 
-## 8. What it does and does not model
+The model combines collective schedules, credit pressure, FEC expansion,
+retry/reload work, shared contention and optional fabric bisection/hop limits.
+Omitting `topology` selects an ideal nonblocking NVSwitch fabric. Predictions
+can lie above or below packet simulation; accuracy depends on the calibration,
+credit window and topology. Use [CALIBRATION.md](CALIBRATION.md) for provenance
+and use packet simulation to check configurations selected by the surrogate.
 
-**Does:**
-- Ideal-NVSwitch default fabric (byte-identical to the pre-topology model).
-- Real-fabric bisection cap + hop propagation (when `topology=` is given).
-- Credit pressure, FEC coding overhead, GBN/SACK retransmission, contention,
-  optical link protection, LLR buffer reload — each enabled by setting the
-  corresponding optional input. With `topology=` given, retransmissions
-  serialize at the bisection-capped rate just like the mean path
-  (`_retry_overhead` receives the topology-capped `T_serial_step`; a
-  50-GB/s cap moves a 16 MiB / 8-GPU / BER 1e-7 / SACK prediction from
-  ~223 µs to ~737 µs — see §12 of `WHITEBOX_SURROGATE.md`).
-- N-independent efficiency factors; N enters through the explicit collective
-  topology (`(N-1)/N` ring steps, `log2(N)` tree levels, NVLS N-cancellation).
+NIC firmware, switch queue dynamics, GPU instructions, and the stateful
+RDMA/PCIe submission model are outside this analytical model. Selecting IBGDA
+or TLP execution in ns-3 does not add those mechanisms to surrogate predictions.
 
-**Does not (by design):**
-- Model firmware / arbiter / VOQ drain overhead → the fitted constants absorb
-  them on average, so per-point error is two-sided (ring mostly below ns-3,
-  tree can be above; the theory/ns-3 ratio is credit-sensitive — see
-  [CALIBRATION.md](../../doc/CALIBRATION.md)). Use it for ordering/trends, not
-  absolutes.
-- Replace packet simulation near a design frontier — surrogate winners are
-  re-verified in ns-3.
 
----
-
-## 9. Tests
+## Tests
 
 ```bash
-python3 -m pytest surrogate/test/ -q          # 72 passed
+python3 -m pytest surrogate/test/ -q
 python3 test/parity/test_surrogate_vs_ns3_fullmesh.py   # fullmesh vs ns-3 (6 pts)
 ```
 
@@ -631,11 +438,180 @@ monotonicity, and the topology name→Topology factory + error paths. The
 full-mesh parity test asserts the ns-3-calibrated surrogate tracks ns-3
 within a tight [0.95, 1.05] band across N=8 AR+AG at {16,64,256} MiB.
 
----
+## Mechanism equations
 
-## 10. Going deeper
+### Design Rule
 
-- [`WHITEBOX_SURROGATE.md`](WHITEBOX_SURROGATE.md) — full derivation, the design
-  rule, and the per-family topology formulas (§12, §13).
-- [`../../doc/CALIBRATION.md`](../../doc/CALIBRATION.md) — how the H200 anchor
-  numbers were measured.
+The surrogate keeps fixed latency separate from serialized packet work:
+
+```text
+L_hat = S_protocol
+        + steps * T_fixed
+        + steps * T_serial * Phi_credit * Phi_fec * Phi_share
+        + T_retransmission
+        + T_reload
+        + T_fec_latency
+```
+
+Credit pressure, FEC expansion, and contention scale only serialized work.
+They do not multiply protocol startup, propagation, or switch-pipeline delay.
+
+### Transfer Work
+
+The collective schedule determines the number of steps and data per step.
+Serialized time is
+
+```text
+T_serial = B_step / BW_eff
+```
+
+The current H200 profile uses:
+
+| Schedule | Effective transfer quantity |
+|---|---:|
+| Ring | 177,000 bytes/us |
+| Tree | 308,300 bytes/us per active level (ns-3-calibrated trunk; 0.685 × B_agg) |
+| NVLS | 535,500 bytes/us aggregate work bandwidth |
+
+Ring uses link propagation for `T_fixed`. Tree uses the switched-path pipeline
+delay. NVLS uses its multicast schedule and startup profile.
+
+The ring preset uses 177,000 B/us. The wire-rate factory gives 180,000 B/us
+from `0.40 * num_lanes * b_link` at 18 lanes and 25,000 B/us per lane;
+the preset retains its fitted value.
+
+#### Collective and step model
+
+`predict()` takes a required `collective` (`allreduce` / `allgather` /
+`alltoall` / `sendrecv`); together with `algorithm` it fixes `steps` and
+`B_step`. It is not inferred from `algorithm` — the caller must name it
+explicitly (omitting it raises `TypeError`; an invalid name raises `ValueError`).
+
+| `collective` | `algorithm` | `steps` | `B_step` (bytes/step) | per-GPU volume |
+|---|---|---:|---|---|
+| `allreduce` | `ring` | `2(N-1)` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `allreduce` | `tree` | `2⌊log₂N⌋` | `α(N)·D / steps` | `α(N)·D` |
+| `allgather` | `nvls` | `2` | `D/N` | `D` (multicast) |
+| `alltoall` | `ring` / `collnetdirect` | `N-1` | `D/N` | `D(N-1)/N` |
+| `alltoall` | `tree` | `⌈log₂N⌉` | `D(N-1)/N / steps` | `D(N-1)/N` |
+| `sendrecv` | any | `1` | `D` | `D` (single hop) |
+
+AllReduce scatters `D(N-1)/N` per GPU over its `2(N-1)` ring steps
+(reduce-scatter + all-gather); the tree's per-step volume is `α(N)·D/steps`
+with the STRUCTURAL trunk-load `α(N)` = 1/2/3 (N≤2 single edge / N≤4 root
+with two children / N≥5 interior node — the busiest GPU↔switch trunk of the
+heap-shaped chunk-pipelined tree; zero free parameters, the tree analogue of
+ring's (N-1)/N); AllGather via NVLS multicast moves `D/N` per
+step over 2 steps; AlltoAll permutes `D(N-1)/N` per GPU — the volume
+correction the DSE analytical model (`bw_model_predict`) describes in comments
+but does not apply. The AlltoAll step count is `N-1` permutation phases
+(ring / `collnetdirect`) or `⌈log₂N⌉` recursive-doubling rounds (tree), not the
+`2(N-1)` an AllReduce routing would imply. Send-Recv is a single
+point-to-point hop: `steps=1`, the full payload, no pipeline credit pressure
+(`Phi_credit = 1`, `C_bdp = ∞`).
+
+The per-step serialization `T_serial = B_step / BW_eff` uses the per-link ring
+rate for AlltoAll and Send-Recv (they serialize over the per-link wire, like
+the ring schedule); AlltoAll's cross-section contention — every GPU exchanges
+with every other simultaneously — is captured by the **topology bisection
+cap** of Section 12 (`min(ring_bw, bisection)`), not a separate bandwidth
+constant, so without a topology AlltoAll is a per-link lower bound.
+
+### Credit Pressure
+
+With `C` credits and `B_chunk` bytes per credit, the sender can keep
+`C * B_chunk` bytes in flight. The schedule requires
+
+```text
+C_bdp = BW_path * T_credit_return / B_chunk
+Phi_credit = max(1, C_bdp / C)
+```
+
+The ratio `C / C_bdp` is the fraction of path bandwidth sustainable by the
+credit window. The current H200 profile uses 91.5 packets for ring and 35.5
+packets for tree. NVLS does not apply the endpoint credit factor in the
+evaluated profile. The scale-out (So) presets (`make_h200_roce_theory`,
+`make_h200_ethernet_theory`) pin both BDPs to infinity: the ns-3 So
+(inter-node) path bypasses the per-VC credit gate — scale-out traffic is
+governed by ECN/DCQCN or VOQ tail-drop + LLR, not credits — so the So stage
+must not inherit the NVLink credit window.
+
+### FEC
+
+For RS(`N_fec`, `K_fec`, `T_fec`), coding expands protected traffic by
+
+```text
+Phi_fec =
+    1 + f_optical * (N_fec / K_fec - 1)
+```
+
+The codec pipeline latency is added separately as `T_fec_latency`.
+
+For a pre-FEC BER `b`, a ten-bit symbol is erroneous with probability
+
+```text
+p_symbol = 1 - (1 - b)^10
+```
+
+If `X` is binomial with `N_fec` trials and probability `p_symbol`, a codeword
+is uncorrectable with probability `Pr[X > T_fec]`. Packet failure probability
+accounts for every codeword carried by that packet.
+
+### Link-Level Retransmission
+
+One protocol step can issue several packet fragments in parallel. The step
+cannot complete until its slowest required fragment arrives. If each fragment
+fails with probability `p` and the step contains `P` fragments, the expected
+maximum number of attempts is
+
+```text
+E[A_max] = sum over r >= 0 of (1 - (1 - p^r)^P)
+```
+
+Selective Acknowledgment retransmits only failed fragments:
+
+```text
+T_retransmission,SACK =
+    steps * T_serial * (E[A_max] - 1)
+```
+
+Go-Back-N also retransmits the issued suffix of the active window. Its mean
+suffix length is `(W + 1) / 2`, where
+
+```text
+W = min(C, C_bdp, packets_per_transfer)
+```
+
+The implementation enforces that Go-Back-N cannot predict less
+retransmission delay than Selective Acknowledgment. When a required packet is
+absent from the configured retry buffer, `T_reload` adds the source latency
+and source transfer time. The optical study uses GPU HBM as this source.
+
+### Contention
+
+`rho_shared` is the fraction of the selected link or switch-output capacity
+consumed by concurrent traffic using that bottleneck. Residual capacity is
+`BW_eff * (1 - rho_shared)`, so
+
+```text
+Phi_share = 1 / (1 - rho_shared)
+```
+
+`BW_eff` is the capacity the serial term actually serializes over — the
+collective's schedule rate (ring rate for alltoall/sendrecv phases, tree/NVLS
+trunk otherwise) already capped by any topology bisection/egress bottleneck.
+Computing `rho_shared` against the uncapped link rate understates the penalty
+exactly when the bottleneck is tightest (25 GB/s competing on a 50 GB/s-capped
+link doubles the transfer; against the raw 177 GB/s rate it would barely
+register).
+
+Disjoint routes use `rho_shared = 0`. Source injection rate is not substituted
+for bottleneck utilization.
+
+## Implementation
+
+The formulas and public factories are implemented in
+[`whitebox_surrogate_v2.py`](../surrogate/theory/whitebox_surrogate_v2.py).
+The [example catalog](../examples/gpu-cluster/README.md) lists independent
+comparisons and sweep scripts; their recorded outputs have different scopes
+from hardware validation.

@@ -5,7 +5,7 @@
 Unlike the hierarchical surrogate (an UNCALIBRATED lower bound), the full-mesh
 surrogate is a CALIBRATED BACK-FIT to ns-3: ``fullmesh_bw`` is the single scalar
 fit to the ns-3 ``FullMeshAllReduce`` / ``FullMeshAllGather`` sweep
-(``configs/calibration/fullmesh_ns3_sweep.py``), which itself runs the ns-3
+(``examples/gpu-cluster/calibration/fullmesh_ns3_sweep.py``), which itself runs the ns-3
 full-mesh injectors on ``--topology=fullmesh`` (every GPU-pair gets a dedicated
 ``--numLanes=18`` NVLink bundle, no switch). The fit achieved MAPE 0.10% on the
 SIMPLE-regime points, so this test asserts a tight symmetric band

@@ -307,7 +307,7 @@ def test_fullmesh_reproduces_ns3_ground_truth():
     """Surrogate fullmesh reproduces the ns-3 FullMeshAllReduce/AllGather
     simTimeUs (the calibration ground truth) within 2% on the SIMPLE regime
     (256 MiB / 8 GPUs: ns-3 AR=165.0 us, AG=90.0 us). fullmesh_bw is back-fit
-    to this ns-3 sweep (configs/calibration/fullmesh_ns3_sweep.py)."""
+    to this ns-3 sweep (examples/gpu-cluster/calibration/fullmesh_ns3_sweep.py)."""
     s = wb.make_h200_fullmesh_theory()
     D = 256 * 1024 * 1024
     ar = s.predict(D, 8, "fullmesh", credits=128, ber=0, collective="allreduce")
@@ -379,7 +379,7 @@ def test_tree_reproduces_ns3_ground_truth():
     t_min_switch=1.06 -- re-fit after the cut-through accounting fix)
     reproduces the ns-3 TreeAllReduce simTimeUs at the TRUE H200 fabric
     (--linksPerGpu=18 x 170 Gbps spray-routed; the calibration ground truth,
-    configs/calibration/tree_ns3_sweep.py) within 5% at 256 MiB (fit
+    examples/gpu-cluster/calibration/tree_ns3_sweep.py) within 5% at 256 MiB (fit
     MAPE 1.88% over all 36 points, per-N 2.4/1.3/1.6/2.3%). startup_us=46
     is the profile's SIMPLE startup (the model takes startup by D regime,
     like the sweep's back-fit)."""
@@ -653,7 +653,7 @@ def test_connectx7_p2p_perftest_fits_ib_write_lat():
     endpoints closely and the 1KB transition within ~8% (overall ~2.6% MAPE).
     """
     s = wb.make_connectx7_p2p_perftest_theory()
-    # ib_write_lat t_avg (us) from configs/calibration/roce_p2p_calib.py
+    # ib_write_lat t_avg (us) from examples/gpu-cluster/calibration/roce_p2p_calib.py
     lat = {2: 1.45, 64: 1.48, 1024: 1.62, 65536: 4.21}
     errs = []
     for D, meas in lat.items():

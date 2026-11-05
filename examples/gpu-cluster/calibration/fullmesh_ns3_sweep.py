@@ -22,7 +22,7 @@ funnels N chunks through one shared switch port). AR = 2 phases
 scalar fit: fullmesh_bw = sum(V^2)/sum(R*V), V = steps*(D/N),
 R = T_ns3 - S - steps*lat.
 
-Run:  python3 configs/calibration/fullmesh_ns3_sweep.py
+Run:  python3 examples/gpu-cluster/calibration/fullmesh_ns3_sweep.py
 """
 
 from __future__ import annotations
@@ -34,7 +34,8 @@ import signal
 import subprocess
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
+DATA = REPO / "configs/calibration"
 
 NUM_GPUS = [4, 8, 16]
 COLLECTIVES = ["allreduce", "allgather"]
@@ -111,7 +112,7 @@ def main():
                       f"chunk={chunk >> 20:3d}MB ({regime_of(chunk):5s}) -> "
                       f"{'FAILED' if t is None else f'{t:.2f} us'}")
 
-    csv_path = Path(__file__).with_name("fullmesh_sweep.csv")
+    csv_path = DATA / "fullmesh_sweep.csv"
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
@@ -146,7 +147,7 @@ def main():
           f"vs physics {PHYSICS_BUNDLE} = {fullmesh_bw / PHYSICS_BUNDLE * 100:.2f}%)")
     print(f"MAPE = {mape:.2f}%")
 
-    json_path = Path(__file__).with_name("fullmesh_calib.json")
+    json_path = DATA / "fullmesh_calib.json"
     json_path.write_text(json.dumps(dict(
         source="ns-3 FullMeshAllReduce/FullMeshAllGather on --topology=fullmesh",
         model="T = startup + steps*(lat + (D/N)/fullmesh_bw); AR steps=2, AG steps=1",

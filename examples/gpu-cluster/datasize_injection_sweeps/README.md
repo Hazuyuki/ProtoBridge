@@ -3,8 +3,8 @@
 Five single-knob sweeps on the ns3-rdma-matched fabric — single shared-leaf
 `tor` topology, 40 Gbps RoCE inter-node links, 1 µs latency, 1000-B bulk
 chunks, `--soTxWindow=64`. This is the same matched fabric as
-[doc/PFC_NS3RDMA_ALIGNMENT.md](../../../doc/PFC_NS3RDMA_ALIGNMENT.md) and
-[doc/SCALEOUT_ALIGNMENT.md](../../../doc/SCALEOUT_ALIGNMENT.md) (the
+[doc/CALIBRATION.md#pfc-and-scale-out-cross-checks](../../../doc/CALIBRATION.md#pfc-and-scale-out-cross-checks) and
+[doc/CALIBRATION.md#pfc-and-scale-out-cross-checks](../../../doc/CALIBRATION.md#pfc-and-scale-out-cross-checks) (the
 ns3-rdma head-to-head notes), so the incast panels here are directly
 comparable with those alignment tables; the ns3-rdma comparison itself is
 documented in those two notes — this example is the ProtoBridge-side
@@ -71,7 +71,7 @@ reproduce them exactly (deterministic seeds).
 The fabric parameters are deliberately the matched ones from the alignment
 notes so the numbers can be cross-read (e.g. the 2-node row in
 `nodes.csv` — 10.4 ms for 50 MB — is the same operating point as the PB
-"tor, PFC off" 2:1 row in `doc/SCALEOUT_ALIGNMENT.md` at 21.90 ms for 2 ×
+"tor, PFC off" 2:1 row in `doc/CALIBRATION.md#pfc-and-scale-out-cross-checks` at 21.90 ms for 2 ×
 50 MB). The ns3-rdma head-to-head itself (FCT ratios, PFC modes, headroom
 sizing) lives in those notes, not here — this example characterizes
 ProtoBridge's DCQCN behavior on the same fabric across data volume,

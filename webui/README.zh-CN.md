@@ -141,7 +141,7 @@ PFC/ECN/丢包阈值顺序会在启动进程前报错。Ethernet、部分 lossy 
 其他操作可选择“RDMA 读取 / Get”“RDMA 发送 / 接收”“RDMA 原子操作”或“RDMA Put +
 信号”模板。操作下拉框还提供 Write/Send with immediate 及单独信号更新。可以调整
 Read/原子操作在途上限、响应方槽位、接收队列容量、RNR 重试和操作数；延迟提交接收
-缓冲可用于观察 RNR 恢复。完成语义和集成示例见 [RDMA 操作说明](../doc/RDMA_OPERATIONS.md)。
+缓冲可用于观察 RNR 恢复。完成语义和集成示例见 [RDMA 操作说明](../doc/RDMA.md#operations)。
 详细模式在完整运行压缩包中保存 `rdma.csv`，也可通过
 `/api/runs/<id>/artifacts/rdma.csv` 单独下载。结果分别统计用户请求与分块 WR、
 提交方观测完成与目标数据就绪，以及拷贝字节数。参数和 C++ 集成方式见

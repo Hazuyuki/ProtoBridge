@@ -162,7 +162,7 @@ atomics**, or **RDMA Put with signal**. The operation selector also offers
 Write/Send with immediate and standalone signal updates. Configure Read/atomic
 credits, responder slots, posted receive capacity, RNR retries and operands in
 the same section. Delaying receive posting lets you observe RNR recovery.
-See [RDMA operations](../doc/RDMA_OPERATIONS.md) for completion rules and examples.
+See [RDMA operations](../doc/RDMA.md#operations) for completion rules and examples.
 
 Detailed runs include `rdma.csv` in **Download run archive**; it is also available
 at `/api/runs/<id>/artifacts/rdma.csv`. Results distinguish logical requests from

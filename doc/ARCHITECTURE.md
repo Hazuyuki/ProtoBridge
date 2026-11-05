@@ -84,97 +84,20 @@ The config path (next section) builds the same kind of graph from a `.cfg`,
 so a protocol is "defined in tens of lines of config" — the paper's OTP
 stencil — without touching the PEX models.
 
-## Config-driven protocol stack (`.cfg`)
+## Configuration boundary
 
-A `.cfg` declares the two layers in one file: a `[stack]` PEX bundle (by
-reference to a `ProtocolProfile`) and an `[op]` OTP stencil (a replicated
-set of logical transfers). A compiler (`ProtocolConfig::Compile`) expands
-the stencil through the vendor `ProtocolModel` — which emits the ACTION +
-delivery WAIT nodes — so the config declares *transfers*, never raw graph
-nodes.
+A `.cfg` names a `[stack]` and an `[op]`. The stack loads a reusable protocol
+profile and applies overrides; the operation supplies the collective schedule
+or a custom transfer stencil. The config runner delegates supported collective
+and algorithm pairs to the same injectors as the inline CLI path. The parity
+tests check exact `simTimeNs` equality for equivalent inputs.
 
-```
-[stack]
-# PEX bundle by reference: protocol/FEC/credits/BER/flow-control/LLR.
-profile = configs/protocol_profiles/h200-ll128.profile
-
-[op]
-# Symbolic params, evaluated in order; may reference numGpus, dataSize,
-# and earlier params. Integer arithmetic only (+ - * / mod, parentheses).
-param.N        = numGpus
-param.segment  = dataSize / N
-param.steps    = 2 * (N - 1)
-
-# Replication domain: one transfer instance per (gpu, step). The first
-# replicate var is the chain axis (each gpu's steps are chained in order).
-replicate.gpu  = 0 .. N-1
-replicate.step = 0 .. steps-1
-
-# Per-chain startup. "auto" = the protocol model's startup delay for the
-# total data size at N GPUs (matches the hand-written RingAllReduce).
-startup        = auto
-# Inter-step software overhead (ns) inserted between a gpu's steps.
-per_step_delay = 0
-
-# The transfer stencil, evaluated per instance with gpu/step/N/segment in
-# scope. flowId and stageId are assigned by the compiler (baseFlowId +
-# stage counter). kind ∈ DATA (alias SEND_DATA) | P2P. (MEMORY_READ /
-# MEMORY_WRITE / COLLECTIVE exist in the transaction layer's grammar but
-# have no send path in the config runner and are rejected at compile time.)
-transfer.0.kind  = DATA
-transfer.0.src   = gpu
-transfer.0.dst   = (gpu + 1) mod N
-transfer.0.bytes = segment
-transfer.0.vc    = 0
-
-# Completion: every gpu's final step must deliver (all | any).
-complete = all
-```
-
-### Collective + algorithm delegation (`collective =` + `algorithm =`)
-
-Instead of a transfer stencil, an `[op]` may set `collective = <c>` +
-`algorithm = <a>` (ring/tree/sharp/hierarchical/nvls) to delegate to a
-calibrated inline injector. The simulator sources the profile's
-fabric-hardware + protocol keys into the same local CLI variables the inline
-path consumes (the PEX-bundle keys go to the bundle object via `Build()`, not
-CLI vars), then runs the injector verbatim — so a `.cfg` run is
-**bit-identical** to the inline path with the profile's values as flags
-(verified by `test/parity/test_config_vs_inline_parity.py`). The
-`topology =` key overrides the CLI fabric (ring allreduce needs
-`topology=ring`; tree and NVLS use `topology=switched`). `numGpus` and
-`dataSize` stay on the CLI. This is the **primary** form for reproducing a
-measured collective.
-
-```
-[stack]
-profile = configs/protocol_profiles/h200-ll128.profile
-
-[op]
-collective = allreduce   # delegate to the calibrated RingAllReduce injector
-algorithm  = ring
-topology   = ring
-```
-
-Run either form with the validated PEX wiring on the profile side:
-
-```
-./ns3 run "gpu-cluster-sim --protocolConfig=\
-configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
-```
-
-Three calibrated configs ship — `h200-ring-allreduce.cfg`
-(`collective=allreduce`/`algorithm=ring`), `h200-tree-allreduce.cfg`
-(`collective=allreduce`/`algorithm=tree`), `h200-nvls-allgather.cfg`
-(`collective=allgather`/`algorithm=nvls`) — plus `h200-request-response.cfg`
-(a two-leg ping-pong stencil, showing the stencil form is not ring-specific).
-Because these ops source the profile's protocol-specific startup (LL 15 µs /
-LL128 25 µs / SIMPLE 46 µs / NVLS 23 µs) and fabric hardware, their latency is
-**bit-identical** to the inline path and reproduces the H200 measurement
-(8-GPU 1 MiB ring → 38.3 µs vs 37.24 µs measured). See
-[doc/CONFIG_GUIDE.md](CONFIG_GUIDE.md) for the user-facing guide, and
-[configs/protocol_configs/](../configs/protocol_configs) /
-[configs/protocol_profiles/](../configs/protocol_profiles).
+Custom stencils compile transfer instances and dependencies into the
+transaction graph. The config runner supports DATA and P2P sends; addressed
+Read/Write, Send/Recv, atomics and signals use the separate
+[RDMA operation API](RDMA.md#operations). The
+[configuration guide](CONFIG_GUIDE.md) defines syntax, profile keys, precedence
+and complete runnable examples.
 
 ## FabricHeader layout
 
@@ -319,3 +242,23 @@ scale-up design space across direct-connect and switched families:
 The design space is bounded by shipping hardware limits: ≤72 GPUs for a
 single NVLink fabric (NVL72), ≤18 NVLinks/GPU (H200 NVLink4), and NVLS only
 within a single NVSwitch ASIC domain (≤8 GPUs).
+
+## Model limits
+
+CPU/GPU execution, HBM/host-memory service and copy engines use configurable
+service queues and latencies. Detailed RDMA adds submission/completion state;
+optional PCIe TLP execution supplies local-link queues and contention. Device
+instructions, cache/coherence effects and NIC internal SRAM occupancy are not
+modeled. See [RDMA](RDMA.md) and [PCIe](PCIE.md) for path-specific limits.
+
+RTTCC probes share the link and queue path but bypass BER corruption and
+lossy tail-drop. The receiver immediately reflects a probe without a separate
+NIC response-service delay. Link-down and configured packet-loss checks can
+still discard control traffic. These assumptions affect interpretation of
+RTT-feedback experiments.
+
+PFC uses output-port/destination congestion; its pause counts differ from
+models based on ingress priority groups. The
+[scale-out comparisons](CALIBRATION.md#pfc-and-scale-out-cross-checks) record
+that distinction. Hardware calibration, independent-simulator comparisons and
+analytical fits have separate scopes in the calibration guide.
