@@ -30,3 +30,19 @@ build_lib_example(
                   ${libnetwork}
                   ${libcore}
 )
+
+build_lib_example(
+  NAME custom-network-topology
+  SOURCE_FILES custom-network-topology.cc
+  LIBRARIES_TO_LINK ${libgpu-cluster}
+                  ${libpoint-to-point}
+                  ${libnetwork}
+                  ${libcore}
+)
+
+build_lib_example(
+  NAME custom-pcie-topology
+  SOURCE_FILES custom-pcie-topology.cc
+  LIBRARIES_TO_LINK ${libgpu-cluster}
+                  ${libcore}
+)

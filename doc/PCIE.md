@@ -160,8 +160,10 @@ RDMA or IBGDA. TLP runs include `pcie.csv` in the run archive and at
 
 For C++ integration, use `PcieFabric::Configure`, `AddRootComplex`,
 `AddEndpoint`, `AddSwitch`, and `AddLink`, then issue asynchronous `Read`/`Write`
-operations. Memory-service callbacks return nonnegative delays; the fabric
-invokes them at the relevant endpoints. `TlpTx` and `TlpRx` trace sources expose
+operations. The [topology development guide](TOPOLOGY_GUIDE.md#pcie-example-connect-gpu-and-nic-endpoints-explicitly)
+walks through a complete example and explains the additional binding needed for
+custom RDMA GPU/NIC placement. Memory-service callbacks return nonnegative delays;
+the fabric invokes them at the relevant endpoints. `TlpTx` and `TlpRx` trace sources expose
 packets and hop endpoint IDs. `SetObserver` provides the richer CSV event data.
 Build the topology before traffic. With RDMA runtimes, share one
 `RdmaHostMemoryResources` across the host and set it before submitting work;

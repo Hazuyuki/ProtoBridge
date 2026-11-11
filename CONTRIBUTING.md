@@ -60,6 +60,8 @@ lists. Add C++ API examples under `src/gpu-cluster/examples/` and register them
 in its `CMakeLists.txt`. Put experiment and calibration scripts under
 `examples/gpu-cluster/`; keep configuration inputs and fitted data under
 `configs/`. Update the example catalog when adding or moving an entry.
+For graph construction, routing and example registration, follow the
+[topology development guide](doc/TOPOLOGY_GUIDE.md).
 
 Generated figures and reference results must identify their producing script
 and workload. Local run logs, review notes and development checkpoints belong

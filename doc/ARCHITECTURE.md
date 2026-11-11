@@ -201,6 +201,9 @@ scale-up design space across direct-connect and switched families:
 
 Topology-specific limits are enforced by the helpers. Hardware reference
 settings and measurement conditions are recorded in [Calibration](CALIBRATION.md).
+For new graphs, the [topology development guide](TOPOLOGY_GUIDE.md) explains
+node/device construction, port IDs, forward/return routing and simulator integration
+through two runnable C++ examples.
 
 ## Model limits
 

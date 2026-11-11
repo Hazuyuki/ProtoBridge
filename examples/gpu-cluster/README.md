@@ -6,7 +6,8 @@ below use that application or show how to call the module from C++.
 
 ```bash
 ./ns3 configure --enable-examples --enable-tests -d debug
-./ns3 build gpu-cluster-sim gpu-cluster-example ring-topology-example hybrid-cluster-example protocol-profile-demo
+./ns3 build gpu-cluster-sim gpu-cluster-example ring-topology-example \
+  hybrid-cluster-example protocol-profile-demo custom-network-topology custom-pcie-topology
 ```
 
 The C++ examples require `--enable-examples`. Several experiment scripts call
@@ -16,8 +17,12 @@ figures; the single-configuration examples are the quickest starting point.
 
 ## C++ API examples
 
-All four live in [`src/gpu-cluster/examples/`](../../src/gpu-cluster/examples/)
+These examples live in [`src/gpu-cluster/examples/`](../../src/gpu-cluster/examples/)
 and are registered with the module build.
+
+To write a new topology, follow the
+[topology development guide](../../doc/TOPOLOGY_GUIDE.md), starting with the
+custom network and PCIe examples below.
 
 | Executable | Purpose |
 |---|---|
@@ -25,12 +30,16 @@ and are registered with the module build.
 | `ring-topology-example` | Build a ring with an optional link-degradation model. |
 | `hybrid-cluster-example` | Connect GPU fabrics through Ethernet gateways. |
 | `protocol-profile-demo` | Load a `.profile` and inspect the protocol/FEC/credit bundle; no traffic is simulated. |
+| `custom-network-topology` | Wire a four-endpoint, two-switch RoCE graph; install routes and run concurrent Writes, optionally with PCIe TLP execution. |
+| `custom-pcie-topology` | Connect GPU/NIC/root/switch nodes explicitly and execute PCIe reads/writes. |
 
 ```bash
 ./ns3 run "gpu-cluster-example --numGpus=2 --numPackets=4" --no-build
 ./ns3 run "ring-topology-example --numGpus=4" --no-build
 ./ns3 run "hybrid-cluster-example --gpusPerNode=2" --no-build
 ./ns3 run "protocol-profile-demo --profile=configs/protocol_profiles/h200-ll128.profile" --no-build
+./ns3 run "custom-network-topology --pcieModel=tlp" --no-build
+./ns3 run "custom-pcie-topology --bytes=4096" --no-build
 ```
 
 ## Runnable configurations

@@ -92,8 +92,10 @@ configuration controls and result downloads.
 
 ## Documentation and examples
 
-Use the [documentation index](doc/README.md) for the six topic guides:
-configuration, architecture, RDMA/IBGDA, PCIe, surrogate, and calibration.
+Use the [documentation index](doc/README.md) for configuration, architecture,
+topology development, RDMA/IBGDA, PCIe, surrogate, and calibration guides.
+The [topology development guide](doc/TOPOLOGY_GUIDE.md) walks through two runnable
+C++ examples, including explicit links and forward/return routes.
 The [example catalog](examples/gpu-cluster/README.md) lists every project C++
 example, runnable configuration, sweep and plotting script.
 
