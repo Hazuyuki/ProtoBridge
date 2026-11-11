@@ -57,8 +57,10 @@ For repeated writes without a stencil:
 ./ns3 run "gpu-cluster-sim --numNodes=2 --gpusPerNode=2 --collective=p2p --rootRank=1 --interNodeTopology=host --interNodeFabricType=RoCE --interNodeBandwidth=200 --interNodeLatency=0 --switchCutThroughDelay=649 --dataSize=8192 --p2pIterations=100 --rdmaSubmission=detailed --rdmaInitiator=cpu --rdmaDataPath=gpudirect --rdmaCpuWqeBuildNs=100 --rdmaQueueDepth=128 --rdmaTraceFile=/tmp/rdma.csv"
 ```
 
-The 100 ns cost is an example, not a perftest default. Timing inputs default to
-zero except `rdmaBatchTimeoutNs=100`. Bandwidth inputs default to zero, meaning
+The 100 ns cost is an example, not a perftest default. CPU/GPU posting,
+memory-service and completion-observation costs default to zero.
+`rdmaBatchTimeoutNs` defaults to 100 ns; the operation-specific
+`rdmaRnrRetryNs` defaults to 1000 ns. Bandwidth inputs default to zero, meaning
 unconstrained. The simulator does not infer missing hardware costs.
 
 ## Events and resources
