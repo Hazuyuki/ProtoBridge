@@ -4,7 +4,7 @@
 Every sweep drives the debug build of `scratch/gpu-cluster-sim.cc` (build
 first: `./ns3 configure -d debug --enable-tests --enable-examples && ./ns3
 build`). The scenario is the ns3-rdma-matched fabric from
-doc/PFC_NS3RDMA_ALIGNMENT.md / doc/SCALEOUT_ALIGNMENT.md — single shared-leaf
+doc/CALIBRATION.md#pfc-and-scale-out-cross-checks / doc/CALIBRATION.md#pfc-and-scale-out-cross-checks — single shared-leaf
 `tor`, 40 Gbps RoCE links, 1 us latency, 1000-B bulk chunks, soTxWindow=64 —
 so the incast panels are directly comparable with the alignment tables.
 
@@ -39,7 +39,7 @@ REPO = Path(__file__).resolve().parents[3]
 SIM = REPO / "build/scratch/ns3.47-gpu-cluster-sim-debug"
 HERE = Path(__file__).resolve().parent
 
-# The ns3-rdma-matched fabric base (see doc/PFC_NS3RDMA_ALIGNMENT.md).
+# The ns3-rdma-matched fabric base (see doc/CALIBRATION.md#pfc-and-scale-out-cross-checks).
 BASE = [
     "--topology=switched",
     "--collective=incast",

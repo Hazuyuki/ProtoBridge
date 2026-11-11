@@ -1,180 +1,66 @@
 # Architecture
 
-ProtoBridge models GPU-fabric communication at L2/MAC, below any IP stack.
-This document describes the layering, the fabric header, the flow-control /
-spraying / reorder model, the NVSwitch datapath, the resilience tiers, and the
-topology grammar.
+ProtoBridge models interconnect communication through two layers. Workloads
+and upper simulators supply operations and data-ready times. OTP turns an
+operation into ordered transfers; PEX executes their packet and device events.
+For runnable inputs use [Configuration](CONFIG_GUIDE.md); calibration evidence
+and recorded comparisons live in [Calibration](CALIBRATION.md).
 
 ## Layering: OTP (operation → packet) and PEX (packet execution)
 
-The simulator is split into two abstraction layers, mirroring the paper's
-OTP/PEX model. **OTP — operation to packet** (a.k.a. C1) turns a tensor
-operation into a stream of fabric packets. **PEX — packet execution**
-(a.k.a. C2) drives those packets across the wire. The two layers are
-decoupled by a small transaction-graph seam (see below): OTP emits a graph of
-ACTION/delivery-WAIT nodes; PEX fires each ACTION as a wire send and feeds
-delivery events back. A collective can be expressed either by a hand-written
-injector (the validated path) or by a few lines of config compiled through
-that seam (the `--protocolConfig` path).
+| Layer | Responsibility | Main components |
+|---|---|---|
+| OTP | Collective schedules, transfer dependencies, protocol selection and completion. | Collective injectors, `ProtocolModel`, `ProtocolPayloadBuilder`, `ProtocolConfig`, transaction graphs. |
+| PEX | Admission, serialization, routing, queues, flow control, errors and recovery. | `FabricEndpoint`, `NvSwitch`/`EthernetSwitch`, credits, FEC, LLR, link and contention models. |
 
-**OTP — operation to packet.** A collective injector (ring-allreduce,
-tree-allreduce, nvls-allgather, sharp-allreduce, fullmesh, alltoall, …)
-decomposes a tensor operation into a stream of fabric packets. For each packet
-it asks:
+`ProtocolModel` selects startup and wire-efficiency rules; payload builders
+construct the modeled packet body. NCCL, UB and MCCL models describe scale-up
+protocol choices; RoCE and plain Ethernet models supply scale-out behavior.
+The shared packet path uses `FabricHeader` for routing and transfer accounting.
+No `InternetStackHelper` is installed.
 
-- `ProtocolModel` (one of 3 vendor models validated in the paper:
-  `NcclProtocolModel`, `UbProtocolModel`, `McclProtocolModel`) to select the
-  wire protocol (e.g. NCCL LL / LL128 / SIMPLE) and wire efficiency.
-- `ProtocolPayloadBuilder` to pack the tensor chunk into the payload.
-- `FabricHeader` to stamp packet type, sequence number, flow ID, virtual
-  channel, source/dest rank.
+```text
+upper workload / ready event
+  -> OTP schedule and dependencies
+  -> endpoint submission and packetization
+  -> PEX queues, links and receiver memory service
+  -> delivery/completion callback -> next dependent operation
+```
 
-**PEX — packet execution.** Each packet traverses:
-
-- `CreditManager` — per-VC credit gating; a DATA packet consumes one credit on
-  the matching VC and the receiver returns a CREDIT packet when the buffer
-  drains.
-- `FecModel` — RS(N,K,T) encoding/decoding; an uncorrectable codeword raises
-  an LLR retry, a correctable one is fixed with a decode-latency cost.
-- `LlrManager` — go-back-N or SACK retransmission of lost/unacknowledged
-  packets.
-- `LinkDegradationModel` — per-link BER sampling (separate rates for
-  intra-node electrical, intra-rack electrical, inter-rack electrical, and
-  inter-rack optical); sampled drops trigger the FEC/LLR path.
-- `ContentionModel` — WFQ arbitration between collective, P2P, and (legacy)
-  memory traffic classes at a shared egress.
-- **NVSwitch** — input VOQs per output port, a crossbar arbiter that resolves
-  Head-of-Line contention on a per-cycle round-robin schedule, and SHARP
-  in-network allreduce (buffers aligned packets, models a compute delay, then
-  multicasts the result to all endpoints).
+Detailed RDMA wraps remote transfers with submission, DMA and completion events.
+Local NVLink transfers retain their scale-up path. The [RDMA guide](RDMA.md)
+describes the CPU/GPU and host/staged/GPUDirect event sequences; the
+[PCIe guide](PCIE.md) explains local TLP packet execution and resources.
 
 ## OTP/PEX boundary: the transaction-graph seam
 
-OTP and PEX never call each other directly. They meet at a small data
-structure, the `ProtocolTransactionGraph`, and a runner,
+Graph-backed execution uses `ProtocolTransactionGraph` and
 `ProtocolTransactionExecutor`:
 
-```
-  OTP side                                  PEX side
-  ┌──────────────────────┐                  ┌──────────────────────┐
-  │ ProtocolTransaction- │  ACTION node     │  action callback     │
-  │ Graph                │ ───────────────▶ │  → SendBulkWire-     │
-  │  (ACTION / WAIT /   │                  │     TransferSize()   │
-  │   DELAY / COMPLETE)  │  PACKET_DELIVERED │                      │
-  │                      │ ◀─────────────── │  receive callback    │
-  │ Executor::NotifyEvent│   (event)        │  → NotifyEvent()     │
-  └──────────────────────┘                  └──────────────────────┘
-```
+| Node or callback | Role |
+|---|---|
+| `ACTION` | Invoke a transfer action through an executor callback. |
+| Delivery `WAIT` | Wait for the matching packet type, ranks, flow/stage and effective byte count. |
+| `DELAY` | Insert startup or inter-step service. |
+| `COMPLETE` | Finish after the selected terminal dependencies. |
+| `NotifyEvent` | Feed a delivery event back into the executor. |
 
-- **OTP** builds the graph: `ProtocolModel::AddTransaction` expands one
-  logical transfer into an `ACTION` (the wire send) plus a delivery `WAIT`
-  (matched on packet type, source/dest rank, flow id, stage id, byte count).
-  `DELAY` nodes insert startup / inter-step software overhead;
-  `COMPLETE` is the terminal fan-in/fan-out node.
-- **The seam** is two callbacks: the executor's `ActionCallback`
-  (OTP → PEX: "fire this wire send") and `NotifyEvent` (PEX → OTP: "a
-  packet matching this WAIT arrived"). The runner derives `stageId =
-  flowId − baseFlowId` on the receive side so the delivery event routes to
-  the right WAIT — this is what lets a multi-step ring pipeline advance.
-- **PEX** owns the `FabricEndpoint` + `FecModel` + `CreditManager` +
-  `LlrManager` + `LinkDegradationModel` + `NVSwitch` models below.
+`ProtocolConfigRunner` compiles custom stencils into this graph and maps send
+actions to `FabricEndpoint::SendBulkWireTransferSize`. `RingAllReduce` uses
+transaction execution by default and also retains a legacy callback path.
+Other injectors can manage their schedules directly. These paths share the
+endpoint/packet models; they do not all require a config-compiled graph.
 
-The hand-written injectors (e.g. `RingAllReduce`) build this graph in C++.
-The config path (next section) builds the same kind of graph from a `.cfg`,
-so a protocol is "defined in tens of lines of config" — the paper's OTP
-stencil — without touching the PEX models.
+## Configuration boundary
 
-## Config-driven protocol stack (`.cfg`)
+A `.cfg` supplies `[stack]` settings and an `[op]` schedule. Supported
+collective/algorithm pairs delegate to the same injectors as inline CLI runs.
+Custom stencils compile DATA/P2P transfers into transaction graphs. Addressed
+RDMA operations use the [operation API](RDMA.md#operations).
 
-A `.cfg` declares the two layers in one file: a `[stack]` PEX bundle (by
-reference to a `ProtocolProfile`) and an `[op]` OTP stencil (a replicated
-set of logical transfers). A compiler (`ProtocolConfig::Compile`) expands
-the stencil through the vendor `ProtocolModel` — which emits the ACTION +
-delivery WAIT nodes — so the config declares *transfers*, never raw graph
-nodes.
-
-```
-[stack]
-# PEX bundle by reference: protocol/FEC/credits/BER/flow-control/LLR.
-profile = configs/protocol_profiles/h200-ll128.profile
-
-[op]
-# Symbolic params, evaluated in order; may reference numGpus, dataSize,
-# and earlier params. Integer arithmetic only (+ - * / mod, parentheses).
-param.N        = numGpus
-param.segment  = dataSize / N
-param.steps    = 2 * (N - 1)
-
-# Replication domain: one transfer instance per (gpu, step). The first
-# replicate var is the chain axis (each gpu's steps are chained in order).
-replicate.gpu  = 0 .. N-1
-replicate.step = 0 .. steps-1
-
-# Per-chain startup. "auto" = the protocol model's startup delay for the
-# total data size at N GPUs (matches the hand-written RingAllReduce).
-startup        = auto
-# Inter-step software overhead (ns) inserted between a gpu's steps.
-per_step_delay = 0
-
-# The transfer stencil, evaluated per instance with gpu/step/N/segment in
-# scope. flowId and stageId are assigned by the compiler (baseFlowId +
-# stage counter). kind ∈ DATA (alias SEND_DATA) | P2P. (MEMORY_READ /
-# MEMORY_WRITE / COLLECTIVE exist in the transaction layer's grammar but
-# have no send path in the config runner and are rejected at compile time.)
-transfer.0.kind  = DATA
-transfer.0.src   = gpu
-transfer.0.dst   = (gpu + 1) mod N
-transfer.0.bytes = segment
-transfer.0.vc    = 0
-
-# Completion: every gpu's final step must deliver (all | any).
-complete = all
-```
-
-### Collective + algorithm delegation (`collective =` + `algorithm =`)
-
-Instead of a transfer stencil, an `[op]` may set `collective = <c>` +
-`algorithm = <a>` (ring/tree/sharp/hierarchical/nvls) to delegate to a
-calibrated inline injector. The simulator sources the profile's
-fabric-hardware + protocol keys into the same local CLI variables the inline
-path consumes (the PEX-bundle keys go to the bundle object via `Build()`, not
-CLI vars), then runs the injector verbatim — so a `.cfg` run is
-**bit-identical** to the inline path with the profile's values as flags
-(verified by `test/parity/test_config_vs_inline_parity.py`). The
-`topology =` key overrides the CLI fabric (ring allreduce needs
-`topology=ring`; tree and NVLS use `topology=switched`). `numGpus` and
-`dataSize` stay on the CLI. This is the **primary** form for reproducing a
-measured collective.
-
-```
-[stack]
-profile = configs/protocol_profiles/h200-ll128.profile
-
-[op]
-collective = allreduce   # delegate to the calibrated RingAllReduce injector
-algorithm  = ring
-topology   = ring
-```
-
-Run either form with the validated PEX wiring on the profile side:
-
-```
-./ns3 run "gpu-cluster-sim --protocolConfig=\
-configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
-```
-
-Three calibrated configs ship — `h200-ring-allreduce.cfg`
-(`collective=allreduce`/`algorithm=ring`), `h200-tree-allreduce.cfg`
-(`collective=allreduce`/`algorithm=tree`), `h200-nvls-allgather.cfg`
-(`collective=allgather`/`algorithm=nvls`) — plus `h200-request-response.cfg`
-(a two-leg ping-pong stencil, showing the stencil form is not ring-specific).
-Because these ops source the profile's protocol-specific startup (LL 15 µs /
-LL128 25 µs / SIMPLE 46 µs / NVLS 23 µs) and fabric hardware, their latency is
-**bit-identical** to the inline path and reproduces the H200 measurement
-(8-GPU 1 MiB ring → 38.3 µs vs 37.24 µs measured). See
-[doc/CONFIG_GUIDE.md](CONFIG_GUIDE.md) for the user-facing guide, and
-[configs/protocol_configs/](../configs/protocol_configs) /
-[configs/protocol_profiles/](../configs/protocol_profiles).
+See the [configuration guide](CONFIG_GUIDE.md) for syntax, parameter defaults,
+precedence and time bounds. Exact config/inline timing parity is checked by
+`test/parity/test_config_vs_inline_parity.py`.
 
 ## FabricHeader layout
 
@@ -199,113 +85,110 @@ LL128 25 µs / SIMPLE 46 µs / NVLS 23 µs) and fabric hardware, their latency i
                                ── total 39 bytes, 16 fields
 ```
 
-`FabricPacketType` (the first byte): `DATA`, `CREDIT`, `ACK`, `NACK`,
-`ALLREDUCE`, `ALLGATHER`, `ALLTOALL`, `REDUCESCATTER`, `BROADCAST`, `P2P`,
-`MEMORY_READ`, `MEMORY_WRITE`, `MEMORY_RESP`, `RETRY_REQUEST`, `RETRY_ACK`,
-`PERMANENT_LOSS`.
+The default serialized header is 39 bytes. Its fields carry routing, sequence,
+flow/VC identity and effective payload accounting. `effectiveDataSize` lets
+collective progress count application bytes while the payload builder charges
+LL/LL128 or other wire overhead. Current packet types are defined in
+[`fabric-header.h`](../src/gpu-cluster/model/fabric-header.h).
 
-### Why `FabricHeader` is necessary: the unified-abstraction contract
+This header is an abstraction used by the simulator. Protocol-specific byte
+accounting and payload construction are handled by their models. Changing
+header size changes serialization and requires new parity/calibration checks.
 
-`FabricHeader` is **not** an attempt to model any one hardware wire format
-(real NVLink flits are 1280-bit units with a vendor routing overlay; that
-layout is not publicly fixed and varies by vendor). Its role is different and
-load-bearing: it is the **vendor-agnostic control-plane contract** that lets
-one datapath serve all vendors, topologies, and protocols at once.
+## Flow control and congestion
 
-The target of this simulator is a *single* datapath spanning 7 vendor
-protocols × ring/tree/SHARP/NVLS/full-mesh/hierarchical topologies ×
-credit/window/rate flow control × the 4-tier resilience model. If every
-vendor/topology pair defined its own header fields, the datapath would explode
-into N×M specialized switch/reorder/credit/FEC/LLR paths. The only way to
-collapse that combinatorial space is to lift the *semantic* fields the control
-plane needs — packet type, end-to-end GPU address, sequence/flow/VC key, TTL,
-payload vs effective size — into one common schema, independent of any
-vendor's on-wire bit layout. `FabricHeader` is that schema.
+### Scale-up credits, spraying and reorder
 
-Two facts make the spine/plug relationship concrete:
+Local scale-up DATA consumes per-VC credits and waits when its send window is
+empty. Receiver buffer release returns credits. `FlowControlGate` provides
+the admission interface, including queued sends and the credit-bypass cases.
+Scale-out traffic bypasses this local credit accounting and uses its network's
+congestion/backpressure mechanisms.
 
-- Of `FabricHeader`'s 16 fields, **only `Protocol` (1 byte) carries vendor
-  identity.** The other 15 are vendor-agnostic control semantics. Vendor
-  encoding is delegated to the `ProtocolPayloadBuilder`; the heavy datapath
-  logic (NVSwitch routing/VOQ/arbiter, reorder buffer, credit manager, FEC
-  model, LLR, collective dispatch) runs entirely on the common schema. This is
-  why plugging in a vendor protocol is a *local* change (the `Protocol` byte
-  + a payload builder), not a rewrite of the spine.
-- `effectiveDataSize` is kept separate from `payloadSize` so that
-  overhead protocols (LL/LL128) can vary their wire size without disturbing
-  collective-progress accounting, which must stay consistent across vendors.
+With several physical links, senders spray chunks across the links; receivers
+track sequence and flow state to handle reordered arrivals and retries.
+NVSwitch VOQs hold traffic by input/output, and the arbiter selects available
+outputs. SHARP reduction waits for aligned contributions, adds compute service
+and multicasts the result.
 
-### Contract vs. encoding (swappable wire bytes)
+### RoCE feedback and pacing
 
-`FabricHeader`-as-contract is necessary and not optional — the unified model
-cannot exist without it. `FabricHeader`-as-39-byte-wire-encoding is the
-*default encoding* of that contract and is separable: if a real flit layout
-becomes available, the on-wire bytes (and the serialization overhead they
-model) can be swapped without touching the control semantics, which would then
-flow through a side channel (a `PacketTag`) rather than the wire header. The
-default 39-byte encoding is what the calibration invariants (the config-vs-inline `simTimeNs` equality asserted by `test/parity/test_config_vs_inline_parity.py`; see [CONTRIBUTING.md](../CONTRIBUTING.md))
-are pinned to; swapping the wire encoding requires re-calibration. **Contract
-≠ encoding.**
+An Ethernet switch marks congested RoCE packets. Receiver feedback generates
+CNPs, and `DcqcnRateMachine` updates the sending flow's rate. Inline remote
+collective traffic uses a scale-out RoCE payload builder when this loop is
+enabled; local traffic keeps its scale-up framing. The per-QP ceiling and
+rate machines pace traffic at the endpoint egress.
 
-## Credit-based flow control + packet spraying + reorder
+`RttccRateMachine` instead samples a reflected RTT probe and adjusts the flow
+rate relative to a target RTT. The probe traverses the queue/link path and the
+receiver reflects it without separate response-service latency. Probes bypass
+BER corruption and lossy tail-drop; independent link-down/packet-loss checks
+can still discard them. RTTCC and DCQCN pacing combine using the larger delay.
 
-- **Credit gating.** Each VC maintains a credit counter initialized to the
-  profile credit count (e.g. 4 VCs × 64 credits on H200). `ConsumeCredit(vc,
-  seq)` decrements by one; when a VC is empty the DATA packet is held in the
-  local send queue until a CREDIT packet returns. `creditBypass` mode lets
-  control traffic (CREDIT/ACK/NACK) skip the gate, preventing flow-control
-  deadlock under BER.
-- **Packet spraying.** A sender with multiple physical links (NVLink lanes)
-  sprays tensor chunks round-robin across them, so a single flow uses the
-  full bisection bandwidth rather than one link's.
-- **Reorder buffer.** The receiver maintains a per-flow reorder buffer keyed
-  on sequence number; out-of-order arrivals (multi-path spraying) are held
-  until the gap fills, then delivered in-order to the collective injector.
+### PFC and loss recovery
+
+PFC parks data directed toward a congested output/destination. Control and
+retry traffic can continue, and a resume drains queued data. Static mode uses
+pause/resume thresholds; dynamic mode scales its threshold with available
+headroom. Timed mode carries a pause duration, refreshes it while congestion
+persists, and cancels it on explicit resume. Per-VC thresholds are available
+through the switch API; otherwise the configured port-level threshold applies.
+
+`soTxWindow` bounds outstanding scale-out packets/chunks. Strict GBN receive
+mode accepts the expected sequence, discards out-of-order data and requests
+recovery of the gap. This packet window is independent of the submission
+model's WR queue and PCIe's read tags.
+
+PFC requires a switch on the scale-out path. Its output/destination occupancy
+criterion differs from ingress-priority-group models, so pause counts are
+not interchangeable across simulators. The [recorded PFC comparisons](CALIBRATION.md#pfc-and-scale-out-cross-checks)
+give the matched conditions. ECN, PFC and drop thresholds are configured in
+[Configuration](CONFIG_GUIDE.md#3-protocol-and-network-parameters).
+
+### Shared contention and workload schedules
+
+Packets compete on actual NetDevice links and switch outputs. An optional
+`ContentionModel` adds a weighted service penalty when more than one traffic
+class is active. Single-node helpers share one model across endpoints; the
+multi-node path uses per-endpoint models. Both use the intra-node rate for
+this service term; scale-out switch/link contention is also executed by PEX.
+The [contention comparison](CALIBRATION.md#shared-contention-regression)
+separates the two effects with controlled weights.
+
+Hierarchical collectives run local and remote phases. The `ncclring` allreduce
+schedule instead uses parallel, rail-rotated global rings, allowing local and
+remote hops to overlap. Uniform-random traffic supplies a fixed-duration
+offered load with warmup and measurement windows. Inputs and counters are
+listed in [Configuration](CONFIG_GUIDE.md#3-protocol-and-network-parameters); experiment
+scripts are listed in the [example catalog](../examples/gpu-cluster/README.md).
 
 ## Four-tier resilience model
 
-A link's effective reliability is the composition of FEC + link-level retry
-(LLR), selected per link via the protocol profile:
+| FEC | LLR | Behavior |
+|---|---|---|
+| off | off | Uncorrected corruption or drops cause permanent loss. |
+| on | off | Correctable errors incur decode service; uncorrectable errors remain lost. |
+| on | on | Correct FEC-covered errors; recover remaining losses with go-back-N/SACK. |
+| off | on | Retry errored/lost packets without FEC correction. |
 
-| Tier | FEC | LLR | Behavior under BER |
-|------|-----|-----|---------------------|
-| no-FEC | off | off | errors are permanent loss (baseline only; BER=0) |
-| FEC-only | on | off | correctable errors fixed at decode cost; uncorrectable → permanent loss |
-| FEC+retry | on | on | correctable fixed; uncorrectable → go-back-N/SACK retransmit |
-| retry-only | off | on | every errored packet retransmits (high overhead, no FEC cushion) |
-
-Control packets (CREDIT/ACK/NACK/RETRY_*) always bypass BER sampling, so
-flow-control credit never deadlocks under a degrading link.
+Control/retry packets bypass BER corruption so recovery can progress. Separate
+packet-loss and link-down checks still apply. These mechanisms run as packet
+events; the [surrogate equations](SURROGATE.md#mechanism-equations) use an
+analytical approximation with their own scope.
 
 ## Extension seams: flow control, arbitration, switching
 
-The PEX datapath exposes three polymorphic hooks so an alternative flow-control
-policy, arbitration algorithm, or switch architecture can be plugged in
-without touching the validated datapath or its call sites. Each has a default
-that reproduces the simulator's historical (calibration-identical) behavior.
+| Extension | Interface | Installation |
+|---|---|---|
+| Arbitration | `Arbiter::SelectGrants(voqs, outputBusyUntil, now)` chooses output grants. | `NvSwitch::SetArbiter`, `MultiNodeTopologyHelper::SetArbiter`, or `--arbiter=<TypeId>`. |
+| Admission | Virtual `FabricEndpoint::FlowControlGate`; built-in policies are CREDIT/WINDOW/RATE. | Subclass the endpoint to provide another admission policy. |
+| Switching | `FabricSwitch` provides port, route and vendor interfaces. | `NvSwitchHelper::SetSwitchType` selects the switch class before installation. |
 
-- **Arbitration — `Arbiter` strategy.** `Arbiter` (abstract, `arbiter.h`) decides
-  which output ports a switch drains each wake-up:
-  `SelectGrants(voqs, outputBusyUntil, now)`. `NvSwitch::Arbitrate()` delegates
-  grant-selection to a `Ptr<Arbiter>` (forwarding + rescheduling stay in the
-  switch). The default `RoundRobinArbiter` grants every port whose VOQ is
-  non-empty and whose egress link is free — the non-blocking crossbar model.
-  Install another policy on a switch via `NvSwitch::SetArbiter()` (or, on the
-  multi-node path, `MultiNodeTopologyHelper::SetArbiter()` / the `--arbiter`
-  CLI flag, e.g.
-  `--arbiter=ns3::RoundRobinArbiter`, the only shipped `Arbiter` subclass; pass
-  the TypeId of your own `Arbiter` subclass for a custom policy).
-- **Flow control — virtual send-gate hook.** `FabricEndpoint::FlowControlGate`
-  is `virtual`. The built-in `FlowControlPolicy` enum (CREDIT/WINDOW/RATE) is
-  the 3-policy fast path; a subclass can override `FlowControlGate` to plug an
-  arbitrary policy beyond the enum without editing the base or the single
-  send-gate call site.
-- **Switching — `FabricSwitch` abstract base + type selector.** Every switch
-  derives from `FabricSwitch` (pure virtuals: `AddPort`, `GetNPorts`, `GetPort`,
-  `AddStaticRoute`, `GetVendorName`). `NvSwitchHelper::SetSwitchType(typeId)`
-  selects any `FabricSwitch` subclass as the switch implementation (default
-  `ns3::NvSwitch`); `Install`/`AddPort` operate on the `FabricSwitch` base so a
-  non-`NvSwitch` subclass plugs in directly.
+`RoundRobinArbiter` is the shipped arbiter and `NvSwitch` the default switch.
+The switch retains forwarding and rescheduling; the arbiter supplies grants.
+See [`arbiter.h`](../src/gpu-cluster/model/arbiter.h),
+[`fabric-endpoint.h`](../src/gpu-cluster/model/fabric-endpoint.h) and
+[`fabric-switch.h`](../src/gpu-cluster/model/fabric-switch.h) for the C++ contracts.
 
 ## Topology grammar
 
@@ -316,6 +199,17 @@ scale-up design space across direct-connect and switched families:
 `2dfullmeshclos`, `switched` (single NVSwitch), `nvl72`, `multiplane`,
 `leafspine`, `3levelhierarchical`, `fattree`, `railfattree`, `dragonflyplus`.
 
-The design space is bounded by shipping hardware limits: ≤72 GPUs for a
-single NVLink fabric (NVL72), ≤18 NVLinks/GPU (H200 NVLink4), and NVLS only
-within a single NVSwitch ASIC domain (≤8 GPUs).
+Topology-specific limits are enforced by the helpers. Hardware reference
+settings and measurement conditions are recorded in [Calibration](CALIBRATION.md).
+For new graphs, the [topology development guide](TOPOLOGY_GUIDE.md) explains
+node/device construction, port IDs, forward/return routing and simulator integration
+through two runnable C++ examples.
+
+## Model limits
+
+Device instructions, cache/coherence effects and internal NIC SRAM occupancy
+are outside this model. CPU/GPU submission and HBM/host-memory/copy service use
+configured resources and latencies. Read the [RDMA](RDMA.md#compatibility-and-scope)
+and [PCIe](PCIE.md#observe-and-integrate) scope sections for those paths.
+Hardware measurements, third-party references and simulator fits are identified
+separately in the calibration guide.

@@ -1,301 +1,160 @@
-# ProtoBridge — An ns-3-Based LLM-to-Packet Simulator for Superpod Interconnect Exploration
+# ProtoBridge
 
-> **Repo scope.** This repository bundles the full ns-3.47 framework, so it
-> builds standalone — `./ns3` and `CMakeLists.txt` are the ns-3 build system.
-> The ProtoBridge-specific code is `src/gpu-cluster/` (OTP + PEX + NVSwitch +
-> injectors), `surrogate/` (latency model), `configs/`,
-> `examples/gpu-cluster/` (alignment demos), and the two `scratch/`
-> entry points; everything else is stock ns-3.
+ProtoBridge simulates GPU collective, point-to-point and RDMA communication.
+Use it to compare interconnect topologies, collective algorithms, flow control,
+loss recovery and host/GPU data paths under the same workload.
 
-Larger LLMs and longer contexts exceed the memory of a single GPU, so serving
-systems partition weights, key-value cache, and activations across many
-devices. Partitioning relieves memory pressure but introduces collective,
-point-to-point, and remote-memory communication that bounds serving latency and
-throughput — motivating *superpods* that connect tens to thousands of GPUs over
-high-bandwidth, low-latency scale-up fabrics.
+Its **Operation-to-Packet (OTP)** layer describes transfers and dependencies;
+its **Packet-Execution (PEX)** layer runs queues, flow control, congestion,
+FEC/retry and switching on ns-3 events. A Python latency surrogate supports
+parameter sweeps before packet simulation.
 
-Superpod interconnect design has not converged: products and proposals differ in
-link technology, topology, and scale-up protocol stack, so architects must
-accurately compare a wide range of designs for target LLM workloads. But the two
-usual tools both fall short:
+The repository bundles ns-3.47 and builds standalone. It models interconnect
+communication; an upper-level simulator supplies compute and data-ready times.
+No physical GPU, CUDA installation or RDMA hardware is required.
 
-- **Latency-bandwidth models** estimate each operation from message size and
-  effective bandwidth with a fixed startup. They are fast but inaccurate (up to
-  ~40% error) and cannot distinguish one scale-up protocol from another.
-- **Packet-level simulators** such as ns-3 model routing, queueing, and packet
-  timing, but each scale-up protocol stack requires a separate LLM-to-packet
-  implementation — so protocols cannot be compared on a common substrate — and
-  detailed simulation takes 2.38–75.70 s per operation, while one serving
-  configuration invokes thousands: hours or days per design.
+## Requirements
 
-**ProtoBridge** closes this gap. It is an ns-3-based LLM-to-packet simulator
-that makes protocol effects explicit through two abstraction layers separating
-protocol-specific behavior from a shared ns-3 path:
+The native simulator and WebUI are tested in Linux CI. You need:
 
-1. **Operation-to-Packet (OTP)** — translates each communication step into
-   packet transfers and defines step dependencies and completion rules,
-   capturing the protocol-specific packet exchange (vendor wire formats:
-   NVIDIA NCCL/NVLink LL·LL128·SIMPLE, Huawei Unified Bus, MetaXLink MCCCL).
-2. **Packet-Execution (PEX)** — carries the shared packet-level mechanisms —
-   credit-based flow control, FEC + go-back-N/SACK retry, per-link BER
-   degradation, and an NVSwitch model (input VOQs, crossbar arbiter, SHARP
-   in-network allreduce) — and drives the ns-3 event system.
+- A C++23 compiler: GCC 11 or later, or Clang 17 or later.
+- CMake 3.20 or later and Ninja or Make.
+- Python 3.10 or later, with `venv` and `pip` for the optional Python tools.
+- Git to clone the repository.
 
-Different protocol configurations are therefore compared on a common ns-3
-simulation substrate by changing only the input configuration; the application
-layer drives `NetDevice` `Send()` / `ReceiveCallback()` directly over a custom
-bare-metal fabric header, with no TCP/IP stack. ProtoBridge matches measured
-superpod communication latency with **17.8% MAPE on H200 NVLink4** across
-1 KB–1 GB. The accompanying paper (in preparation) reports the full validation
-against real NCCL measurements, the surrogate's accuracy relative to the
-latency-bandwidth baseline, and the coarse-to-fine design workflow (with case
-studies on scale-up memory pools and co-packaged optics).
+On Ubuntu/Debian, install the build tools with:
 
-For fast design exploration, ProtoBridge ships a **protocol-defined latency
-surrogate** that combines OTP parameters (startup, effective bandwidth) with
-analytical models of each PEX mechanism. It is grounded in the H200 NVLink4
-reference and predicts per-operation latency in microseconds —
-fast enough to sweep many designs where the packet simulator cannot. See
-[surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md) for the guide and
-[doc/CALIBRATION.md](doc/CALIBRATION.md) for the in-repo H200 calibration data.
-
-RC RDMA operations support CPU or GPU initiation and host DRAM, host staging, or
-GPUDirect payload paths with `--rdmaSubmission=detailed`. The default `startup`
-mode retains existing behavior; `ibgda` remains a GPU/GPUDirect compatibility
-preset. See [doc/RDMA.md](doc/RDMA.md) for runnable examples, WebUI controls and
-the C++ interface, [doc/RDMA_OPERATIONS.md](doc/RDMA_OPERATIONS.md) for Read/Get,
-Send/Recv, immediate notifications, atomics and PutSignal/Wait/Test, or
-[doc/IBGDA.md](doc/IBGDA.md) for GPU-specific bulk Write examples.
-
-Detailed RDMA also offers an error-free PCIe packet model with shared GPU/NIC
-paths, TLP queues, six credit pools and finite read tags. Select
-`pcieModel=tlp`; the existing bandwidth model remains the default. See
-[doc/PCIE.md](doc/PCIE.md) for examples, parameters and trace interpretation.
-
-## What this is (and is not)
-
-**Is:** an interconnect-only simulator + a surrogate model. Credit-based flow
-control, packet spraying + reorder, NVSwitch VOQ/crossbar/SHARP, a four-tier
-FEC/retry resilience model, link BER degradation, and a parametric topology
-grammar spanning 15 families.
-
-**Is not:** a full system simulator. There is no TCP/IP stack and no LLM serving
-runtime (no model execution, KV-cache, memory-hierarchy, or PD-split model);
-the latency surrogate here is interconnect-only, not the
-end-to-end multi-model DSE used in the paper's case studies. The application
-layer issues direct collectives (allreduce / allgather / alltoall / broadcast /
-reduce / reduce-scatter) against the fabric.
-
-## Architecture
-
-```
-            ┌─────────────────────────────────────────────────────┐
-   App ───▶ │  OTP: operation → packet                             │
- (collective│   ProtocolModel (3 vendors) + ProtocolPayloadBuilder │
-  injector) │   FabricHeader (type/seq/flow/VC)                    │
-            └──────────────────────┬──────────────────────────────┘
-                                   ▼
-            ┌─────────────────────────────────────────────────────┐
-            │  PEX: packet execution                                │
-            │   FecModel  CreditManager  LlrManager  LinkDegradation│
-            │   NVSwitch: VOQ + crossbar arbiter + SHARP allreduce │
-            │   ContentionModel (WFQ collective vs P2P)             │
-            └──────────────────────┬──────────────────────────────┘
-                                   ▼
-                          PointToPoint channel (BER + delay + bw)
+```bash
+sudo apt-get update
+sudo apt-get install -y git g++ cmake ninja-build python3 python3-venv python3-pip
 ```
 
-- **OTP** turns a collective operation into a stream of fabric packets:
-  `ProtocolModel` selects the vendor wire format / protocol (LL / LL128 /
-  SIMPLE for NCCL; …), `ProtocolPayloadBuilder` packs the
-  tensor chunks, and `FabricHeader` carries Packet Type (DATA/CREDIT),
-  Sequence Number, Flow ID, and Virtual Channel ID.
-- **PEX** executes those packets: `FecModel` (RS codes), `CreditManager`
-  (per-VC credit gating), `LlrManager` (go-back-N / SACK retransmission),
-  `LinkDegradationModel` (per-link BER sampling), and the NVSwitch model
-  (input VOQs, a crossbar arbiter resolving output-port contention, and
-  SHARP in-network allreduce with multicast return).
-
-See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the full design, the
-FabricHeader layout, the four-tier resilience model, and the topology grammar.
+Other platform prerequisites are covered by the bundled
+[ns-3 installation guide](doc/installation/source/index.rst).
 
 ## Quickstart
 
-### Build
+Clone the repository and create a Python environment:
 
 ```bash
-./ns3 configure --enable-examples --enable-tests -d debug
-./ns3 build
+git clone https://github.com/Hazuyuki/ProtoBridge.git
+cd ProtoBridge
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-### Run a collective from a config (primary form)
-
-A `.cfg` is the primary input: it names a calibrated collective + algorithm, the
-fabric topology, and — via the `[stack]` profile — the PEX bundle and fabric
-hardware, so a one-line run reproduces a measured H200 latency with no per-run
-flags.
+Build the ProtoBridge module and its ns-3 dependencies, then run the H200 ring
+example. Run subsequent commands from the repository root:
 
 ```bash
-./ns3 run "gpu-cluster-sim --protocolConfig=\
-configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576"
+./ns3 configure --enable-modules=gpu-cluster --enable-examples --enable-tests -d debug
+./ns3 build gpu-cluster-sim protocol-profile-demo -j 2
+./ns3 run "gpu-cluster-sim --protocolConfig=configs/protocol_configs/h200-ring-allreduce.cfg --numGpus=8 --dataSize=1048576" --no-build
 ```
 
-Output (8-GPU 1 MiB ring allreduce):
+The run prints a `RESULT_START` / `RESULT_END` block. Representative fields
+from this example are shown below; the complete block contains more counters:
 
-```
+```text
 RESULT_START
+status=complete
+simTimeNs=38308
 simTimeUs=38.3
 RESULT_END
 ```
 
-This reproduces the H200 NVLink4 measurement (37.24 µs) to ~3% and is
-**bit-identical** to the inline path run with the profile's values as flags —
-`test/parity/test_config_vs_inline_parity.py` asserts exact `simTimeNs`
-equality across `{ring, tree, nvls}` × sizes × GPU counts. Three calibrated
-ops ship: `h200-ring-allreduce.cfg` (`collective=allreduce`/`algorithm=ring`),
-`h200-tree-allreduce.cfg` (`collective=allreduce`/`algorithm=tree`),
-`h200-nvls-allgather.cfg` (`collective=allgather`/`algorithm=nvls`). `numGpus`
-and `dataSize` stay on the CLI. See [doc/CONFIG_GUIDE.md](doc/CONFIG_GUIDE.md).
+`simTimeNs` and `simTimeUs` are simulated durations. `status=incomplete` means
+the operation did not finish within the simulated workload limit; inspect the
+resolved settings and counters before interpreting its duration.
 
-### Equivalent inline flags
-
-The config form sources the profile's fabric-hardware + protocol keys into the
-same local CLI variables the inline path consumes (the PEX-bundle keys go to the
-bundle object via `Build()`), so the two are interchangeable. The ring `.cfg`
-is bit-identical to:
+For addressed RDMA Read with the error-free PCIe packet model:
 
 ```bash
-./ns3 run "gpu-cluster-sim --topology=ring --collective=allreduce --algorithm=ring \
-  --numGpus=8 --dataSize=1048576 \
-  --bandwidth=170 --latency=400 --numLanes=18 --linksPerGpu=1 \
-  --startupLL=15000 --startupLL128=25000 --startupSIMPLE=46000 \
-  --forceProtocol=0 --fecN=544 --fecK=514 --fecT=15 ..."   # full set in test/parity/
+./ns3 run "gpu-cluster-sim --protocolConfig=configs/protocol_configs/rdma-read.cfg --numNodes=2 --gpusPerNode=2 --dataSize=9000 --pcieModel=tlp --pcieTraceFile=/tmp/pcie.csv" --no-build
 ```
 
-Key flags: `--topology` (ring/fullmesh/switched/fattree/leafspine/nvl72/
-hypercube/torus/mesh/…), `--algorithm` (ring/tree/sharp/nvls/fullmesh/auto),
-`--numGpus`, `--dataSize`, `--ber` + `--fecN/--fecK/--fecT` (resilience),
-`--llrEnabled --llrMode=gobackn|sack`, `--protocolModel`,
-`--arbiter` (crossbar arbitration strategy, default `roundrobin`).
+RDMA uses the RoCE packet path and defaults to the legacy startup model.
+Detailed timing independently selects CPU/GPU initiation and
+host/staged/GPUDirect memory paths. The IBGDA preset selects GPU initiation
+with GPUDirect.
 
-> **Extending the datapath.** Three polymorphic seams let you plug an
-> alternative flow-control policy (`FabricEndpoint::FlowControlGate` is
-> `virtual`), arbitration algorithm (subclass `Arbiter`; select via
-> `NvSwitch::SetArbiter` / `--arbiter`), or switch architecture (subclass
-> `FabricSwitch`; select via `NvSwitchHelper::SetSwitchType`). Each default
-> reproduces the calibrated behavior. See
-> [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md#extension-seams).
-
-### Load a hardware profile
-
-```bash
-./ns3 run "protocol-profile-demo --profile=configs/protocol_profiles/h200-ll128.profile"
-```
-
-Prints the resolved bundle: vendor, FEC (544/514/15), 4 VCs × 64 credits,
-credit flow control, LLR off.
-
-### Define a custom protocol stencil in config
-
-A `.cfg` whose `[op]` lists transfers (no `collective=`/`algorithm=`) compiles
-to a transaction graph run by the generic runner — the "define a protocol in
-tens of lines of config" seam; the validated PEX topology/BER/FEC wiring is
-reused unchanged. `h200-request-response.cfg` (a two-leg ping-pong) ships as
-the stencil example; the ring/tree/nvls `.cfg`s above use
-`collective=`+`algorithm=` to delegate to the calibrated injectors. See
-[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the `.cfg` schema and the
-OTP/PEX transaction-graph seam.
-
-## Browser-based simulation lab
-
-Select a communication scenario, edit/import `.cfg` and `.profile` inputs, and
-run the actual ns-3 simulator from a local web interface:
+## WebUI
 
 ```bash
 python -m pip install -r webui/requirements.txt
-./ns3 build gpu-cluster-sim
-python -m webui --port 8080
+python -m webui --host 127.0.0.1 --port 8080
 ```
 
-Open **http://127.0.0.1:8080**. The lab includes a topology schematic, queued
-execution with cancellation/timeouts, native results and step-completion traces,
-persistent history, comparison of completed runs, and CSV/run-archive downloads.
-Inputs are copied per run; generated data stays outside the repository.
-The interface defaults to English; **EN / 中文** in the header switches language
-without resetting inputs or results, and remembers the preference in the browser.
-See the [English guide](webui/README.md) or [中文使用说明](webui/README.zh-CN.md)
-for configuration, Docker/Mac SSH access, troubleshooting, and checks.
+Open <http://localhost:8080>. The interface defaults to English and supports
+Chinese. See the [English](webui/README.md) or
+[Chinese](webui/README.zh-CN.md) guide for SSH/VS Code forwarding, Docker,
+configuration controls and result downloads.
 
-## Surrogate model
+## Documentation and examples
 
-A latency surrogate lives under `surrogate/`, grounded in H200 NVLink4
-(18 NVLinks/GPU, 900 GB/s peak aggregate bidirectional — 450 GB/s per direction — 400 ns link latency):
+Use the [documentation index](doc/README.md) for configuration, architecture,
+topology development, RDMA/IBGDA, PCIe, surrogate, and calibration guides.
+The [topology development guide](doc/TOPOLOGY_GUIDE.md) walks through two runnable
+C++ examples, including explicit links and forward/return routes.
+The [example catalog](examples/gpu-cluster/README.md) lists every project C++
+example, runnable configuration, sweep and plotting script.
 
-| Model | Location | What it is | Accuracy |
-|-------|----------|------------|----------|
-| Theory-derived | `surrogate/theory/whitebox_surrogate_v2.py` | First-principles physical bound (startup + serialization + credit round-trip + FEC/retry terms) | lower bound (see [CALIBRATION.md](doc/CALIBRATION.md) for the credit-pinned ratio) |
-
-For topology-aware prediction, pass an optional `topology=` descriptor to
-`predict()` — the `Topology` dataclass (built via
-`make_topology(bisection_gbps=, hop_count=)` or
-`make_topology_from_family(family, N, per_link_gbps=)` over 15 fabric families)
-applies a bisection-bandwidth cap and hop-count propagation; omitting it is
-byte-identical to the ideal-fabric model. See
-[surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md).
-
-```bash
-# Predict ring allreduce latency at 4 GPU / 1 MiB (theory model, lower bound).
-python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory().predict(1<<20,4,"ring",credits=32,ber=0,collective="allreduce"))'
-
-# Custom hardware: override any H200 parameter (see surrogate/theory/USER_GUIDE.md).
-python3 -c 'from surrogate.theory import whitebox_surrogate_v2 as wb; print(wb.make_h200_ring_theory(num_lanes=8, startup_us=7).predict(1<<20,4,"ring",credits=32,ber=0,collective="allreduce"))'
-```
-
-See [surrogate/theory/USER_GUIDE.md](surrogate/theory/USER_GUIDE.md) for the guide and
-[doc/CALIBRATION.md](doc/CALIBRATION.md) for the H200 calibration data.
-
-## Tests
-
-```bash
-# C++ unit + integration suites
-./ns3 run "test-runner --suite=gpu-cluster"
-./ns3 run "test-runner --suite=gpu-cluster-integration"
-
-# Python surrogate tests (needs pytest — see surrogate/requirements.txt)
-pip3 install -r surrogate/requirements.txt
-python3 -m pytest surrogate/test/ -v
-```
-
-## Calibration data
-
-All calibration is H200 NVLink4 (no A800). Under `surrogate/calibration/`:
-
-- `h200_ring4_ar_baseline.json` — 27 raw ns-3 ring-allreduce points (4 GPU,
-  64 KiB–1 GiB, 3 seeds each).
-
-## Architecture constraints
-
-- **No TCP/IP stack.** `InternetStackHelper` is never installed on a node;
-  there is no IPv4/IPv6, no TCP/UDP.
-- **Bare-metal communication.** The application layer calls `NetDevice::Send()`
-  and registers a `ReceiveCallback` directly.
-- **Discrete-event only.** No `while(true)` polling or 1-cycle timers; every
-  state machine advances on ns-3 events and callbacks.
+The surrogate's Python API and mechanism equations are in
+[the surrogate guide](doc/SURROGATE.md). It predicts interconnect latency;
+stateful RDMA/PCIe submission remains part of packet simulation.
 
 ## Repository layout
 
-```
-src/gpu-cluster/        OTP + PEX + NVSwitch + collective injectors + tests
-scratch/                gpu-cluster-sim.cc (simulator entry), protocol-profile-demo.cc
-configs/                protocol_profiles/ (h200-ll128.profile), protocol_configs/ (.cfg), dse/topo_specs.csv, calibration/ (fit machinery)
-examples/gpu-cluster/   alignment demos vs measured/external references (see its README)
-surrogate/              theory/  calibration/  test/
-test/parity/            test_config_vs_inline_parity.py (config-vs-inline bit-identity gate)
-doc/                    ARCHITECTURE / CALIBRATION / CONFIG_GUIDE / SURROGATE (+ ns-3 manual)
-```
+| Path | Purpose |
+|---|---|
+| `src/gpu-cluster/` | ProtoBridge models, helpers and C++ tests. |
+| `src/gpu-cluster/examples/` | Small C++ API and topology examples. |
+| `scratch/gpu-cluster-sim.cc` | Main simulator command-line application. |
+| `configs/protocol_configs/` | Runnable operation and collective `.cfg` files. |
+| `configs/protocol_profiles/` | Shared hardware/protocol `.profile` values. |
+| `configs/calibration/` | Fitted parameter JSON and recorded sweep CSV data. |
+| `configs/dse/` | Topology specifications for design sweeps. |
+| `examples/gpu-cluster/` | Reference comparisons, sweep/fit scripts and figures. |
+| `surrogate/` | Analytical model, baseline data and Python tests. |
+| `test/parity/` | Native simulation regression and parity tests. |
+| `webui/` | Local web service, browser interface and tests. |
+| `doc/` | Project guides and bundled ns-3 documentation. |
+
+The bundled ns-3 modules, examples, release notes and manuals retain their
+upstream organization. ProtoBridge also modifies selected core/network
+primitives used by its packet path; see [CHANGES.md](CHANGES.md).
+
+## Development
+
+[CONTRIBUTING.md](CONTRIBUTING.md) lists build/test commands and the
+configuration-parity requirements. The [CI workflow](.github/workflows/ci.yml)
+runs the full build, C++ suites, surrogate/parity checks and WebUI tests.
+
+## Validation and model scope
+
+The [calibration guide](doc/CALIBRATION.md) records hardware references,
+third-party measurements and fits to packet simulation separately. Check its
+workload, topology, credit window and fit conditions when reusing a parameter.
+Detailed RDMA/IBGDA and PCIe defaults are illustrative mechanism inputs.
+Record the Git commit and resolved configuration with reported results.
+
+GPU kernel execution, device firmware and application compute are represented
+by configured costs or upper-simulator ready times. PCIe TLP execution covers
+error-free Gen3–5 traffic on established links. The analytical surrogate has
+its own scope; selecting detailed RDMA/PCIe does not add those state machines
+to its predictions.
+
+## Support and contributions
+
+ProtoBridge is maintained by **NICS-EFC**. Use
+[GitHub Issues](https://github.com/Hazuyuki/ProtoBridge/issues) for questions,
+bug reports and feature requests. Include the commit, command, configuration
+and relevant result/log output so others can reproduce a problem.
+
+For contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). Project and bundled
+framework credits are recorded in [AUTHORS](AUTHORS).
 
 ## License
 
-GPL-2.0 — see [LICENSE](LICENSE). The simulator is built on the ns-3
-framework; see [CONTRIBUTING.md](CONTRIBUTING.md) and the ns-3
-[doc/](doc/) manual for the underlying framework.
+The primary license is GPL-2.0-only. See [LICENSE](LICENSE) and the component
+license notices in [LICENSES/](LICENSES/).

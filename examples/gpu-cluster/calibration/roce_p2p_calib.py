@@ -4,7 +4,7 @@ RoCE v2 P2P calibration against an ib_write_bw / ib_write_lat perftest curve.
 
 Data source
 -----------
-/share_data/zhuyu/RoCEv2_benchmark_data.md  (third-party engineering blog,
+Embedded perftest reference (third-party engineering blog,
 kubernetes.recipes, author Luca Berton, 2026-06-15). Environment: NVIDIA
 ConnectX-7 400G, RoCEv2 (GID idx 3, IPv4), MTU 4096, RC, TX depth 128,
 CQ moderation 1, PCIe relaxed order ON, ibv_wr* API ON.
@@ -19,7 +19,7 @@ exercised by perftest.
 
 Provenance / honesty
 --------------------
-- Third-party blog, not peer-reviewed, not the project's A800 hardware.
+- Third-party blog, not peer-reviewed, not a local H200 measurement.
 - No switch model, no PFC/ECN config disclosed, no congestion data.
 => This is a SOFT, externally-anchored sanity calibration of scalar RoCE
    constants, NOT a fidelity verdict on collective simTime.
@@ -34,7 +34,7 @@ What it extracts (the calibration-relevant values)
 - saturation knee                         ~ 4 KB
 - line rate                               400 Gbps
 
-Run:  python3 configs/calibration/roce_p2p_calib.py
+Run:  python3 examples/gpu-cluster/calibration/roce_p2p_calib.py
 """
 
 from __future__ import annotations
@@ -182,7 +182,7 @@ def main():
 
     print("=" * 72)
     print("RoCE P2P calibration vs ib_write_bw / ib_write_lat perftest curve")
-    print("Source: /share_data/zhuyu/RoCEv2_benchmark_data.md (ConnectX-7 400G)")
+    print("Source: embedded third-party perftest reference (ConnectX-7 400G)")
     print("=" * 72)
 
     print("\n[1] Single-write latency L(S)=a+b*S**c (ib_write_lat, same switch)")
@@ -258,7 +258,7 @@ def main():
                                "DCQCN/PFC/ECN (no congestion data)"],
         },
     }
-    out_path = Path(__file__).with_suffix(".json")
+    out_path = Path(__file__).resolve().parents[3] / "configs/calibration/roce_p2p_calib.json"
     out_path.write_text(json.dumps(out, indent=2))
     print(f"\n[5] Wrote {out_path}")
     print("\nVerdict: data calibrates the raw-RDMA scalar constants of the RoCE")

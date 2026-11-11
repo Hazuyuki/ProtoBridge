@@ -17,9 +17,9 @@ stencils, and detailed multi-node collectives. Change `rdmaOperation` to `read`,
 `signal` for the native RDMA workload. Use `rdmaDataPath=staged` to include copies
 through host DRAM.
 
-CLI flags, profile keys, and `[stack]` keys use the same parameter names. Resolved
-profile/stack values override corresponding CLI values. For example, add
-`pcieModel = tlp` to `[stack]` to override a profile's bandwidth model.
+PCIe controls work as CLI flags and profile/`[stack]` keys. Apply the
+common [configuration precedence](CONFIG_GUIDE.md#configuration-precedence)
+when switching an existing profile to `pcieModel=tlp`.
 
 ## Paths and shared resources
 
@@ -160,8 +160,10 @@ RDMA or IBGDA. TLP runs include `pcie.csv` in the run archive and at
 
 For C++ integration, use `PcieFabric::Configure`, `AddRootComplex`,
 `AddEndpoint`, `AddSwitch`, and `AddLink`, then issue asynchronous `Read`/`Write`
-operations. Memory-service callbacks return nonnegative delays; the fabric
-invokes them at the relevant endpoints. `TlpTx` and `TlpRx` trace sources expose
+operations. The [topology development guide](TOPOLOGY_GUIDE.md#pcie-example-connect-gpu-and-nic-endpoints-explicitly)
+walks through a complete example and explains the additional binding needed for
+custom RDMA GPU/NIC placement. Memory-service callbacks return nonnegative delays;
+the fabric invokes them at the relevant endpoints. `TlpTx` and `TlpRx` trace sources expose
 packets and hop endpoint IDs. `SetObserver` provides the richer CSV event data.
 Build the topology before traffic. With RDMA runtimes, share one
 `RdmaHostMemoryResources` across the host and set it before submitting work;

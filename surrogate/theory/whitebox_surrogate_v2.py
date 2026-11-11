@@ -8,7 +8,7 @@ The H200 profile uses three schedule-throughput quantities and two
 schedule-specific credit-window quantities. This is the same profile budget as
 the previous link-bandwidth, switch-efficiency, credit-batch formulation.
 
-Key derivations (see WHITEBOX_SURROGATE.md for the complete equations):
+Key derivations (see doc/SURROGATE.md#mechanism-equations for the equations):
 
 1. Credit pressure:
    Phi_credit = max(1, C_bdp,a / C)
@@ -1847,7 +1847,7 @@ def make_h200_tree_theory(**overrides):
     Calibrated to the post-local-rank-fix ns-3 ``TreeAllReduce`` at the TRUE
     H200 fabric (``--linksPerGpu=18`` separate NVLink4 lanes @ 170 Gbps,
     spray-routed; every tree edge carries the full D; see
-    ``configs/calibration/tree_ns3_sweep.py`` / ``tree_calib.json``). TWO
+    ``examples/gpu-cluster/calibration/tree_ns3_sweep.py`` / ``tree_calib.json``). TWO
     fitted parameters: ``tree_bw_per_level`` = 308300 B/us the GPU<->NVSwitch
     trunk rate (eta = 0.81 vs the 18 x 170 Gbps = 382500 B/us trunk physics)
     and ``t_min_switch`` = 1.06 us the fixed per-step cost. Both re-fit after
@@ -1902,7 +1902,7 @@ def make_h200_fullmesh_theory(**overrides):
     Structurally it is NVLS WITHOUT the N-fold serialization -- each peer's
     bundle carries one chunk per phase, so ``T_step = (D/N)/fullmesh_bw``
     (no ``*N`` factor). ``fullmesh_bw`` is back-fit to the ns-3 sweep
-    (``configs/calibration/fullmesh_ns3_sweep.py``); the model omits
+    (``examples/gpu-cluster/calibration/fullmesh_ns3_sweep.py``); the model omits
     per-packet credit flow, VOQ arbitration and the inter-phase barrier that
     ns-3 models, so the least-squares fit STRADDLES ns-3 (slightly above at
     some fit points, below at others — a calibrated back-fit, not a bound;
@@ -2086,7 +2086,7 @@ def make_connectx7_p2p_perftest_theory(**overrides):
     Calibrated to the ib_write_lat single-write latency curve from a
     third-party perftest blog (NVIDIA ConnectX-7 400G, RoCEv2 GID index 3,
     MTU 4096, RC, TX depth 128). Provenance + the fit live in
-    ``configs/calibration/roce_p2p_calib.py`` / ``.json``; the data source is
+    ``examples/gpu-cluster/calibration/roce_p2p_calib.py`` / ``.json``; the data source is
     a third-party engineering blog, NOT the project's A800 hardware, so this
     is a soft externally-anchored calibration of the raw-RDMA scalar
     constants, not a collective-fidelity verdict.

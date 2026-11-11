@@ -34,7 +34,7 @@ physics), MAPE 1.88% all-36 (per-N 2.4/1.3/1.6/2.3%). The pre-fix fit
 (4.10 us / 275400 B/us, MAPE 12.65%) was absorbing the per-packet
 cut-through serialization derate into both constants.
 
-Run:  python3 configs/calibration/tree_ns3_sweep.py
+Run:  python3 examples/gpu-cluster/calibration/tree_ns3_sweep.py
 """
 
 from __future__ import annotations
@@ -47,7 +47,8 @@ import signal
 import subprocess
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
+DATA = REPO / "configs/calibration"
 
 NUM_GPUS = [4, 8, 16, 32]
 SIZES = [1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20, 32 << 20,
@@ -202,7 +203,7 @@ def main(argv=None):
     if refit_only:
         # Re-fit from the existing sweep CSV (no ns-3 runs); the rows keep
         # their recorded wire/startup regimes.
-        csv_in = Path(__file__).with_name("tree_sweep.csv")
+        csv_in = DATA / "tree_sweep.csv"
         with csv_in.open() as f:
             for r in csv.DictReader(f):
                 rows.append(dict(
@@ -224,7 +225,7 @@ def main(argv=None):
                       f"({proto_of(chunk):6s}) -> "
                       f"{'FAILED' if t is None else f'{t:.2f} us'}")
 
-    csv_path = Path(__file__).with_name("tree_sweep.csv")
+    csv_path = DATA / "tree_sweep.csv"
     if not refit_only:
         with csv_path.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -257,7 +258,7 @@ def main(argv=None):
     for n, m in per_n.items():
         print(f"  N={n:>2}: {m:.2f}%")
 
-    json_path = Path(__file__).with_name("tree_calib.json")
+    json_path = DATA / "tree_calib.json"
     json_path.write_text(json.dumps(dict(
         source=("ns-3 TreeAllReduce (chunk-pipelined full-volume, post "
                 "volume-fix + post local-rank-fix e1cdd9c) on "
