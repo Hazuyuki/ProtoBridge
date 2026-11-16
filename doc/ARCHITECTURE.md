@@ -51,6 +51,50 @@ transaction execution by default and also retains a legacy callback path.
 Other injectors can manage their schedules directly. These paths share the
 endpoint/packet models; they do not all require a config-compiled graph.
 
+### Ring AllReduce slice progress
+
+`--algorithm=ring --ringProgress=slice` models a single-channel NCCL SIMPLE
+schedule on one host. `chunk` remains the simulator default for existing
+configurations; `auto` selects slices only for eligible SIMPLE transactions.
+The reference is NVIDIA NCCL commit
+[`ad2d192`](https://github.com/NVIDIA/nccl/tree/ad2d192c1f279aefcaf340f67e07880b65a1116b):
+`src/device/all_reduce.h`, `src/device/prims_simple.h`,
+`src/include/coll_sizes.h` and the SIMPLE buffer default in `src/init.cc`.
+
+The default 4 MiB SIMPLE buffer has eight steps. Each chunk uses four steps;
+each slice uses two. Thus a full chunk is 2 MiB, with two 1 MiB slices and
+four send slots per ring edge. Smaller chunks use NCCL's slice-size rule:
+the larger of `ceil(elements / 32) * 16` and the nominal slice size divided
+by 32, in elements. Set `ringElementBytes` to the packed element width.
+
+A forwarded slice waits for its matching input, local issue order and an
+available send slot. The receiver releases that slot when it consumes the
+input. Both ReduceScatter and AllGather follow the same ring direction.
+Large tensors run multiple buffer-sized loops; a rank starts its next loop
+after its final receive, without a global barrier. Empty slice positions
+advance the slot grid without fabricating payload. The logical partition
+keeps the simulator's balanced byte remainders rather than reproducing
+NCCL's padded tail partition.
+
+```bash
+./ns3 run "gpu-cluster-sim --numGpus=8 --topology=switched --algorithm=ring --dataSize=16777216 --forceProtocol=3 --ringProgress=slice --ringElementBytes=2 --ringSliceTraceFile=/tmp/ring-slices.csv" --no-build
+```
+
+`ringProgressEffective` and `ringPipelineLoops` in RESULT report the selected
+schedule. CSV events identify time, rank, loop, step, slice and effective
+bytes. `issued` means queued for fabric service; `delivered` closes the
+matching input wait; `consumed` releases the sender's SIMPLE slot.
+`bulkChunkSize` separately controls wire packetization. It does not set the
+SIMPLE slice size.
+
+This schedule does not implement NCCL's tuner, GPU copy/reduction kernels,
+memory-visibility delay or multi-channel scheduling. Existing explicit
+per-step compute service remains a whole-step barrier, charged once; zero
+allows streaming progress. LL/LL128, cross-host Ring, `ncclring`, standalone
+AllGather/ReduceScatter and hierarchical collectives retain their existing
+progress rules. These limits must be recorded in comparisons with NCCL or
+other backends.
+
 ## Configuration boundary
 
 A `.cfg` supplies `[stack]` settings and an `[op]` schedule. Supported

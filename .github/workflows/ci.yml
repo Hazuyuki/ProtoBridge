@@ -61,7 +61,7 @@ jobs:
 
       - name: C++ test suites
         run: |
-          for suite in gpu-cluster gpu-cluster-integration gpu-cluster-ibgda \
+          for suite in gpu-cluster gpu-cluster-ring-slices gpu-cluster-integration gpu-cluster-ibgda \
             gpu-cluster-rdma-modes gpu-cluster-rdma-operations gpu-cluster-pcie \
             gpu-cluster-time-conversions gpu-cluster-time-safety \
             devices-point-to-point time data-rate error-model buffer drop-tail-queue; do

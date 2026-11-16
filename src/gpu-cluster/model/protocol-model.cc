@@ -38,6 +38,16 @@ ProtocolModel::AddTransaction(
     const ProtocolTransactionRequest& request,
     const std::vector<ProtocolTransactionNodeId>& dependencies) const
 {
+    return AddTransaction(graph, request, dependencies, nullptr);
+}
+
+ProtocolTransactionNodeId
+ProtocolModel::AddTransaction(
+    ProtocolTransactionGraph& graph,
+    const ProtocolTransactionRequest& request,
+    const std::vector<ProtocolTransactionNodeId>& dependencies,
+    ProtocolTransactionNodeId* issueNode) const
+{
     ProtocolTransactionAction action;
     action.packetType = request.packetType;
     action.sourceRank = request.sourceRank;
@@ -104,6 +114,10 @@ ProtocolModel::AddTransaction(
     std::string prefix = request.label.empty() ? "transfer" : request.label;
     ProtocolTransactionNodeId actionNode =
         graph.AddAction(action, dependencies, prefix + ".send");
+    if (issueNode)
+    {
+        *issueNode = actionNode;
+    }
     return graph.AddWait(matcher,
                          completionBytes,
                          0,

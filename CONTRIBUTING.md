@@ -23,7 +23,7 @@ or completion semantics, and keep unrelated changes in separate PRs.
 ```bash
 ./ns3 configure --enable-examples --enable-tests -d debug
 ./ns3 build
-for suite in gpu-cluster gpu-cluster-integration gpu-cluster-ibgda \
+for suite in gpu-cluster gpu-cluster-ring-slices gpu-cluster-integration gpu-cluster-ibgda \
   gpu-cluster-rdma-modes gpu-cluster-rdma-operations gpu-cluster-pcie \
   gpu-cluster-time-conversions gpu-cluster-time-safety; do
   ./ns3 run "test-runner --test-name=$suite --fullness=EXTENSIVE" --no-build

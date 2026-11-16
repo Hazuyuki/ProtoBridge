@@ -210,6 +210,26 @@ def test_config_vs_inline_parity():
         check_parity(op, num_gpus, data_size, profile)
 
 
+def test_simple_slice_progress_matches_config_and_inline(tmp_path):
+    profile = parse_profile(PROFILE)
+    profile["forceProtocol"] = "3"
+    cfg = tmp_path / "simple-ring.cfg"
+    cfg.write_text(
+        "[stack]\nprofile = " + PROFILE + "\nforceProtocol = 3\n"
+        "[op]\ncollective = allreduce\nalgorithm = ring\ntopology = ring\n"
+    )
+    shared = ["--numGpus=4", "--dataSize=1048576", "--RngRun=1",
+              "--ringProgress=slice", "--ringBufferBytes=131072", "--ringElementBytes=2"]
+    configured = run_sim(["--protocolConfig=" + str(cfg)] + shared)
+    inline = run_sim(["--topology=ring", "--collective=allreduce", "--algorithm=ring"]
+                     + inline_flags_from_profile(profile) + shared)
+    assert configured[:2] == inline[:2]
+    assert configured[0] == "complete"
+    for result in (configured, inline):
+        assert "ringProgressEffective=slice\n" in result[2]
+        assert "ringPipelineLoops=4\n" in result[2]
+
+
 if __name__ == "__main__":
     # Direct (non-pytest) runner: prints a one-line verdict per case.
     profile = parse_profile(PROFILE)

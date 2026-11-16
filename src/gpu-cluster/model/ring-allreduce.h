@@ -13,9 +13,12 @@
 #include "collective-injector.h"
 #include "fabric-endpoint.h"
 #include "fabric-header.h"
+#include "ns3/traced-callback.h"
 #include "protocol-transaction.h"
 
 #include <functional>
+#include <limits>
+#include <string>
 #include <vector>
 
 namespace ns3
@@ -51,6 +54,17 @@ public:
     uint64_t GetPerStepSwOverheadNs(uint64_t chunkSize) const;
     void SetLlThreshold(uint64_t threshold);
     void SetLl128Threshold(uint64_t threshold);
+    /// chunk preserves the original segment barrier; slice enables the
+    /// single-channel NCCL SIMPLE slice/loop schedule; auto selects slice
+    /// only for NCCL SIMPLE with the transaction executor.
+    void SetProgressMode(const std::string& mode);
+    const std::string& GetProgressMode() const;
+    bool UsesSliceProgress() const;
+    void SetSimpleBufferBytes(uint64_t bytes);
+    uint64_t GetSimpleBufferBytes() const;
+    void SetElementBytes(uint32_t bytes);
+    uint32_t GetElementBytes() const;
+    uint32_t GetPipelineLoopCount() const;
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
 
@@ -80,6 +94,8 @@ private:
     void ComputeRingPositions();
     void OnPacketReceived(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header);
     void BuildTransactionGraph();
+    void BuildSliceTransactionGraph();
+    void ConfigureTransactionExecutor();
     void ExecuteTransactionAction(const ProtocolTransactionAction& action);
     void OnTransactionNodeComplete(ProtocolTransactionNodeId nodeId);
     void OnTransactionComplete();
@@ -107,6 +123,11 @@ private:
     uint16_t m_flowId;
     uint8_t m_protocolId;
     bool m_useTransactionModel;
+    std::string m_progressMode;
+    bool m_useSliceProgress;
+    uint64_t m_simpleBufferBytes;
+    uint32_t m_elementBytes;
+    uint32_t m_pipelineLoopCount;
 
     RingState m_state;
     uint64_t m_startupDelayNs;
@@ -155,6 +176,23 @@ private:
     Ptr<ProtocolTransactionExecutor> m_transactionExecutor;
     std::vector<uint16_t> m_transactionGpuByNode;
     std::vector<uint32_t> m_transactionStepByNode;
+    struct SliceLocation
+    {
+        uint16_t rank{std::numeric_limits<uint16_t>::max()};
+        uint32_t loop{0};
+        uint32_t step{0};
+        uint32_t slice{0};
+        uint64_t bytes{0};
+    };
+    std::vector<SliceLocation> m_sliceByFlow;
+    std::vector<SliceLocation> m_sliceByNode;
+    std::vector<SliceLocation> m_sliceConsumedByNode;
+    std::vector<SliceLocation> m_emptyIssueByNode;
+    /// rank, loop, step, slice, effective bytes. Issued means queued for
+    /// fabric service; Delivered means the matching receive wait completed.
+    TracedCallback<uint16_t, uint32_t, uint32_t, uint32_t, uint64_t> m_sliceIssued;
+    TracedCallback<uint16_t, uint32_t, uint32_t, uint32_t, uint64_t> m_sliceDelivered;
+    TracedCallback<uint16_t, uint32_t, uint32_t, uint32_t, uint64_t> m_sliceConsumed;
     std::function<void(uint64_t durationNs)> m_completionCallback;
 };
 

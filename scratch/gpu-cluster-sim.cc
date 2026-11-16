@@ -80,6 +80,14 @@ static uint64_t g_deliveryDurationNs = 0;
 static bool g_waitingRdma = false;
 static std::vector<Ptr<RdmaSubmissionModel>> g_rdmaModels;
 
+static void
+WriteRingSlice(std::shared_ptr<std::ofstream> output, std::string event, uint16_t rank,
+               uint32_t loop, uint32_t step, uint32_t slice, uint64_t bytes)
+{
+    *output << Simulator::Now().GetNanoSeconds() << ',' << event << ',' << rank << ','
+            << loop << ',' << step << ',' << slice << ',' << bytes << '\n';
+}
+
 // ---------------------------------------------------------------------------
 // Wire-transfer patterns (p2p / fanout / incast): bare point-to-point bulk
 // transfers on the SAME credit-gated bulk path (SendBulkWireTransferSize)
@@ -345,6 +353,9 @@ main(int argc, char* argv[])
     uint64_t perStepSwOverheadNs = 0;
     uint16_t rootRank = 0;
     uint32_t forceProtocol = 0;  // 0=auto, 1=LL, 2=LL128, 3=SIMPLE
+    std::string ringProgress = "chunk";
+    uint64_t ringBufferBytes = 4 * 1024 * 1024;
+    uint32_t ringElementBytes = 1;
     double protocolWireEfficiency = 1.0;
     // So (inter-node) RoCE wire efficiency: -1 means "leave the model default
     // (0.95) untouched". Separate from --protocolWireEfficiency (the Su-model
@@ -668,6 +679,9 @@ main(int argc, char* argv[])
     cmd.AddValue("computeBaseLL128", "Base compute delay for LL128 protocol in ring AllReduce per-step (ns)", computeBaseLL128Ns);
     cmd.AddValue("computeBaseSIMPLE", "Base compute delay for SIMPLE protocol in ring AllReduce per-step (ns)", computeBaseSIMPLENs);
     cmd.AddValue("forceProtocol", "Force protocol: 0=auto, 1=LL, 2=LL128, 3=SIMPLE", forceProtocol);
+    cmd.AddValue("ringProgress", "Ring AllReduce progress: chunk (legacy), slice (single-host NCCL SIMPLE), auto", ringProgress);
+    cmd.AddValue("ringBufferBytes", "NCCL SIMPLE buffer bytes for slice progress (default 4 MiB)", ringBufferBytes);
+    cmd.AddValue("ringElementBytes", "Packed element bytes for SIMPLE slice alignment: 1/2/4/8/16", ringElementBytes);
     cmd.AddValue("useTransactionModel",
                  "Use event-driven protocol transactions for supported collectives",
                  useTransactionModel);
@@ -743,6 +757,8 @@ main(int argc, char* argv[])
     cmd.AddValue("ringChannels", "Channels (parallel rings) for ncclring algorithm, 0=auto(gpusPerNode)", ringChannels);
     std::string stepTraceFile = "";
     cmd.AddValue("stepTraceFile", "Path to write per-step completion CSV (gpu,step,startNs,completeNs,delayNs)", stepTraceFile);
+    std::string ringSliceTraceFile;
+    cmd.AddValue("ringSliceTraceFile", "CSV of Ring SIMPLE slice issue, delivery and consumption events", ringSliceTraceFile);
     std::string protocolConfigPath = "";
     cmd.AddValue("protocolConfig",
                  "Path to a .cfg protocol config. When set, the [stack] profile drives the "
@@ -930,6 +946,9 @@ main(int argc, char* argv[])
 
     Config::SetDefault("ns3::RingAllReduce::UseTransactionModel",
                        BooleanValue(useTransactionModel));
+    Config::SetDefault("ns3::RingAllReduce::ProgressMode", StringValue(ringProgress));
+    Config::SetDefault("ns3::RingAllReduce::SimpleBufferBytes", UintegerValue(ringBufferBytes));
+    Config::SetDefault("ns3::RingAllReduce::ElementBytes", UintegerValue(ringElementBytes));
     Config::SetDefault("ns3::SharpAllReduce::UseTransactionModel",
                        BooleanValue(useTransactionModel));
 
@@ -2115,6 +2134,7 @@ main(int argc, char* argv[])
               << " llrReload=" << llrReloadBandwidthGBps << "GB/s+"
               << llrReloadLatencyNs << "ns" << std::endl;
 
+    std::shared_ptr<std::ofstream> ringSliceTrace;
     Ptr<CollectiveInjector> injector;
     Ptr<RdmaOperationTraffic> rdmaTraffic;
     ProtocolConfigRunner configRunner;  // used only in config mode
@@ -2466,6 +2486,17 @@ main(int argc, char* argv[])
             if (computeBaseLLNs > 0 || computeBaseLL128Ns > 0 || computeBaseSIMPLENs > 0)
             {
                 ar->SetComputeBaseDelays(NanoSeconds(computeBaseLLNs), NanoSeconds(computeBaseLL128Ns), NanoSeconds(computeBaseSIMPLENs));
+            }
+            if (!ringSliceTraceFile.empty())
+            {
+                NS_ABORT_MSG_IF(!ar->UsesSliceProgress(),
+                                "ringSliceTraceFile requires Ring AllReduce with effective slice progress");
+                ringSliceTrace = std::make_shared<std::ofstream>(ringSliceTraceFile);
+                NS_ABORT_MSG_IF(!*ringSliceTrace, "Cannot open ringSliceTraceFile");
+                *ringSliceTrace << "timeNs,event,rank,loop,step,slice,bytes\n";
+                ar->TraceConnectWithoutContext("SliceIssued", MakeBoundCallback(&WriteRingSlice, ringSliceTrace, std::string("issued")));
+                ar->TraceConnectWithoutContext("SliceDelivered", MakeBoundCallback(&WriteRingSlice, ringSliceTrace, std::string("delivered")));
+                ar->TraceConnectWithoutContext("SliceConsumed", MakeBoundCallback(&WriteRingSlice, ringSliceTrace, std::string("consumed")));
             }
             ar->Start();
             injector = ar;
@@ -2956,6 +2987,9 @@ main(int argc, char* argv[])
         }
     }
 
+    NS_ABORT_MSG_IF(!ringSliceTraceFile.empty() && !ringSliceTrace,
+                    "ringSliceTraceFile requires Ring AllReduce with effective slice progress");
+
     // Background P2P interferer: a self-driven P2pTraffic flow that shares the
     // fabric with the primary collective. Scheduled at bgP2pStartTimeNs so it
     // can overlap (or precede) the collective, exercising multi-class WFQ
@@ -3179,6 +3213,14 @@ main(int argc, char* argv[])
     std::cout << "topology=" << topology << std::endl;
     std::cout << "collective=" << collective << std::endl;
     std::cout << "algorithm=" << algorithm << std::endl;
+    if (auto ring = DynamicCast<RingAllReduce>(injector))
+    {
+        std::cout << "ringProgress=" << ring->GetProgressMode() << std::endl;
+        std::cout << "ringProgressEffective=" << (ring->UsesSliceProgress() ? "slice" : "chunk") << std::endl;
+        std::cout << "ringBufferBytes=" << ring->GetSimpleBufferBytes() << std::endl;
+        std::cout << "ringElementBytes=" << ring->GetElementBytes() << std::endl;
+        std::cout << "ringPipelineLoops=" << ring->GetPipelineLoopCount() << std::endl;
+    }
     std::cout << "protocolModel=" << protocolModelType << std::endl;
     std::cout << "transactionModel=" << (useTransactionModel ? "enabled" : "legacy")
               << std::endl;

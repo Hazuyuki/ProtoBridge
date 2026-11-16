@@ -70,6 +70,18 @@ public:
         const ProtocolTransactionRequest& request,
         const std::vector<ProtocolTransactionNodeId>& dependencies = {}) const;
 
+    /** Append the default single-action transaction, also exposing its issue
+     * node. Issue completion means submission to the fabric, not delivery.
+     * Slice producers use this distinction to preserve local issue order
+     * while waiting separately for the corresponding input slice.
+     * Multi-stage protocol overrides retain the three-argument interface.
+     */
+    ProtocolTransactionNodeId AddTransaction(
+        ProtocolTransactionGraph& graph,
+        const ProtocolTransactionRequest& request,
+        const std::vector<ProtocolTransactionNodeId>& dependencies,
+        ProtocolTransactionNodeId* issueNode) const;
+
     /// Force a specific protocol for all sizes (0=auto-select)
     void SetForceProtocolId(uint8_t protocolId);
     uint8_t GetForceProtocolId() const;

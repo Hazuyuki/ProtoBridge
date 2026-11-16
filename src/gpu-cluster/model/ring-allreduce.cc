@@ -15,13 +15,18 @@
 #include "ring-allreduce.h"
 
 #include "nccl-protocol.h"
+#include "nccl-protocol-model.h"
 #include "protocol-model.h"
 
+#include "ns3/abort.h"
 #include "ns3/boolean.h"
 #include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
+#include "ns3/string.h"
+#include "ns3/time-bounds.h"
 
+#include <algorithm>
 #include <limits>
 
 namespace ns3
@@ -38,6 +43,33 @@ RingAllReduce::GetTypeId()
                             .SetParent<CollectiveInjector>()
                             .SetGroupName("GpuCluster")
                             .AddConstructor<RingAllReduce>()
+                            .AddAttribute("ProgressMode",
+                                "chunk preserves segment barriers; slice models NCCL SIMPLE slices; auto selects slice for SIMPLE transactions.",
+                                StringValue("chunk"),
+                                MakeStringAccessor(&RingAllReduce::m_progressMode),
+                                MakeStringChecker())
+                            .AddAttribute("SimpleBufferBytes",
+                                "NCCL SIMPLE buffer size; 8 slots, 4 steps per chunk and 2 steps per slice.",
+                                UintegerValue(4 * 1024 * 1024),
+                                MakeUintegerAccessor(&RingAllReduce::m_simpleBufferBytes),
+                                MakeUintegerChecker<uint64_t>(128))
+                            .AddAttribute("ElementBytes",
+                                "Packed element width for NCCL SIMPLE slice alignment (1, 2, 4, 8 or 16 bytes).",
+                                UintegerValue(1),
+                                MakeUintegerAccessor(&RingAllReduce::m_elementBytes),
+                                MakeUintegerChecker<uint32_t>(1, 16))
+                            .AddTraceSource("SliceIssued",
+                                "Slice submitted to the fabric: rank, loop, step, slice, effective bytes.",
+                                MakeTraceSourceAccessor(&RingAllReduce::m_sliceIssued),
+                                "ns3::RingAllReduce::SliceCallback")
+                            .AddTraceSource("SliceDelivered",
+                                "Matching input slice delivered: rank, loop, step, slice, effective bytes.",
+                                MakeTraceSourceAccessor(&RingAllReduce::m_sliceDelivered),
+                                "ns3::RingAllReduce::SliceCallback")
+                            .AddTraceSource("SliceConsumed",
+                                "Input slice consumed and its SIMPLE send slot released: rank, loop, input step, slice, effective bytes.",
+                                MakeTraceSourceAccessor(&RingAllReduce::m_sliceConsumed),
+                                "ns3::RingAllReduce::SliceCallback")
                             .AddAttribute("PerStepComputeDelay",
                                 "Software overhead per Reduce-Scatter step in nanoseconds.",
                                 UintegerValue(0),
@@ -58,6 +90,11 @@ RingAllReduce::RingAllReduce()
       m_flowId(1),
       m_protocolId(0),
       m_useTransactionModel(true),
+      m_progressMode("chunk"),
+      m_useSliceProgress(false),
+      m_simpleBufferBytes(4 * 1024 * 1024),
+      m_elementBytes(1),
+      m_pipelineLoopCount(0),
       m_state(RingState::IDLE),
       m_startupDelayNs(0),
       m_perStepSwOverheadNs(0),
@@ -98,6 +135,10 @@ RingAllReduce::DoDispose()
     m_transactionGraph.Clear();
     m_transactionGpuByNode.clear();
     m_transactionStepByNode.clear();
+    m_sliceByFlow.clear();
+    m_sliceByNode.clear();
+    m_sliceConsumedByNode.clear();
+    m_emptyIssueByNode.clear();
     // Detach the receive callbacks BEFORE dropping the endpoint references:
     // they hold raw `this`, so a packet still in flight after this injector
     // is disposed would invoke OnPacketReceived on freed memory (same class
@@ -126,6 +167,14 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     // grid below (and in every ring step count). Fail loudly instead of
     // executing an integer division by zero.
     NS_ABORT_MSG_IF(numGpus == 0, "RingAllReduce::Initialize requires at least one GPU");
+    NS_ABORT_MSG_IF(m_progressMode != "chunk" && m_progressMode != "slice" &&
+                        m_progressMode != "auto",
+                    "Ring progress must be chunk, slice or auto");
+    NS_ABORT_MSG_IF(m_simpleBufferBytes < 128 || m_simpleBufferBytes % 8 != 0,
+                    "Ring SIMPLE buffer must be at least 128 bytes and divisible by 8");
+    NS_ABORT_MSG_IF(m_elementBytes == 0 || m_elementBytes > 16 ||
+                        (m_elementBytes & (m_elementBytes - 1)) != 0,
+                    "Ring element width must be 1, 2, 4, 8 or 16 bytes");
     m_numGpus = numGpus;
     m_dataSize = dataSize;
     m_endpoints = endpoints;
@@ -171,6 +220,16 @@ RingAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     // Wire protocol: segment size determines per-channel protocol (LL/LL128/SIMPLE)
     NcclProtocol wireProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_segmentSize));
     m_protocolId = static_cast<uint8_t>(wireProto);
+    const bool oneHost = std::all_of(m_endpoints.begin(), m_endpoints.end(),
+        [this](const auto& ep) {
+            return ep && ep->GetNodeId() == m_endpoints.front()->GetNodeId();
+        });
+    const bool canSlice = m_useTransactionModel && oneHost &&
+        DynamicCast<NcclProtocolModel>(protoModel) && wireProto == NcclProtocol::SIMPLE;
+    NS_ABORT_MSG_IF(m_progressMode == "slice" && !canSlice && dataSize > 0 && numGpus > 1,
+                    "Slice progress requires one GPU host, NCCL SIMPLE and the transaction executor");
+    m_useSliceProgress = m_progressMode != "chunk" && canSlice;
+    m_pipelineLoopCount = 0;
 
     SetupReceiveCallbacks();
 
@@ -267,6 +326,14 @@ RingAllReduce::SetPerStepSwOverhead(Time delay)
 void RingAllReduce::SetSwOverheadPerByteNs(uint64_t perByteNs) { m_swOverheadPerByteNs = perByteNs; }
 void RingAllReduce::SetLlThreshold(uint64_t threshold) { m_llThreshold = threshold; }
 void RingAllReduce::SetLl128Threshold(uint64_t threshold) { m_ll128Threshold = threshold; }
+void RingAllReduce::SetProgressMode(const std::string& mode) { m_progressMode = mode; }
+const std::string& RingAllReduce::GetProgressMode() const { return m_progressMode; }
+bool RingAllReduce::UsesSliceProgress() const { return m_useSliceProgress; }
+void RingAllReduce::SetSimpleBufferBytes(uint64_t bytes) { m_simpleBufferBytes = bytes; }
+uint64_t RingAllReduce::GetSimpleBufferBytes() const { return m_simpleBufferBytes; }
+void RingAllReduce::SetElementBytes(uint32_t bytes) { m_elementBytes = bytes; }
+uint32_t RingAllReduce::GetElementBytes() const { return m_elementBytes; }
+uint32_t RingAllReduce::GetPipelineLoopCount() const { return m_pipelineLoopCount; }
 void RingAllReduce::SetComputeBaseDelays(Time ll, Time ll128, Time simple)
 {
     m_computeBaseLLNs = ll.GetNanoSeconds();
@@ -323,7 +390,14 @@ RingAllReduce::Start()
 
     if (m_useTransactionModel)
     {
-        BuildTransactionGraph();
+        if (m_useSliceProgress)
+        {
+            BuildSliceTransactionGraph();
+        }
+        else
+        {
+            BuildTransactionGraph();
+        }
         m_transactionExecutor->Start();
         return;
     }
@@ -429,6 +503,231 @@ RingAllReduce::BuildTransactionGraph()
     m_transactionGpuByNode.resize(m_transactionGraph.GetNodeCount(), invalidGpu);
     m_transactionStepByNode.resize(m_transactionGraph.GetNodeCount(), invalidStep);
 
+    ConfigureTransactionExecutor();
+}
+
+void
+RingAllReduce::BuildSliceTransactionGraph()
+{
+    // NCCL SIMPLE: NCCL_STEPS=8, ALLREDUCE_CHUNKSTEPS=4,
+    // ALLREDUCE_SLICESTEPS=2. See coll_sizes.h and prims_simple.h at
+    // NVIDIA/nccl ad2d192c1f279aefcaf340f67e07880b65a1116b.
+    constexpr uint32_t slicesPerChunk = 2;
+    constexpr uint32_t sendSlots = 4; // NCCL_STEPS / ALLREDUCE_SLICESTEPS
+    const uint64_t stepBytes = m_simpleBufferBytes / 8 / m_elementBytes * m_elementBytes;
+    const uint64_t chunkBytes = stepBytes * 4;
+    const uint64_t nominalSliceBytes = stepBytes * 2;
+    const TimeBounds::Wide loopCapacity = TimeBounds::Wide{chunkBytes} * m_numGpus;
+    const TimeBounds::Wide loops = TimeBounds::Wide{m_dataSize} / loopCapacity +
+                                  (TimeBounds::Wide{m_dataSize} % loopCapacity != 0);
+    const TimeBounds::Wide flowCount = loops * m_totalSteps * slicesPerChunk;
+    const uint64_t availableFlows = PROTOCOL_TRANSACTION_ANY_FLOW - m_flowId;
+    NS_ABORT_MSG_IF(flowCount > availableFlows,
+                    "Slice ring exceeds the 16-bit transaction-flow namespace; increase the SIMPLE buffer");
+    NS_ABORT_MSG_IF(flowCount * m_numGpus * 6 + 2 >
+                        std::numeric_limits<ProtocolTransactionNodeId>::max(),
+                    "Slice ring exceeds the transaction graph node namespace");
+    NS_ABORT_MSG_IF(TimeBounds::Wide{m_dataSize} * m_totalSteps >
+                        std::numeric_limits<uint64_t>::max(),
+                    "Slice ring effective traffic exceeds the byte ledger");
+    m_pipelineLoopCount = static_cast<uint32_t>(loops);
+    const auto flowTotal = static_cast<uint32_t>(flowCount);
+    const auto invalidGpu = std::numeric_limits<uint16_t>::max();
+    const auto invalidStep = std::numeric_limits<uint32_t>::max();
+    m_transactionGraph.Clear();
+    m_transactionGpuByNode.clear();
+    m_transactionStepByNode.clear();
+    m_sliceByNode.clear();
+    m_sliceConsumedByNode.clear();
+    m_emptyIssueByNode.clear();
+    m_sliceByFlow.assign(flowTotal, SliceLocation{});
+
+    auto sizeNodeMetadata = [this, invalidGpu, invalidStep](ProtocolTransactionNodeId id) {
+        const auto count = static_cast<std::size_t>(id) + 1;
+        if (m_sliceByNode.size() < count)
+        {
+            m_sliceByNode.resize(count);
+            m_sliceConsumedByNode.resize(count);
+            m_emptyIssueByNode.resize(count);
+            m_transactionGpuByNode.resize(count, invalidGpu);
+            m_transactionStepByNode.resize(count, invalidStep);
+        }
+    };
+    auto sliceCapacity = [this, nominalSliceBytes](uint64_t bytes) {
+        // Byte-preserving analogue of ncclSimpleSliceSize, using the actual
+        // element width for the 16-element alignment. No padding is sent.
+        const uint64_t elements = bytes / m_elementBytes + (bytes % m_elementBytes != 0);
+        const uint64_t aligned = (elements / 32 + (elements % 32 != 0)) * 16;
+        const uint64_t minimum = nominalSliceBytes / m_elementBytes / 32;
+        return std::max(aligned, minimum) * m_elementBytes;
+    };
+    auto stepCompute = [this](uint64_t bytes) {
+        if (m_swOverheadPerByteNs || m_computeBaseLLNs || m_computeBaseLL128Ns ||
+            m_computeBaseSIMPLENs)
+        {
+            uint64_t base = bytes < m_llThreshold ? m_computeBaseLLNs
+                : bytes < m_ll128Threshold ? m_computeBaseLL128Ns : m_computeBaseSIMPLENs;
+            const TimeBounds::Wide ns = TimeBounds::Wide{m_swOverheadPerByteNs} * bytes + base;
+            return ns > std::numeric_limits<uint64_t>::max()
+                ? Time::Max() : TimeBounds::FromNanoseconds(static_cast<uint64_t>(ns));
+        }
+        return TimeBounds::FromNanoseconds(m_perStepSwOverheadNs);
+    };
+
+    std::vector<uint16_t> next(m_numGpus), predecessor(m_numGpus, invalidGpu);
+    for (uint16_t rank = 0; rank < m_numGpus; ++rank)
+    {
+        next[rank] = GetSendTarget(rank, 0);
+        NS_ABORT_MSG_IF(next[rank] >= m_numGpus || predecessor[next[rank]] != invalidGpu,
+                        "Slice ring requires a permutation of all ranks");
+        predecessor[next[rank]] = rank;
+    }
+    std::vector<bool> visited(m_numGpus, false);
+    uint16_t cursor = 0;
+    for (uint32_t i = 0; i < m_numGpus; ++i)
+    {
+        NS_ABORT_MSG_IF(visited[cursor], "Slice ring must be one cycle covering every rank");
+        visited[cursor] = true;
+        cursor = next[cursor];
+    }
+    NS_ABORT_MSG_IF(cursor != 0, "Slice ring does not close");
+
+    Ptr<ProtocolModel> protocol = m_endpoints[0]->GetProtocolModel();
+    const auto startup = m_transactionGraph.AddDelay(
+        TimeBounds::FromNanoseconds(m_startupDelayNs), {}, "collective-startup");
+    std::vector<ProtocolTransactionNodeId> issued(m_numGpus, startup);
+    std::vector<ProtocolTransactionNodeId> loopReady(m_numGpus, startup);
+    std::vector<std::vector<ProtocolTransactionNodeId>> consumed(
+        m_numGpus, std::vector<ProtocolTransactionNodeId>(flowTotal, PROTOCOL_TRANSACTION_INVALID_NODE));
+    std::vector<ProtocolTransactionNodeId> completionDependencies;
+    uint64_t remaining = m_dataSize;
+    for (uint32_t loop = 0; loop < m_pipelineLoopCount; ++loop)
+    {
+        const uint64_t loopBytes = static_cast<uint64_t>(
+            std::min(TimeBounds::Wide{remaining}, loopCapacity));
+        remaining -= loopBytes;
+        const uint64_t baseSegment = loopBytes / m_numGpus;
+        const uint64_t remainder = loopBytes % m_numGpus;
+        std::vector<std::vector<ProtocolTransactionNodeId>> input(
+            m_numGpus, std::vector<ProtocolTransactionNodeId>(slicesPerChunk, startup));
+        std::vector<std::vector<uint64_t>> inputBytes(
+            m_numGpus, std::vector<uint64_t>(slicesPerChunk));
+        std::vector<ProtocolTransactionNodeId> inputComplete = loopReady;
+        for (uint32_t step = 0; step < m_totalSteps; ++step)
+        {
+            auto delivered = input;
+            auto deliveredBytes = inputBytes;
+            for (uint16_t rank = 0; rank < m_numGpus; ++rank)
+            {
+                const uint32_t position = m_ringPos[rank];
+                const uint32_t chunk = (position + m_numGpus - 1 - step % m_numGpus) % m_numGpus;
+                const uint64_t segment = baseSegment + (chunk < remainder);
+                const uint64_t capacity = sliceCapacity(segment);
+                // Existing explicit per-step compute remains a whole-step
+                // barrier, charged once. Zero means streaming consumption.
+                const Time compute = stepCompute(baseSegment + (remainder != 0));
+                auto barrier = PROTOCOL_TRANSACTION_INVALID_NODE;
+                if (step > 0 && !compute.IsZero())
+                {
+                    barrier = m_transactionGraph.AddDelay(compute, {inputComplete[rank], issued[rank]});
+                }
+                for (uint32_t slice = 0; slice < slicesPerChunk; ++slice)
+                {
+                    const uint32_t ordinal = (loop * m_totalSteps + step) * slicesPerChunk + slice;
+                    const uint64_t offset = capacity * slice;
+                    const uint64_t bytes = offset < segment ? std::min(capacity, segment - offset) : 0;
+                    m_sliceByFlow[ordinal] = {invalidGpu, loop, step, slice, 0};
+                    std::vector<ProtocolTransactionNodeId> deps{issued[rank]};
+                    deps.push_back(step == 0 ? loopReady[rank] : input[rank][slice]);
+                    if (barrier != PROTOCOL_TRANSACTION_INVALID_NODE)
+                    {
+                        deps.push_back(barrier);
+                    }
+                    if (ordinal >= sendSlots)
+                    {
+                        const auto free = consumed[rank][ordinal - sendSlots];
+                        NS_ABORT_MSG_IF(free == PROTOCOL_TRANSACTION_INVALID_NODE,
+                                        "SIMPLE slot reuse has no peer-consumption dependency");
+                        deps.push_back(free);
+                    }
+                    const auto ready = m_transactionGraph.AddDelay(Seconds(0), deps);
+                    if (step > 0)
+                    {
+                        NS_ABORT_MSG_IF(inputBytes[rank][slice] != bytes,
+                                        "Ring slice changed size between receipt and forwarding");
+                        const uint32_t previous = ordinal - slicesPerChunk;
+                        consumed[predecessor[rank]][previous] = ready;
+                        sizeNodeMetadata(ready);
+                        m_sliceConsumedByNode[ready] = {rank, loop, step - 1, slice, bytes};
+                    }
+                    ProtocolTransactionNodeId issue, wait;
+                    if (bytes == 0)
+                    {
+                        // Empty slices still advance the SIMPLE slot grid,
+                        // but do not fabricate payload or network packets.
+                        issue = m_transactionGraph.AddDelay(Seconds(0), {ready});
+                        wait = m_transactionGraph.AddDelay(Seconds(0), {issue});
+                        sizeNodeMetadata(wait);
+                        m_emptyIssueByNode[issue] = {rank, loop, step, slice, 0};
+                    }
+                    else
+                    {
+                        ProtocolTransactionRequest request;
+                        request.sourceRank = rank;
+                        request.destinationRank = next[rank];
+                        request.flowId = static_cast<uint16_t>(m_flowId + ordinal);
+                        request.stageId = ordinal;
+                        request.effectiveBytes = bytes;
+                        request.hasProtocolId = true;
+                        request.protocolId = m_protocolId;
+                        wait = protocol->AddTransaction(m_transactionGraph, request, {ready}, &issue);
+                        sizeNodeMetadata(wait);
+                    }
+                    issued[rank] = issue;
+                    delivered[next[rank]][slice] = wait;
+                    deliveredBytes[next[rank]][slice] = bytes;
+                    m_sliceByNode[wait] = {next[rank], loop, step, slice, bytes};
+                }
+            }
+            input = std::move(delivered);
+            inputBytes = std::move(deliveredBytes);
+            for (uint16_t rank = 0; rank < m_numGpus; ++rank)
+            {
+                const auto complete = m_transactionGraph.AddDelay(Seconds(0), input[rank]);
+                sizeNodeMetadata(complete);
+                m_transactionGpuByNode[complete] = rank;
+                m_transactionStepByNode[complete] = loop * m_totalSteps + step;
+                inputComplete[rank] = complete;
+                completionDependencies.push_back(complete);
+            }
+        }
+        // NCCL finishes the final directRecv before starting the next loop.
+        // This is per rank, not a global barrier between all GPUs.
+        for (uint16_t rank = 0; rank < m_numGpus; ++rank)
+        {
+            auto previous = issued[rank];
+            for (uint32_t slice = 0; slice < slicesPerChunk; ++slice)
+            {
+                const auto ready = m_transactionGraph.AddDelay(Seconds(0), {previous, input[rank][slice]});
+                sizeNodeMetadata(ready);
+                m_sliceConsumedByNode[ready] = {rank, loop, m_totalSteps - 1, slice, inputBytes[rank][slice]};
+                const uint32_t ordinal = ((loop + 1) * m_totalSteps - 1) * slicesPerChunk + slice;
+                consumed[predecessor[rank]][ordinal] = ready;
+                previous = ready;
+            }
+            loopReady[rank] = previous;
+        }
+    }
+    NS_ABORT_MSG_IF(remaining != 0, "Slice ring did not cover the logical tensor");
+    completionDependencies.insert(completionDependencies.end(), loopReady.begin(), loopReady.end());
+    m_transactionGraph.AddCompletion(completionDependencies);
+    sizeNodeMetadata(m_transactionGraph.GetNodeCount() - 1);
+    ConfigureTransactionExecutor();
+}
+
+void
+RingAllReduce::ConfigureTransactionExecutor()
+{
     m_transactionExecutor = CreateObject<ProtocolTransactionExecutor>();
     m_transactionExecutor->SetActionCallback(
         [this](const ProtocolTransactionAction& action) { ExecuteTransactionAction(action); });
@@ -451,6 +750,17 @@ RingAllReduce::ExecuteTransactionAction(const ProtocolTransactionAction& action)
     {
         NS_FATAL_ERROR("Ring AllReduce emitted an invalid transaction action");
     }
+    if (m_useSliceProgress)
+    {
+        const auto ordinal = static_cast<uint32_t>(action.flowId - m_flowId);
+        NS_ABORT_MSG_IF(ordinal >= m_sliceByFlow.size(), "Unknown ring slice flow");
+        const auto& slice = m_sliceByFlow[ordinal];
+        m_sliceIssued(action.sourceRank, slice.loop, slice.step, slice.slice,
+                      action.effectiveBytes);
+        NS_ABORT_MSG_IF(action.effectiveBytes > std::numeric_limits<uint64_t>::max() - m_sentDataBytes,
+                        "Ring sent-data ledger overflow");
+        m_sentDataBytes += action.effectiveBytes;
+    }
     m_endpoints[action.sourceRank]->SendBulkWireTransferSize(
         action.destinationRank,
         action.effectiveBytes,
@@ -462,6 +772,30 @@ RingAllReduce::ExecuteTransactionAction(const ProtocolTransactionAction& action)
 void
 RingAllReduce::OnTransactionNodeComplete(ProtocolTransactionNodeId nodeId)
 {
+    if (nodeId < m_emptyIssueByNode.size())
+    {
+        const auto& slice = m_emptyIssueByNode[nodeId];
+        if (slice.rank < m_numGpus)
+        {
+            m_sliceIssued(slice.rank, slice.loop, slice.step, slice.slice, 0);
+        }
+    }
+    if (nodeId < m_sliceByNode.size())
+    {
+        const auto& slice = m_sliceByNode[nodeId];
+        if (slice.rank < m_numGpus)
+        {
+            m_sliceDelivered(slice.rank, slice.loop, slice.step, slice.slice, slice.bytes);
+        }
+    }
+    if (nodeId < m_sliceConsumedByNode.size())
+    {
+        const auto& slice = m_sliceConsumedByNode[nodeId];
+        if (slice.rank < m_numGpus)
+        {
+            m_sliceConsumed(slice.rank, slice.loop, slice.step, slice.slice, slice.bytes);
+        }
+    }
     if (nodeId >= m_transactionGpuByNode.size())
     {
         return;
@@ -469,7 +803,9 @@ RingAllReduce::OnTransactionNodeComplete(ProtocolTransactionNodeId nodeId)
 
     const uint16_t gpu = m_transactionGpuByNode[nodeId];
     const uint32_t step = m_transactionStepByNode[nodeId];
-    if (gpu >= m_numGpus || step >= m_totalSteps)
+    const uint64_t maxSteps = m_useSliceProgress
+        ? static_cast<uint64_t>(m_totalSteps) * m_pipelineLoopCount : m_totalSteps;
+    if (gpu >= m_numGpus || step >= maxSteps)
     {
         return;
     }
@@ -510,6 +846,19 @@ RingAllReduce::IsAllGatherStep(uint32_t step) const
 uint16_t
 RingAllReduce::GetSendTarget(uint16_t gpu, uint32_t step) const
 {
+    if (m_useSliceProgress)
+    {
+        // NCCL's ReduceScatter and AllGather both follow ring->next.
+        if (gpu < m_endpoints.size() && m_endpoints[gpu])
+        {
+            const auto next = m_endpoints[gpu]->GetRingNext();
+            if (next != 0xFFFF)
+            {
+                return next;
+            }
+        }
+        return (gpu + 1) % m_numGpus;
+    }
     if (IsReduceScatterStep(step))
     {
         // Reduce-Scatter: clockwise. Prefer the topology-embedded next neighbor

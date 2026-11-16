@@ -203,6 +203,9 @@ probe/target controls above. Parameter sweeps are under
 | CLI controls | Use |
 |---|---|
 | `--algorithm=ncclring`, `--ringChannels` | Allreduce on parallel global rings; 0 channels selects `gpusPerNode`. |
+| `--algorithm=ring`, `--ringProgress=chunk\|slice\|auto` | Ring AllReduce progress. Default `chunk` preserves the original segment barrier. `slice` requires single-host NCCL SIMPLE transaction execution; `auto` uses slices only when eligible. This control does not change `ncclring`, AllGather, ReduceScatter or hierarchical schedules. |
+| `--ringBufferBytes`, `--ringElementBytes` | SIMPLE buffer (default 4194304 B, at least 128 B and divisible by 8) and packed element width (1/2/4/8/16 B; default 1). See [slice scheduling](ARCHITECTURE.md#ring-allreduce-slice-progress). |
+| `--ringSliceTraceFile` | Write slice issue, delivery and consumption CSV; requires effective slice progress. Issue means submission to the fabric, not the first wire byte. |
 | `--interNodeTopology`, `--interNodeSpines`, `--interNodeTorusWidth`, `--interNodeDragonflyGroupSize` | Select the inter-node fabric and its shape. |
 | `--linkDataRate` | Per-physical-link rate in Gb/s; 0 uses `bandwidth`. |
 | `--perStepSwOverhead`, `--swOverheadPerByte`, `--computeBaseLL`, `--computeBaseLL128`, `--computeBaseSIMPLE`, `--llThreshold`, `--ll128Threshold`, `--startupDelay` | Collective protocol selection and per-step software/compute service controls. |
