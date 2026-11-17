@@ -213,6 +213,21 @@ probe/target controls above. Parameter sweeps are under
 | `--bgP2pEnabled`, `--bgP2pSrc`, `--bgP2pDst`, `--bgP2pSizeBytes`, `--bgP2pStartTimeNs`, `--bgP2pIntervalNs` | Inject a concurrent background flow. |
 | `--randTraffic`, `--randMsgBytes`, `--randInjectionRate`, `--randWarmupNs`, `--randMeasureNs` | Fixed-duration random inter-node traffic; default message 64 KiB, warmup 50 us and measurement 200 us. |
 
+RESULT includes `executionPlanVersion=1`, `selectedAlgorithm`,
+`planImplementation`, `selectedProtocol`/ID, selection policies and protocol
+scope. These describe the instantiated injector separately from the requested
+`algorithm`. AUTO remains a simulator heuristic. NVLS requires switched
+NVLink, NCCL and SIMPLE; forcing LL/LL128 excludes it from AUTO. ReduceScatter
+AUTO uses Ring because an NVLS ReduceScatter injector is not implemented.
+
+`planChannels=0` and `planThreadsPerChannel=-1` mean those resources are not
+modelled, rather than a measured or inferred NCCL launch configuration.
+Parallel rings report their resolved channel count. Chunk and startup service
+are reported when known; `planChunkModel` distinguishes nominal SIMPLE chunks,
+Tree pipeline chunks and channel segments. Hierarchical protocols are reported
+as `per_phase` instead of claiming one uniform wire protocol. Multi-node
+protocol scope is scale-up; the remote transport has its own protocol rules.
+
 `bgP2pIntervalNs=0` uses one packet-serialization time at the intra-node rate,
 with a minimum of 1 ns. Set it explicitly to pace a remote background flow at
 the inter-node rate. `bgP2pBytesSent`/`bgP2pPacketsSent` count injection calls.

@@ -53,6 +53,7 @@ class SharpAllReduce : public CollectiveInjector
     void SetStartupDelay(Time delay) override;
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
+    std::optional<uint64_t> GetStartupDelayNs() const override { return m_startupDelayNs; }
 
     SharpState GetState() const { return m_state; }
 

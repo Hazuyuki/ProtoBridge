@@ -44,6 +44,8 @@ public:
     void SetPerStepSwOverhead(Time delay);
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
+    std::optional<uint8_t> GetWireProtocolId() const override { return m_protocolId; }
+    std::optional<uint64_t> GetStartupDelayNs() const override { return m_startupDelayNs; }
 
     AllGatherState GetState() const { return m_state; }
     const std::vector<uint32_t>& GetGpuCompletedSteps() const

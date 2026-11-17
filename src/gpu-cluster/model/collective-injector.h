@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,12 @@ public:
     virtual CollectiveType GetCollectiveType() const = 0;
 
     virtual bool IsCompleted() const = 0;
+
+    /// Selected sender protocol for a uniform schedule; empty for per-phase
+    /// or per-transfer selection. Scale-out transport can use another protocol.
+    virtual std::optional<uint8_t> GetWireProtocolId() const { return std::nullopt; }
+    /// Actual configured launch service, when the injector has one startup.
+    virtual std::optional<uint64_t> GetStartupDelayNs() const { return std::nullopt; }
 
     // Per-step trace instrumentation: when set, every step completion is
     // logged as a CSV row: gpu,step,collectiveStartNs,completeNs,sinceStartNs

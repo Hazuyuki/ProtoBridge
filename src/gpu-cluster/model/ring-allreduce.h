@@ -67,6 +67,8 @@ public:
     uint32_t GetPipelineLoopCount() const;
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
+    std::optional<uint8_t> GetWireProtocolId() const override { return m_protocolId; }
+    std::optional<uint64_t> GetStartupDelayNs() const override { return m_startupDelayNs; }
 
     RingState GetState() const { return m_state; }
 

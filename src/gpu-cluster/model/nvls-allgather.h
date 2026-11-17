@@ -49,6 +49,7 @@ class NvlsAllGather : public CollectiveInjector
     void SetStartupDelay(Time delay) override;
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
+    std::optional<uint64_t> GetStartupDelayNs() const override { return m_startupDelayNs; }
 
     NvlsAllGatherState GetState() const { return m_state; }
 

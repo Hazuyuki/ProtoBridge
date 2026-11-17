@@ -46,6 +46,8 @@ public:
     void SetStartupDelay(Time delay) override;
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
+    std::optional<uint8_t> GetWireProtocolId() const override { return m_protocolId; }
+    std::optional<uint64_t> GetStartupDelayNs() const override { return m_startupDelayNs; }
 
     void SetRootRank(uint16_t rootRank);
 

@@ -54,10 +54,13 @@ class TreeAllReduce : public CollectiveInjector
     void SetSwOverheadPerByteNs(uint64_t nsPerByte);
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
+    std::optional<uint8_t> GetWireProtocolId() const override { return m_protocolId; }
+    std::optional<uint64_t> GetStartupDelayNs() const override { return m_startupDelayNs; }
 
     TreeAllReduceState GetState() const { return m_state; }
     uint32_t GetCompletedGpuCount() const { return m_gpuDoneCount; }
     uint32_t GetTotalSteps() const { return m_totalSteps; }
+    uint64_t GetPipelineChunkBytes() const { return m_pipeChunkSize; }
     const std::vector<uint32_t>& GetGpuCurrentSteps() const { return m_gpuCurrentStep; }
 
   private:

@@ -130,11 +130,8 @@ PatternReceive(uint16_t srcRank, Ptr<Packet> packet, FabricHeader header)
     }
 }
 
-// Adaptive algorithm selection (NCCL-like): pick the collective algorithm
-// from (topology, message size, N). Small/latency-bound messages favor tree
-// (2*log2(N) steps); large/bandwidth-bound favor ring (2*(N-1) pipelined);
-// NVSwitch fabrics can use NVLS/SHARP (switch-assisted, ~2 steps). Mirrored
-// in Python by scripts/algo_selector.py.
+// Simulator heuristic, not the NCCL tuner. Only include offload when its
+// injector, fabric and protocol are supported by this driver.
 static std::string
 ResolveAutoAlgorithm(const std::string& coll, const std::string& topo,
                      uint64_t dataSize, uint32_t N, bool hasNvls)
@@ -142,7 +139,13 @@ ResolveAutoAlgorithm(const std::string& coll, const std::string& topo,
     const uint64_t MEDIUM = 1ull << 26;   // 64 MiB
     const uint64_t NVLS_THRESH = 1ull << 23;  // 8 MiB
 
-    if (coll == "allgather" || coll == "reducescatter")
+    if (coll == "reducescatter")
+    {
+        // There is no NVLS ReduceScatter injector. Report the ring that
+        // the driver actually executes instead of selecting an unused name.
+        return "ring";
+    }
+    if (coll == "allgather")
     {
         if (hasNvls && dataSize >= NVLS_THRESH)
         {
@@ -2140,10 +2143,23 @@ main(int argc, char* argv[])
     ProtocolConfigRunner configRunner;  // used only in config mode
     // Resolve "auto" for the single-shot path (trace path resolves per-phase
     // inside CreateTraceCollectiveInjector). hasNvls follows the same rule.
-    bool hasNvls = (topology == "switched");
+    const bool ncclProtocol = DynamicCast<NcclProtocolModel>(protoModel) != nullptr;
+    const auto requestedProtocolId = protoModel->GetForceProtocolId();
+    bool hasNvls = numNodes <= 1 && topology == "switched" && fabricType == FabricType::NVLINK && ncclProtocol &&
+                   (requestedProtocolId == 0 || requestedProtocolId == 3);
     std::string algo = (algorithm == "auto")
         ? ResolveAutoAlgorithm(collective, topology, dataSize, numGpus, hasNvls)
         : algorithm;
+    bool protocolConstrainedByAlgorithm = false;
+    NS_ABORT_MSG_IF(algo == "nvls" && !hasNvls,
+                    "NVLS requires switched NVLink, NcclProtocolModel and SIMPLE");
+    if (algo == "nvls" && ncclProtocol)
+    {
+        NS_ABORT_MSG_IF(requestedProtocolId != 0 && requestedProtocolId != 3,
+                        "NCCL NVLS requires the SIMPLE protocol");
+        protocolConstrainedByAlgorithm = requestedProtocolId == 0;
+        protoModel->SetForceProtocolId(3);
+    }
     if (algorithm == "auto")
     {
         std::cout << "[algo] " << collective << " size=" << dataSize
@@ -3213,6 +3229,88 @@ main(int argc, char* argv[])
     std::cout << "topology=" << topology << std::endl;
     std::cout << "collective=" << collective << std::endl;
     std::cout << "algorithm=" << algorithm << std::endl;
+    // Describe the instantiated schedule, separately from the CLI request.
+    // Consumers must not infer execution from an AUTO request or a fallback.
+    const std::string implementation = injector ? injector->GetInstanceTypeId().GetName()
+        : rdmaTraffic ? "ns3::RdmaOperationTraffic" : "bare_transfer";
+    const std::map<std::string, std::string> implementations = {
+        {"ns3::RingAllReduce", "ring"}, {"ns3::RingAllGather", "ring"},
+        {"ns3::RingReduceScatter", "ring"}, {"ns3::RingBroadcast", "ring"},
+        {"ns3::RingReduce", "ring"}, {"ns3::TreeAllReduce", "tree"},
+        {"ns3::NcclRingAllReduce", "ncclring"}, {"ns3::SharpAllReduce", "nvls"},
+        {"ns3::NvlsAllGather", "nvls"}, {"ns3::FullMeshAllReduce", "fullmesh"},
+        {"ns3::FullMeshAllGather", "fullmesh"}, {"ns3::FullMeshReduceScatter", "fullmesh"},
+        {"ns3::HierarchicalAllReduce", "hierarchical"},
+        {"ns3::HierarchicalAllGather", "hierarchical"},
+        {"ns3::HierarchicalReduceScatter", "hierarchical"},
+        {"ns3::HierarchicalAlltoAll", "hierarchical"}
+    };
+    auto selected = implementations.find(implementation);
+    std::string executed = selected != implementations.end() ? selected->second : "unknown";
+    if (collective == "p2p") executed = "p2p";
+    if (implementation == "ns3::AlltoAllInjector")
+        executed = topology == "ring" ? "ring" : "direct";
+    std::optional<uint8_t> wireId = injector ? injector->GetWireProtocolId() : std::nullopt;
+    if (implementation == "ns3::SharpAllReduce")
+        wireId = protoModel->GetProtocolId(dataSize);
+    if (implementation == "ns3::NvlsAllGather")
+    {
+        const auto id = protoModel->GetProtocolId(dataSize / numGpus);
+        if (dataSize % numGpus == 0 || protoModel->GetProtocolId(dataSize / numGpus + 1) == id)
+            wireId = id;
+    }
+    if (!injector && collective == "p2p" && numNodes <= 1)
+        wireId = protoModel->GetProtocolId(dataSize);
+    std::string wireProtocol = "per_transfer";
+    if (executed == "hierarchical" || (collective == "p2p" && numNodes > 1))
+    {
+        wireProtocol = "per_phase";
+        wireId.reset();
+    }
+    else if (wireId)
+    {
+        wireProtocol = DynamicCast<NcclProtocolModel>(protoModel)
+            ? (*wireId == 1 ? "LL" : *wireId == 2 ? "LL128" : *wireId == 3 ? "SIMPLE"
+                                                                                  : "id:" + std::to_string(*wireId))
+            : "id:" + std::to_string(*wireId);
+    }
+    std::cout << "executionPlanVersion=1" << std::endl;
+    std::cout << "selectedAlgorithm=" << executed << std::endl;
+    std::cout << "algorithmSelectionPolicy="
+              << (algorithm == "auto" ? "simulator_heuristic" : "explicit") << std::endl;
+    std::cout << "planImplementation=" << implementation << std::endl;
+    std::cout << "selectedProtocol=" << wireProtocol << std::endl;
+    std::cout << "selectedProtocolId=" << (wireId ? static_cast<int>(*wireId) : -1) << std::endl;
+    std::cout << "protocolSelectionPolicy="
+              << (wireId ? (protocolConstrainedByAlgorithm ? "algorithm_constraint"
+                            : protoModel->GetForceProtocolId() ? "forced" : "size_threshold")
+                         : wireProtocol) << std::endl;
+    std::cout << "protocolScope=" << (numNodes > 1 ? "scale_up" : "sender") << std::endl;
+    uint32_t channels = 0; // 0 = the implementation does not model channels.
+    std::string channelModel = "not_modelled";
+    if (auto parallel = DynamicCast<NcclRingAllReduce>(injector))
+    {
+        channels = parallel->GetResolvedNumChannels();
+        channelModel = "rail_rings";
+        const uint64_t grid = static_cast<uint64_t>(numGpus) * channels;
+        std::cout << "planChunkBytes=" << dataSize / grid + (dataSize % grid != 0) << std::endl;
+        std::cout << "planChunkModel=channel_segment" << std::endl;
+    }
+    else if (DynamicCast<RingAllReduce>(injector))
+    {
+        channels = 1;
+        channelModel = "single_ring";
+    }
+    std::cout << "planChannels=" << channels << std::endl;
+    std::cout << "channelModel=" << channelModel << std::endl;
+    std::cout << "planThreadsPerChannel=-1" << std::endl;
+    if (injector && injector->GetStartupDelayNs())
+        std::cout << "planStartupDelayNs=" << *injector->GetStartupDelayNs() << std::endl;
+    if (auto tree = DynamicCast<TreeAllReduce>(injector))
+    {
+        std::cout << "planChunkBytes=" << tree->GetPipelineChunkBytes() << std::endl;
+        std::cout << "planChunkModel=tree_pipeline" << std::endl;
+    }
     if (auto ring = DynamicCast<RingAllReduce>(injector))
     {
         std::cout << "ringProgress=" << ring->GetProgressMode() << std::endl;
@@ -3220,6 +3318,11 @@ main(int argc, char* argv[])
         std::cout << "ringBufferBytes=" << ring->GetSimpleBufferBytes() << std::endl;
         std::cout << "ringElementBytes=" << ring->GetElementBytes() << std::endl;
         std::cout << "ringPipelineLoops=" << ring->GetPipelineLoopCount() << std::endl;
+        const uint64_t chunk = ring->UsesSliceProgress()
+            ? ring->GetSimpleBufferBytes() / 8 / ring->GetElementBytes() * ring->GetElementBytes() * 4
+            : dataSize / numGpus + (dataSize % numGpus != 0);
+        std::cout << "planChunkBytes=" << chunk << std::endl;
+        std::cout << "planChunkModel=" << (ring->UsesSliceProgress() ? "simple_nominal" : "ring_segment") << std::endl;
     }
     std::cout << "protocolModel=" << protocolModelType << std::endl;
     std::cout << "transactionModel=" << (useTransactionModel ? "enabled" : "legacy")

@@ -48,6 +48,8 @@ public:
     void SetStartupDelay(Time delay) override;
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
+    std::optional<uint8_t> GetWireProtocolId() const override { return m_protocolId; }
+    std::optional<uint64_t> GetStartupDelayNs() const override { return m_startupDelayNs; }
 
     // Multi-node ring construction (node-major rank layout: rank = node*g+local)
     void SetGpusPerNode(uint32_t gpusPerNode);
