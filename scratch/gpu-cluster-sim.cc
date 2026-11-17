@@ -2145,14 +2145,15 @@ main(int argc, char* argv[])
     // inside CreateTraceCollectiveInjector). hasNvls follows the same rule.
     const bool ncclProtocol = DynamicCast<NcclProtocolModel>(protoModel) != nullptr;
     const auto requestedProtocolId = protoModel->GetForceProtocolId();
-    bool hasNvls = numNodes <= 1 && topology == "switched" && fabricType == FabricType::NVLINK && ncclProtocol &&
+    bool hasNvls = (collective == "allreduce" || collective == "allgather") &&
+                   numNodes <= 1 && topology == "switched" && fabricType == FabricType::NVLINK && ncclProtocol &&
                    (requestedProtocolId == 0 || requestedProtocolId == 3);
     std::string algo = (algorithm == "auto")
         ? ResolveAutoAlgorithm(collective, topology, dataSize, numGpus, hasNvls)
         : algorithm;
     bool protocolConstrainedByAlgorithm = false;
     NS_ABORT_MSG_IF(algo == "nvls" && !hasNvls,
-                    "NVLS requires switched NVLink, NcclProtocolModel and SIMPLE");
+                    "NVLS requires single-host AllReduce/AllGather, switched NVLink, NCCL and SIMPLE");
     if (algo == "nvls" && ncclProtocol)
     {
         NS_ABORT_MSG_IF(requestedProtocolId != 0 && requestedProtocolId != 3,
