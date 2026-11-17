@@ -3251,7 +3251,12 @@ main(int argc, char* argv[])
     if (collective == "p2p") executed = "p2p";
     if (implementation == "ns3::AlltoAllInjector")
         executed = topology == "ring" ? "ring" : "direct";
-    std::optional<uint8_t> wireId = injector ? injector->GetWireProtocolId() : std::nullopt;
+    int wireId = -1;
+    if (injector)
+    {
+        const auto reported = injector->GetWireProtocolId();
+        if (reported) wireId = static_cast<int>(reported.value());
+    }
     if (implementation == "ns3::SharpAllReduce")
         wireId = protoModel->GetProtocolId(dataSize);
     if (implementation == "ns3::NvlsAllGather")
@@ -3266,14 +3271,17 @@ main(int argc, char* argv[])
     if (executed == "hierarchical" || (collective == "p2p" && numNodes > 1))
     {
         wireProtocol = "per_phase";
-        wireId.reset();
+        wireId = -1;
     }
-    else if (wireId)
+    else if (wireId >= 0)
     {
-        wireProtocol = DynamicCast<NcclProtocolModel>(protoModel)
-            ? (*wireId == 1 ? "LL" : *wireId == 2 ? "LL128" : *wireId == 3 ? "SIMPLE"
-                                                                                  : "id:" + std::to_string(*wireId))
-            : "id:" + std::to_string(*wireId);
+        wireProtocol = "id:" + std::to_string(wireId);
+        if (ncclProtocol)
+        {
+            if (wireId == 1) wireProtocol = "LL";
+            else if (wireId == 2) wireProtocol = "LL128";
+            else if (wireId == 3) wireProtocol = "SIMPLE";
+        }
     }
     std::cout << "executionPlanVersion=1" << std::endl;
     std::cout << "selectedAlgorithm=" << executed << std::endl;
@@ -3281,9 +3289,9 @@ main(int argc, char* argv[])
               << (algorithm == "auto" ? "simulator_heuristic" : "explicit") << std::endl;
     std::cout << "planImplementation=" << implementation << std::endl;
     std::cout << "selectedProtocol=" << wireProtocol << std::endl;
-    std::cout << "selectedProtocolId=" << (wireId ? static_cast<int>(*wireId) : -1) << std::endl;
+    std::cout << "selectedProtocolId=" << wireId << std::endl;
     std::cout << "protocolSelectionPolicy="
-              << (wireId ? (protocolConstrainedByAlgorithm ? "algorithm_constraint"
+              << (wireId >= 0 ? (protocolConstrainedByAlgorithm ? "algorithm_constraint"
                             : protoModel->GetForceProtocolId() ? "forced" : "size_threshold")
                          : wireProtocol) << std::endl;
     std::cout << "protocolScope=" << (numNodes > 1 ? "scale_up" : "sender") << std::endl;
@@ -3305,8 +3313,11 @@ main(int argc, char* argv[])
     std::cout << "planChannels=" << channels << std::endl;
     std::cout << "channelModel=" << channelModel << std::endl;
     std::cout << "planThreadsPerChannel=-1" << std::endl;
-    if (injector && injector->GetStartupDelayNs())
-        std::cout << "planStartupDelayNs=" << *injector->GetStartupDelayNs() << std::endl;
+    if (injector)
+    {
+        const auto startup = injector->GetStartupDelayNs();
+        if (startup) std::cout << "planStartupDelayNs=" << startup.value() << std::endl;
+    }
     if (auto tree = DynamicCast<TreeAllReduce>(injector))
     {
         std::cout << "planChunkBytes=" << tree->GetPipelineChunkBytes() << std::endl;
