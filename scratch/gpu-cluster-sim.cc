@@ -57,6 +57,7 @@
 #include "ns3/rttcc-rate-machine.h"
 #include "ns3/sharp-allreduce.h"
 #include "ns3/tree-allreduce.h"
+#include "ns3/nccl-local-tree.h"
 #include "ns3/ub-payload-builder.h"
 #include "ns3/ub-protocol-model.h"
 
@@ -159,7 +160,7 @@ ResolveAutoAlgorithm(const std::string& coll, const std::string& topo,
         {
             return "nvls";
         }
-        // Tree wins for latency-bound small messages (far fewer steps).
+        // Retain the simulator's small-message Tree selection heuristic.
         if (dataSize < MEDIUM)
         {
             return "tree";
@@ -756,6 +757,10 @@ main(int argc, char* argv[])
     cmd.AddValue("rttccProbeIntervalNs", "RTTCC min spacing between RTT probes per flow in ns (0=default 5000)", rttccProbeIntervalNs);
     cmd.AddValue("intraNodeTopology", "Intra-node topology: switched/fullmesh", intraNodeTopology);
     cmd.AddValue("intraNodeAlgorithm", "Intra-node algorithm for hierarchical: ring/fullmesh", intraNodeAlgorithm);
+    uint32_t treeMaxChannels = 0;
+    uint64_t treeSimpleBufferBytes = NcclLocalTree::DefaultSimpleBuffer;
+    cmd.AddValue("treeMaxChannels", "Local NCCL Tree communicator channel limit (0=one duplicated graph)", treeMaxChannels);
+    cmd.AddValue("treeSimpleBufferBytes", "Local NCCL Tree SIMPLE FIFO buffer per channel", treeSimpleBufferBytes);
     uint32_t ringChannels = 0;
     cmd.AddValue("ringChannels", "Channels (parallel rings) for ncclring algorithm, 0=auto(gpusPerNode)", ringChannels);
     std::string stepTraceFile = "";
@@ -2453,20 +2458,31 @@ main(int argc, char* argv[])
         }
         else if (algo == "tree")
         {
-            Ptr<TreeAllReduce> ar = CreateObject<TreeAllReduce>();
+            Ptr<CollectiveInjector> ar;
+            const bool localWiring = topology == "switched" || topology == "fullmesh" || topology == "ring";
+            const bool localNccl = numNodes == 1 && ncclProtocol && localWiring;
+            if (localNccl && SelectTreeWireProtocol(protoModel, dataSize, numGpus) ==
+                                 static_cast<uint8_t>(NcclProtocol::SIMPLE))
+            {
+                auto local = CreateObject<NcclLocalTree>();
+                local->Configure(treeMaxChannels, treeSimpleBufferBytes, NanoSeconds(perStepSwOverheadNs),
+                                 swOverheadPerByteNs);
+                ar = local;
+            }
+            else
+            {
+                NS_ABORT_MSG_IF(!localNccl && (treeMaxChannels || treeSimpleBufferBytes != NcclLocalTree::DefaultSimpleBuffer),
+                                "Tree channel controls require one host and the NCCL protocol model");
+                auto generic = CreateObject<TreeAllReduce>();
+                generic->SetPerStepSwOverhead(NanoSeconds(perStepSwOverheadNs));
+                generic->SetSwOverheadPerByteNs(swOverheadPerByteNs);
+                ar = generic;
+            }
             ar->Initialize(numGpus, dataSize, endpoints);
             ar->SetCompletionCallback(MakeCallback(&OnCollectiveComplete));
             if (startupDelayNs > 0)
             {
                 ar->SetStartupDelay(NanoSeconds(startupDelayNs));
-            }
-            if (perStepSwOverheadNs > 0)
-            {
-                ar->SetPerStepSwOverhead(NanoSeconds(perStepSwOverheadNs));
-            }
-            if (swOverheadPerByteNs > 0)
-            {
-                ar->SetSwOverheadPerByteNs(swOverheadPerByteNs);
             }
             ar->Start();
             injector = ar;
@@ -3237,7 +3253,7 @@ main(int argc, char* argv[])
     const std::map<std::string, std::string> implementations = {
         {"ns3::RingAllReduce", "ring"}, {"ns3::RingAllGather", "ring"},
         {"ns3::RingReduceScatter", "ring"}, {"ns3::RingBroadcast", "ring"},
-        {"ns3::RingReduce", "ring"}, {"ns3::TreeAllReduce", "tree"},
+        {"ns3::RingReduce", "ring"}, {"ns3::TreeAllReduce", "tree"}, {"ns3::NcclLocalTree", "tree"},
         {"ns3::NcclRingAllReduce", "ncclring"}, {"ns3::SharpAllReduce", "nvls"},
         {"ns3::NvlsAllGather", "nvls"}, {"ns3::FullMeshAllReduce", "fullmesh"},
         {"ns3::FullMeshAllGather", "fullmesh"}, {"ns3::FullMeshReduceScatter", "fullmesh"},
@@ -3284,6 +3300,11 @@ main(int argc, char* argv[])
         }
     }
     std::cout << "executionPlanVersion=1" << std::endl;
+    if (executed == "tree")
+    {
+        std::cout << "treeStartupSource=" << (startupDelayNs > 0 ? "explicit_delay" : "wire_protocol")
+                  << std::endl;
+    }
     std::cout << "selectedAlgorithm=" << executed << std::endl;
     std::cout << "algorithmSelectionPolicy="
               << (algorithm == "auto" ? "simulator_heuristic" : "explicit") << std::endl;
@@ -3304,6 +3325,26 @@ main(int argc, char* argv[])
         const uint64_t grid = static_cast<uint64_t>(numGpus) * channels;
         std::cout << "planChunkBytes=" << dataSize / grid + (dataSize % grid != 0) << std::endl;
         std::cout << "planChunkModel=channel_segment" << std::endl;
+    }
+    else if (auto tree = DynamicCast<NcclLocalTree>(injector))
+    {
+        channels = tree->GetChannelBytes().size();
+        channelModel = "replicated_local_chain";
+        std::cout << "treeChannelLimit=" << tree->GetChannelLimit() << std::endl;
+        std::cout << "treeChannelLimitSource=" << (treeMaxChannels ? "configured" : "duplicated_graph_fallback") << std::endl;
+        std::cout << "treeDepth=" << tree->GetRankOrder().size() - 1 << std::endl;
+        std::cout << "treeSimpleBufferBytes=" << tree->GetSimpleBuffer() << std::endl;
+        auto printList = [](const char* name, const auto& values) {
+            std::cout << name << "=";
+            for (size_t i = 0; i < values.size(); ++i)
+                std::cout << (i ? "," : "") << values[i];
+            std::cout << std::endl;
+        };
+        printList("treeRankOrder", tree->GetRankOrder());
+        printList("treeChannelBytes", tree->GetChannelBytes());
+        printList("treeDeliveredBytesPerHop", tree->GetDeliveredBytes());
+        std::cout << "planChunkBytes=" << tree->GetChunkBytes() << std::endl;
+        std::cout << "planChunkModel=tree_protocol_step" << std::endl;
     }
     else if (DynamicCast<RingAllReduce>(injector))
     {

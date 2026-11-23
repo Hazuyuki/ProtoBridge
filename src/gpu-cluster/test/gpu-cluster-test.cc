@@ -57,6 +57,7 @@
 #include "ns3/ring-reducescatter.h"
 #include "ns3/ring-broadcast.h"
 #include "ns3/tree-allreduce.h"
+#include "ns3/nccl-local-tree.h"
 #include "ns3/sharp-allreduce.h"
 #include "ns3/nvls-allgather.h"
 #include "ns3/fullmesh-allreduce.h"
@@ -8612,6 +8613,81 @@ NonRootReceived(const std::vector<uint32_t>& rxPerRank, uint16_t root)
     }
     return true;
 }
+
+class LocalTreeDeliveryTest : public TestCase
+{
+  public:
+    explicit LocalTreeDeliveryTest(bool dropTraffic)
+        : TestCase(dropTraffic
+                       ? "NCCL local Tree waits for dropped payload"
+                       : "NCCL local Tree delivers all channels along the installed rank order"),
+          m_dropTraffic(dropTraffic)
+    {
+    }
+
+    void DoRun() override
+    {
+        const std::vector<uint16_t> order{0, 3, 1, 4, 2};
+        auto cluster = BuildCollectiveCluster(order.size(), true);
+        auto sw = GetFirstSwitch(cluster.switchNodes);
+        sw->SetVoqDepth(m_dropTraffic ? 1 : 2048);
+        for (size_t pos = 0; pos < order.size(); ++pos)
+        {
+            auto ep = cluster.endpoints[order[pos]];
+            ep->SetRingNeighbors(order[(pos + 1) % order.size()],
+                                 order[(pos + order.size() - 1) % order.size()]);
+        }
+        auto tree = CreateObject<NcclLocalTree>();
+        // More channels than ranks, uneven ranges and more than eight FIFO
+        // turns per channel. The tail must finish on every directed edge.
+        constexpr uint32_t channels = 7;
+        constexpr uint64_t bytes = (1 << 20) + 3;
+        tree->Configure(channels, 64 << 10, NanoSeconds(0), 0);
+        tree->Initialize(order.size(), bytes, cluster.endpoints);
+        bool complete = false;
+        tree->SetCompletionCallback([&](uint64_t) {
+            NS_TEST_EXPECT_MSG_EQ(complete, false, "only one collective completion");
+            complete = true;
+            for (auto delivered : tree->GetDeliveredBytes())
+            {
+                NS_TEST_EXPECT_MSG_EQ(delivered,
+                                      bytes,
+                                      "each hop must deliver exactly the tensor size");
+            }
+        });
+        tree->Start();
+        Simulator::Stop(MilliSeconds(500));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ((sw->GetDroppedPackets() > 0), m_dropTraffic, "test switch loss");
+        NS_TEST_EXPECT_MSG_EQ(complete, !m_dropTraffic, "completion requires every payload");
+        NS_TEST_EXPECT_MSG_EQ((tree->GetRankOrder() == order),
+                              true,
+                              "use the local topology order");
+        NS_TEST_EXPECT_MSG_EQ(tree->GetDeliveredBytes().size(),
+                              2 * (order.size() - 1),
+                              "reduce and broadcast");
+        NS_TEST_EXPECT_MSG_EQ(tree->GetChannelBytes().size(),
+                              channels,
+                              "channels are independent of rank count");
+        tree->Dispose();
+        Simulator::Destroy();
+    }
+
+  private:
+    bool m_dropTraffic;
+};
+
+class NcclLocalTreeTestSuite : public TestSuite
+{
+  public:
+    NcclLocalTreeTestSuite()
+        : TestSuite("gpu-cluster-nccl-local-tree", Type::UNIT)
+    {
+        AddTestCase(new LocalTreeDeliveryTest(false), TestCase::Duration::QUICK);
+        AddTestCase(new LocalTreeDeliveryTest(true), TestCase::Duration::QUICK);
+    }
+};
+static NcclLocalTreeTestSuite g_ncclLocalTreeTests;
 
 class RingAllReduceCorrectnessTest : public TestCase
 {

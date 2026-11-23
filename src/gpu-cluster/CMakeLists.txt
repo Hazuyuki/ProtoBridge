@@ -50,6 +50,7 @@ build_lib(
     model/sharp-allreduce.cc
     model/nvls-allgather.cc
     model/tree-allreduce.cc
+    model/nccl-local-tree.cc
     model/ring-allgather.cc
     model/ring-reducescatter.cc
     model/ring-broadcast.cc
@@ -118,6 +119,7 @@ build_lib(
     model/sharp-allreduce.h
     model/nvls-allgather.h
     model/tree-allreduce.h
+    model/nccl-local-tree.h
     model/ring-allgather.h
     model/ring-reducescatter.h
     model/ring-broadcast.h

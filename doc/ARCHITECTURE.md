@@ -95,6 +95,34 @@ AllGather/ReduceScatter and hierarchical collectives retain their existing
 progress rules. These limits must be recorded in comparisons with NCCL or
 other backends.
 
+### Single-host NCCL Tree AllReduce
+
+For NCCL SIMPLE on a single switched, ring or full-mesh host, `NcclLocalTree` follows the local
+rank order from the topology. A channel reduces from leaf to root and broadcasts
+back along the same chain. `--treeMaxChannels` supplies the communicator limit.
+A missing graph uses one duplicated local chain (limit two). The isolated request
+planner uses protocol traffic cells, the default Tree thread thresholds and the
+payload to choose nonempty channel ranges. The assumed rank order is replicated
+on each channel. [NCCL graph connections](https://github.com/NVIDIA/nccl/blob/v2.27.7-1/src/graph/connect.cc)
+and [NCCL planning](https://github.com/NVIDIA/nccl/blob/v2.27.7-1/src/enqueue.cc).
+
+The SIMPLE step uses one eighth of `--treeSimpleBufferBytes` (default 4 MiB),
+rounded down to the 512-byte protocol grain. The selected wire protocol supplies
+the startup service. Eight FIFO slots per directed edge allow successive chunks
+to overlap, with delivery tracked separately for each slot. Channels with equal
+ranges on the replicated chain advance under an equal-share approximation.
+Their individual packets enter the shared endpoint queues. A shorter last
+range has independent readiness. The final leaf must receive every range.
+[Device Tree and channel ranges](https://github.com/NVIDIA/nccl/blob/v2.27.7-1/src/device/all_reduce.h).
+
+RESULT exposes the channel limit and its source, active channels, local rank
+order, the nominal per-channel chunk, exact channel payloads and observed payload
+delivery per directed hop. LL and LL128 publish readiness by line and continue
+to use the generic Tree forwarding approximation with matching protocol startup.
+Multi-host and other protocol models also use the generic Tree. GPU reduction
+and memory service require separate validation. [LL device primitive](https://github.com/NVIDIA/nccl/blob/v2.27.7-1/src/device/prims_ll.h)
+and [LL128 device primitive](https://github.com/NVIDIA/nccl/blob/v2.27.7-1/src/device/prims_ll128.h).
+
 ## Configuration boundary
 
 A `.cfg` supplies `[stack]` settings and an `[op]` schedule. Supported

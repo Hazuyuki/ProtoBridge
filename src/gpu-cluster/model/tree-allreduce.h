@@ -7,7 +7,8 @@
  * direction (D up during reduce, D down during broadcast), forwarded in
  * pipeline chunks so the hops overlap.
  *
- * Volume model (matches real NCCL tree AllReduce):
+ * Generic binary-tree fallback. NCCL single-host SIMPLE uses NcclLocalTree.
+ * Volume model:
  * - Reduce: every non-root GPU sends D bytes to its parent; a parent forwards
  *   byte ranges up only once received from ALL children (min across children).
  * - Broadcast: the root re-broadcasts reduced byte ranges down; interior GPUs
@@ -29,6 +30,10 @@
 
 namespace ns3
 {
+
+// The simulator's existing Tree wire-size heuristic is shared by the driver
+// and both Tree executors, including when the protocol is forced.
+uint8_t SelectTreeWireProtocol(Ptr<ProtocolModel> model, uint64_t bytes, uint16_t ranks);
 
 enum class TreeAllReduceState
 {
@@ -93,7 +98,6 @@ class TreeAllReduce : public CollectiveInjector
 
     uint16_t m_numGpus;
     uint64_t m_dataSize;
-    uint64_t m_chunkSize;      // D/N, kept for protocol-threshold selection
     uint64_t m_pipeChunkSize;  // pipeline forwarding granularity
     uint16_t m_flowId;
     uint8_t m_protocolId;

@@ -26,7 +26,6 @@
 #include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
-#include "nccl-protocol.h"
 #include "protocol-model.h"
 
 #include <algorithm>
@@ -47,6 +46,14 @@ constexpr uint64_t PIPE_CHUNK_MIN = 64ULL * 1024;
 constexpr uint64_t PIPE_CHUNK_MAX = 8ULL * 1024 * 1024;
 } // namespace
 
+uint8_t
+SelectTreeWireProtocol(Ptr<ProtocolModel> model, uint64_t bytes, uint16_t ranks)
+{
+    NS_ABORT_MSG_IF(!ranks, "Tree requires at least one rank");
+    const uint64_t segment = bytes / ranks;
+    return model->GetProtocolId(segment ? segment : bytes);
+}
+
 TypeId
 TreeAllReduce::GetTypeId()
 {
@@ -60,7 +67,6 @@ TreeAllReduce::GetTypeId()
 TreeAllReduce::TreeAllReduce()
     : m_numGpus(0),
       m_dataSize(0),
-      m_chunkSize(0),
       m_pipeChunkSize(0),
       m_flowId(1),
       m_protocolId(0),
@@ -176,11 +182,6 @@ TreeAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
     m_depth = GetTreeDepth();
     m_totalSteps = 2 * m_depth;
 
-    // D/N, kept only for protocol-threshold selection (same per-step payload
-    // granularity the ring model uses to pick LL/LL128/SIMPLE).
-    m_chunkSize = dataSize / numGpus;
-    if (m_chunkSize == 0) m_chunkSize = dataSize;
-
     m_pipeChunkSize = std::clamp<uint64_t>(dataSize / (32ULL * m_depth),
                                            PIPE_CHUNK_MIN, PIPE_CHUNK_MAX);
 
@@ -199,13 +200,11 @@ TreeAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
 
     // Protocol selection based on chunk size (per-step payload)
     Ptr<ProtocolModel> protoModel = m_endpoints[0]->GetProtocolModel();
+    m_protocolId = SelectTreeWireProtocol(protoModel, dataSize, numGpus);
     if (m_startupDelayNs == 0)
     {
-        uint8_t protoId = protoModel->GetProtocolId(dataSize);
-        m_startupDelayNs = protoModel->GetStartupDelayNs(protoId, m_numGpus);
+        m_startupDelayNs = protoModel->GetStartupDelayNs(m_protocolId, m_numGpus);
     }
-    NcclProtocol wireProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_chunkSize));
-    m_protocolId = static_cast<uint8_t>(wireProto);
 
     SetupReceiveCallbacks();
 
@@ -213,7 +212,7 @@ TreeAllReduce::Initialize(uint16_t numGpus, uint64_t dataSize,
                 << " dataSize=" << dataSize << " pipeChunk=" << m_pipeChunkSize
                 << " depth=" << m_depth
                 << " startupDelay=" << m_startupDelayNs << "ns"
-                << " protocol=" << static_cast<int>(wireProto));
+                << " protocol=" << static_cast<int>(m_protocolId));
 }
 
 void
