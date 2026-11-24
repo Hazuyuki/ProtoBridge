@@ -51,13 +51,17 @@ public:
     void SetStartupDelay(Time delay) override;
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
-    std::optional<uint8_t> GetWireProtocolId() const override { return m_protocolId; }
+    std::optional<uint8_t> GetWireProtocolId() const override;
     std::optional<uint64_t> GetStartupDelayNs() const override { return m_startupDelayNs; }
 
     AlltoAllState GetState() const { return m_state; }
     void SetSegmentSize(uint64_t bytes);
     void SetConcurrentMode(bool concurrent);
     void SetTwoDimensionalRouting(uint32_t rows, uint32_t cols);
+    // Configure before Initialize for a flat local NCCL P2P communicator.
+    void ConfigureLocalNcclP2p(uint32_t channelsPerPeer);
+    const std::vector<uint16_t>& GetP2pPeerDeltas() const { return m_p2pPeerDeltas; }
+    const std::vector<uint64_t>& GetConcurrentReceivedBytes() const { return m_gpuReceivedBytes; }
 
     /// Test probe: chunk `gpu`'s size in the coverage grid.
     uint64_t ProbeChunkSizeOf(uint16_t gpu) const
@@ -103,6 +107,9 @@ private:
     uint64_t m_chunkRemainder;  // dataSize % numGpus spread one byte each
     uint64_t m_sentDataBytes;   // cumulative payload bytes sent (coverage)
     uint8_t m_protocolId;
+    uint8_t m_remainderProtocolId{0};
+    uint32_t m_p2pChannelsPerPeer{0};
+    std::vector<uint16_t> m_p2pPeerDeltas;
 
     AlltoAllState m_state;
     AlltoAllMode m_mode;

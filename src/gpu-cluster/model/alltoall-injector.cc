@@ -14,6 +14,9 @@
 #include "nccl-protocol.h"
 #include "protocol-model.h"
 
+#include <algorithm>
+#include <bit>
+
 namespace ns3
 {
 
@@ -150,13 +153,49 @@ AlltoAllInjector::Initialize(uint16_t numGpus, uint64_t dataSize,
     }
 
     Ptr<ProtocolModel> protoModel = m_endpoints[0]->GetProtocolModel();
-    NcclProtocol startupProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_dataSize));
-    if (m_startupDelayNs == 0)
+    m_p2pPeerDeltas.clear();
+    if (m_p2pChannelsPerPeer)
     {
-        m_startupDelayNs = protoModel->GetStartupDelayNs(static_cast<uint8_t>(startupProto), m_numGpus);
+        // NCCL v2.27.7-1 init.cc, flat p2pSchedule. Each rank posts the same
+        // relative round; no collective barrier separates neighboring rounds.
+        const uint32_t slots = std::bit_ceil(static_cast<uint32_t>(numGpus));
+        uint32_t delta = 0;
+        for (uint32_t round = 1; round < slots; ++round)
+        {
+            delta = (delta + round) % slots;
+            if (delta < numGpus)
+            {
+                m_p2pPeerDeltas.push_back(delta);
+            }
+        }
+        // NCCL enqueue.cc, addP2pToPlan: local connectors with LL buffers
+        // use LL up to maxChannelsPerPeer * NCCL_P2P_LL_THRESHOLD bytes.
+        const auto peerProtocol = [&](uint64_t bytes) -> uint8_t {
+            if (const auto forced = protoModel->GetForceProtocolId()) return forced;
+            constexpr uint64_t p2pLlThreshold = 16384;
+            return static_cast<uint8_t>(bytes <= m_p2pChannelsPerPeer * p2pLlThreshold
+                                            ? NcclProtocol::LL : NcclProtocol::SIMPLE);
+        };
+        m_protocolId = peerProtocol(m_chunkSize);
+        m_remainderProtocolId = m_chunkRemainder ? peerProtocol(m_chunkSize + 1) : m_protocolId;
+        if (m_startupDelayNs == 0)
+        {
+            if (m_chunkSize) m_startupDelayNs = protoModel->GetStartupDelayNs(m_protocolId, numGpus);
+            if (m_chunkRemainder)
+            {
+                m_startupDelayNs = std::max(m_startupDelayNs,
+                                            protoModel->GetStartupDelayNs(m_remainderProtocolId, numGpus));
+            }
+        }
     }
-    NcclProtocol wireProto = static_cast<NcclProtocol>(protoModel->GetProtocolId(m_chunkSize));
-    m_protocolId = static_cast<uint8_t>(wireProto);
+    else
+    {
+        m_protocolId = m_remainderProtocolId = protoModel->GetProtocolId(m_chunkSize);
+        if (m_startupDelayNs == 0)
+        {
+            m_startupDelayNs = protoModel->GetStartupDelayNs(protoModel->GetProtocolId(m_dataSize), numGpus);
+        }
+    }
 
     SetupReceiveCallbacks();
 
@@ -171,8 +210,24 @@ AlltoAllInjector::Initialize(uint16_t numGpus, uint64_t dataSize,
                 << " dataSize=" << dataSize << " chunkSize=" << m_chunkSize
                 << " totalSteps=" << m_totalSteps
                 << " mode=" << (m_mode == AlltoAllMode::CONCURRENT ? "CONCURRENT" : "RING_PIPELINE")
-                << " protocol=" << static_cast<int>(wireProto)
+                << " protocol=" << static_cast<int>(m_protocolId)
                 << " startupDelay=" << m_startupDelayNs << "ns");
+}
+
+void
+AlltoAllInjector::ConfigureLocalNcclP2p(uint32_t channelsPerPeer)
+{
+    NS_ABORT_MSG_IF(!std::has_single_bit(channelsPerPeer) || channelsPerPeer > 64,
+                    "NCCL P2P channels per peer must be a power of two from 1 to 64");
+    m_p2pChannelsPerPeer = channelsPerPeer;
+}
+
+std::optional<uint8_t>
+AlltoAllInjector::GetWireProtocolId() const
+{
+    if (m_chunkSize == 0 && m_chunkRemainder) return m_remainderProtocolId;
+    if (m_remainderProtocolId != m_protocolId) return std::nullopt;
+    return m_protocolId;
 }
 
 void
@@ -335,6 +390,14 @@ AlltoAllInjector::TriggerConcurrentSends()
 {
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
+        if (!m_p2pPeerDeltas.empty())
+        {
+            for (uint16_t delta : m_p2pPeerDeltas)
+            {
+                SendGpuConcurrentChunk(gpu, (gpu + delta) % m_numGpus);
+            }
+            continue;
+        }
         for (uint16_t dest = 0; dest < m_numGpus; dest++)
         {
             if (dest == gpu)
@@ -377,7 +440,7 @@ AlltoAllInjector::SendGpuConcurrentChunk(uint16_t gpu, uint16_t dest)
     m_sentDataBytes += chunkBytes;
     m_endpoints[gpu]->SendBulkWireTransferSize(nextHop,
                                                 chunkBytes,
-                                                m_protocolId,
+                                                dest < m_chunkRemainder ? m_remainderProtocolId : m_protocolId,
                                                 flowId,
                                                 0);
 

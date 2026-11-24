@@ -29,7 +29,7 @@ NS_LOG_COMPONENT_DEFINE("ProtocolProfile");
 
 // Reserved keys that Build() consumes directly (not forwarded as attributes).
 static const char* RESERVED[] = {
-    "protocolModel", "forceProtocol",
+    "protocolModel", "forceProtocol", "p2pChannelsPerPeer",
     "fecN", "fecK", "fecT", "fecEnabled",
     "fecEncodeLatencyNs", "fecDecodeLatencyNs",
     "vcCount", "vcCredits",

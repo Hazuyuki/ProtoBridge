@@ -357,6 +357,7 @@ main(int argc, char* argv[])
     uint64_t perStepSwOverheadNs = 0;
     uint16_t rootRank = 0;
     uint32_t forceProtocol = 0;  // 0=auto, 1=LL, 2=LL128, 3=SIMPLE
+    uint32_t p2pChannelsPerPeer = 0;
     std::string ringProgress = "chunk";
     uint64_t ringBufferBytes = 4 * 1024 * 1024;
     uint32_t ringElementBytes = 1;
@@ -683,6 +684,7 @@ main(int argc, char* argv[])
     cmd.AddValue("computeBaseLL128", "Base compute delay for LL128 protocol in ring AllReduce per-step (ns)", computeBaseLL128Ns);
     cmd.AddValue("computeBaseSIMPLE", "Base compute delay for SIMPLE protocol in ring AllReduce per-step (ns)", computeBaseSIMPLENs);
     cmd.AddValue("forceProtocol", "Force protocol: 0=auto, 1=LL, 2=LL128, 3=SIMPLE", forceProtocol);
+    cmd.AddValue("p2pChannelsPerPeer", "Local NCCL communicator channel limit for the P2P LL cutoff (0=one-channel fallback)", p2pChannelsPerPeer);
     cmd.AddValue("ringProgress", "Ring AllReduce progress: chunk (legacy), slice (single-host NCCL SIMPLE), auto", ringProgress);
     cmd.AddValue("ringBufferBytes", "NCCL SIMPLE buffer bytes for slice progress (default 4 MiB)", ringBufferBytes);
     cmd.AddValue("ringElementBytes", "Packed element bytes for SIMPLE slice alignment: 1/2/4/8/16", ringElementBytes);
@@ -860,6 +862,7 @@ main(int argc, char* argv[])
         // Protocol model + startup + thresholds.
         applyS(protocolModelType, "protocolModel");
         applyU32(forceProtocol, "forceProtocol");
+        applyU32(p2pChannelsPerPeer, "p2pChannelsPerPeer");
         applyU64(startupLLNs, "StartupDelayLL");
         applyU64(startupLL128Ns, "StartupDelayLL128");
         applyU64(startupSIMPLENs, "StartupDelaySIMPLE");
@@ -2624,6 +2627,11 @@ main(int argc, char* argv[])
                 }
             }
             Ptr<AlltoAllInjector> a2a = CreateObject<AlltoAllInjector>();
+            if (numNodes == 1 && ncclProtocol && fabricType == FabricType::NVLINK &&
+                (topology == "switched" || topology == "fullmesh"))
+            {
+                a2a->ConfigureLocalNcclP2p(p2pChannelsPerPeer ? p2pChannelsPerPeer : 1);
+            }
             a2a->Initialize(numGpus, dataSize, endpoints);
             a2a->SetCompletionCallback(MakeCallback(&OnCollectiveComplete));
             // Use AlltoAll-specific startup if provided, otherwise use protocol startup
@@ -3311,11 +3319,32 @@ main(int argc, char* argv[])
     std::cout << "planImplementation=" << implementation << std::endl;
     std::cout << "selectedProtocol=" << wireProtocol << std::endl;
     std::cout << "selectedProtocolId=" << wireId << std::endl;
+    auto printList = [](const char* name, const auto& values) {
+        std::cout << name << "=";
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            std::cout << (i ? "," : "") << values[i];
+        }
+        std::cout << std::endl;
+    };
+    auto a2a = DynamicCast<AlltoAllInjector>(injector);
+    const bool localP2p = a2a && !a2a->GetP2pPeerDeltas().empty();
+    if (localP2p)
+    {
+        std::cout << "alltoallStartupSource=" << (startupDelayNs || startupAlltoAllNs ? "explicit_delay" : "peer_protocol")
+                  << std::endl;
+        std::cout << "p2pChannelsPerPeer=" << (p2pChannelsPerPeer ? p2pChannelsPerPeer : 1) << std::endl;
+        std::cout << "p2pChannelsPerPeerSource=" << (p2pChannelsPerPeer ? "configured" : "single_channel_fallback") << std::endl;
+        printList("p2pPeerDeltas", a2a->GetP2pPeerDeltas());
+        std::cout << "p2pSentPayloadBytes=" << a2a->GetSentDataBytes() << std::endl;
+        printList("p2pReceivedPayloadBytes", a2a->GetConcurrentReceivedBytes());
+    }
     std::cout << "protocolSelectionPolicy="
-              << (wireId >= 0 ? (protocolConstrainedByAlgorithm ? "algorithm_constraint"
+              << (localP2p && !requestedProtocolId ? "nccl_p2p_peer_bytes"
+                  : wireId >= 0 ? (protocolConstrainedByAlgorithm ? "algorithm_constraint"
                             : protoModel->GetForceProtocolId() ? "forced" : "size_threshold")
                          : wireProtocol) << std::endl;
-    std::cout << "protocolScope=" << (numNodes > 1 ? "scale_up" : "sender") << std::endl;
+    std::cout << "protocolScope=" << (localP2p ? "peer" : numNodes > 1 ? "scale_up" : "sender") << std::endl;
     uint32_t channels = 0; // 0 = the implementation does not model channels.
     std::string channelModel = "not_modelled";
     if (auto parallel = DynamicCast<NcclRingAllReduce>(injector))
@@ -3334,12 +3363,6 @@ main(int argc, char* argv[])
         std::cout << "treeChannelLimitSource=" << (treeMaxChannels ? "configured" : "duplicated_graph_fallback") << std::endl;
         std::cout << "treeDepth=" << tree->GetRankOrder().size() - 1 << std::endl;
         std::cout << "treeSimpleBufferBytes=" << tree->GetSimpleBuffer() << std::endl;
-        auto printList = [](const char* name, const auto& values) {
-            std::cout << name << "=";
-            for (size_t i = 0; i < values.size(); ++i)
-                std::cout << (i ? "," : "") << values[i];
-            std::cout << std::endl;
-        };
         printList("treeRankOrder", tree->GetRankOrder());
         printList("treeChannelBytes", tree->GetChannelBytes());
         printList("treeDeliveredBytesPerHop", tree->GetDeliveredBytes());
