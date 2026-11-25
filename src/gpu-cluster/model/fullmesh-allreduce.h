@@ -34,7 +34,8 @@ enum class FullMeshArState
     IDLE,
     REDUCE_SCATTER,
     ALL_GATHER,
-    COMPLETED
+    COMPLETED,
+    LOCAL_REDUCE
 };
 
 class FullMeshAllReduce : public CollectiveInjector
@@ -51,6 +52,8 @@ public:
     void SetCompletionCallback(std::function<void(uint64_t durationNs)> cb) override;
     void Start() override;
     void SetStartupDelay(Time delay) override;
+    /// Exposed local reduction service before reduced shards can be gathered.
+    void SetLocalComputeDelay(Time delay) { m_localComputeDelay = delay; }
     CollectiveType GetCollectiveType() const override;
     bool IsCompleted() const override;
     std::optional<uint8_t> GetWireProtocolId() const override { return m_protocolId; }
@@ -109,6 +112,7 @@ private:
     uint8_t m_protocolId;
 
     FullMeshArState m_state;
+    Time m_localComputeDelay;
     uint64_t m_startupDelayNs;
 
     // Per-GPU tracking: bytes received in current phase

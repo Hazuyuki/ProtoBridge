@@ -12,6 +12,7 @@
 #include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
+#include "ns3/time-bounds.h"
 #include "nccl-protocol.h"
 #include "protocol-model.h"
 
@@ -216,7 +217,7 @@ FullMeshAllReduce::TriggerReduceScatterPhase()
         return;
     }
 
-    // Each GPU sends its chunk to all N-1 other GPUs simultaneously
+    // Each GPU sends each peer the shard that peer will reduce.
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
         if (gpu >= m_endpoints.size() || !m_endpoints[gpu])
@@ -345,17 +346,21 @@ FullMeshAllReduce::CheckReduceScatterComplete()
 
     if (m_reduceScatterDoneCount >= m_numGpus)
     {
-        NS_LOG_INFO("Reduce-Scatter phase complete, starting AllGather");
-        TriggerAllGatherPhase();
+        if (m_localComputeDelay.IsZero())
+        {
+            TriggerAllGatherPhase();
+            return;
+        }
+        m_state = FullMeshArState::LOCAL_REDUCE;
+        m_pendingEvents.push_back(
+            TimeBounds::Schedule(m_localComputeDelay, &FullMeshAllReduce::TriggerAllGatherPhase, this));
     }
 }
 
 void
 FullMeshAllReduce::CheckAllGatherComplete()
 {
-    // Each GPU receives the chunks of the other N-1 sources: the grid
-    // total minus its own chunk (same as reduce-scatter — each rank
-    // broadcasts its reduced chunk to all others).
+    // Each GPU receives the other ranks' reduced shards, the grid minus its own shard.
     for (uint16_t gpu = 0; gpu < m_numGpus; gpu++)
     {
         const uint64_t expectedTotal = ExpectedBytesPerDest(gpu);

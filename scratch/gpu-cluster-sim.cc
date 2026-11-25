@@ -29,6 +29,7 @@
 #include "ns3/hierarchical-reducescatter.h"
 #include "ns3/link-degradation.h"
 #include "ns3/llr-manager.h"
+#include "ns3/mccl-protocol-model.h"
 #include "ns3/multi-node-topology-helper.h"
 #include "ns3/nccl-protocol-model.h"
 #include "ns3/nccl-protocol-payload-builder.h"
@@ -56,6 +57,7 @@
 #include "ns3/roce-protocol-model.h"
 #include "ns3/rttcc-rate-machine.h"
 #include "ns3/sharp-allreduce.h"
+#include "ns3/time-bounds.h"
 #include "ns3/tree-allreduce.h"
 #include "ns3/nccl-local-tree.h"
 #include "ns3/ub-payload-builder.h"
@@ -66,6 +68,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <set>
 #include <unordered_map>
@@ -2152,6 +2155,47 @@ main(int argc, char* argv[])
     // Resolve "auto" for the single-shot path (trace path resolves per-phase
     // inside CreateTraceCollectiveInjector). hasNvls follows the same rule.
     const bool ncclProtocol = DynamicCast<NcclProtocolModel>(protoModel) != nullptr;
+    std::optional<Time> fullmeshReduceDelay;
+    // The phase starts after all rank-owned shards have arrived. Ranks reduce
+    // concurrently, so a per-output-byte cost uses the largest shard once.
+    auto configureFullMeshReduction = [&](auto reduce) {
+        if (numNodes != 1) return;
+        TimeBounds::Wide ns = localComputeDelayNs;
+        const bool hasBases = localComputeBaseLLNs || localComputeBaseLL128Ns || localComputeBaseSIMPLENs;
+        if (numGpus <= 1 || dataSize == 0)
+        {
+            ns = 0;
+        }
+        else if (localComputePerByteNs || hasBases)
+        {
+            const uint64_t shardBytes = dataSize / numGpus + (dataSize % numGpus != 0);
+            ns = TimeBounds::Wide{localComputePerByteNs} * shardBytes;
+            if (hasBases)
+            {
+                if (ncclProtocol)
+                {
+                    switch (static_cast<NcclProtocol>(reduce->GetWireProtocolId().value()))
+                    {
+                    case NcclProtocol::LL: ns += localComputeBaseLLNs; break;
+                    case NcclProtocol::LL128: ns += localComputeBaseLL128Ns; break;
+                    case NcclProtocol::SIMPLE: ns += localComputeBaseSIMPLENs; break;
+                    default: NS_ABORT_MSG("Unsupported NCCL wire protocol for fullmesh local reduction");
+                    }
+                }
+                else if (DynamicCast<McclProtocolModel>(protoModel))
+                {
+                    ns += localComputeBaseSIMPLENs; // MCCL SIMPLE has wire ID 1.
+                }
+                else
+                {
+                    NS_ABORT_MSG("LL/LL128/SIMPLE fullmesh local compute bases require NCCL or MCCL");
+                }
+            }
+        }
+        fullmeshReduceDelay = TimeBounds::FromNanoseconds(ns);
+        NS_ABORT_MSG_IF(!TimeBounds::CanSchedule(*fullmeshReduceDelay), "Fullmesh local reduction exceeds the time horizon");
+        reduce->SetLocalComputeDelay(*fullmeshReduceDelay);
+    };
     const auto requestedProtocolId = protoModel->GetForceProtocolId();
     bool hasNvls = (collective == "allreduce" || collective == "allgather") &&
                    numNodes <= 1 && topology == "switched" && fabricType == FabricType::NVLINK && ncclProtocol &&
@@ -2494,6 +2538,7 @@ main(int argc, char* argv[])
         {
             Ptr<FullMeshAllReduce> ar = CreateObject<FullMeshAllReduce>();
             ar->Initialize(numGpus, dataSize, endpoints);
+            configureFullMeshReduction(ar);
             ar->SetCompletionCallback(MakeCallback(&OnCollectiveComplete));
             if (startupDelayNs > 0)
             {
@@ -2900,6 +2945,7 @@ main(int argc, char* argv[])
         {
             Ptr<FullMeshReduceScatter> rs = CreateObject<FullMeshReduceScatter>();
             rs->Initialize(numGpus, dataSize, endpoints);
+            configureFullMeshReduction(rs);
             rs->SetCompletionCallback(MakeCallback(&OnCollectiveComplete));
             if (startupDelayNs > 0)
             {
@@ -3308,6 +3354,10 @@ main(int argc, char* argv[])
         }
     }
     std::cout << "executionPlanVersion=1" << std::endl;
+    if (fullmeshReduceDelay)
+    {
+        std::cout << "planLocalReduceDelayNs=" << fullmeshReduceDelay->GetNanoSeconds() << std::endl;
+    }
     if (executed == "tree")
     {
         std::cout << "treeStartupSource=" << (startupDelayNs > 0 ? "explicit_delay" : "wire_protocol")

@@ -2,14 +2,15 @@
  * SPDX-License-Identifier: GPL-2.0-only
  * fullmesh-reducescatter.cc
  *
- * Full-Mesh ReduceScatter: each GPU sends its chunk to all N-1 others simultaneously.
- * Single phase (reduce only, no gather back).
+ * Full-Mesh ReduceScatter: each GPU sends each peer the shard that peer owns.
+ * The reduced output is available after delivery and any exposed local compute.
  */
 
 #include "fullmesh-reducescatter.h"
 #include "ns3/fatal-error.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
+#include "ns3/time-bounds.h"
 #include "nccl-protocol.h"
 #include "protocol-model.h"
 
@@ -228,9 +229,16 @@ FullMeshReduceScatter::CheckCompletion()
         }
     }
 
-    if (m_doneCount >= m_numGpus)
+    if (m_doneCount >= m_numGpus && m_state == FullMeshRsState::RUNNING)
     {
-        Complete();
+        if (m_localComputeDelay.IsZero())
+        {
+            Complete();
+            return;
+        }
+        m_state = FullMeshRsState::LOCAL_REDUCE;
+        m_pendingEvents.push_back(
+            TimeBounds::Schedule(m_localComputeDelay, &FullMeshReduceScatter::Complete, this));
     }
 }
 
